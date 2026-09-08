@@ -34,14 +34,14 @@ class ParamSpace:
 
     def __init__(self, params: list[ParamSpec]):
         self.params = list(params)
-        # 参与寻优的参数（text 与无界 number 除外：无上下界的连续参数
-        # 无法归一化，固定透传并警告——优化器只能在有界域内工作）
+        # 参与寻优的参数：text 与"有界缺失的 number/int"固定透传
+        # （优化器只能在有界域工作；半无界旋钮如 leaf_size 保持默认即可）
         self._opt: list[ParamSpec] = []
         self._fixed: dict[str, object] = {}
         for p in self.params:
-            if p.kind == "text":
-                self._fixed[p.key] = p.default
-            elif p.kind == "number" and (p.min is None or p.max is None):
+            unbounded = (p.kind in ("number", "int")
+                         and (p.min is None or p.max is None))
+            if p.kind == "text" or unbounded:
                 self._fixed[p.key] = p.default
             else:
                 self._opt.append(p)

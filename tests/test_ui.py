@@ -357,6 +357,26 @@ def test_opt_workbench():
     assert wb.hist_table.rowCount() == 2
 
 
+def test_autotuner_ui():
+    """UI 接缝2：目标切到 ML 方法调参 -> _make_objective 产出 AutoTunerObjective。"""
+    win = _win_get()
+    win._set_dataset(load_demo("iris"))
+    app.processEvents()
+    wb = win.opt_page
+    assert getattr(wb, "_spec", None) is not None      # 数据上下文已注入
+    wb._obj_kind.setCurrentText("ML 方法调参（AutoTuner）")
+    app.processEvents()
+    wb._ml_method.setCurrentText("logistic")
+    obj = wb._make_objective()
+    assert obj.__class__.__name__ == "AutoTunerObjective"
+    assert obj.space.dim >= 1
+    # 一次评估能返回有限分数
+    s = obj(obj.space.sample(np.random.RandomState(0)))
+    assert np.isfinite(s)
+    wb._obj_kind.setCurrentText("合成函数")
+    app.processEvents()
+
+
 def test_no_dataset_button():
     """无数据点运行：提示而非崩溃。"""
     win = MainWindow()
@@ -383,6 +403,7 @@ if __name__ == "__main__":
         ("purpose_filter", test_purpose_filter),
         ("neural_pages", test_neural_pages),
         ("opt_workbench", test_opt_workbench),
+        ("autotuner_ui", test_autotuner_ui),
         ("no_dataset_button", test_no_dataset_button),
     ]
     print(f"UI 回归测试 {len(tests)} 项")

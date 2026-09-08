@@ -1,0 +1,6 @@
+method,default_cv_f1,tuned_cv_f1,gain,best_params,secs
+svc,0.9827,0.9783,-0.0045,"{'C': 1.0, 'kernel': 'rbf', 'gamma': 'auto', 'class_weight': 'balanced'}",12.8
+knn,0.9759,0.9775,0.0016,"{'leaf_size': 30, 'n_neighbors': 1, 'weights': 'distance', 'metric': 'manhattan'}",4.3
+random_forest,0.9755,0.9721,-0.0033,"{'n_estimators': 300, 'max_depth': 0, 'min_samples_leaf': 1, 'class_weight': 'none'}",53.3
+logistic,0.9698,0.9683,-0.0015,"{'C': 1.0, 'penalty': 'l2', 'class_weight': 'balanced'}",47.3
+gaussian_nb,0.7806,0.8058,0.0252,{'var_smoothing': 1e-09},0.6

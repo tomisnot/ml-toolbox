@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
             return
         self.chain_page.show_spec(self.spec, self.dataset.profile())
         self.data_page.show_spec(self.spec)
+        self.opt_page.set_data_context(self.spec)
         self.tabs.setCurrentIndex(self.TAB_CHAIN)
 
     def _open_pipeline_dialog(self):

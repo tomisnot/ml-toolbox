@@ -58,7 +58,8 @@ class OptWorkbench(QWidget):
         g1 = QGroupBox("目标函数")
         f1 = QFormLayout(g1)
         self._obj_kind = QComboBox()
-        self._obj_kind.addItems(["合成函数", "ML 方法调参（阶段4）"])
+        self._obj_kind.addItems(["合成函数", "ML 方法调参（AutoTuner）"])
+        self._obj_kind.currentTextChanged.connect(self._on_obj_kind)
         f1.addRow("类型", self._obj_kind)
         self._synth = QComboBox()
         self._obj_info = QLabel("")
@@ -67,7 +68,22 @@ class OptWorkbench(QWidget):
         self._synth.addItems(synth_names())
         self._synth.currentTextChanged.connect(self._on_synth_change)
         f1.addRow("函数", self._synth)
+        # ML 方法调参行（接缝2）：方法 + CV 折数，由主窗口注入数据上下文
+        from ..core import registry as ml_registry
+        ml_registry.load_builtin()
+        self._ml_method = QComboBox()
+        self._ml_method.addItems([m.name for m in ml_registry.all_methods()
+                                  if m.task == "supervised"])
+        self._ml_cv = QComboBox()
+        self._ml_cv.addItems(["3", "5", "10"])
+        self._ml_cv.setCurrentText("3")
+        self._lbl_method = QLabel("方法")
+        self._lbl_cv = QLabel("CV 折数")
+        f1.addRow(self._lbl_method, self._ml_method)
+        f1.addRow(self._lbl_cv, self._ml_cv)
         f1.addRow(self._obj_info)
+        for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
+            w.setVisible(False)
         self._on_synth_change(self._synth.currentText())
         form.addWidget(g1)
 
@@ -237,13 +253,40 @@ class OptWorkbench(QWidget):
         self.btn_pause.setEnabled(True)
         self._launch_next()
 
+    def set_data_context(self, spec):
+        """主窗口注入当前数据视图（AutoTuner 目标需要 X/y）。"""
+        self._spec = spec
+
+    def _on_obj_kind(self, text):
+        synth = text.startswith("合成")
+        self._synth.setVisible(synth)
+        for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
+            w.setVisible(not synth)
+        if synth:
+            self._on_synth_change(self._synth.currentText())
+        else:
+            self._obj_info.setText("用当前数据集评估“方法+超参”的 CV 主指标，"
+                                   "优化器自动搜索最优超参（接缝2）。需先在数据页加载数据。")
+
+    def _make_objective(self):
+        if self._obj_kind.currentText().startswith("合成"):
+            return make_objective_from_synth(self._synth.currentText())
+        from ..opt.bridges import AutoTunerObjective, method_param_space
+        spec = getattr(self, "_spec", None)
+        if spec is None or spec.y is None:
+            raise RuntimeError("ML 方法调参需要先加载带目标列的数据")
+        name = self._ml_method.currentText()
+        space = method_param_space(name)
+        return AutoTunerObjective(name, spec.X, spec.y, space,
+                                  cv_folds=int(self._ml_cv.currentText()))
+
     def _launch_next(self):
         if not self._queue:
             self._finish_all()
             return
         name = self._queue.pop(0)
         try:
-            objective = make_objective_from_synth(self._synth.currentText())
+            objective = self._make_objective()
         except Exception as e:
             self._prog.setText(f"目标构造失败：{e}")
             self._running = False

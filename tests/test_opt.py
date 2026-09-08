@@ -376,6 +376,58 @@ def test_pareto_front_dominance():
     assert set(pf.index) == {0, 1, 2, 3} - {1}, "(2,2) 被 (1,1) 支配"
 
 
+def test_autotuner_beats_default():
+    """接缝2 验收：AutoTuner 调 logistic 超参，CV f1 ≥ 默认参数。"""
+    import pandas as pd
+    from ml_toolbox.core import registry as ml
+    from ml_toolbox.opt.bridges import autotune
+    ml.load_builtin()
+    from sklearn.datasets import make_classification
+    X, y = make_classification(200, 8, n_informative=5, random_state=0)
+    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(8)])
+    rec, best, val = autotune("logistic", X, pd.Series(y),
+                              optimizer=registry.get("gp_bo"),
+                              budget=Budget(n_evals=20), cv_folds=3, seed=1)
+    assert rec.error is None, rec.error
+    assert val is not None and val > 0.5
+    # 默认参数基线
+    from ml_toolbox.core import runner
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    from ml_toolbox.core.contracts import RunConfig
+    spec = Pipeline.default().run(Dataset.from_arrays(X.values, y, "t"))
+    base = runner.run_one(ml.get("logistic"), spec,
+                          RunConfig(extras={"cv_folds": 3}))
+    base_f1 = base.result.metrics.get("cv_f1_mean",
+                                      base.result.metrics.get("f1"))
+    assert val >= base_f1 - 0.05, f"调参 {val:.3f} 不应明显劣于默认 {base_f1:.3f}"
+
+
+def test_response_surface_bridge():
+    """接缝3 验收：全域采样的评估历史 -> 响应面回归可学（R²>0.5）。"""
+    from ml_toolbox.opt.bridges import response_surface
+    sp = ParamSpace([ParamSpec("a", "a", "number", 0.0, min=0, max=5),
+                     ParamSpec("b", "b", "number", 0.0, min=0, max=5)])
+    obj = make_objective(lambda q: (q["a"] - 2) ** 2 + (q["b"] - 3) ** 2,
+                         sp, name="surf")
+    rec = optimize(obj, registry.get("random_search"), Budget(n_evals=60),
+                   seed=1)
+    out = response_surface(rec, "random_forest")
+    assert out is not None
+    m, res, r2 = out
+    assert np.isfinite(r2) and r2 > 0.5, f"响应面 R2={r2}"
+
+
+def test_gpbo_reuses_gpr_surrogate():
+    """接缝1 实证：GP-BO 内部代理就是 sklearn GPR（purpose=surrogate 兑现）。"""
+    from ml_toolbox.opt.synth import make_objective_from_synth
+    obj = make_objective_from_synth("six_hump")
+    o = registry.get("gp_bo")
+    optimize(obj, o, Budget(n_evals=15), cfg={"n_init": 5}, seed=1)
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    assert isinstance(o._gpr, GaussianProcessRegressor)
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
