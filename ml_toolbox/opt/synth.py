@@ -103,3 +103,41 @@ def make_objective_from_synth(key: str):
     obj.f_min = f_min          # type: ignore[attr-defined]  基准判近真值用
     obj.x_min = x_min          # type: ignore[attr-defined]
     return obj
+
+
+# ================================================================ 多目标（ZDT）
+def zdt1(dim=6):
+    """ZDT1：凸 Pareto 前沿（f2 = g·(1−sqrt(f1/g))），f1=x0, f2 见正文。"""
+    sp = ParamSpace([ParamSpec(f"x{i}", f"x{i}", "number", 0.0, min=0, max=1)
+                     for i in range(dim)])
+    def f(q):
+        x = np.array([q[f"x{i}"] for i in range(dim)])
+        g = 1 + 9 * np.mean(x[1:]) if dim > 1 else 1.0
+        return np.array([x[0], g * (1 - np.sqrt(x[0] / g))])
+    return sp, f
+
+
+def zdt2(dim=6):
+    """ZDT2：凹 Pareto 前沿。"""
+    sp = ParamSpace([ParamSpec(f"x{i}", f"x{i}", "number", 0.0, min=0, max=1)
+                     for i in range(dim)])
+    def f(q):
+        x = np.array([q[f"x{i}"] for i in range(dim)])
+        g = 1 + 9 * np.mean(x[1:]) if dim > 1 else 1.0
+        return np.array([x[0], g * (1 - (x[0] / g) ** 2)])
+    return sp, f
+
+
+MULTI_SYNTH = {"zdt1": ("ZDT1（凸前沿）", zdt1),
+               "zdt2": ("ZDT2（凹前沿）", zdt2)}
+
+
+def make_objective_multi(key: str, dim: int = 6):
+    """-> 多目标 Objective（multi=True, n_obj=2）。"""
+    from .contracts import CallableObjective
+    label, builder = MULTI_SYNTH[key]
+    sp, fn = builder(dim=dim)
+    obj = CallableObjective(fn, sp, name=key, multi=True, n_obj=2)
+    obj.multi = True
+    obj.n_obj = 2
+    return obj

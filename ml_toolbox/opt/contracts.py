@@ -82,7 +82,10 @@ class ParamSpace:
             x = params.get(p.key, p.default)
             if p.kind == "select":
                 ch = [str(c) for c in (p.choices or [])]
-                v[i] = (ch.index(str(x)) / max(len(ch) - 1, 1)) if ch else 0.0
+                try:
+                    v[i] = ch.index(str(x)) / max(len(ch) - 1, 1)
+                except ValueError:
+                    v[i] = 0.0
             elif p.kind == "bool":
                 v[i] = 1.0 if _as_bool(x) else 0.0
             else:
@@ -167,23 +170,30 @@ class Objective(abc.ABC):
     name: str = "objective"
     space: ParamSpace
     multi: bool = False          # True = 返回向量（多目标，阶段3）
+    n_obj: int = 1               # 目标数（multi=True 时 >1）
     noise: bool = False          # 含噪（数模仿真标定）→ 提示需要重复评估
     minimize: bool = True        # maximize 的目标取负实现，runner 统一化
 
     def __init__(self, name="objective", space: ParamSpace = None,
-                 noise: bool = False, minimize: bool = True):
+                 noise: bool = False, minimize: bool = True,
+                 multi: bool = False, n_obj: int = 1):
         self.name = name
         self.space = space
         self.noise = noise
         self.minimize = minimize
+        self.multi = multi
+        self.n_obj = n_obj if multi else 1
 
     @abc.abstractmethod
     def evaluate(self, params: dict) -> float:
-        """原始方向的一次评估。"""
+        """原始方向的一次评估。multi=True 时返回可迭代（各目标原始方向）。"""
         ...
 
-    def __call__(self, params: dict) -> float:
+    def __call__(self, params: dict):
         v = self.evaluate(params)
+        if self.multi:
+            a = np.asarray(v, float)
+            return a if self.minimize else -a
         return float(v) if self.minimize else -float(v)
 
 
@@ -191,8 +201,10 @@ class CallableObjective(Objective):
     """把 lambda/函数包装成 Objective（数模标定、合成函数、AutoTuner 都用它）。"""
 
     def __init__(self, fn: Callable[[dict], float], space: ParamSpace,
-                 name="callable", noise=False, minimize=True):
-        super().__init__(name=name, space=space, noise=noise, minimize=minimize)
+                 name="callable", noise=False, minimize=True,
+                 multi=False, n_obj=1):
+        super().__init__(name=name, space=space, noise=noise, minimize=minimize,
+                         multi=multi, n_obj=n_obj)
         self._fn = fn
 
     def evaluate(self, params):
@@ -270,6 +282,8 @@ class OptRecord:
     seed: int = 42
     history: pd.DataFrame = field(default_factory=pd.DataFrame)
     best: Optional[dict] = None          # {params..., score}
+    multi: bool = False                  # 多目标轨迹（history 含 f0..fk 列）
+    pareto: Optional[pd.DataFrame] = None    # 非支配解集（multi 时）
     elapsed: float = 0.0
     error: Optional[str] = None
 

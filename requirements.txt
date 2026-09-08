@@ -12,3 +12,5 @@ pyqtgraph>=0.13.1
 matplotlib>=3.7
 # 可选：神经网络方法族（torch_mlp）。未安装时其余 52 方法照常可用
 # torch>=2.0
+# 可选：优化框架 optuna 引擎（TPE/ASHA）。未装时自研引擎照常可用
+# optuna>=3.0

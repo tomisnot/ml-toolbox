@@ -274,6 +274,108 @@ def test_gpbo_mixed_space():
     assert r.best["ker"] == "rbf", f"最优核应为 rbf，实得 {r.best['ker']}"
 
 
+def _optuna_available():
+    try:
+        import optuna  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def test_cma_es_batch_contract():
+    """CMA-ES 是 batch 引擎：ask 返回一代 list，tell 收 list[dict]+list[score]。"""
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-3, max=3),
+                     ParamSpec("y", "y", "number", 0.0, min=-3, max=3)])
+    o = registry.get("cma_es")
+    from ml_toolbox.opt.contracts import Budget as B
+    o.setup(sp, 1, {"popsize": 8}, B(n_evals=40))
+    a = o.ask()
+    assert isinstance(a, list) and len(a) == 8 and isinstance(a[0], dict)
+    o.tell(a, [float(i) for i in range(8)])      # 整代分数
+    assert o.m is not None
+
+
+def test_cma_es_beats_random():
+    from ml_toolbox.opt.synth import make_objective_from_synth
+    obj = make_objective_from_synth("rosenbrock_2d")
+    r = optimize(obj, registry.get("cma_es"), Budget(n_evals=60),
+                 cfg={"popsize": 8}, seed=1)
+    rs = optimize(obj, registry.get("random_search"), Budget(n_evals=60),
+                  seed=1)
+    assert r.error is None and r.best["score"] < rs.best["score"]
+
+
+def test_batch_budget_respected():
+    """batch 引擎的 objective 调用数严格 ≤ n_evals（末代截断）。"""
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-3, max=3)])
+    obj = make_objective(lambda q: q["x"] ** 2, sp, name="q")
+    r = optimize(obj, registry.get("cma_es"), Budget(n_evals=20),
+                 cfg={"popsize": 8}, seed=2)
+    assert len(r.history) == 20, f"应正好 20，实得 {len(r.history)}"
+
+
+def test_nelder_mead_local():
+    """NM 在光滑单谷函数上收敛到真最优附近。"""
+    from ml_toolbox.opt.synth import make_objective_from_synth
+    obj = make_objective_from_synth("six_hump")
+    r = optimize(obj, registry.get("nelder_mead"), Budget(n_evals=80), seed=1)
+    assert r.error is None
+    assert r.best["score"] <= obj.f_min + 0.02, \
+        f"NM {r.best['score']:.4f} 未逼近真最优 {obj.f_min:.4f}"
+
+
+def test_tpe_mixed_space():
+    if not _optuna_available():
+        print("    (optuna 不可用，跳过 tpe)")
+        return
+    sp = _mixed_space()
+    def f(q):
+        base = {"rbf": 0.0, "poly": 1.0, "lin": 3.0}[q["ker"]]
+        return (q["x"] - 1.0) ** 2 + base + 0.1 * q["k"]
+    r = optimize(make_objective(f, sp, name="tpe_mixed"),
+                 registry.get("tpe"), Budget(n_evals=30), seed=3)
+    assert r.error is None
+    assert r.best["ker"] in ("rbf", "poly", "lin")
+    assert r.best["score"] < 2.0
+
+
+def test_asha_runs():
+    if not _optuna_available():
+        print("    (optuna 不可用，跳过 asha)")
+        return
+    from ml_toolbox.opt.synth import make_objective_from_synth
+    obj = make_objective_from_synth("ackley_3d")
+    r = optimize(obj, registry.get("asha"), Budget(n_evals=25), seed=4)
+    assert r.error is None and r.best is not None
+
+
+def test_nsga_ii_pareto():
+    """多目标：NSGA-II 在 ZDT1 上逼近凸 Pareto 前沿（f2=1-sqrt(f1)）。"""
+    from ml_toolbox.opt.synth import make_objective_multi
+    obj = make_objective_multi("zdt1", dim=6)
+    assert obj.multi and obj.n_obj == 2
+    r = optimize(obj, registry.get("nsga_ii"), Budget(n_evals=2000),
+                 cfg={"popsize": 20}, seed=21)
+    assert r.error is None, r.error
+    assert r.pareto is not None and len(r.pareto) >= 5
+    P = r.pareto[["f0", "f1"]].to_numpy(float)
+    dev = np.abs(P[:, 1] - (1 - np.sqrt(P[:, 0]))).max()
+    assert dev < 0.35, f"前沿偏离凸形 {dev:.3f}"
+    assert P[:, 0].max() - P[:, 0].min() > 0.5, "前沿应覆盖 f0 大部分区间"
+
+
+def test_pareto_front_dominance():
+    """pareto_front 正确性：支配关系手工例。"""
+    from ml_toolbox.opt.runner import pareto_front, dominates
+    import pandas as pd
+    assert dominates(np.array([1.0, 2.0]), np.array([1.0, 3.0]))
+    assert not dominates(np.array([1.0, 2.0]), np.array([0.5, 3.0]))
+    h = pd.DataFrame({"f0": [1.0, 2.0, 0.5, 3.0], "f1": [1.0, 2.0, 3.0, 0.5],
+                      "status": ["ok"] * 4})
+    pf = pareto_front(h, 2)
+    assert set(pf.index) == {0, 1, 2, 3} - {1}, "(2,2) 被 (1,1) 支配"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
