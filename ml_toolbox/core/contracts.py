@@ -128,7 +128,11 @@ class DataSpec:
 # ---------------------------------------------------------------- 参数 schema
 @dataclass
 class ParamSpec:
-    """旋钮声明：UI 据此生成控件，并校验/清洗运行级覆写。"""
+    """旋钮声明：UI 据此生成控件，并校验/清洗运行级覆写。
+
+    共享内核：ML 侧用它做参数面板，优化侧（ml_toolbox.opt）用它构成
+    ParamSpace（采样/投影/向量化）。log=True 表示对数尺度（lr/正则强度类）。
+    """
     key: str
     label: str = ""
     kind: str = "number"        # number | int | select | bool | text
@@ -137,6 +141,7 @@ class ParamSpec:
     max: Optional[float] = None
     choices: Optional[list] = None
     hint: str = ""
+    log: bool = False           # 对数尺度（需 min>0；优化侧采样用，ML 侧忽略）
 
     def clean(self, raw):
         """把 UI 原始值转成类型正确的值；非法输入抛 ValueError。"""
