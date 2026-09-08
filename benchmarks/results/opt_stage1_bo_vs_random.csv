@@ -1,0 +1,7 @@
+func,optimizer,best_mean,best_std,budget,seeds
+ackley3d,gp_bo,0.86355,0.17313,40,3
+ackley3d,random_search,5.3285,0.43665,40,3
+six_hump,gp_bo,-1.02654,0.00379,40,3
+six_hump,random_search,-0.89634,0.16466,40,3
+goldstein,gp_bo,32.00595,30.03831,40,3
+goldstein,random_search,39.06115,7.55999,40,3

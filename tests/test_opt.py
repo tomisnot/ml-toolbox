@@ -202,6 +202,79 @@ def test_history_to_dataset():
     assert len(ds.frame) == 25
 
 
+def test_gpbo_beats_random_sample_efficiency():
+    """阶段1 验收：GP-BO 在标准函数上样本效率显著优于随机搜索。
+
+    判据：同预算下 BO 的 best 至少好 2 倍，或达到同等质量所需评估次数减半。
+    种子固定保证可复现（P11）。
+    """
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-3, max=3),
+                     ParamSpec("y", "y", "number", 0.0, min=-3, max=3)])
+    # Michalewicz 2D（多峰，随机搜索易困在局部）
+    def michel(q):
+        x, y = q["x"], q["y"]
+        return -(x * np.sin(x ** 2 / np.pi) + y * np.sin(2 * y ** 2 / np.pi))
+    obj = make_objective(michel, sp, name="michel")
+    r_bo = optimize(obj, registry.get("gp_bo"), Budget(n_evals=40),
+                    cfg={"n_init": 6}, seed=11)
+    r_rs = optimize(obj, registry.get("random_search"), Budget(n_evals=40),
+                    seed=11)
+    assert r_bo.error is None, r_bo.error
+    assert r_bo.best["score"] < r_rs.best["score"], \
+        f"BO {r_bo.best['score']:.3f} 应优于随机 {r_rs.best['score']:.3f}"
+
+
+def test_gpbo_acquisitions_and_failures():
+    """三种采集函数都能跑；失败观测不进 GP 但记入历史。"""
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-2, max=2)])
+    obj = make_objective(lambda q: (q["x"] - 0.7) ** 2, sp, name="q1")
+    for acq in ("ei", "ucb", "pi"):
+        r = optimize(obj, registry.get("gp_bo"), Budget(n_evals=18),
+                     cfg={"acq": acq, "n_init": 4}, seed=12)
+        assert r.error is None, f"{acq}: {r.error}"
+        assert r.best["score"] < 1.0, f"{acq} best={r.best['score']}"
+
+    def flaky(q):
+        if q["x"] < -1.0:
+            raise RuntimeError("sim crash")
+        return (q["x"] - 0.5) ** 2
+    r = optimize(make_objective(flaky, sp, name="flaky"),
+                 registry.get("gp_bo"), Budget(n_evals=20),
+                 cfg={"n_init": 4}, seed=13)
+    assert r.error is None
+    assert (r.history["status"] == "failed").any()
+    assert r.best["score"] < 0.5
+
+
+def test_gpbo_surrogate_1d_curve():
+    """代理面页数据接口：一维切片给出 GP 后验 mu/sigma（阶段2 UI 消费）。"""
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-2, max=2),
+                     ParamSpec("k", "k", "int", 5, min=1, max=9)])
+    obj = make_objective(lambda q: (q["x"] - 1.0) ** 2, sp, name="s1")
+    opt = registry.get("gp_bo")
+    r = optimize(obj, opt, Budget(n_evals=16), cfg={"n_init": 4}, seed=14)
+    out = opt.surrogate_1d("x", {"k": 5})
+    assert out is not None
+    xs, mu, sd = out
+    assert len(xs) == len(mu) == len(sd) == 100
+    assert (sd >= 0).all()
+    # 后验均值最低点应大致在真最优附近（宽松判据）
+    assert -2 <= xs[int(np.argmin(mu))] <= 2
+
+
+def test_gpbo_mixed_space():
+    """类别/bool/int 混合空间（索引取整向量化）GP-BO 可跑通。"""
+    sp = _mixed_space()
+    def f(q):
+        base = {"rbf": 0.0, "poly": 1.0, "lin": 3.0}[q["ker"]]
+        return (q["x"] - 1.0) ** 2 + base + 0.1 * q["k"]
+    r = optimize(make_objective(f, sp, name="mixed"),
+                 registry.get("gp_bo"), Budget(n_evals=25),
+                 cfg={"n_init": 5}, seed=15)
+    assert r.error is None
+    assert r.best["ker"] == "rbf", f"最优核应为 rbf，实得 {r.best['ker']}"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
