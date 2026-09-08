@@ -4,6 +4,7 @@
 这件无法提前预测的事，变成"在统一界面里低成本遍历尝试"的工程流程。
 
 - 53 个方法 / 11 族（含神经网络 MLP，方案 C：训练过程可视化）
+- 8 个优化器 + 自动调参工作区（序贯优化，与 ML 三接缝互通）
 - 按**建模目的**（预测/判别/归因/分群/降维/综合评价/异常/代理模型/基线）筛选
 - 每个方法声明自己的核心图，UI 基类不预设图长什么样
 - 一份数据 + 一条可检视管道，全方法共享；实验自动存档可回看
@@ -12,10 +13,11 @@
 ```powershell
 pip install -r requirements.txt
 python app.py            # 启动界面
-python tests/run_all.py  # 质量门（smoke + 18 回归 + 14 UI）
+python tests/run_all.py  # 质量门（smoke + 18 回归 + 16 UI + 27 优化）
 ```
 
-> 神经网络方法族（`torch_mlp`）需 `pip install torch`；未安装时其余 52 方法照常可用。
+> 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
+> `pip install optuna`；二者均为可选依赖，未装时其余方法/自研优化器照常可用。
 
 ---
 
@@ -33,6 +35,12 @@ ml_toolbox/
 │   └── demo.py         8 个离线演示数据集
 ├── methods/       11 个方法族 + plots.py（纯 matplotlib 绘图函数）
 │   └── neural/    神经网络（方案 C）：recorder 黑匣子 + TorchMLP + nnplots
+├── opt/           序贯优化子框架（兄弟框架，零 Qt）
+│   ├── contracts.py   ParamSpace / Objective / Optimizer(ask-tell) / OptRecord
+│   ├── engines/       baseline·bo(GP-BO)·evo(CMA-ES/NSGA-II)·local(NM)·optuna适配
+│   ├── runner.py      optimize() 预算控制 + on_eval 直播回调
+│   ├── bridges.py     三接缝：AutoTuner / 响应面 / GPR 代理
+│   └── synth.py       标准测试函数（Ackley/Rosenbrock/ZDT…）
 ├── ui/            PyQt5 界面（唯一有 Qt 依赖的层）
 │   ├── main_window.py     主窗口装配
 │   ├── inspector.py       检视页基类（按 PageSpec 动态装配 + 页类型注册表）
@@ -48,7 +56,7 @@ ml_toolbox/
 ├── tests/         smoke / 回归 / UI / run_all（一键门）
 ├── benchmarks/    数学建模基准（结果表在 benchmarks/results/）
 ├── checks/        离屏截图自查闭环
-└── docs/          项目定位.md（宪法）· 契约.md · pitfalls.md（25 条）
+└── docs/          项目定位.md（宪法）· 契约.md · 优化定位.md · 优化契约.md · pitfalls.md（33 条）
 ```
 
 **依赖方向单向**：`ui → core + methods`，`methods → core`，`core → 无内部依赖`。
@@ -162,9 +170,11 @@ anomaly 4 · svm 3 · knn 1 · baseline 1 · neural 1。
 
 | 命令 | 内容 |
 |---|---|
-| `python tests/run_all.py` | 一键门：smoke（53 方法 × 6 任务）+ 18 回归 + 14 UI |
-| `python checks/ui_shot.py` | 离屏渲染真实界面 → 47 张 PNG → 按 checklist 视觉自查 |
+| `python tests/run_all.py` | 一键门：smoke（53 方法 × 6 任务）+ 18 回归 + 16 UI + 27 优化 |
+| `python checks/ui_shot.py` | 离屏渲染真实界面 → 53 张 PNG → 按 checklist 视觉自查 |
 | `python benchmarks/run_benchmarks.py` | 数模基准（Iris/Wine/Housing/blobs/异常/时序/digits） |
+| `python benchmarks/run_opt_bench.py` | 优化基准：GP-BO vs 随机搜索（标准函数全领先） |
+| `python benchmarks/run_autotune_bench.py` | AutoTuner 数模验收（digits 调参 ≥ 默认） |
 
 回归门覆盖的"静默 bug"（只有测试能抓到的那类）：热图朝向像素级验色、异常分数方向、
 标签编码跨实例、时间切分不泄漏未来、CV 零开销、参数三态、Qt 信号载荷污染、
@@ -174,9 +184,11 @@ anomaly 4 · svm 3 · knn 1 · baseline 1 · neural 1。
 
 - 神经网络仅 MLP（全连接，分类/回归）；CNN/RNN/Transformer 等结构未覆盖，
   但方案 C 的 recorder + 注册页机制可直接复用；torch 为可选依赖，未装时该族跳过；
-- **自动调参 / 序贯优化框架规划中（未实现）**——与 ML 工具箱"兄弟框架 + 共享内核 +
-  三接缝互通"，定位与开发规划见 `docs/优化定位.md`；数模的代理模型路径当前仍是
-  `gpr/bayesian_ridge` 出响应面，再交给外部优化算法（scipy.optimize / 自写遗传算法）；
+- **自动调参 / 序贯优化子框架已落地（阶段 0-4）**——与 ML 工具箱"兄弟框架 +
+  共享内核 + 三接缝互通"：8 个优化器（自研 GP-BO/CMA-ES/NSGA-II/Nelder-Mead +
+  适配 TPE/ASHA）、UI 直播工作区、AutoTuner（自动调 ML 超参）、响应面回流。
+  定位见 `docs/优化定位.md`，契约见 `docs/优化契约.md`。数模代理模型路径仍是
+  `gpr/bayesian_ridge` 出响应面，再交给优化框架或外部算法；
 - 时序方法当前只消费 y 序列，**忽略外生特征 X**（`can_handle` 已要求有 y）；
 - 单次运行内 estimator 驻留内存，不支持断点续训；
 - Windows 优先验证（LightGBM×Qt 导入顺序铁律见 `docs/pitfalls.md` L1）。
@@ -210,4 +222,6 @@ class MyMethod(MLMethod):
 
 - `docs/项目定位.md` —— 项目宪法（定位/目标/原则）与迭代状态
 - `docs/契约.md` —— 方法 / 数据 / 可视化 / 持久化四份契约
-- `docs/pitfalls.md` —— 19 条踩坑（症状→原因→修法），新坑按格式追加
+- `docs/优化定位.md` —— 序贯优化子框架宪法（与 ML 兄弟框架 + 三接缝）
+- `docs/优化契约.md` —— 优化侧 ask-and-tell 契约 + 引擎表 + 三接缝桥
+- `docs/pitfalls.md` —— 33 条踩坑（症状→原因→修法），新坑按格式追加

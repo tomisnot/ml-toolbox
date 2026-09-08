@@ -172,3 +172,55 @@
 - **约定**：`methods/__init__.py` 对 neural 子包单独 `try/except`；
   `mlp.py` 内 torch 全部惰性 import（fit 里才 import）。
   未装 torch 的环境其余 52 方法照常注册；测试用 `_neural_available()` 跳过。
+
+## 优化框架（阶段 0-4）
+
+### O1. 种群式算法拆 ask/tell：ask 返回当前种群 = 重复评估，子代永远没被评
+- **症状**：NSGA-II 在 ZDT1 上前沿偏差 4.5，f0 覆盖 [0.03, 0.6]，怎么加预算都不改善。
+- **原因**：ask 返回 `self.P`（父种群）→ runner 评估父种群 → tell 里繁殖子代 Q
+  但 Q 从未返回给 runner 评估。每代都在重评同一批父代。
+- **修法**：引入"待评缓冲" `self._to_eval`——初代 = P，之后每代 tell 结束时
+  `_to_eval = _breed()`，ask 永远返回 `_to_eval`。
+  断言见 `test_nsga_ii_pareto`（前沿贴合 f2=1-√f1，偏差 <0.35）。
+
+### O2. 多项式变异步长按"位置"选边界距离，应按"移动方向"
+- **症状**：NSGA-II 收敛慢、种群堆在中间区域。
+- **原因**：`width = where(x<0.5, x, 1-x)` 是"到较近边界"；delta<0（向左移）
+  时 x=0.8 会拿到 0.2 的步长上限（应 0.8），向右同理——变异被系统性压向中心。
+- **修法**：`dist = where(delta<0, x, 1-x)`（向左最多到 0，向右最多到 1）。
+
+### O3. ParamSpace 有界规则漏了 int：半无界旋钮采样直接崩
+- **症状**：AutoTuner 调 knn 报 `TypeError: int() argument ... not 'NoneType'`。
+- **原因**：knn 的 `leaf_size` 是 `int` 且 `max=None`；排除规则只写了
+  `p.kind == "number"` 的无界检查，`from_vector` 里 `int(p.max)` 炸。
+- **修法**：`unbounded = p.kind in ("number","int") and (p.min is None or p.max is None)`
+  统一固定透传。数模语义上也对：leaf_size 这类性能旋钮不该进寻优空间。
+
+### O4. 评估历史回流 ML：分数列被 _infer_kind 误判为分类
+- **症状**：`response_surface` 的 R² = -4e24（数值爆炸）。
+- **原因**：CV f1 只有少数几个不同值 → `_infer_kind` 判成分类 → 评估走
+  accuracy 路径、分层切分抛"least populated class has only 1 member"。
+- **修法**：`_quick_spec` 强制 `spec.target_kind="regression"`。
+  另注意：响应面只对**全域采样**（random_search）的历史有意义——GP-BO 的点
+  集中在最优点附近，分数方差 ~1e-5，任何回归 R² 都失真（这是数学事实不是 bug）。
+
+### O5. batch 引擎的预算边界：ask 一代 8 个但预算只剩 3
+- **症状**：`Budget(n_evals=20)` 跑 CMA-ES 实际评估 24 次。
+- **修法**：runner 在**评估前**截断 `plist = plist[:max(room,1)]`——
+  objective 调用数严格 ≤ n_evals（评估后才截断等于超调黑盒）。
+  断言见 `test_batch_budget_respected`。
+
+### O6. 采集函数签名不统一：ei() 收到 beta 关键字崩
+- **症状**：GP-BO 配 ucb 时 `TypeError: unexpected keyword 'beta'`。
+- **修法**：runner 按采集函数名分发各自 kwargs；ucb 签名加 `best=None`
+  占位统一三函数调用式。教训：注册表式的函数集合要约定统一签名。
+
+### O7. optuna 适配层的 tell 语义：失败观测必须用 state=FAIL
+- **症状**：objective 抛异常时 study 里记了个 inf 分数，污染 TPE 的先验模型。
+- **修法**：`study.tell(trial, state=TrialState.FAIL)`，不喂数值。
+
+### O8. 顺序跑多优化器时，超参面板误套所有优化器
+- **症状**：UI 里面板显示 gp_bo 的采集函数下拉，跑 random_search 时也把它
+  的 cfg 传给 random_search（无该参数，静默忽略但用户以为生效了）。
+- **修法**：`_param_owner` 记录面板归属，`_collect_opt_cfg(name)` 只对
+  当前 owner 返回覆写，其余优化器用默认。
