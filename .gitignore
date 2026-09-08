@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# 实验记录（本地资产，不入库）
+runs/
+
+# UI 截图自查临时产物
+checks/shots/
+
+.vscode/
+
+tests/

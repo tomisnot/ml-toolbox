@@ -1,0 +1,7 @@
+method,family,task,ok,elapsed_s,explained_variance,primary
+lda_proj,manifold,manifold,True,0.04,0.4776,explained_variance
+pca,manifold,manifold,True,0.01,0.2186,explained_variance
+kernel_pca,manifold,manifold,True,0.12,,explained_variance
+tsne,manifold,manifold,True,5.64,,explained_variance
+umap,manifold,manifold,True,55.2,,explained_variance
+isomap,manifold,manifold,True,1.61,,explained_variance

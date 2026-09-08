@@ -1,0 +1,8 @@
+method,family,task,ok,elapsed_s,rmse,mae,r2,mape,primary
+holt_winters,timeseries,timeseries,True,0.22,20.7533,17.7114,0.8817,4.2516,rmse
+holt,timeseries,timeseries,True,0.02,61.9642,50.3586,-0.055,12.5087,rmse
+ts_trend,timeseries,timeseries,True,0.01,62.4711,49.9106,-0.0724,12.3148,rmse
+ses,timeseries,timeseries,True,0.0,64.5418,52.6292,-0.1446,12.5814,rmse
+arima,timeseries,timeseries,True,0.07,73.7702,65.7444,-0.4954,17.821,rmse
+ts_naive,timeseries,timeseries,True,0.01,82.1623,73.4336,-0.8549,19.9376,rmse
+theta,timeseries,timeseries,True,0.04,82.1623,73.4336,-0.8549,19.9376,rmse

@@ -1,0 +1,7 @@
+method,family,task,ok,elapsed_s,silhouette,n_clusters,primary
+hdbscan,cluster,cluster,True,0.01,0.6824,5.0,silhouette
+agglomerative,cluster,cluster,True,0.06,0.5698,3.0,silhouette
+dbscan,cluster,cluster,True,0.01,0.5524,2.0,silhouette
+spectral,cluster,cluster,True,0.09,0.5522,3.0,silhouette
+kmeans,cluster,cluster,True,0.91,0.5507,3.0,silhouette
+gmm,cluster,cluster,True,0.05,0.5469,3.0,silhouette

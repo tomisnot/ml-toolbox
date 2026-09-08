@@ -1,0 +1,50 @@
+# -*- coding: utf-8 -*-
+"""后台运行线程：批量遍历不冻结界面。进度经信号回报主线程。
+
+⚠ Windows 已知坑：LightGBM 与 Qt 的 OpenMP 冲突通过"import 顺序"解决
+（见 methods/ensemble.py 顶层导入）——入口脚本必须在构造 QApplication
+之前 import ml_toolbox.ui.main_window。
+"""
+from __future__ import annotations
+
+import traceback
+
+from PyQt5.QtCore import QThread, pyqtSignal
+
+from ..core import runner
+from ..core.contracts import RunConfig, DataSpec
+
+
+class BatchWorker(QThread):
+    progress = pyqtSignal(int, int, str)          # done, total, current
+    finished_ok = pyqtSignal(list)                # list[RunRecord]
+    failed = pyqtSignal(str)
+
+    def __init__(self, names: list[str], spec: DataSpec,
+                 cfg: RunConfig, parent=None):
+        super().__init__(parent)
+        self.names, self.spec, self.cfg = names, spec, cfg
+
+    def run(self):
+        try:
+            recs = runner.run_batch(
+                self.names, self.spec, self.cfg,
+                progress=lambda i, n, nm: self.progress.emit(i, n, nm))
+            self.finished_ok.emit(recs)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class SingleWorker(QThread):
+    finished_ok = pyqtSignal(object)              # RunRecord
+    failed = pyqtSignal(str)
+
+    def __init__(self, method, spec: DataSpec, cfg: RunConfig, parent=None):
+        super().__init__(parent)
+        self.method, self.spec, self.cfg = method, spec, cfg
+
+    def run(self):
+        try:
+            self.finished_ok.emit(runner.run_one(self.method, self.spec, self.cfg))
+        except Exception:
+            self.failed.emit(traceback.format_exc())

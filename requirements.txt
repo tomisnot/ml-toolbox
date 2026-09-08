@@ -1,0 +1,14 @@
+# ML Toolbox 依赖（Windows / Python 3.10 实测）
+numpy>=1.26
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.4        # HDBSCAN 需要 1.3+
+xgboost>=2.0
+lightgbm>=4.0
+statsmodels>=0.14
+umap-learn>=0.5
+PyQt5>=5.15
+pyqtgraph>=0.13.1
+matplotlib>=3.7
+# 可选：神经网络方法族（torch_mlp）。未安装时其余 52 方法照常可用
+# torch>=2.0
