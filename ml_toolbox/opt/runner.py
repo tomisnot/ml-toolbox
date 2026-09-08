@@ -153,10 +153,18 @@ def compare_records(records: list[OptRecord]) -> "pd.DataFrame":
     for r in records:
         ok = r.history[r.history["status"] == "ok"] if len(r.history) else \
             r.history
+        if getattr(r, "multi", False):
+            row = {"optimizer": r.optimizer, "objective": r.objective,
+                   "pareto_n": len(r.pareto) if r.pareto is not None else 0,
+                   "n_evals": len(ok), "elapsed_s": round(r.elapsed, 2)}
+            if r.error:
+                row["error"] = r.error.splitlines()[-1][:120]
+            rows.append(row)
+            continue
         row = {"optimizer": r.optimizer, "objective": r.objective,
                "best": (round(float(r.best["score"]), 6) if r.best else None),
                "n_evals": len(ok), "elapsed_s": round(r.elapsed, 2)}
-        if len(ok):
+        if len(ok) and "best_so_far" in ok.columns:
             bs = ok["best_so_far"].to_numpy()
             # 收敛效率：走完"首次评估 -> 最终 best"进度的 90% 所需评估次数
             # （按 range 定义，正负值安全）

@@ -197,6 +197,20 @@ def capture_opt(win):
             app.processEvents()
             shots.append((f"opt_page_{i}", wb.tabs.currentWidget().grab()))
         shots.append(("opt_full", win.grab()))
+        # 多目标 Pareto 页
+        from ml_toolbox.opt.synth import make_objective_multi
+        mobj = make_objective_multi("zdt1", dim=6)
+        mrec = optimize(mobj, oreg.get("nsga_ii"), Budget(n_evals=1200),
+                        cfg={"popsize": 20}, seed=9)
+        wb._records = {"nsga_ii": mrec}
+        wb._refresh_live(mrec)
+        app.processEvents()
+        wb.tabs.setCurrentIndex(3)               # Pareto 页
+        app.processEvents()
+        for c in wb.tabs.currentWidget().findChildren(MplCanvas):
+            c.draw()
+        app.processEvents()
+        shots.append(("opt_pareto", wb.tabs.currentWidget().grab()))
     except Exception as e:
         print(f"优化工作区截图跳过: {e}")
     return shots

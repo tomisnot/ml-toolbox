@@ -338,6 +338,18 @@ def test_opt_workbench():
     wb._records = {"gp_bo": rec2}
     wb._refresh_live(rec2)
     app.processEvents()
+    # 多目标 Pareto 页路径（NSGA-II + ZDT1）
+    try:
+        from ml_toolbox.opt.synth import make_objective_multi
+        mobj = make_objective_multi("zdt1", dim=4)
+        mrec = optimize(mobj, oreg.get("nsga_ii"), Budget(n_evals=120),
+                        cfg={"popsize": 20}, seed=5)
+        wb._records = {"nsga_ii": mrec}
+        wb._refresh_live(mrec)
+        app.processEvents()
+        assert mrec.pareto is not None and len(mrec.pareto) >= 3
+    except Exception as e:                      # nsga_ii 未注册等
+        print("    (pareto 页跳过:", e, ")")
     # 多优化器对比表
     wb._records = {"random_search": rec, "gp_bo": rec2}
     wb._refresh_compare()

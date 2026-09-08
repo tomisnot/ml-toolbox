@@ -117,10 +117,12 @@ class OptWorkbench(QWidget):
         self.canvas_conv = MplCanvas(width=8, height=5)
         self.canvas_par = MplCanvas(width=8, height=5)
         self.canvas_sc = MplCanvas(width=8, height=5)
+        self.canvas_pareto = MplCanvas(width=8, height=5)
         self.canvas_sur = MplCanvas(width=8, height=5)
         self.tabs.addTab(self._wrap(self.canvas_conv), "收敛曲线")
         self.tabs.addTab(self._wrap(self.canvas_par), "平行坐标")
         self.tabs.addTab(self._wrap(self.canvas_sc), "探索地图")
+        self.tabs.addTab(self._wrap(self.canvas_pareto), "Pareto 前沿")
         self.tabs.addTab(self._wrap(self.canvas_sur), "代理切片")
         right.addWidget(self.tabs)
 
@@ -279,10 +281,15 @@ class OptWorkbench(QWidget):
         self._running = False
         self._reset_buttons()
         self._refresh_compare()
-        self._prog.setText(
-            f"完成：{len(self._records)} 个优化器 · "
-            + "  ".join(f"{k}={v.best['score']:.4g}" if v.best else f"{k}=失败"
-                        for k, v in self._records.items()))
+        parts = []
+        for k, v in self._records.items():
+            if getattr(v, "multi", False):
+                parts.append(f"{k}=前沿{len(v.pareto) if v.pareto is not None else 0}")
+            elif v.best:
+                parts.append(f"{k}={v.best['score']:.4g}")
+            else:
+                parts.append(f"{k}=失败")
+        self._prog.setText(f"完成：{len(self._records)} 个优化器 · " + "  ".join(parts))
 
     def _toggle_pause(self):
         if self._worker:
@@ -304,6 +311,17 @@ class OptWorkbench(QWidget):
 
     # ================================================== 刷新
     def _refresh_live(self, record):
+        if getattr(record, "multi", False):
+            # 多目标：Pareto 页 + 平行坐标（按 f0 着色）；其余页占位
+            self._draw(self.canvas_pareto, opt_plots.plot_pareto, record)
+            self._draw(self.canvas_par, opt_plots.plot_parallel, record)
+            for cv, msg in ((self.canvas_conv, "多目标无单一收敛曲线，看 Pareto 页"),
+                            (self.canvas_sc, "多目标探索看 Pareto 前沿页"),
+                            (self.canvas_sur, "多目标暂无代理切片")):
+                cv.draw_result(lambda ax, _r, m=msg: ax.text(
+                    0.5, 0.5, m, ha="center", va="center", color="#888"), None)
+            self._refresh_history(record)
+            return
         # 收敛（叠加已完成的多条）
         extra = [(k, r.history) for k, r in self._records.items()
                  if r is not record and len(r.history)]

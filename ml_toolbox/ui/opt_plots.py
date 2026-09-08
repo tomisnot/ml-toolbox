@@ -56,7 +56,8 @@ def plot_parallel(ax, record):
     lo, hi = M.min(0), M.max(0)
     span = np.where(hi - lo < 1e-12, 1.0, hi - lo)
     Z = (M - lo) / span
-    s = ok["score"].to_numpy(float)
+    scol = "score" if "score" in ok.columns else "f0"   # 多目标用 f0 着色
+    s = ok[scol].to_numpy(float)
     smin, smax = np.nanmin(s), np.nanmax(s)
     sn = (s - smin) / max(smax - smin, 1e-12)
     cmap = plt_cmap()
@@ -111,6 +112,29 @@ def plot_scatter2d(ax, record):
         plt.colorbar(sc, ax=ax, shrink=0.8).set_label("score", fontsize=8)
     except Exception:
         pass
+
+
+def plot_pareto(ax, record):
+    """Pareto 前沿：全部可行点（灰）+ 非支配前沿（绿）+ 连线。"""
+    h = record.history
+    if h is None or h.empty or "f0" not in h.columns:
+        ax.text(0.5, 0.5, "多目标运行才有 Pareto 前沿（选 NSGA-II + ZDT）",
+                ha="center", va="center", color="#888", fontsize=9)
+        return
+    ok = h[h["status"] == "ok"]
+    ax.scatter(ok["f0"], ok["f1"], s=14, color="#bbb", alpha=0.7,
+               label="全部评估")
+    pf = record.pareto
+    if pf is not None and len(pf):
+        p = pf.sort_values("f0")
+        ax.scatter(p["f0"], p["f1"], s=42, color=_GREEN, edgecolors="k",
+                   linewidths=0.5, zorder=5, label=f"Pareto 前沿（{len(pf)}）")
+        ax.plot(p["f0"], p["f1"], "-", color=_GREEN, lw=1.2, alpha=0.8)
+    ax.set_xlabel("目标 f0")
+    ax.set_ylabel("目标 f1")
+    ax.set_title("Pareto 前沿（均最小化，绿=非支配）")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.25)
 
 
 def plot_surrogate_1d(ax, bundle):
