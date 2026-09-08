@@ -166,6 +166,42 @@ def capture_list(win):
     return out
 
 
+def capture_opt(win):
+    """优化工作区：喂入两条 OptRecord 渲染四页 + 对比表（不依赖线程时序）。"""
+    from ml_toolbox.opt import registry as oreg
+    from ml_toolbox.opt.contracts import Budget
+    from ml_toolbox.opt.synth import make_objective_from_synth
+    from ml_toolbox.opt.runner import optimize
+    from ml_toolbox.ui.widgets import MplCanvas
+    shots = []
+    try:
+        oreg.load_builtin()
+        win.tabs.setCurrentIndex(win.TAB_OPT)
+        app.processEvents()
+        wb = win.opt_page
+        obj = make_objective_from_synth("ackley_3d")
+        gp = oreg.get("gp_bo")
+        r1 = optimize(obj, gp, Budget(n_evals=25), cfg={"n_init": 6}, seed=7)
+        r2 = optimize(obj, oreg.get("random_search"), Budget(n_evals=25),
+                      seed=7)
+        wb._cur_opt = gp
+        wb._records = {"gp_bo": r1, "random_search": r2}
+        wb._refresh_live(r1)
+        wb._refresh_compare()
+        app.processEvents()
+        for i in range(wb.tabs.count()):
+            wb.tabs.setCurrentIndex(i)
+            app.processEvents()
+            for c in wb.tabs.currentWidget().findChildren(MplCanvas):
+                c.draw()
+            app.processEvents()
+            shots.append((f"opt_page_{i}", wb.tabs.currentWidget().grab()))
+        shots.append(("opt_full", win.grab()))
+    except Exception as e:
+        print(f"优化工作区截图跳过: {e}")
+    return shots
+
+
 if __name__ == "__main__":
     win = build_window()
     load_scenario(win)
@@ -177,6 +213,10 @@ if __name__ == "__main__":
     # 逐场景（不同方法族核心图）
     win._set_dataset(load_demo("iris"))   # 复位再跑场景，避免污染
     for name, pix in capture_scenarios(win):
+        pix.save(shot_path(name))
+        print("截图 " + shot_path(name))
+    # 优化工作区
+    for name, pix in capture_opt(win):
         pix.save(shot_path(name))
         print("截图 " + shot_path(name))
     win.close()

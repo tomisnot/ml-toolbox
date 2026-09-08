@@ -71,7 +71,7 @@ def test_batch_run():
     win._on_batch_done(recs)
     app.processEvents()
     assert win.compare_table.rowCount() == 3
-    assert win.tabs.count() == 5
+    assert win.tabs.count() == 6      # +优化调参工作区
     # 画廊应有 3 张缩略图
     from ml_toolbox.ui.gallery import _Thumb
     thumbs = win.gallery.findChildren(_Thumb)
@@ -310,6 +310,41 @@ def test_neural_pages():
     win._set_dataset(load_demo("iris"))
 
 
+def test_opt_workbench():
+    """优化工作区：构建 + 喂入 OptRecord 刷新四页不崩。"""
+    win = _win_get()
+    win.tabs.setCurrentIndex(win.TAB_OPT)
+    app.processEvents()
+    wb = win.opt_page
+    assert wb is not None
+    from ml_toolbox.opt import registry as oreg
+    from ml_toolbox.opt.contracts import Budget
+    from ml_toolbox.opt.synth import make_objective_from_synth
+    from ml_toolbox.opt.runner import optimize
+    oreg.load_builtin()
+    obj = make_objective_from_synth("six_hump")
+    rec = optimize(obj, oreg.get("random_search"), Budget(n_evals=15),
+                   seed=3)
+    assert len(rec.history) == 15
+    # 直接喂 record 刷新（不经过 worker 线程，测渲染路径）
+    wb._records = {"random_search": rec}
+    wb._refresh_live(rec)
+    app.processEvents()
+    assert wb.hist_table.rowCount() == 15
+    # GP-BO 代理切片路径
+    gp = oreg.get("gp_bo")
+    rec2 = optimize(obj, gp, Budget(n_evals=14), cfg={"n_init": 5}, seed=4)
+    wb._cur_opt = gp
+    wb._records = {"gp_bo": rec2}
+    wb._refresh_live(rec2)
+    app.processEvents()
+    # 多优化器对比表
+    wb._records = {"random_search": rec, "gp_bo": rec2}
+    wb._refresh_compare()
+    app.processEvents()
+    assert wb.hist_table.rowCount() == 2
+
+
 def test_no_dataset_button():
     """无数据点运行：提示而非崩溃。"""
     win = MainWindow()
@@ -335,6 +370,7 @@ if __name__ == "__main__":
         ("history_load", test_history_load),
         ("purpose_filter", test_purpose_filter),
         ("neural_pages", test_neural_pages),
+        ("opt_workbench", test_opt_workbench),
         ("no_dataset_button", test_no_dataset_button),
     ]
     print(f"UI 回归测试 {len(tests)} 项")

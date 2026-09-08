@@ -48,3 +48,47 @@ class SingleWorker(QThread):
             self.finished_ok.emit(runner.run_one(self.method, self.spec, self.cfg))
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+class OptWorker(QThread):
+    """序贯优化后台线程（P13 直播）：每次评估 emit 一条，支持暂停/中止。
+
+    与 BatchWorker 的关键差异：ML 是一次性 finished_ok；优化是过程流——
+    eval_done 逐条携带截至当前的 OptRecord，UI 增量刷新收敛曲线。
+    """
+    eval_done = pyqtSignal(object, int)           # record, i
+    finished_ok = pyqtSignal(object)              # 最终 OptRecord
+    failed = pyqtSignal(str)
+
+    def __init__(self, objective, optimizer, budget, cfg=None, seed=42,
+                 parent=None):
+        super().__init__(parent)
+        self.objective, self.optimizer, self.budget = objective, optimizer, budget
+        self.cfg, self.seed = cfg or {}, seed
+        self._stop = False
+        self._pause = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def set_pause(self, v: bool):
+        self._pause = v
+
+    def run(self):
+        from ..opt.runner import optimize
+        try:
+            rec = optimize(
+                self.objective, self.optimizer, self.budget, cfg=self.cfg,
+                seed=self.seed,
+                on_eval=lambda r, i: self.eval_done.emit(r, i),
+                should_stop=lambda: self._pause_wait())
+            self.finished_ok.emit(rec)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+    def _pause_wait(self) -> bool:
+        """暂停=自旋等待（评估间隔短，可接受）；停止=立即 True。"""
+        import time
+        while self._pause and not self._stop:
+            time.sleep(0.05)
+        return self._stop

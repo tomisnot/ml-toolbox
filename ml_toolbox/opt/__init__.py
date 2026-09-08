@@ -20,5 +20,5 @@
     rec = optimize(obj, registry.get("random_search"), Budget(n_evals=30))
     print(rec.best)
 """
-from .contracts import (ParamSpace, Objective, CallableObjective, Optimizer,
+from .contracts import (ParamSpace, Objective, CallableObjective, Optimizer,  # noqa: F401
                         OptRecord, Budget, make_objective)   # noqa: F401

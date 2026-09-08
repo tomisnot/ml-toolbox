@@ -11,7 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings("ignore")
 
 import numpy as np
-import pandas as pd
 
 from ml_toolbox.core.contracts import ParamSpec
 from ml_toolbox.opt import registry
@@ -252,7 +251,7 @@ def test_gpbo_surrogate_1d_curve():
                      ParamSpec("k", "k", "int", 5, min=1, max=9)])
     obj = make_objective(lambda q: (q["x"] - 1.0) ** 2, sp, name="s1")
     opt = registry.get("gp_bo")
-    r = optimize(obj, opt, Budget(n_evals=16), cfg={"n_init": 4}, seed=14)
+    optimize(obj, opt, Budget(n_evals=16), cfg={"n_init": 4}, seed=14)
     out = opt.surrogate_1d("x", {"k": 5})
     assert out is not None
     xs, mu, sd = out

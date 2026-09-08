@@ -132,17 +132,21 @@ class MainWindow(QMainWindow):
         self.gallery.thumb_clicked.connect(self._show_from_gallery)
         from .data_page import DataPage
         self.data_page = DataPage()
+        from .opt_page import OptWorkbench
+        self.opt_page = OptWorkbench()
         self.tabs.addTab(self.chain_page, "处理链")
         self.tabs.addTab(self.data_page, "数据检视")
         self.tabs.addTab(self.compare_table, "对比视图")
         self.tabs.addTab(self.gallery, "核心图对比")
         self.tabs.addTab(self.inspector, "方法检视")
+        self.tabs.addTab(self.opt_page, "优化调参")
         # 索引集中管理（pitfalls L14：勿再硬编码 setCurrentIndex 数字）
         self.TAB_CHAIN = self.tabs.indexOf(self.chain_page)
         self.TAB_DATA = self.tabs.indexOf(self.data_page)
         self.TAB_COMPARE = self.tabs.indexOf(self.compare_table)
         self.TAB_GALLERY = self.tabs.indexOf(self.gallery)
         self.TAB_INSPECT = self.tabs.indexOf(self.inspector)
+        self.TAB_OPT = self.tabs.indexOf(self.opt_page)
 
         self.params = ParamPanel()
         self.params.rerun_requested.connect(self._rerun_current)
