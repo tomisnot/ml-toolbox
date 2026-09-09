@@ -224,3 +224,29 @@
   的 cfg 传给 random_search（无该参数，静默忽略但用户以为生效了）。
 - **修法**：`_param_owner` 记录面板归属，`_collect_opt_cfg(name)` 只对
   当前 owner 返回覆写，其余优化器用默认。
+
+### O9. QToolBar 内嵌 widget 直接 setVisible(False) 会被布局重新 show
+- **症状**：Perspective 切到优化模式后，`_cv.setVisible(False)` 调了，
+  但 `win._cv.isVisible()` 仍 True（测试 perspective_switch 抓到）。
+- **原因**：QToolBar 在布局/重排时会对自己包的那层 widget 重新 show；
+  你 hide 的是内层 widget，外层包装 QAction 仍是 visible。
+- **修法**：隐藏 `tb.addWidget(w)` **返回的 QAction**（`act.setVisible(False)`），
+  不是隐藏 w 本身。所有按模式显隐的工具栏控件都要存这个返回值
+  （main_window `_ml_only_actions`）。
+
+### O10. 库函数不能要求调用方先做注册（bridges 里 registry.get 抛空表）
+- **症状**：test_opt 里 `AutoTunerObjective('logistic', ...)` 报
+  `未注册的方法: logistic（可用: []）`——core.registry 从未 load_builtin。
+- **原因**：UI 启动路径会 load_builtin，但纯后端调用者（脚本/测试/其他项目）
+  不会；bridges 假设了"ML 注册表已加载"这个隐式前提。
+- **修法**：`method_param_space` / `AutoTunerObjective.__init__` 里
+  `ml_registry.load_builtin()`（幂等）。注册表 load 是廉价且可重入的。
+
+### O11. 数据源接入别把"数据侧"和"评估侧"混成一个概念
+- **症状**：设计评审时把 AutoTuner 说成"依赖 ML 工作区的数据上下文"，
+  被用户指出：真实主场景是接入正在运行的外部程序。
+- **辨析**：① 数据侧（程序持续产数）= `FileSource`，评估仍是训练+CV；
+  ② 评估侧（程序就是黑盒）= `ProcessObjective`，与 ML 无关。
+  两者正交，UI 上也分开（数据源组 vs 目标类型下拉），别混。
+- **教训**：UI 里的隐式依赖（`_spec` 注入）要显式化为可选项 + 状态栏，
+  否则"能跑通"掩盖了"绑错了假设"。

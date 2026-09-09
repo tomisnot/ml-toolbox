@@ -26,21 +26,34 @@ _LOWER_BETTER = {"rmse", "mae", "mape", "silhouette_deficit"}
 def method_param_space(method_name: str,
                        exclude: tuple = ()) -> ParamSpace:
     """方法的 param_schema -> 可寻优 ParamSpace（无界/文本参数自动固定）。"""
+    ml_registry.load_builtin()          # 幂等：库函数不要求调用方先注册
     m = ml_registry.get(method_name)
     return ParamSpace([p for p in m.param_schema if p.key not in exclude])
 
 
 class AutoTunerObjective(Objective):
-    """objective(params) = 方法在 (X,y) 上的 CV 主指标（统一最小化方向）。
+    """objective(params) = 方法在数据上的 CV 主指标（统一最小化方向）。
 
-    cv_folds<=1 时用单次 holdout（train/test 划分由外部传入的 Xtr/ytr 决定）。
+    数据来源三选一（接缝2 修正：不绑定 ML 工作区的当前数据集）：
+      AutoTunerObjective("logistic", X, y, space)              # 裸数组（向后兼容）
+      AutoTunerObjective("logistic", source, space=space)     # DataSource（文件/内部）
+      source 也可以是 DataSpec（自动包成 SpecSource 快照）。
     """
 
-    def __init__(self, method_name: str, X, y, space: ParamSpace,
-                 metric: str = "", cv_folds: int = 4, seed: int = 42,
-                 name: str = ""):
+    def __init__(self, method_name: str, X=None, y=None,
+                 space: ParamSpace = None, metric: str = "",
+                 cv_folds: int = 4, seed: int = 42, name: str = ""):
+        # 位置参数宽容：AutoTunerObjective(name, source, space=...)
+        if space is None and isinstance(y, ParamSpace):
+            space, y = y, None
+        if (y is None and not hasattr(X, "fetch") and not hasattr(X, "X")
+                and not hasattr(X, "frame")):
+            raise ValueError("需要 (X, y) 或 DataSource/DataSpec/Dataset")
+        self._src = self._norm_source(X, y)
+        ml_registry.load_builtin()       # 幂等：显式传 space 时也要能取到方法
         self._m = ml_registry.get(method_name)
-        self._X, self._y = X, y
+        if space is None:
+            space = ParamSpace([p for p in self._m.param_schema])
         self._cv = cv_folds
         self._seed = seed
         # 主指标：显式给定优先，否则按方法 target_kind 推（回归 rmse / 分类 f1）
@@ -50,23 +63,38 @@ class AutoTunerObjective(Objective):
         super().__init__(name=name or f"autotune_{method_name}",
                          space=space, minimize=True)
 
+    @staticmethod
+    def _norm_source(X, y):
+        from .sources import DataSource, SpecSource
+        if isinstance(X, DataSource):
+            return X
+        if y is None and hasattr(X, "X"):        # DataSpec
+            return SpecSource(X)
+        if y is None and hasattr(X, "frame"):    # Dataset
+            from ..core.pipeline import Pipeline
+            return SpecSource(Pipeline.default().run(X))
+        import pandas as pd
+        from .sources import ArraySource
+        return ArraySource(pd.DataFrame(X), None if y is None else pd.Series(y))
+
     def evaluate(self, params):
+        X, y = self._src.fetch()               # 每次评估取最新数据（文件源=热更新）
         cfg = RunConfig(overrides=dict(params), seed=self._seed,
                         extras={"cv_folds": self._cv} if self._cv >= 2 else {})
         try:
             if self._cv >= 2:
-                cv = self._m.cross_validate(self._X, self._y, cfg, self._cv)
+                cv = self._m.cross_validate(X, y, cfg, self._cv)
                 key = f"cv_{self._metric}_mean"
                 if key not in cv:                      # 主指标名不匹配：取任一 cv_*_mean
                     key = next((k for k in cv if k.startswith("cv_")
                                 and k.endswith("_mean")), None)
                 score = cv.get(key, float("nan"))
             else:
-                res = self._m.fit(self._X, self._y, cfg)
-                pred = self._m.predict(self._X, res)
-                res.artifacts["y_true"] = np.asarray(self._y)
+                res = self._m.fit(X, y, cfg)
+                pred = self._m.predict(X, res)
+                res.artifacts["y_true"] = np.asarray(y)
                 res.artifacts["y_pred"] = np.asarray(pred)
-                m = self._m.evaluate(res, self._X, self._y)
+                m = self._m.evaluate(res, X, y)
                 score = m.get(self._metric, float("nan"))
         except Exception:
             return float("inf")
@@ -85,14 +113,15 @@ def autotune(objective_or_name, X=None, y=None, optimizer=None,
              budget=None, cv_folds=4, metric="", seed=42, cfg=None):
     """一步式自动调参：返回 (OptRecord, best_params, best_metric_value)。
 
-    autotune("logistic", X, y, optimizer=..., budget=...) 形式最常用。
+    数据侧三种入口都支持：
+      autotune("logistic", X, y, ...)                  # 裸数组
+      autotune("logistic", source, ...)                # DataSource/DataSpec/Dataset
     """
     from .runner import optimize
     from . import registry as opt_registry
     if isinstance(objective_or_name, str):
         name = objective_or_name
-        space = method_param_space(name)
-        obj = AutoTunerObjective(name, X, y, space, metric=metric,
+        obj = AutoTunerObjective(name, X, y, metric=metric,
                                  cv_folds=cv_folds, seed=seed)
     else:
         obj = objective_or_name
@@ -101,7 +130,8 @@ def autotune(objective_or_name, X=None, y=None, optimizer=None,
     best_val = None
     if rec.best:
         bv = rec.best["score"]
-        best_val = bv if obj._metric in _LOWER_BETTER else -bv
+        lower = getattr(obj, "_metric", "score") in _LOWER_BETTER
+        best_val = bv if lower else -bv
     return rec, (rec.best or {}), best_val
 
 

@@ -71,7 +71,7 @@ def test_batch_run():
     win._on_batch_done(recs)
     app.processEvents()
     assert win.compare_table.rowCount() == 3
-    assert win.tabs.count() == 6      # +优化调参工作区
+    assert win.tabs.count() == 5      # ML 工作区五页（优化是平级 Perspective，非 tab）
     # 画廊应有 3 张缩略图
     from ml_toolbox.ui.gallery import _Thumb
     thumbs = win.gallery.findChildren(_Thumb)
@@ -310,10 +310,29 @@ def test_neural_pages():
     win._set_dataset(load_demo("iris"))
 
 
-def test_opt_workbench():
-    """优化工作区：构建 + 喂入 OptRecord 刷新四页不崩。"""
+def test_perspective_switch():
+    """兄弟框架的 UI 语义：模式切换整区替换，ML 专属控件按模式显隐。"""
     win = _win_get()
-    win.tabs.setCurrentIndex(win.TAB_OPT)
+    assert win.stack.count() == 2
+    assert win.stack.currentIndex() == 0
+    assert win._cv.isVisible() and win.browser.isVisible()
+    win._mode_opt.trigger()
+    app.processEvents()
+    assert win.stack.currentIndex() == 1
+    assert win.opt_page.isVisible()
+    assert not win._cv.isVisible()          # ML 专属控件隐藏
+    assert not win.browser.isVisible()      # ML 工作区整体隐藏
+    assert win._demo.isVisible()            # 共享工具栏保留
+    win._mode_ml.trigger()
+    app.processEvents()
+    assert win.stack.currentIndex() == 0
+    assert win._cv.isVisible()
+
+
+def test_opt_workbench():
+    """优化工作区：构建 + 喂入 OptRecord 刷新五页不崩。"""
+    win = _win_get()
+    win._mode_opt.trigger()
     app.processEvents()
     wb = win.opt_page
     assert wb is not None
@@ -358,7 +377,7 @@ def test_opt_workbench():
 
 
 def test_autotuner_ui():
-    """UI 接缝2：目标切到 ML 方法调参 -> _make_objective 产出 AutoTunerObjective。"""
+    """UI 接缝2：目标切到 ML 方法调参 -> 数据源状态 + AutoTunerObjective。"""
     win = _win_get()
     win._set_dataset(load_demo("iris"))
     app.processEvents()
@@ -366,6 +385,9 @@ def test_autotuner_ui():
     assert getattr(wb, "_spec", None) is not None      # 数据上下文已注入
     wb._obj_kind.setCurrentText("ML 方法调参（AutoTuner）")
     app.processEvents()
+    # 数据源状态栏可见且绿字（内部数据集已连接）
+    assert wb._src_group.isVisible()
+    assert "内部数据集" in wb._src_status.text()
     wb._ml_method.setCurrentText("logistic")
     obj = wb._make_objective()
     assert obj.__class__.__name__ == "AutoTunerObjective"
@@ -373,6 +395,32 @@ def test_autotuner_ui():
     # 一次评估能返回有限分数
     s = obj(obj.space.sample(np.random.RandomState(0)))
     assert np.isfinite(s)
+    # 外部文件数据源：写临时 csv -> FileSource 绿字 -> 删文件 -> 红字
+    import tempfile, os as _os
+    import pandas as _pd
+    tmp = _os.path.join(tempfile.gettempdir(), "ui_src_test.csv")
+    df = _pd.DataFrame(np.random.RandomState(0).randn(30, 3), columns=list("abc"))
+    df["target"] = (df["a"] > 0).astype(int)
+    df.to_csv(tmp, index=False)
+    wb._src_kind.setCurrentText("外部文件（csv/parquet）")
+    wb._src_path.setText(tmp)
+    wb._src_target.setText("target")
+    wb.refresh_source_status()
+    assert "文件 ui_src_test.csv" in wb._src_status.text()
+    assert "#2ca02c" in wb._src_status.styleSheet()
+    _os.remove(tmp)
+    wb.refresh_source_status()
+    assert "#c0392b" in wb._src_status.styleSheet()   # 读取失败 -> 红
+    # 外部程序目标：参数定义解析
+    wb._obj_kind.setCurrentText("外部程序（黑盒进程）")
+    app.processEvents()
+    sp = wb._proc_space("a=0..5, b=-1..1")
+    assert sp.dim == 2 and sp.keys == ["a", "b"]
+    try:
+        wb._proc_space("bad")
+        assert False, "非法参数定义应抛 ValueError"
+    except ValueError:
+        pass
     wb._obj_kind.setCurrentText("合成函数")
     app.processEvents()
 
@@ -402,6 +450,7 @@ if __name__ == "__main__":
         ("history_load", test_history_load),
         ("purpose_filter", test_purpose_filter),
         ("neural_pages", test_neural_pages),
+        ("perspective_switch", test_perspective_switch),
         ("opt_workbench", test_opt_workbench),
         ("autotuner_ui", test_autotuner_ui),
         ("no_dataset_button", test_no_dataset_button),

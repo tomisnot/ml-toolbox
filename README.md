@@ -13,7 +13,7 @@
 ```powershell
 pip install -r requirements.txt
 python app.py            # 启动界面
-python tests/run_all.py  # 质量门（smoke + 18 回归 + 16 UI + 27 优化）
+python tests/run_all.py  # 质量门（smoke + 18 回归 + 17 UI + 30 优化）
 ```
 
 > 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
@@ -39,6 +39,8 @@ ml_toolbox/
 │   ├── contracts.py   ParamSpace / Objective / Optimizer(ask-tell) / OptRecord
 │   ├── engines/       baseline·bo(GP-BO)·evo(CMA-ES/NSGA-II)·local(NM)·optuna适配
 │   ├── runner.py      optimize() 预算控制 + on_eval 直播回调
+│   ├── sources.py     数据侧接入：FileSource(热重读)/SpecSource/ArraySource
+│   ├── process.py     评估侧接入：ProcessObjective(外部程序黑盒，stdout 解析)
 │   ├── bridges.py     三接缝：AutoTuner / 响应面 / GPR 代理
 │   └── synth.py       标准测试函数（Ackley/Rosenbrock/ZDT…）
 ├── ui/            PyQt5 界面（唯一有 Qt 依赖的层）
@@ -56,7 +58,7 @@ ml_toolbox/
 ├── tests/         smoke / 回归 / UI / run_all（一键门）
 ├── benchmarks/    数学建模基准（结果表在 benchmarks/results/）
 ├── checks/        离屏截图自查闭环
-└── docs/          项目定位.md（宪法）· 契约.md · 优化定位.md · 优化契约.md · pitfalls.md（33 条）
+└── docs/          项目定位.md（宪法）· 契约.md · 优化定位.md · 优化契约.md · pitfalls.md（36 条）
 ```
 
 **依赖方向单向**：`ui → core + methods`，`methods → core`，`core → 无内部依赖`。
@@ -142,16 +144,21 @@ anomaly 4 · svm 3 · knn 1 · baseline 1 · neural 1。
 
 ## 四、界面速览
 
+两种对等的工作模式（Perspective，工具栏最左切换）：
+
 ```
-┌ 工具栏  打开数据 · 演示数据 · 管道设置 · 历史 · 对新数据预测 · 诊断 · 交叉验证 · 种子 ┐
-│ 方法库    │ 处理链 │ 数据检视 │ 对比视图 │ 核心图对比 │ 方法检视 │  参数面板      │
-│ 族分组    │ 大卡片 │ 相关热图 │ 指标表   │ 缩略网格   │ 动态分页 │  旋钮+⟳重跑   │
-│ 用途筛选  │ 每步   │ 缩放平移 │ cv 列    │ 按主指标   │ mpl/pg   │  空=默认      │
-│ 搜索      │ 摘要   │          │          │ 排序       │ table    │               │
-└ 底部  ▶ 遍历运行所选方法（进度回报）───────────────────────────────────────────┘
+┌ [ML 方法试验台 | 优化调参]  打开数据 · 演示数据 · 管道设置 · 历史 · 种子 ┐
+│ ML 模式：方法库 │ 处理链 │ 数据检视 │ 对比视图 │ 核心图对比 │ 方法检视 │ 参数 │
+│ 优化模式：数据源+目标+优化器+预算+超参 │ 收敛曲线│平行坐标│探索地图│Pareto│代理 │
+└ 底部  ▶ 遍历运行所选方法 / ▶ 开始优化（逐条直播）────────────────────────┘
 ```
 
-五页对应数模工作流：**看数据**（处理链/数据检视）→ **选模型**（遍历+对比+画廊）→
+ML 专属控件（诊断/交叉验证/对新数据预测）在优化模式下自动隐藏；数据工具栏共享。
+优化工作区的目标函数三类型：合成函数 / ML 方法调参（AutoTuner，数据源可选
+"ML 内部数据集"或"外部文件 csv/parquet 热重读"）/ 外部程序（参数注入命令模板，
+stdout 解析分数）——"接入正在运行的程序"的两种耦合方式（数据侧/评估侧）都覆盖。
+
+ML 五页对应数模工作流：**看数据**（处理链/数据检视）→ **选模型**（遍历+对比+画廊）→
 **看细节**（方法检视）→ **调参**（右栏就地重跑）→ **出结果**（对新数据预测导出）。
 
 ### 神经网络检视页（方案 C：训练过程可视化）
@@ -170,7 +177,7 @@ anomaly 4 · svm 3 · knn 1 · baseline 1 · neural 1。
 
 | 命令 | 内容 |
 |---|---|
-| `python tests/run_all.py` | 一键门：smoke（53 方法 × 6 任务）+ 18 回归 + 16 UI + 27 优化 |
+| `python tests/run_all.py` | 一键门：smoke（53 方法 × 6 任务）+ 18 回归 + 17 UI + 30 优化 |
 | `python checks/ui_shot.py` | 离屏渲染真实界面 → 53 张 PNG → 按 checklist 视觉自查 |
 | `python benchmarks/run_benchmarks.py` | 数模基准（Iris/Wine/Housing/blobs/异常/时序/digits） |
 | `python benchmarks/run_opt_bench.py` | 优化基准：GP-BO vs 随机搜索（标准函数全领先） |
@@ -224,4 +231,4 @@ class MyMethod(MLMethod):
 - `docs/契约.md` —— 方法 / 数据 / 可视化 / 持久化四份契约
 - `docs/优化定位.md` —— 序贯优化子框架宪法（与 ML 兄弟框架 + 三接缝）
 - `docs/优化契约.md` —— 优化侧 ask-and-tell 契约 + 引擎表 + 三接缝桥
-- `docs/pitfalls.md` —— 33 条踩坑（症状→原因→修法），新坑按格式追加
+- `docs/pitfalls.md` —— 36 条踩坑（症状→原因→修法），新坑按格式追加

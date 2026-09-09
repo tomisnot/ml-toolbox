@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings("ignore")
 
 import numpy as np
+import pandas as pd
 
 from ml_toolbox.core.contracts import ParamSpec
 from ml_toolbox.opt import registry
@@ -426,6 +427,75 @@ def test_gpbo_reuses_gpr_surrogate():
     optimize(obj, o, Budget(n_evals=15), cfg={"n_init": 5}, seed=1)
     from sklearn.gaussian_process import GaussianProcessRegressor
     assert isinstance(o._gpr, GaussianProcessRegressor)
+
+
+def test_file_source_hot_reload():
+    """数据侧接入：外部程序追加 csv 行，FileSource 下次 fetch 看到新数据。"""
+    import tempfile
+    from ml_toolbox.opt.sources import FileSource
+    tmp = os.path.join(tempfile.gettempdir(), "opt_src_rt.csv")
+    try:
+        pd.DataFrame({"a": [1.0, 2.0], "target": [0, 1]}).to_csv(tmp, index=False)
+        src = FileSource(tmp, "target")
+        X, y = src.fetch()
+        assert len(X) == 2 and "target" not in X.columns
+        pd.DataFrame({"a": [3.0], "target": [1]}).to_csv(tmp, mode="a",
+                                                         header=False, index=False)
+        X2, _ = src.fetch()
+        assert len(X2) == 3, "mtime 变化应触发重读"
+        assert "文件" in src.describe()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def test_process_objective_and_failure():
+    """评估侧接入：子进程黑盒可优化；进程失败记 failed 不崩（P10）。"""
+    import tempfile
+    from ml_toolbox.opt.process import ProcessObjective
+    script = os.path.join(tempfile.gettempdir(), "opt_fake_sim.py")
+    with open(script, "w") as f:
+        f.write("import sys\na=float(sys.argv[1])\n"
+                "print('score: %.6f' % ((a-1.3)**2))\n")
+    sp = ParamSpace([ParamSpec("a", "a", "number", 0.0, min=-3, max=3)])
+    obj = ProcessObjective(f'python "{script}" {{a}}', sp, name="fakesim")
+    r = optimize(obj, registry.get("nelder_mead"), Budget(n_evals=40), seed=1)
+    assert r.error is None, r.error
+    assert r.best["score"] < 0.01 and abs(r.best["a"] - 1.3) < 0.15
+    bad = ProcessObjective('python -c "import sys; sys.exit(2)"', sp,
+                           name="badproc")
+    r2 = optimize(bad, registry.get("random_search"), Budget(n_evals=5), seed=1)
+    assert r2.error is None and r2.best is None
+    assert (r2.history["status"] == "failed").all()
+
+
+def test_autotuner_accepts_source():
+    """AutoTunerObjective 三种数据入口：裸数组 / DataSpec / FileSource。"""
+    import tempfile
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    from ml_toolbox.opt.bridges import AutoTunerObjective
+    from ml_toolbox.opt.sources import FileSource
+    rng = np.random.RandomState(0)
+    X = pd.DataFrame(rng.randn(60, 3), columns=list("abc"))
+    y = pd.Series((X["a"] > 0).astype(int))
+    p = {"C": 1.0}
+    o1 = AutoTunerObjective("logistic", X, y, cv_folds=3)
+    assert np.isfinite(o1(p))
+    spec = Pipeline.default().run(Dataset(X.assign(target=y.values),
+                                          name="t", target="target"))
+    o2 = AutoTunerObjective("logistic", spec, cv_folds=3)
+    assert o2._src.__class__.__name__ == "SpecSource"
+    assert np.isfinite(o2(p))
+    tmp = os.path.join(tempfile.gettempdir(), "opt_at_src.csv")
+    try:
+        X.assign(target=y.values).to_csv(tmp, index=False)
+        o3 = AutoTunerObjective("logistic", FileSource(tmp, "target"),
+                                cv_folds=3)
+        assert np.isfinite(o3(p))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def main():

@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""主窗口：数据 -> 处理链 -> 遍历/对比 -> 检视 -> 调参重跑 的闭环装配。
+"""主窗口：两种对等工作模式（Perspective）——ML 方法试验台 / 优化调参。
 
 布局（简单模式原则：主界面只留必要控件，高级参数进语义位置面板）：
-  工具栏   打开文件 / 演示数据 / 管道设置 / 诊断开关 / 随机种子
-  左栏     方法浏览器（勾选 = 遍历候选集）
-  中栏     处理链 | 对比视图 | 方法检视
-  右栏     参数面板（选中方法的旋钮 + ⟳ 应用并重跑）
+  工具栏   [ML 方法试验台 | 优化调参] 模式切换 · 打开文件 / 演示数据 /
+           管道设置 / 历史 / 种子（ML 专属：对新数据预测 / 诊断 / 交叉验证）
+  ML 模式   左方法库 | 中（处理链|数据|对比|画廊|检视）| 右参数面板 + 遍历条
+  优化模式   OptWorkbench 全权接管（目标含合成/ML 调参/外部程序，数据源显式）
+
+兄弟框架在 UI 上的语义：模式平级、共享数据工具栏；ML 专属控件按模式显隐。
 """
 from __future__ import annotations
 
@@ -17,8 +19,9 @@ import pandas as pd
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-                            QAction, QFileDialog, QMessageBox, QComboBox,
-                            QLineEdit, QCheckBox, QLabel, QSplitter, QTabWidget,
+                            QAction, QActionGroup, QFileDialog, QMessageBox,
+                            QComboBox, QLineEdit, QCheckBox, QLabel,
+                            QSplitter, QTabWidget, QStackedWidget,
                             QTableWidget, QTableWidgetItem, QHeaderView,
                             QPushButton, QApplication)
 
@@ -38,7 +41,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         registry.load_builtin()
-        self.setWindowTitle("ML Toolbox · 机器学习方法试验台")
+        self.setWindowTitle("ML Toolbox · 方法试验台 + 优化调参")
         self.resize(1500, 900)
 
         self.dataset: Dataset | None = None
@@ -57,6 +60,21 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = self.addToolBar("main")
         tb.setMovable(False)
+
+        # ---- 模式切换（兄弟框架的 UI 语义：顶层对等，非 tab 附属）
+        self._mode_ml = QAction("ML 方法试验台", self, checkable=True)
+        self._mode_opt = QAction("优化调参", self, checkable=True)
+        self._mode_ml.setChecked(True)
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+        grp.addAction(self._mode_ml)
+        grp.addAction(self._mode_opt)
+        self._mode_ml.triggered.connect(lambda: self._set_mode(0))
+        self._mode_opt.triggered.connect(lambda: self._set_mode(1))
+        tb.addAction(self._mode_ml)
+        tb.addAction(self._mode_opt)
+        tb.addSeparator()
+
         act_open = QAction("打开数据…", self)
         act_open.triggered.connect(self._open_file)
         tb.addAction(act_open)
@@ -75,15 +93,21 @@ class MainWindow(QMainWindow):
         act_hist.triggered.connect(self._open_history)
         tb.addAction(act_hist)
 
+        # ML 专属控件（优化模式下隐藏）。注意：QToolBar 布局时会重新 show
+        # 内嵌 widget，直接 hide(widget) 会被覆盖——必须 hide addWidget
+        # 返回的包装 QAction（pitfalls O9）。
+        self._ml_only_actions: list = []
+
         act_pred = QAction("对新数据预测…", self)
         act_pred.setToolTip("用当前选中方法的已拟合模型预测新的 csv（同管道变换 -> 导出预测表）")
         act_pred.triggered.connect(self._predict_on_new)
         tb.addAction(act_pred)
+        self._ml_only_actions.append(act_pred)
 
         self._diag = QCheckBox("诊断")
         self._diag.setToolTip("零侵入：开启后方法把中间产物装进 diag 供检视（模式 7）")
         self._diag.toggled.connect(lambda v: setattr(self._cfg, "diag", v))
-        tb.addWidget(self._diag)
+        self._ml_only_actions.append(tb.addWidget(self._diag))
 
         self._cv = QCheckBox("交叉验证")
         self._cv.setToolTip("开启后遍历额外跑 k 折 CV，对比视图显示 cv_*_mean±std（默认关，零开销）")
@@ -99,18 +123,36 @@ class MainWindow(QMainWindow):
         self._cv.toggled.connect(_toggle_cv)
         self._cv_folds.currentTextChanged.connect(
             lambda t: self._cfg.extras.__setitem__("cv_folds", int(t)) if self._cv.isChecked() else None)
-        tb.addWidget(self._cv)
-        tb.addWidget(self._cv_folds)
+        self._ml_only_actions.append(tb.addWidget(self._cv))
+        self._ml_only_actions.append(tb.addWidget(self._cv_folds))
 
-        tb.addWidget(QLabel("  种子 "))
+        self._ml_only_actions.append(tb.addWidget(QLabel("  种子 ")))
         self._seed = QLineEdit("42")
         self._seed.setFixedWidth(46)
-        tb.addWidget(self._seed)
+        self._ml_only_actions.append(tb.addWidget(self._seed))
+
+    def _set_mode(self, idx: int):
+        """Perspective 切换：主区域整体换 + ML 专属工具栏项显隐。"""
+        self.stack.setCurrentIndex(idx)
+        ml = idx == 0
+        for a in self._ml_only_actions:
+            a.setVisible(ml)
+        if not ml:
+            self.opt_page.refresh_source_status()
 
     # ================================================== 主体
     def _build_body(self):
-        central = QWidget()
-        outer = QVBoxLayout(central)
+        # Perspective 容器：0 = ML 工作区，1 = 优化工作区（兄弟框架，整区切换）
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_ml_page())
+        from .opt_page import OptWorkbench
+        self.opt_page = OptWorkbench(self)
+        self.stack.addWidget(self.opt_page)
+        self.setCentralWidget(self.stack)
+
+    def _build_ml_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(4)
         lay = QHBoxLayout()
@@ -132,21 +174,17 @@ class MainWindow(QMainWindow):
         self.gallery.thumb_clicked.connect(self._show_from_gallery)
         from .data_page import DataPage
         self.data_page = DataPage()
-        from .opt_page import OptWorkbench
-        self.opt_page = OptWorkbench()
         self.tabs.addTab(self.chain_page, "处理链")
         self.tabs.addTab(self.data_page, "数据检视")
         self.tabs.addTab(self.compare_table, "对比视图")
         self.tabs.addTab(self.gallery, "核心图对比")
         self.tabs.addTab(self.inspector, "方法检视")
-        self.tabs.addTab(self.opt_page, "优化调参")
         # 索引集中管理（pitfalls L14：勿再硬编码 setCurrentIndex 数字）
         self.TAB_CHAIN = self.tabs.indexOf(self.chain_page)
         self.TAB_DATA = self.tabs.indexOf(self.data_page)
         self.TAB_COMPARE = self.tabs.indexOf(self.compare_table)
         self.TAB_GALLERY = self.tabs.indexOf(self.gallery)
         self.TAB_INSPECT = self.tabs.indexOf(self.inspector)
-        self.TAB_OPT = self.tabs.indexOf(self.opt_page)
 
         self.params = ParamPanel()
         self.params.rerun_requested.connect(self._rerun_current)
@@ -176,7 +214,7 @@ class MainWindow(QMainWindow):
         bl.addWidget(self.btn_run)
         bl.addWidget(self._progress, 1)
         outer.addWidget(bottom)
-        self.setCentralWidget(central)
+        return page
 
     # ================================================== 数据
     def _on_selection(self, names):

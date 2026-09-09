@@ -55,10 +55,35 @@ class OptWorkbench(QWidget):
         form = QVBoxLayout(host)
         form.setSpacing(10)
 
+        g0 = QGroupBox("数据源")
+        f0 = QFormLayout(g0)
+        # 数据从哪来（显式呈现跨框架/跨进程依赖）：内部数据集 / 外部文件
+        self._src_kind = QComboBox()
+        self._src_kind.addItems(["ML 内部数据集", "外部文件（csv/parquet）"])
+        self._src_kind.currentTextChanged.connect(lambda *_: self.refresh_source_status())
+        f0.addRow("来源", self._src_kind)
+        self._src_path = QLineEdit()
+        self._src_path.setPlaceholderText("数据文件路径（外部程序写入的 csv/parquet）")
+        self._src_path.editingFinished.connect(self.refresh_source_status)
+        self._lbl_path = QLabel("路径")
+        f0.addRow(self._lbl_path, self._src_path)
+        self._src_target = QLineEdit("target")
+        self._src_target.setFixedWidth(90)
+        self._src_target.editingFinished.connect(self.refresh_source_status)
+        self._lbl_target = QLabel("目标列")
+        f0.addRow(self._lbl_target, self._src_target)
+        self._src_status = QLabel("")
+        self._src_status.setStyleSheet("color:#888; font-size:11px;")
+        self._src_status.setWordWrap(True)
+        f0.addRow(self._src_status)
+        form.addWidget(g0)
+        self._src_group = g0
+
         g1 = QGroupBox("目标函数")
         f1 = QFormLayout(g1)
         self._obj_kind = QComboBox()
-        self._obj_kind.addItems(["合成函数", "ML 方法调参（AutoTuner）"])
+        self._obj_kind.addItems(["合成函数", "ML 方法调参（AutoTuner）",
+                                 "外部程序（黑盒进程）"])
         self._obj_kind.currentTextChanged.connect(self._on_obj_kind)
         f1.addRow("类型", self._obj_kind)
         self._synth = QComboBox()
@@ -68,7 +93,7 @@ class OptWorkbench(QWidget):
         self._synth.addItems(synth_names())
         self._synth.currentTextChanged.connect(self._on_synth_change)
         f1.addRow("函数", self._synth)
-        # ML 方法调参行（接缝2）：方法 + CV 折数，由主窗口注入数据上下文
+        # ML 方法调参行（接缝2）：方法 + CV 折数
         from ..core import registry as ml_registry
         ml_registry.load_builtin()
         self._ml_method = QComboBox()
@@ -81,8 +106,23 @@ class OptWorkbench(QWidget):
         self._lbl_cv = QLabel("CV 折数")
         f1.addRow(self._lbl_method, self._ml_method)
         f1.addRow(self._lbl_cv, self._ml_cv)
+        # 外部程序行（评估侧接入）：参数定义 + 命令模板 + 解析式
+        self._proc_params = QLineEdit("a=0..5, b=0..5")
+        self._proc_params.setPlaceholderText("寻优参数：名=下界..上界，逗号分隔")
+        self._proc_cmd = QLineEdit("python sim.py --a {a} --b {b}")
+        self._proc_cmd.setPlaceholderText("参数以 {key} 占位注入；{params_file}=json 文件")
+        self._proc_parse = QLineEdit(r"score[:=]\s*(-?\d+(?:\.\d+)?)")
+        self._proc_parse.setPlaceholderText("stdout 正则（含一个捕获组）")
+        self._lbl_pparams = QLabel("参数")
+        self._lbl_cmd = QLabel("命令")
+        self._lbl_parse = QLabel("解析")
+        f1.addRow(self._lbl_pparams, self._proc_params)
+        f1.addRow(self._lbl_cmd, self._proc_cmd)
+        f1.addRow(self._lbl_parse, self._proc_parse)
         f1.addRow(self._obj_info)
-        for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
+        for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv,
+                  self._proc_params, self._lbl_pparams,
+                  self._proc_cmd, self._lbl_cmd, self._proc_parse, self._lbl_parse):
             w.setVisible(False)
         self._on_synth_change(self._synth.currentText())
         form.addWidget(g1)
@@ -254,31 +294,109 @@ class OptWorkbench(QWidget):
         self._launch_next()
 
     def set_data_context(self, spec):
-        """主窗口注入当前数据视图（AutoTuner 目标需要 X/y）。"""
+        """主窗口注入当前数据视图（"ML 内部数据集"数据源用）。"""
         self._spec = spec
+        self.refresh_source_status()
+
+    # ------------------------------------------------ 数据源（显式呈现依赖）
+    def _uses_source(self) -> bool:
+        """AutoTuner 需要数据；合成函数/外部程序不需要（进程自产数据）。"""
+        return self._obj_kind.currentText().startswith("ML")
+
+    def _current_source(self):
+        """按数据源选择构造 DataSource。抛异常 = 未配置/不可读。"""
+        from ..opt.sources import SpecSource, FileSource
+        if self._src_kind.currentText().startswith("ML"):
+            spec = getattr(self, "_spec", None)
+            if spec is None or spec.y is None:
+                raise RuntimeError("ML 内部数据集未加载（先在 ML 模式打开数据）")
+            return SpecSource(spec)
+        path = self._src_path.text().strip()
+        if not path:
+            raise RuntimeError("数据源=外部文件：请填写 csv/parquet 路径")
+        return FileSource(path, self._src_target.text().strip() or "target")
+
+    def refresh_source_status(self):
+        """状态栏一行：绿=已连接 / 灰=未配置 / 红=读取失败。"""
+        g0 = getattr(self, "_src_group", None)
+        if g0 is None:
+            return
+        g0.setVisible(self._uses_source())
+        file_mode = self._src_kind.currentText().startswith("外部")
+        for w in (self._src_path, self._lbl_path, self._src_target,
+                  self._lbl_target):
+            w.setVisible(file_mode)
+        if not self._uses_source():
+            return
+        try:
+            src = self._current_source()
+            X, y = src.fetch()                   # 真读一次 = 连接测试
+            self._src_status.setText("● " + src.describe() + f" · 特征 {X.shape[1]} 维")
+            self._src_status.setStyleSheet("color:#2ca02c; font-size:11px;")
+        except Exception as e:
+            self._src_status.setText("● " + str(e)[:160])
+            self._src_status.setStyleSheet("color:#c0392b; font-size:11px;")
 
     def _on_obj_kind(self, text):
         synth = text.startswith("合成")
+        ml = text.startswith("ML")
+        proc = text.startswith("外部")
         self._synth.setVisible(synth)
         for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
-            w.setVisible(not synth)
+            w.setVisible(ml)
+        for w in (self._proc_params, self._lbl_pparams,
+                  self._proc_cmd, self._lbl_cmd, self._proc_parse,
+                  self._lbl_parse):
+            w.setVisible(proc)
         if synth:
             self._on_synth_change(self._synth.currentText())
+        elif ml:
+            self._obj_info.setText("目标 = 方法在数据源上的 CV 主指标；"
+                                   "数据源在上方显式选择（内部数据集或外部文件）。")
         else:
-            self._obj_info.setText("用当前数据集评估“方法+超参”的 CV 主指标，"
-                                   "优化器自动搜索最优超参（接缝2）。需先在数据页加载数据。")
+            self._obj_info.setText("参数注入命令模板跑外部程序，从 stdout 解析分数。"
+                                   "数据由程序自产，无需数据源。")
+        self.refresh_source_status()
+
+    @staticmethod
+    def _proc_space(text: str):
+        """"a=0..5, b=-1..1" -> ParamSpace（外部程序的黑盒参数都是连续的）。"""
+        import re
+        from ..core.contracts import ParamSpec
+        from ..opt.contracts import ParamSpace
+        specs = []
+        for tok in text.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            m = re.match(r"^(\w+)\s*=\s*(-?[\d.eE+-]+)\s*\.\.\s*(-?[\d.eE+-]+)$",
+                         tok)
+            if not m:
+                raise ValueError(f"参数定义无法解析：{tok!r}（期望 名=下界..上界）")
+            lo, hi = float(m.group(2)), float(m.group(3))
+            if hi <= lo:
+                raise ValueError(f"参数 {m.group(1)} 上界须大于下界")
+            specs.append(ParamSpec(m.group(1), m.group(1), "number",
+                                   (lo + hi) / 2, min=lo, max=hi))
+        if not specs:
+            raise ValueError("至少定义一个寻优参数，如 a=0..5")
+        return ParamSpace(specs)
 
     def _make_objective(self):
-        if self._obj_kind.currentText().startswith("合成"):
+        kind = self._obj_kind.currentText()
+        if kind.startswith("合成"):
             return make_objective_from_synth(self._synth.currentText())
-        from ..opt.bridges import AutoTunerObjective, method_param_space
-        spec = getattr(self, "_spec", None)
-        if spec is None or spec.y is None:
-            raise RuntimeError("ML 方法调参需要先加载带目标列的数据")
-        name = self._ml_method.currentText()
-        space = method_param_space(name)
-        return AutoTunerObjective(name, spec.X, spec.y, space,
-                                  cv_folds=int(self._ml_cv.currentText()))
+        if kind.startswith("ML"):
+            from ..opt.bridges import AutoTunerObjective
+            return AutoTunerObjective(
+                self._ml_method.currentText(), self._current_source(),
+                cv_folds=int(self._ml_cv.currentText()))
+        from ..opt.process import ProcessObjective
+        return ProcessObjective(self._proc_cmd.text().strip(),
+                                self._proc_space(self._proc_params.text()),
+                                parse=self._proc_parse.text().strip()
+                                or r"score[:=]\s*(-?\d+(?:\.\d+)?)",
+                                name="external_proc")
 
     def _launch_next(self):
         if not self._queue:

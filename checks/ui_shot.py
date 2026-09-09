@@ -176,7 +176,7 @@ def capture_opt(win):
     shots = []
     try:
         oreg.load_builtin()
-        win.tabs.setCurrentIndex(win.TAB_OPT)
+        win._mode_opt.trigger()              # Perspective：切到优化工作区
         app.processEvents()
         wb = win.opt_page
         obj = make_objective_from_synth("ackley_3d")
