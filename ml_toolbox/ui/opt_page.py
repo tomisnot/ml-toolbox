@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from PyQt5.QtCore import Qt
@@ -636,6 +638,10 @@ class OptWorkbench(QWidget):
                 self._ml_method.currentText(), self._current_source(),
                 cv_folds=int(self._ml_cv.currentText()))
         space, mapping = self._proc_space(self._proc_params.text())
+        cwd = self._proc_cwd.text().strip()
+        if cwd and not os.path.isdir(cwd):
+            raise ValueError(f"黑盒工作目录不存在：{cwd}"
+                             "（导入的配置可能来自别的机器，请改「目录」）")
         if self._proc_mode.currentIndex() == 1:
             from ..opt.process import BatchProcessObjective
             import json as _json

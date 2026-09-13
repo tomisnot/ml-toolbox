@@ -1,0 +1,42 @@
+{
+  "kind": "ml_toolbox.opt.workspace",
+  "version": 1,
+  "objective_kind": "外部程序（黑盒进程）",
+  "synth": "ackley",
+  "ml_method": "ridge",
+  "ml_cv": "3",
+  "source_kind": "ML 内部数据集",
+  "source_path": "",
+  "source_target": "target",
+  "proc": {
+    "mode": 1,
+    "params": "freq_mhz=7200..7500, intensity=0.3..1.0",
+    "cmd": "python scripts\\freeze_blackbox.py --points {points_file} --out {out_file} --fast --box 5 0.2",
+    "cwd": "D:\\学\\BaiduSyncdisk\\编程\\code\\python\\Energy Level",
+    "parse": "score[:=]\\s*(-?\\d+(?:\\.\\d+)?)",
+    "score_field": "C_dual_worst",
+    "maximize": true,
+    "constraints": "S_ret_worst>=0.99",
+    "point_extra": "{\"pol\": \"椭圆偏\", \"ell\": {\"alpha_deg\": 0.0, \"theta_deg\": 0.0, \"eps_deg\": 0.0}, \"fwhm_ns\": 40.0}",
+    "stagger": "6",
+    "timeout": "5400"
+  },
+  "budget": {
+    "n_evals": "12",
+    "stall": "0",
+    "seed": "42",
+    "workers": "4"
+  },
+  "optimizers": ["gp_bo"],
+  "opt_cfg_owner": "gp_bo",
+  "optimizer_cfg": {
+    "gp_bo": {
+      "acq": "ei",
+      "xi": 0.01,
+      "beta": 2.0,
+      "n_init": 8,
+      "n_candidates": 4000,
+      "constrain": false
+    }
+  }
+}
