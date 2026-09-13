@@ -455,6 +455,60 @@ def test_opt_cfg_export_import():
     assert sp.dim == 2 and mp == {"alpha_deg": "ell.alpha_deg"}
 
 
+def test_opt_worker_parallel_e2e():
+    """真实线程链冒烟：OptWorker(QThread) + workers=2 + 子进程批量黑盒。
+
+    offscreen 下不点 GUI，但走完整 _launch_next 同款路径：
+    OptWorker.run -> optimize(workers=2) -> evaluate_many -> subprocess。
+    """
+    import tempfile
+    from ml_toolbox.core.contracts import ParamSpec
+    from ml_toolbox.opt.contracts import ParamSpace, Budget
+    from ml_toolbox.opt.process import BatchProcessObjective
+    from ml_toolbox.ui.worker import OptWorker
+    script = os.path.join(tempfile.gettempdir(), "ui_bb_fake.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("import argparse, json\n"
+                "p=argparse.ArgumentParser(); p.add_argument('--points'); "
+                "p.add_argument('--out'); a=p.parse_args()\n"
+                "pts=json.load(open(a.points,encoding='utf-8'))\n"
+                "out=[{'id':q.get('id',k),'ok':True,"
+                "'C_dual':1.0-(float(q['x'])-0.5)**2,'S_ret':1.0}\n"
+                "     for k,q in enumerate(pts)]\n"
+                "json.dump(out,open(a.out,'w',encoding='utf-8'))\n")
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=0.0, max=1.0)])
+    cmd = (f'python "{script}" --points {{points_file}} --out {{out_file}}')
+    obj = BatchProcessObjective(cmd, sp,
+                                point_map={"x": "x"},
+                                score_field="C_dual", minimize=False,
+                                constraints=[{"field": "S_ret", "op": ">=",
+                                              "value": 0.99}],
+                                stagger=0.0, timeout=60.0, name="uibb")
+    from ml_toolbox.opt import registry as oreg
+    oreg.load_builtin()
+    w = OptWorker(obj, oreg.get("random_search"), Budget(n_evals=6),
+                  seed=3, workers=2)
+    done = {"rec": None, "fail": None, "n_eval": 0}
+    w.eval_done.connect(lambda r, i: done.update(n_eval=i + 1))
+    w.finished_ok.connect(lambda r: done.update(rec=r))
+    w.failed.connect(lambda tb: done.update(fail=tb))
+    w.start()
+    import time
+    t0 = time.time()
+    while w.isRunning() and time.time() - t0 < 120:
+        app.processEvents()
+        time.sleep(0.02)
+    w.wait(5000)
+    app.processEvents()
+    assert done["fail"] is None, done["fail"]
+    rec = done["rec"]
+    assert rec is not None and rec.error is None, rec.error if rec else "无记录"
+    assert len(rec.history) == 6
+    assert (rec.history["status"] == "ok").all()
+    assert done["n_eval"] == 6                    # 直播回调逐条到达
+    assert abs(rec.best["score"] + 1.0) < 0.3     # 最小化方向峰 = -1
+
+
 def test_no_dataset_button():
     """无数据点运行：提示而非崩溃。"""
     win = MainWindow()
@@ -484,6 +538,7 @@ if __name__ == "__main__":
         ("opt_workbench", test_opt_workbench),
         ("autotuner_ui", test_autotuner_ui),
         ("opt_cfg_export_import", test_opt_cfg_export_import),
+        ("opt_worker_parallel_e2e", test_opt_worker_parallel_e2e),
         ("no_dataset_button", test_no_dataset_button),
     ]
     print(f"UI 回归测试 {len(tests)} 项")
