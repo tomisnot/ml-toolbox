@@ -722,6 +722,13 @@ class OptWorkbench(QWidget):
     def _on_one_done(self, record):
         self._records[record.optimizer] = record
         self._refresh_live(record)
+        # 留痕：runs/<run_id>/{opt_record.json, history.csv}（平坦性脚本/回看用）
+        try:
+            from ..opt import persistence
+            d = persistence.save_record(record)
+            self._prog.setText(f"已存留痕 → runs/{os.path.basename(d)}")
+        except Exception as e:
+            self._prog.setText(f"留痕失败：{e}")
         self._launch_next()
 
     def _on_fail(self, tb):
