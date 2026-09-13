@@ -414,7 +414,7 @@ def test_autotuner_ui():
     # 外部程序目标：参数定义解析
     wb._obj_kind.setCurrentText("外部程序（黑盒进程）")
     app.processEvents()
-    sp = wb._proc_space("a=0..5, b=-1..1")
+    sp, _mp = wb._proc_space("a=0..5, b=-1..1")
     assert sp.dim == 2 and sp.keys == ["a", "b"]
     try:
         wb._proc_space("bad")
@@ -423,6 +423,36 @@ def test_autotuner_ui():
         pass
     wb._obj_kind.setCurrentText("合成函数")
     app.processEvents()
+
+
+def test_opt_cfg_export_import():
+    """配置导出/导入：freeze 实战配置装载 -> 面板状态 -> objective 构造。"""
+    import json
+    from ml_toolbox.ui.opt_page import OptWorkbench
+    wb = OptWorkbench()
+    cfg_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "cases", "freeze_autotune.json")
+    with open(cfg_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    wb.set_config(cfg)
+    g = wb.get_config()
+    assert g["objective_kind"] == "外部程序（黑盒进程）"
+    assert g["proc"]["mode"] == 1 and g["proc"]["score_field"] == "C_dual"
+    assert g["proc"]["maximize"] is True
+    assert g["budget"]["workers"] == "8"
+    assert g["optimizers"] == ["gp_bo"]
+    obj = wb._make_objective()
+    assert obj.__class__.__name__ == "BatchProcessObjective"
+    assert obj.minimize is False and obj.space.dim == 2
+    assert obj.constraints and obj.constraints[0]["field"] == "S_ret"
+    # 往返稳定：再导一次与第一次一致
+    assert wb.get_config() == g
+    # 约束解析
+    cs = OptWorkbench._parse_constraints("S_ret>=0.99, kick_m05>0.5")
+    assert cs[1] == {"field": "kick_m05", "op": ">", "value": 0.5}
+    # 嵌套路径参数：ell.alpha_deg -> 参数名 alpha_deg + mapping
+    sp, mp = OptWorkbench._proc_space("freq_mhz=7200..7500, ell.alpha_deg=-90..90")
+    assert sp.dim == 2 and mp == {"alpha_deg": "ell.alpha_deg"}
 
 
 def test_no_dataset_button():
@@ -453,6 +483,7 @@ if __name__ == "__main__":
         ("perspective_switch", test_perspective_switch),
         ("opt_workbench", test_opt_workbench),
         ("autotuner_ui", test_autotuner_ui),
+        ("opt_cfg_export_import", test_opt_cfg_export_import),
         ("no_dataset_button", test_no_dataset_button),
     ]
     print(f"UI 回归测试 {len(tests)} 项")

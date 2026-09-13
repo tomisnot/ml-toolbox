@@ -107,22 +107,67 @@ class OptWorkbench(QWidget):
         f1.addRow(self._lbl_method, self._ml_method)
         f1.addRow(self._lbl_cv, self._ml_cv)
         # 外部程序行（评估侧接入）：参数定义 + 命令模板 + 解析式
+        self._proc_mode = QComboBox()
+        self._proc_mode.addItems(["stdout 单点（解析一个分数）",
+                                  "JSON 批量（pts/res 文件，可并行）"])
+        self._proc_mode.currentTextChanged.connect(lambda *_: self._on_proc_mode())
+        self._lbl_mode = QLabel("模式")
         self._proc_params = QLineEdit("a=0..5, b=0..5")
-        self._proc_params.setPlaceholderText("寻优参数：名=下界..上界，逗号分隔")
+        self._proc_params.setPlaceholderText("寻优参数：名=下界..上界 或 名=甲|乙|丙；"
+                                             "名:点内路径=... 支持嵌套字段")
         self._proc_cmd = QLineEdit("python sim.py --a {a} --b {b}")
-        self._proc_cmd.setPlaceholderText("参数以 {key} 占位注入；{params_file}=json 文件")
+        self._proc_cmd.setPlaceholderText("单点：{key} 占位注入；批量：{points_file}/{out_file}")
+        self._proc_cwd = QLineEdit()
+        self._proc_cwd.setPlaceholderText("黑盒工作目录（可空）")
         self._proc_parse = QLineEdit(r"score[:=]\s*(-?\d+(?:\.\d+)?)")
         self._proc_parse.setPlaceholderText("stdout 正则（含一个捕获组）")
+        self._proc_score = QLineEdit("score")
+        self._proc_score.setPlaceholderText("res.json 目标字段（支持 a.b 嵌套）")
+        self._proc_max = QCheckBox("越大越好")
+        self._proc_max.setChecked(True)
+        self._proc_cons = QLineEdit()
+        self._proc_cons.setPlaceholderText("约束：S_ret>=0.99, kick>=0.5（逗号分隔，可空）")
+        self._proc_extra = QLineEdit("{}")
+        self._proc_extra.setPlaceholderText('固定字段 JSON：{"pol":"椭圆偏","fwhm_ns":40}')
+        self._proc_stagger = QLineEdit("4")
+        self._proc_stagger.setFixedWidth(70)
+        self._proc_stagger.setToolTip("相邻子进程启动间隔秒（防共享数据库首访竞争）")
+        self._proc_timeout = QLineEdit("1800")
+        self._proc_timeout.setFixedWidth(70)
+        self._proc_timeout.setToolTip("单点评估超时（秒）")
         self._lbl_pparams = QLabel("参数")
         self._lbl_cmd = QLabel("命令")
+        self._lbl_cwd = QLabel("目录")
         self._lbl_parse = QLabel("解析")
+        self._lbl_score = QLabel("目标字段")
+        self._lbl_cons = QLabel("约束")
+        self._lbl_extra = QLabel("固定字段")
+        self._lbl_stagger = QLabel("错峰(s)")
+        self._lbl_timeout = QLabel("超时(s)")
+        f1.addRow(self._lbl_mode, self._proc_mode)
         f1.addRow(self._lbl_pparams, self._proc_params)
         f1.addRow(self._lbl_cmd, self._proc_cmd)
+        f1.addRow(self._lbl_cwd, self._proc_cwd)
         f1.addRow(self._lbl_parse, self._proc_parse)
+        f1.addRow(self._lbl_score, self._proc_score)
+        f1.addRow(self._lbl_cons, self._proc_cons)
+        f1.addRow(self._lbl_extra, self._proc_extra)
+        f1.addRow("", self._proc_max)
+        f1.addRow(self._lbl_stagger, self._proc_stagger)
+        f1.addRow(self._lbl_timeout, self._proc_timeout)
         f1.addRow(self._obj_info)
+        self._proc_single_w = [self._proc_parse]
+        self._proc_batch_w = [self._proc_score, self._lbl_score, self._proc_cons,
+                              self._lbl_cons, self._proc_extra, self._lbl_extra,
+                              self._proc_max, self._proc_stagger, self._lbl_stagger]
         for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv,
+                  self._proc_mode, self._lbl_mode,
                   self._proc_params, self._lbl_pparams,
-                  self._proc_cmd, self._lbl_cmd, self._proc_parse, self._lbl_parse):
+                  self._proc_cmd, self._lbl_cmd,
+                  self._proc_cwd, self._lbl_cwd,
+                  self._proc_parse, self._lbl_parse,
+                  self._proc_timeout, self._lbl_timeout,
+                  *self._proc_batch_w):
             w.setVisible(False)
         self._on_synth_change(self._synth.currentText())
         form.addWidget(g1)
@@ -155,6 +200,11 @@ class OptWorkbench(QWidget):
         self._seed = QLineEdit("42")
         self._seed.setFixedWidth(70)
         f3.addRow("种子", self._seed)
+        self._workers = QLineEdit("1")
+        self._workers.setFixedWidth(70)
+        self._workers.setToolTip("并行评估进程数（外部程序 JSON 批量模式有效；"
+                                 "1=串行。建议 = 物理核数 × 0.7~1.0）")
+        f3.addRow("并行评估数", self._workers)
         form.addWidget(g3)
 
         # 参数子面板（选中优化器的 param_schema）
@@ -204,6 +254,13 @@ class OptWorkbench(QWidget):
         self.btn_stop = QPushButton("⏹ 停止")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
+        self.btn_export = QPushButton("📤 导出配置")
+        self.btn_export.setToolTip("把左栏全部设置（目标/数据源/优化器/预算）存成 JSON，"
+                                   "下次导入即可复现同一次运行")
+        self.btn_export.clicked.connect(self._export_cfg)
+        self.btn_import = QPushButton("📥 导入配置")
+        self.btn_import.setToolTip("从 JSON 配置文件恢复全部设置")
+        self.btn_import.clicked.connect(self._import_cfg)
         self._prog = QLabel("选择目标函数与优化器，点开始")
         self._prog.setStyleSheet("color:#555;")
 
@@ -211,8 +268,13 @@ class OptWorkbench(QWidget):
         bottom.addWidget(self.btn_run)
         bottom.addWidget(self.btn_pause)
         bottom.addWidget(self.btn_stop)
-        bottom.addWidget(self._prog, 1)
+        bottom.addStretch(1)
+        bottom.addWidget(self.btn_import)
+        bottom.addWidget(self.btn_export)
         outer.addLayout(bottom)
+        outer2 = QHBoxLayout()
+        outer2.addWidget(self._prog, 1)
+        outer.addLayout(outer2)
         self._on_opt_change(self._opt_sel.currentText())   # 初始填充超参面板
 
     def _wrap(self, w):
@@ -273,6 +335,138 @@ class OptWorkbench(QWidget):
                 except ValueError:
                     cfg[k] = p.default
         return cfg
+
+    # ================================================== 配置导出 / 导入
+    CFG_VERSION = 1
+
+    def _combo_set(self, cb, text):
+        i = cb.findText(str(text))
+        if i >= 0:
+            cb.setCurrentIndex(i)
+
+    def get_config(self) -> dict:
+        """左栏全部设置 -> 可 JSON 序列化的 dict（导出用）。"""
+        cfg = {
+            "kind": "ml_toolbox.opt.workspace",
+            "version": self.CFG_VERSION,
+            "objective_kind": self._obj_kind.currentText(),
+            "synth": self._synth.currentText(),
+            "ml_method": self._ml_method.currentText(),
+            "ml_cv": self._ml_cv.currentText(),
+            "source_kind": self._src_kind.currentText(),
+            "source_path": self._src_path.text(),
+            "source_target": self._src_target.text(),
+            "proc": {
+                "mode": self._proc_mode.currentIndex(),
+                "params": self._proc_params.text(),
+                "cmd": self._proc_cmd.text(),
+                "cwd": self._proc_cwd.text(),
+                "parse": self._proc_parse.text(),
+                "score_field": self._proc_score.text(),
+                "maximize": self._proc_max.isChecked(),
+                "constraints": self._proc_cons.text(),
+                "point_extra": self._proc_extra.text(),
+                "stagger": self._proc_stagger.text(),
+                "timeout": self._proc_timeout.text(),
+            },
+            "budget": {"n_evals": self._n_evals.text(),
+                       "stall": self._stall.text(),
+                       "seed": self._seed.text(),
+                       "workers": self._workers.text()},
+            "optimizers": self._selected_optimizers(),
+            # 面板超参只归属当前选中的优化器（与 _launch_next 的运行语义一致）
+            "opt_cfg_owner": getattr(self, "_param_owner", ""),
+            "optimizer_cfg": {getattr(self, "_param_owner", ""):
+                              self._collect_opt_cfg(self._param_owner)
+                              if getattr(self, "_param_owner", "") else {}},
+        }
+        return cfg
+
+    def set_config(self, cfg: dict):
+        """get_config 的逆操作；未知键忽略，缺失键保持现值。"""
+        if not isinstance(cfg, dict):
+            raise ValueError("配置须是 JSON 对象")
+        self._combo_set(self._obj_kind, cfg.get("objective_kind", "合成函数"))
+        self._combo_set(self._synth, cfg.get("synth", ""))
+        self._combo_set(self._ml_method, cfg.get("ml_method", ""))
+        self._combo_set(self._ml_cv, cfg.get("ml_cv", ""))
+        self._combo_set(self._src_kind, cfg.get("source_kind", ""))
+        if "source_path" in cfg:
+            self._src_path.setText(str(cfg["source_path"]))
+        if "source_target" in cfg:
+            self._src_target.setText(str(cfg["source_target"]))
+        for k, w in (("mode", self._proc_mode), ("params", self._proc_params),
+                     ("cmd", self._proc_cmd), ("cwd", self._proc_cwd),
+                     ("parse", self._proc_parse),
+                     ("score_field", self._proc_score),
+                     ("constraints", self._proc_cons),
+                     ("point_extra", self._proc_extra),
+                     ("stagger", self._proc_stagger),
+                     ("timeout", self._proc_timeout)):
+            v = cfg.get("proc", {}).get(k)
+            if v is None:
+                continue
+            if isinstance(w, QComboBox):
+                w.setCurrentIndex(int(v))
+            else:
+                w.setText(str(v))
+        if "maximize" in cfg.get("proc", {}):
+            self._proc_max.setChecked(bool(cfg["proc"]["maximize"]))
+        b = cfg.get("budget", {})
+        for k, w in (("n_evals", self._n_evals), ("stall", self._stall),
+                     ("seed", self._seed), ("workers", self._workers)):
+            if k in b:
+                w.setText(str(b[k]))
+        opts = cfg.get("optimizers")
+        if opts:
+            for n, cb in self._opt_boxes.items():
+                cb.setChecked(n in opts)
+        for n, oc in (cfg.get("optimizer_cfg") or {}).items():
+            if n not in self._opt_boxes or not isinstance(oc, dict):
+                continue
+            if n != self._param_owner:
+                self._opt_sel.setCurrentText(n)     # _on_opt_change 重建面板
+            for k, v in oc.items():
+                pair = self._param_widgets.get(k)
+                if pair is None:
+                    continue
+                p, w = pair
+                if p.kind == "bool":
+                    w.setChecked(bool(v))
+                elif p.kind == "select":
+                    self._combo_set(w, v)
+                else:
+                    w.setText(str(v))
+        self._on_obj_kind(self._obj_kind.currentText())
+
+    def _export_cfg(self):
+        import json
+        import os
+        from PyQt5.QtWidgets import QFileDialog
+        p, _ = QFileDialog.getSaveFileName(
+            self, "导出优化配置", "opt_config.json", "JSON (*.json)")
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(self.get_config(), f, ensure_ascii=False, indent=2)
+            self._prog.setText(f"配置已导出：{os.path.basename(p)}")
+        except OSError as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
+    def _import_cfg(self):
+        import json
+        from PyQt5.QtWidgets import QFileDialog
+        p, _ = QFileDialog.getOpenFileName(self, "导入优化配置", "", "JSON (*.json)")
+        if not p:
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.set_config(cfg)
+            self._prog.setText(f"已导入配置：{p}")
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"{type(e).__name__}: {e}")
 
     # ================================================== 运行控制
     def _selected_optimizers(self):
@@ -344,10 +538,17 @@ class OptWorkbench(QWidget):
         self._synth.setVisible(synth)
         for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
             w.setVisible(ml)
-        for w in (self._proc_params, self._lbl_pparams,
-                  self._proc_cmd, self._lbl_cmd, self._proc_parse,
-                  self._lbl_parse):
+        proc_widgets = [self._proc_mode, self._lbl_mode,
+                        self._proc_params, self._lbl_pparams,
+                        self._proc_cmd, self._lbl_cmd,
+                        self._proc_cwd, self._lbl_cwd,
+                        self._proc_timeout, self._lbl_timeout,
+                        self._proc_parse, self._lbl_parse,
+                        *self._proc_batch_w]
+        for w in proc_widgets:
             w.setVisible(proc)
+        if proc:
+            self._on_proc_mode()
         if synth:
             self._on_synth_change(self._synth.currentText())
         elif ml:
@@ -358,29 +559,72 @@ class OptWorkbench(QWidget):
                                    "数据由程序自产，无需数据源。")
         self.refresh_source_status()
 
+    def _on_proc_mode(self):
+        """外部程序子模式：stdout 单点 vs JSON 批量（并行）。"""
+        if not self._proc_mode.isVisible():
+            return
+        batch = self._proc_mode.currentIndex() == 1
+        self._proc_parse.setVisible(not batch)
+        self._lbl_parse.setVisible(not batch)
+        for w in self._proc_batch_w:
+            w.setVisible(batch)
+        if batch:
+            self._workers.setText(self._workers.text() or "1")
+            self._obj_info.setText("一批点写 pts.json → 黑盒进程 → 读 res.json。"
+                                   "命令含 {points_file}/{out_file} 占位；"
+                                   "并行评估数>1 时每点一个子进程（错峰启动）。")
+        else:
+            self._obj_info.setText("参数注入命令模板跑外部程序，从 stdout 解析分数。"
+                                   "数据由程序自产，无需数据源。")
+
     @staticmethod
     def _proc_space(text: str):
-        """"a=0..5, b=-1..1" -> ParamSpace（外部程序的黑盒参数都是连续的）。"""
+        """参数定义 -> ParamSpace。
+
+        语法（逗号分隔）：
+          名=下界..上界          连续
+          名=整数下界..上界#int  整数
+          名=甲|乙|丙            离散 select
+          点内路径=...           批量模式映射（如 ell.alpha_deg=-90..90，
+                                 参数名 = 路径末段；亦支持 名:路径=...）
+        """
         import re
         from ..core.contracts import ParamSpec
         from ..opt.contracts import ParamSpace
-        specs = []
+        specs, mapping = [], {}
         for tok in text.split(","):
             tok = tok.strip()
             if not tok:
                 continue
-            m = re.match(r"^(\w+)\s*=\s*(-?[\d.eE+-]+)\s*\.\.\s*(-?[\d.eE+-]+)$",
-                         tok)
+            m = re.match(r"^([\w.]+)\s*(?::([\w.]+))?\s*=\s*(.+)$", tok)
             if not m:
-                raise ValueError(f"参数定义无法解析：{tok!r}（期望 名=下界..上界）")
-            lo, hi = float(m.group(2)), float(m.group(3))
-            if hi <= lo:
-                raise ValueError(f"参数 {m.group(1)} 上界须大于下界")
-            specs.append(ParamSpec(m.group(1), m.group(1), "number",
-                                   (lo + hi) / 2, min=lo, max=hi))
+                raise ValueError(f"参数定义无法解析：{tok!r}"
+                                 "（期望 名=下界..上界 / 名=甲|乙 / 路径=...）")
+            key, path, rhs = m.group(1), m.group(2), m.group(3).strip()
+            if path is None and "." in key:     # 点路径即字段名，末段做参数名
+                path, key = key, key.rsplit(".", 1)[-1]
+            if path:
+                mapping[key] = path
+            mm = re.match(r"^(-?[\d.eE+-]+)\s*\.\.\s*(-?[\d.eE+-]+)(#int)?$", rhs)
+            if mm:
+                lo, hi = float(mm.group(1)), float(mm.group(2))
+                if hi <= lo:
+                    raise ValueError(f"参数 {key} 上界须大于下界")
+                if mm.group(3):
+                    specs.append(ParamSpec(key, key, "int", int((lo + hi) / 2),
+                                           min=int(lo), max=int(hi)))
+                else:
+                    specs.append(ParamSpec(key, key, "number", (lo + hi) / 2,
+                                           min=lo, max=hi))
+            else:
+                choices = [c.strip() for c in rhs.split("|") if c.strip()]
+                if len(choices) < 2:
+                    raise ValueError(f"参数 {key} 取值非法：{rhs!r}")
+                specs.append(ParamSpec(key, key, "select", choices[0],
+                                       choices=choices))
         if not specs:
             raise ValueError("至少定义一个寻优参数，如 a=0..5")
-        return ParamSpace(specs)
+        return ParamSpace(specs), mapping
 
     def _make_objective(self):
         kind = self._obj_kind.currentText()
@@ -391,12 +635,49 @@ class OptWorkbench(QWidget):
             return AutoTunerObjective(
                 self._ml_method.currentText(), self._current_source(),
                 cv_folds=int(self._ml_cv.currentText()))
+        space, mapping = self._proc_space(self._proc_params.text())
+        if self._proc_mode.currentIndex() == 1:
+            from ..opt.process import BatchProcessObjective
+            import json as _json
+            try:
+                extra = _json.loads(self._proc_extra.text().strip() or "{}")
+            except ValueError as e:
+                raise ValueError(f"固定字段不是合法 JSON：{e}")
+            if not isinstance(extra, dict):
+                raise ValueError("固定字段须是 JSON 对象，如 {\"pol\": \"椭圆偏\"}")
+            return BatchProcessObjective(
+                self._proc_cmd.text().strip(), space,
+                cwd=self._proc_cwd.text().strip(),
+                point_map=mapping, point_extra=extra,
+                score_field=self._proc_score.text().strip() or "score",
+                minimize=not self._proc_max.isChecked(),
+                constraints=self._parse_constraints(self._proc_cons.text()),
+                stagger=float(self._proc_stagger.text() or 4),
+                timeout=float(self._proc_timeout.text() or 1800),
+                name="external_batch")
         from ..opt.process import ProcessObjective
-        return ProcessObjective(self._proc_cmd.text().strip(),
-                                self._proc_space(self._proc_params.text()),
+        return ProcessObjective(self._proc_cmd.text().strip(), space,
                                 parse=self._proc_parse.text().strip()
                                 or r"score[:=]\s*(-?\d+(?:\.\d+)?)",
+                                cwd=self._proc_cwd.text().strip(),
+                                timeout=float(self._proc_timeout.text() or 120),
                                 name="external_proc")
+
+    @staticmethod
+    def _parse_constraints(text: str):
+        """"S_ret>=0.99, kick_m05>0.5" -> [{"field","op","value"}, ...]。"""
+        import re
+        out = []
+        for tok in (text or "").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            m = re.match(r"^([\w.]+)\s*(>=|<=|>|<|==)\s*(-?[\d.eE+-]+)$", tok)
+            if not m:
+                raise ValueError(f"约束无法解析：{tok!r}（期望 字段>=数值）")
+            out.append({"field": m.group(1), "op": m.group(2),
+                        "value": float(m.group(3))})
+        return out
 
     def _launch_next(self):
         if not self._queue:
@@ -416,8 +697,12 @@ class OptWorkbench(QWidget):
                         stall=int(self._stall.text() or 0))
         cfg = self._collect_opt_cfg(name)
         seed = int(self._seed.text() or 42)
+        try:
+            workers = int(self._workers.text() or 1)
+        except ValueError:
+            workers = 1
         self._worker = OptWorker(objective, optimizer, budget, cfg=cfg,
-                                 seed=seed, parent=self)
+                                 seed=seed, workers=workers, parent=self)
         self._worker.eval_done.connect(self._on_eval)
         self._worker.finished_ok.connect(self._on_one_done)
         self._worker.failed.connect(self._on_fail)

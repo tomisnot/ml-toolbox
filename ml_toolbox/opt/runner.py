@@ -26,15 +26,20 @@ def _run_id(optimizer: str, objective: str, seed: int) -> str:
 
 def optimize(objective: Objective, optimizer: Optimizer,
              budget: Budget | None = None, cfg: dict | None = None,
-             seed: int = 42, on_eval=None, should_stop=None) -> OptRecord:
+             seed: int = 42, on_eval=None, should_stop=None,
+             workers: int = 1) -> OptRecord:
     """跑一条完整优化轨迹。
 
     on_eval(record, i)     —— 每次评估后回调（UI 直播 / 进度打印）。
     should_stop() -> bool  —— 外部中止（UI 的"停止"按钮）。
+    workers              —— 并行评估点数（>1 时每轮 ask_batch(workers) 后交给
+                            objective.evaluate_many 一批；序贯信息在"批"边界更新，
+                            即每轮评估完才 tell，GP 看到的是上一轮的全部观测）。
     """
     budget = budget or Budget()
     cfg = cfg or {}
     multi = bool(getattr(objective, "multi", False))
+    workers = max(int(workers), 1)
     rec = OptRecord(run_id=_run_id(optimizer.name, objective.name, seed),
                     optimizer=optimizer.name, objective=objective.name,
                     space_desc=objective.space.describe(),
@@ -55,42 +60,33 @@ def optimize(objective: Objective, optimizer: Optimizer,
                 break
             if budget.stall and stall >= budget.stall and not multi:
                 break
+            room = budget.n_evals - i
             params = optimizer.ask()
-            batch = isinstance(params, list)
-            plist = params if batch else [params]
-            if batch:
-                # 预算边界：评估前截断一代，objective 调用数严格 ≤ n_evals
-                room = budget.n_evals - i
-                plist = plist[:max(room, 1)]
-            results = []
-            for p in plist:
-                try:
-                    s = objective(p)
-                    if multi:
-                        s = np.asarray(s, float)
-                        status = "ok" if np.isfinite(s).all() else "failed"
-                        if status == "failed":
-                            s = np.full_like(s, np.inf)
-                    else:
-                        s = float(s)
-                        status = "ok" if np.isfinite(s) else "failed"
-                        if status == "failed":
-                            s = np.inf
-                except Exception as e:
-                    # 约束违反（黑盒主动拒绝）= 有用信息，单列 status；
-                    # 其余异常 = 真失败（崩溃/超时），censored。
-                    if not multi and getattr(objective, "has_constraints",
-                                            False) and objective.is_constraint_error(e):
-                        s, status = np.inf, "infeasible"
-                    else:
-                        s = np.full(objective.n_obj, np.inf) if multi else np.inf
-                        status = "failed"
-                results.append((p, s, status))
-            # 一代全部评完再 tell（种群式算法的语义）
+            pass_list = isinstance(params, list)
+            if not pass_list and workers > 1:
+                # 序贯式引擎 + 并行预算：改要一批（GP-BO 有 top-k 多样化，
+                # 其余引擎默认连发 ask()）
+                params = optimizer.ask_batch(min(workers, room))
+                pass_list = True
+            plist = params if pass_list else [params]
+            plist = plist[:max(room, 1)]      # 预算边界：objective 调用数 ≤ n_evals
+            if pass_list and workers > 1 and not multi:
+                # 并行：按 workers 分块喂 evaluate_many（并发度 = workers；
+                # 种群式一代可能大于一块）。返回分数已是最小化方向。
+                results = []
+                for j in range(0, len(plist), workers):
+                    chunk = plist[j:j + workers]
+                    results += [(p, float(s), st) for (p, (s, st))
+                                in zip(chunk, objective.evaluate_many(chunk))]
+            elif pass_list:
+                results = _eval_plist(objective, plist, multi)
+            else:
+                results = [_eval_one(objective, plist[0], multi)]
+            # 一代全部评完再 tell（种群式算法 / 并行批次的语义）
             optimizer.tell(
-                [r[0] for r in results] if batch else results[0][0],
-                [r[1] for r in results] if batch else results[0][1],
-                status=[r[2] for r in results] if batch else results[0][2])
+                [r[0] for r in results] if pass_list else results[0][0],
+                [r[1] for r in results] if pass_list else results[0][1],
+                status=[r[2] for r in results] if pass_list else results[0][2])
             for p, s, status in results:
                 row = dict(p)
                 if multi:
@@ -122,6 +118,31 @@ def optimize(objective: Objective, optimizer: Optimizer,
         rec.best = _mk_best(best_params, best)
     rec.elapsed = time.time() - t0
     return rec
+
+
+def _eval_one(objective: Objective, p: dict, multi: bool):
+    """单点评估 + 异常纪律（P10）：失败不抛出，记 status。"""
+    try:
+        s = objective(p)
+        if multi:
+            s = np.asarray(s, float)
+            if np.isfinite(s).all():
+                return (p, s, "ok")
+            return (p, np.full_like(s, np.inf), "failed")
+        s = float(s)
+        return (p, s, "ok") if np.isfinite(s) else (p, np.inf, "failed")
+    except Exception as e:
+        # 约束违反（黑盒主动拒绝）= 有用信息，单列 status；
+        # 其余异常 = 真失败（崩溃/超时），censored。
+        if (not multi and getattr(objective, "has_constraints", False)
+                and objective.is_constraint_error(e)):
+            return (p, np.inf, "infeasible")
+        s = np.full(objective.n_obj, np.inf) if multi else np.inf
+        return (p, s, "failed")
+
+
+def _eval_plist(objective: Objective, plist: list, multi: bool):
+    return [_eval_one(objective, p, multi) for p in plist]
 
 
 def dominates(a, b) -> bool:

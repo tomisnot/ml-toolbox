@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 
 import numpy as np
 
@@ -165,3 +166,180 @@ class ProcessObjective(Objective):
             return b.decode("utf-8")
         except UnicodeDecodeError:
             return b.decode("gbk", errors="replace")
+
+
+class InfeasiblePoint(RuntimeError):
+    """约束违反（黑盒输出判定）：该点不可行，但是有用信息。"""
+
+
+def _set_nested(d: dict, path: str, value):
+    keys = path.split(".")
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+    d[keys[-1]] = value
+
+
+class BatchProcessObjective(Objective):
+    """一次进程吃一批点的黑盒（pts.json 进 / res.json 出 + 多字段解析）。
+
+    与 ProcessObjective 的分工：后者 = "一个点一次进程 + stdout 一个数"；
+    本类 = "一批点一次（或几次）进程 + 结果文件多字段"，专为昂贵黑盒的
+    并行评估设计（runner workers>1 时经 evaluate_many 进入）。
+
+    约定（freeze 黑盒同款接口）：
+    - cmd_template 含 {points_file}/{out_file} 占位；每个子进程吃一个
+      单点 pts.json（黑盒按点切分到多进程是交接方的推荐并行方式）；
+    - point_map: {参数名: 点内路径}，路径支持 "ell.alpha_deg" 式嵌套；
+      point_extra: 固定字段（如 {"pol": "椭圆偏", "fwhm_ns": 40.0}）；
+    - score_field: 目标字段名；constraints: [{"field","op","value"}]
+      任一不满足 -> 该点不可行（on_infeasible 决定 censor/penalize）；
+    - ok=false 的行 = 真失败（censored），与约束违反区分；
+    - stagger: 相邻子进程启动间隔秒（SQLite 等共享资源的首次访问竞争）；
+    - evaluate_many 返回的分数**已是统一最小化方向**（框架契约）。
+    """
+
+    def __init__(self, cmd_template: str, space: ParamSpace, *,
+                 cwd: str = "", point_map: dict | None = None,
+                 point_extra: dict | None = None,
+                 score_field: str = "C_dual", minimize: bool = True,
+                 constraints: list | None = None,
+                 on_infeasible: str = "penalize", penalty_mult: float = 10.0,
+                 stagger: float = 4.0, timeout: float = 7200.0,
+                 name: str = "batch_process"):
+        super().__init__(name=name, space=space, minimize=minimize,
+                         has_constraints=bool(constraints))
+        self.cmd_template = cmd_template
+        self.cwd = cwd or None
+        self.point_map = dict(point_map or {})
+        self.point_extra = dict(point_extra or {})
+        self.score_field = score_field
+        self.constraints = list(constraints or [])
+        self.on_infeasible = on_infeasible
+        self.penalty_mult = float(penalty_mult)
+        self.stagger = float(stagger)
+        self.timeout = float(timeout)
+        self._worst_ok = -float("inf")     # 历史最差可行分（最小化方向取 max）
+        self.last_error = ""
+
+    # ------------------------------------------------ 点构造 / 解析
+    def _to_point(self, params: dict, pid) -> dict:
+        pt = {"id": pid}
+        pt.update(self.point_extra)
+        pm = self.point_map or {k: k for k in params}   # 无映射时参数名即字段名
+        for k, path in pm.items():
+            if k in params:
+                _set_nested(pt, path, params[k])
+        return pt
+
+    @staticmethod
+    def _get_nested(d: dict, path: str):
+        for k in path.split("."):
+            d = d[k]
+        return d
+
+    def _violations(self, row: dict) -> list:
+        bad = []
+        for c in self.constraints:
+            try:
+                v = self._get_nested(row, c["field"])
+            except (KeyError, TypeError):
+                continue                     # 字段缺失不判（黑盒版本差异容错）
+            op = c.get("op", ">=")
+            ok = {"<=": v <= c["value"], ">=": v >= c["value"],
+                  "<": v < c["value"], ">": v > c["value"],
+                  "==": v == c["value"]}.get(op, True)
+            if not ok:
+                bad.append(f"{c['field']}={v:.4g} {op} {c['value']} 不满足")
+        return bad
+
+    def _penalty(self) -> float:
+        base = self._worst_ok if np.isfinite(self._worst_ok) and self._worst_ok > 0 \
+            else 1.0
+        return base * self.penalty_mult + 1.0
+
+    # ------------------------------------------------ 单进程求值
+    def _run_point(self, params: dict, pid: int):
+        """-> (score_min_dir, status)。status: ok|infeasible|failed。"""
+        import subprocess
+        pt = self._to_point(params, pid)
+        tmpdir = tempfile.mkdtemp(prefix="optb_")
+        pf = os.path.join(tmpdir, "pts.json")
+        of = os.path.join(tmpdir, "res.json")
+        try:
+            with open(pf, "w", encoding="utf-8") as f:
+                json.dump([pt], f, ensure_ascii=False)
+            cmd = (self.cmd_template.replace("{points_file}", pf.replace("\\", "/"))
+                   .replace("{out_file}", of.replace("\\", "/")))
+            try:
+                r = subprocess.run(cmd, capture_output=True, cwd=self.cwd,
+                                   timeout=self.timeout, shell=True)
+            except subprocess.TimeoutExpired:
+                self.last_error = f"超时 {self.timeout}s: {cmd}"
+                return np.inf, "failed"
+            if not os.path.exists(of):
+                self.last_error = (f"无输出文件；rc={r.returncode} "
+                                   f"{ProcessObjective._dec(r.stderr)[-300:]}")
+                return np.inf, "failed"
+            with open(of, encoding="utf-8", errors="replace") as f:
+                rows = json.load(f)
+            row = rows[0] if isinstance(rows, list) and rows else rows
+            if not row.get("ok", True):
+                self.last_error = f"黑盒报失败: {row.get('err', row)}"
+                return np.inf, "failed"
+            bad = self._violations(row)
+            if bad:
+                if self.on_infeasible == "penalize":
+                    s = float(row.get(self.score_field, np.nan))
+                    if np.isfinite(s):
+                        v = s if self.minimize else -s
+                        self._worst_ok = max(self._worst_ok, v)
+                    return self._penalty(), "ok"   # 惩罚分可微地喂 GP
+                return np.inf, "infeasible"
+            s = float(row[self.score_field])
+            v = s if self.minimize else -s
+            self._worst_ok = max(self._worst_ok, v)
+            return v, "ok"
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            return np.inf, "failed"
+        finally:
+            for p in (pf, of):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+
+    # ------------------------------------------------ 主接口
+    def evaluate(self, params: dict) -> float:
+        """单点 = 长度 1 的批。返回原始方向分数（infeasible 抛异常）。"""
+        v, st = self._run_point(params, 0)
+        if st == "failed":
+            raise RuntimeError(f"黑盒评估失败: {self.last_error}")
+        if st == "infeasible":
+            raise InfeasiblePoint("约束违反")
+        return v if self.minimize else -v
+
+    def evaluate_many(self, plist: list) -> list:
+        """并行一批：每点一个子进程，错峰启动（ThreadPool 只管调度，
+        真并行在子进程层——黑盒内部单线程，无 GIL/BLAS 干扰）。"""
+        from concurrent.futures import ThreadPoolExecutor
+        n = len(plist)
+        if n == 1:
+            return [self._run_point(plist[0], 0)]
+        results: list = [None] * n
+
+        def go(i):
+            if self.stagger > 0:
+                time.sleep(i * self.stagger)
+            results[i] = self._run_point(plist[i], i)
+
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            list(ex.map(go, range(n)))
+        for i in range(n):
+            if results[i] is None:            # 线程异常兜底
+                results[i] = (np.inf, "failed")
+        return results

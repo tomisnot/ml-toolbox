@@ -56,7 +56,24 @@ class GPBO(Optimizer):
 
     # ------------------------------------------------ 主接口
     def ask(self):
-        n_init = int(self.cfg.get("n_init", 8))
+        v = self._next_points(1)
+        return v[0] if v else self.space.sample(self._rng)
+
+    def ask_batch(self, n: int):
+        """并行候选：预热期 = n 个随机点；之后 = 采集函数 top-k 贪心多样化。
+
+        不做多样化会让 n 个并行点全挤在采集函数同一个峰上（GP 视角下
+        它们几乎等价），信息量 ≈ 1。贪心策略：按 acq 降序排队，逐个入选，
+        但拒绝与已入选点距离 < min_dist 的候选（在 [0,1]^d 归一化坐标下）。
+        """
+        n = max(int(n), 1)
+        pts = self._next_points(n)
+        while len(pts) < n:                     # 采集失败兜底：随机补齐
+            pts.append(self.space.sample(self._rng))
+        return pts
+
+    def _next_points(self, n: int):
+        """-> list[dict]，长度 ≤ n（不足由调用方随机兜底）。"""
         constrain = bool(self.cfg.get("constrain", False))
         if constrain:
             # 约束模式：可行点可能极稀疏，不能等"凑够 n_init 个可行点"（会永远
@@ -64,16 +81,23 @@ class GPBO(Optimizer):
             ready = (len(self._X) >= 2 and len(self._Xc) >= 4
                      and len(set(self._yc)) >= 2)
             if not ready:
-                return self.space.sample(self._rng)
-        elif len(self._X) < max(n_init, 2):
-            return self.space.sample(self._rng)
-        v = self._optimize_acq()
-        if v is None:                        # GP 拟合失败 -> 随机兜底
+                return [self.space.sample(self._rng) for _ in range(n)]
+        elif len(self._X) < max(int(self.cfg.get("n_init", 8)), 2):
+            return [self.space.sample(self._rng) for _ in range(n)]
+        vs = self._optimize_acq(k=n)
+        if vs is None:                          # GP 拟合失败 -> 交给调用方随机兜底
             self._fallback_n += 1
-            return self.space.sample(self._rng)
-        return self.space.from_vector(v)
+            return []
+        return [self.space.from_vector(v) for v in vs]
 
     def tell(self, params, score, status="ok"):
+        # 并行批次（ask_batch）与种群式会传 list；单点 ask 传 dict
+        if isinstance(params, list):
+            for p, s, st in zip(params, score,
+                                status if isinstance(status, list)
+                                else [status] * len(params)):
+                self.tell(p, s, st)
+            return
         v = self.space.to_vector(params)
         if status == "ok" and np.isfinite(score):
             self._X.append(v)
@@ -105,7 +129,12 @@ class GPBO(Optimizer):
         g.fit(X, y)
         return g
 
-    def _optimize_acq(self):
+    def _optimize_acq(self, k: int = 1):
+        """采集函数 top-k（k=1 即经典单点 ask）。-> list[[0,1]^d] 或 None。
+
+        k>1 时贪心多样化：按 acq 降序逐个入选，拒绝与已入选点欧氏距离
+        < min_dist（默认 0.05·sqrt(d)，即"不同盆地"）的候选。
+        """
         try:
             gpr = self._fit()
         except Exception:
@@ -130,7 +159,18 @@ class GPBO(Optimizer):
         s2 = self._acq_at(gpr, acq, best, C, kw)
         if bool(self.cfg.get("constrain", False)):
             s2 = s2 * self._pfits(C)          # cEI = EI × P(可行)
-        return C[int(np.argmax(s2))]
+        if k <= 1:
+            return [C[int(np.argmax(s2))]]
+        order = np.argsort(s2)[::-1]
+        min_dist = float(self.cfg.get("min_dist", 0.05)) * np.sqrt(self.space.dim)
+        chosen = []
+        for idx in order:
+            v = C[idx]
+            if all(np.linalg.norm(v - u) >= min_dist for u in chosen):
+                chosen.append(v)
+                if len(chosen) >= k:
+                    break
+        return chosen
 
     def _acq_at(self, gpr, acq, best, V, kw):
         mu, sd = gpr.predict(V, return_std=True)

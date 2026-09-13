@@ -539,6 +539,111 @@ def test_constrained_process_objective():
     assert opt._gpc is not None, "cEI 未进入采集优化（warmup 死锁复发？）"
 
 
+# ================================================================ 批量黑盒 / 并行
+_BATCH_FAKE = None
+
+
+def _batch_fake_script():
+    """pts.json/res.json 假黑盒（freeze 接口同款）：窄峰 + S_ret 硬约束。"""
+    global _BATCH_FAKE
+    if _BATCH_FAKE is None:
+        import tempfile
+        _BATCH_FAKE = os.path.join(tempfile.gettempdir(), "opt_batch_fake.py")
+        with open(_BATCH_FAKE, "w", encoding="utf-8") as f:
+            f.write(
+                "import argparse, json\n"
+                "p=argparse.ArgumentParser(); p.add_argument('--points'); "
+                "p.add_argument('--out'); a=p.parse_args()\n"
+                "pts=json.load(open(a.points,encoding='utf-8'))\n"
+                "if isinstance(pts,dict): pts=[pts]\n"
+                "out=[]\n"
+                "for k,q in enumerate(pts):\n"
+                "    fr=float(q['freq_mhz']); I=float(q['intensity'])\n"
+                "    C=1.0-((fr-7350)/40.0)**2-((I-0.65)/0.35)**2\n"
+                "    S=1.0-max(0.0,I-0.9)*5\n"
+                "    out.append({'id':q.get('id',k),'ok':True,'C_dual':C,"
+                "'S_ret':S,'kick_m05':max(0.0,C)})\n"
+                "json.dump(out,open(a.out,'w',encoding='utf-8'))\n")
+    return _BATCH_FAKE.replace("\\", "/")
+
+
+def _batch_objective(workers_space=True):
+    from ml_toolbox.opt.process import BatchProcessObjective
+    sp = ParamSpace([ParamSpec("freq_mhz", "频率", "number", 7350.0,
+                               min=7200.0, max=7500.0),
+                     ParamSpec("intensity", "光强", "number", 0.65,
+                               min=0.3, max=1.0)])
+    cmd = f'python "{_batch_fake_script()}" --points {{points_file}} --out {{out_file}}'
+    return BatchProcessObjective(
+        cmd, sp, point_map={"freq_mhz": "freq_mhz", "intensity": "intensity"},
+        score_field="C_dual", minimize=False,
+        constraints=[{"field": "S_ret", "op": ">=", "value": 0.99}],
+        on_infeasible="penalize", stagger=0.0, timeout=60.0, name="bf")
+
+
+def test_batch_process_objective_single():
+    """批量黑盒单点：pts/res 往返 + maximize 方向 + 约束 penalize 生效。"""
+    obj = _batch_objective()
+    assert obj.has_constraints
+    # 峰处：C_dual≈1，S_ret=1 可行 -> 原始方向 ≈1
+    s = obj.evaluate({"freq_mhz": 7350.0, "intensity": 0.65})
+    assert abs(s - 1.0) < 0.02, s
+    # I=1.0 -> S_ret=0.5 违反约束 -> penalize（分数被压到远低于可行最优）
+    sp = obj.evaluate({"freq_mhz": 7350.0, "intensity": 1.0})
+    assert sp < s, f"违反约束点应被惩罚：{sp} !< {s}"
+
+
+def test_batch_process_objective_parallel():
+    """evaluate_many 一批：返回 [(score_min_dir,status)]，长度对齐，方向统一。"""
+    obj = _batch_objective()
+    plist = [{"freq_mhz": 7350.0, "intensity": 0.65},
+             {"freq_mhz": 7200.0, "intensity": 1.0},
+             {"freq_mhz": 7500.0, "intensity": 0.5}]
+    res = obj.evaluate_many(plist)
+    assert len(res) == 3
+    for s, st in res:
+        assert st in ("ok", "infeasible", "failed")
+        assert np.isfinite(s) or st == "failed"
+    # minimize=False -> 返回最小化方向 = -C_dual；峰点应是最小（最负）
+    assert res[0][0] == min(r[0] for r in res)
+
+
+def test_gp_bo_ask_batch_diversified():
+    """ask_batch 返回 n 个互异点（多样化），预热期给随机点。"""
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-5, max=5),
+                     ParamSpec("y", "y", "number", 0.0, min=-5, max=5)])
+    o = registry.get("gp_bo")
+    from ml_toolbox.opt.contracts import Budget as B
+    o.setup(sp, 1, {"n_init": 4}, B(n_evals=40))
+    pts = o.ask_batch(4)
+    assert len(pts) == 4 and all(isinstance(p, dict) for p in pts)
+    # 预热期 4 个随机点应互不相同（概率上几乎必然）
+    vs = {tuple(np.round(sp.to_vector(p), 6)) for p in pts}
+    assert len(vs) == 4, "ask_batch 预热期应给互异随机点"
+
+
+def test_parallel_runner_gp_bo():
+    """workers>1 端到端：GP-BO 并行批次收敛到峰附近，objective 数 ≤ n_evals。"""
+    obj = _batch_objective()
+    r = optimize(obj, registry.get("gp_bo"), Budget(n_evals=32),
+                 cfg={"n_init": 8}, seed=5, workers=4)
+    assert r.error is None, r.error
+    assert len(r.history) <= 32
+    b = r.best
+    assert abs(b["freq_mhz"] - 7350) < 40 and 0.4 < b["intensity"] < 0.9, b
+    assert b["score"] > -0.98     # 最小化方向：峰 ≈ -1
+
+
+def test_evaluate_many_default_serial():
+    """无 evaluate_many 覆写的普通 objective：默认串行实现方向统一。"""
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-3, max=3)])
+    obj = make_objective(lambda q: (q["x"] - 1.0) ** 2, sp, name="d")
+    res = obj.evaluate_many([{"x": 1.0}, {"x": 3.0}])
+    assert len(res) == 2
+    assert res[0][1] == "ok" and abs(res[0][0]) < 1e-9   # 最小化方向 0
+    assert res[1][0] > res[0][0]
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

@@ -208,6 +208,29 @@ class Objective(abc.ABC):
             return a if self.minimize else -a
         return float(v) if self.minimize else -float(v)
 
+    def evaluate_many(self, plist: list) -> list:
+        """批量评估钩子（runner workers>1 并行评估时调用）。
+
+        返回 [(score, status), ...]，score 已统一为最小化方向，
+        status ∈ {"ok","failed","infeasible"}。
+
+        默认实现 = 逐点串行 __call__：任何 objective 免费获得批量能力。
+        能"一次进程吃一批点"的黑盒（如 freeze 的 pts.json 接口）覆写它，
+        自己做进程切分/错峰/多字段解析——真并行只在这一层实现。
+        """
+        out = []
+        for p in plist:
+            try:
+                s = float(self(p))
+                out.append((s, "ok" if np.isfinite(s) else "failed"))
+            except Exception as e:
+                if (getattr(self, "has_constraints", False)
+                        and self.is_constraint_error(e)):
+                    out.append((float("inf"), "infeasible"))
+                else:
+                    out.append((float("inf"), "failed"))
+        return out
+
 
 class CallableObjective(Objective):
     """把 lambda/函数包装成 Objective（数模标定、合成函数、AutoTuner 都用它）。"""
@@ -263,6 +286,14 @@ class Optimizer(abc.ABC):
         ...
 
     # ------------------------------------------------ 可选覆写
+    def ask_batch(self, n: int):
+        """一次要 n 个候选点（runner 并行评估时用；workers>1 才调用）。
+
+        默认实现 = 连发 n 次 ask（序贯式优化器在并行下退化为"同时猜 n 次"，
+        仍安全）。GP-BO 等覆写它做采集函数 top-k，避免 n 个点挤在同一个峰上。
+        """
+        return [self.ask() for _ in range(max(int(n), 1))]
+
     def inspect_pages(self, record: "OptRecord"):
         """声明式检视页（复用 core.PageSpec 契约，UI 层同一装配器）。"""
         return []

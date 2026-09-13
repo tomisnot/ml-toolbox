@@ -61,10 +61,11 @@ class OptWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, objective, optimizer, budget, cfg=None, seed=42,
-                 parent=None):
+                 workers=1, parent=None):
         super().__init__(parent)
         self.objective, self.optimizer, self.budget = objective, optimizer, budget
         self.cfg, self.seed = cfg or {}, seed
+        self.workers = max(int(workers), 1)
         self._stop = False
         self._pause = False
 
@@ -79,7 +80,7 @@ class OptWorker(QThread):
         try:
             rec = optimize(
                 self.objective, self.optimizer, self.budget, cfg=self.cfg,
-                seed=self.seed,
+                seed=self.seed, workers=self.workers,
                 on_eval=lambda r, i: self.eval_done.emit(r, i),
                 should_stop=lambda: self._pause_wait())
             self.finished_ok.emit(rec)
