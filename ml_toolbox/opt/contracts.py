@@ -173,16 +173,28 @@ class Objective(abc.ABC):
     n_obj: int = 1               # 目标数（multi=True 时 >1）
     noise: bool = False          # 含噪（数模仿真标定）→ 提示需要重复评估
     minimize: bool = True        # maximize 的目标取负实现，runner 统一化
+    has_constraints: bool = False  # 黑盒有硬约束（评估会主动拒绝不可行点）
 
     def __init__(self, name="objective", space: ParamSpace = None,
                  noise: bool = False, minimize: bool = True,
-                 multi: bool = False, n_obj: int = 1):
+                 multi: bool = False, n_obj: int = 1,
+                 has_constraints: bool = False):
         self.name = name
         self.space = space
         self.noise = noise
         self.minimize = minimize
         self.multi = multi
         self.n_obj = n_obj if multi else 1
+        self.has_constraints = has_constraints
+
+    def is_constraint_error(self, exc: Exception) -> bool:
+        """异常是"约束违反"（该点不可行，是有用信息）还是"程序崩溃"（噪声）？
+
+        默认 False（一切异常都当失败 censored）。带硬约束的黑盒覆写它，
+        把黑盒主动拒绝的信号识别出来 -> runner 记 status='infeasible'，
+        约束感知优化器据此建模可行域（而非浪费评估或退化）。
+        """
+        return False
 
     @abc.abstractmethod
     def evaluate(self, params: dict) -> float:

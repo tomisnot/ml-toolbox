@@ -39,19 +39,33 @@ class GPBO(Optimizer):
         ParamSpec("n_init", "随机预热次数", "int", 8, min=2, max=50,
                   hint="GP 拟合前的纯随机评估数"),
         ParamSpec("n_candidates", "候选池", "int", 2000, min=200, max=20000),
+        ParamSpec("constrain", "约束感知(cEI)", "bool", False,
+                  hint="黑盒有硬约束时开启：额外 GP 分类器建模可行域，"
+                       "采集函数=EI×P(可行)，避免在不可行区浪费评估"),
     ]
 
     def setup(self, space, seed, cfg, budget):
         super().setup(space, seed, cfg, budget)
         self._X: list[np.ndarray] = []      # [0,1]^d 观测坐标
         self._y: list[float] = []
+        self._Xc: list[np.ndarray] = []     # 约束分类样本（可行=1/不可行=0）
+        self._yc: list[int] = []
         self._gpr = None
+        self._gpc = None                     # 可行域分类器（constrain 开启时）
         self._fallback_n = 0                 # 观测不足时随机退化的计数
 
     # ------------------------------------------------ 主接口
     def ask(self):
         n_init = int(self.cfg.get("n_init", 8))
-        if len(self._X) < max(n_init, 2):
+        constrain = bool(self.cfg.get("constrain", False))
+        if constrain:
+            # 约束模式：可行点可能极稀疏，不能等"凑够 n_init 个可行点"（会永远
+            # 停在随机预热）。只要 目标GP 有≥2可行点 + 分类器两类都见过，就开跑。
+            ready = (len(self._X) >= 2 and len(self._Xc) >= 4
+                     and len(set(self._yc)) >= 2)
+            if not ready:
+                return self.space.sample(self._rng)
+        elif len(self._X) < max(n_init, 2):
             return self.space.sample(self._rng)
         v = self._optimize_acq()
         if v is None:                        # GP 拟合失败 -> 随机兜底
@@ -64,7 +78,13 @@ class GPBO(Optimizer):
         if status == "ok" and np.isfinite(score):
             self._X.append(v)
             self._y.append(float(score))
-        # failed 观测不进 GP（censored），历史由 runner 记录
+        # 约束感知：可行/不可行都进分类器（infeasible 是有用信息）
+        if bool(self.cfg.get("constrain", False)):
+            if status == "ok":
+                self._Xc.append(v); self._yc.append(1)
+            elif status == "infeasible":
+                self._Xc.append(v); self._yc.append(0)
+        # failed（崩溃/超时）不进任何模型（censored），历史由 runner 记录
 
     # ------------------------------------------------ GP 与采集
     def _fit(self):
@@ -108,11 +128,33 @@ class GPBO(Optimizer):
                                0.0, 1.0)
                 C = np.vstack([C, cand])
         s2 = self._acq_at(gpr, acq, best, C, kw)
+        if bool(self.cfg.get("constrain", False)):
+            s2 = s2 * self._pfits(C)          # cEI = EI × P(可行)
         return C[int(np.argmax(s2))]
 
     def _acq_at(self, gpr, acq, best, V, kw):
         mu, sd = gpr.predict(V, return_std=True)
         return acq(mu, sd, best, **kw)
+
+    def _pfits(self, V) -> np.ndarray:
+        """可行概率 P(可行|x)：对 0/1 标签做 GP 分类（latent + logistic）。
+
+        样本不足或两类缺失时返回全 1（不干预采集）。分类器缓存在 self._gpc，
+        每次 ask 重拟合（评估昂贵，分类开销可忽略）。
+        """
+        if len(self._yc) < 4 or len(set(self._yc)) < 2:
+            return np.ones(len(V))
+        from sklearn.gaussian_process import GaussianProcessClassifier
+        from sklearn.gaussian_process.kernels import RBF
+        try:
+            gpc = GaussianProcessClassifier(
+                kernel=RBF(length_scale=0.5, length_scale_bounds=(0.05, 5.0)),
+                random_state=0)
+            gpc.fit(np.asarray(self._Xc), np.asarray(self._yc))
+            self._gpc = gpc
+            return gpc.predict_proba(V)[:, 1]
+        except Exception:
+            return np.ones(len(V))
 
     # ------------------------------------------------ 检视支持（阶段2 UI 消费）
     def surrogate_1d(self, key: str, other: dict, n: int = 100):

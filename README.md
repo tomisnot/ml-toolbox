@@ -40,7 +40,8 @@ ml_toolbox/
 │   ├── engines/       baseline·bo(GP-BO)·evo(CMA-ES/NSGA-II)·local(NM)·optuna适配
 │   ├── runner.py      optimize() 预算控制 + on_eval 直播回调
 │   ├── sources.py     数据侧接入：FileSource(热重读)/SpecSource/ArraySource
-│   ├── process.py     评估侧接入：ProcessObjective(外部程序黑盒，stdout 解析)
+│   ├── process.py     评估侧接入：ProcessObjective(外部程序黑盒，stdout 解析；
+│   │                  硬约束 constraint_signal + on_infeasible=censor/penalize)
 │   ├── bridges.py     三接缝：AutoTuner / 响应面 / GPR 代理
 │   └── synth.py       标准测试函数（Ackley/Rosenbrock/ZDT…）
 ├── ui/            PyQt5 界面（唯一有 Qt 依赖的层）
@@ -58,7 +59,8 @@ ml_toolbox/
 ├── tests/         smoke / 回归 / UI / run_all（一键门）
 ├── benchmarks/    数学建模基准（结果表在 benchmarks/results/）
 ├── checks/        离屏截图自查闭环
-└── docs/          项目定位.md（宪法）· 契约.md · 优化定位.md · 优化契约.md · pitfalls.md（36 条）
+└── docs/          项目定位.md（宪法）· 契约.md · 优化定位.md · 优化契约.md ·
+                   原子模拟对接.md（实战）· pitfalls.md（41 条）
 ```
 
 **依赖方向单向**：`ui → core + methods`，`methods → core`，`core → 无内部依赖`。

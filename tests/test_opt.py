@@ -498,6 +498,47 @@ def test_autotuner_accepts_source():
             os.remove(tmp)
 
 
+def test_constrained_process_objective():
+    """带硬约束黑盒：infeasible 状态 + penalize 策略 + cEI 不死锁（彩排固化）。
+
+    用无 sleep 的内联脚本，预算小，只验三条关键路径。
+    """
+    import tempfile
+    from ml_toolbox.opt.process import ProcessObjective
+    # 约束：a>=0.5 才可行（模拟软件拒绝，退出码 3 + 信号词）
+    script = os.path.join(tempfile.gettempdir(), "opt_constrained_sim.py")
+    with open(script, "w") as f:
+        f.write("import sys\na=float(sys.argv[1])\n"
+                "if a < 0.5:\n    print('违反约束', file=sys.stderr); sys.exit(3)\n"
+                "print('score: %.4f' % ((a-0.8)**2))\n")
+    sp = ParamSpace([ParamSpec("a", "a", "number", 0.0, min=0.0, max=1.0)])
+    cmd = f'python "{script}" {{a:.3f}}'
+
+    # 1) constraint_signal -> infeasible 状态（非 failed）
+    obj = ProcessObjective(cmd, sp, name="c1", constraint_signal="违反")
+    assert obj.has_constraints and obj.is_constraint_error(RuntimeError("违反约束"))
+    assert not obj.is_constraint_error(RuntimeError("段错误"))
+    r = optimize(obj, registry.get("random_search"), Budget(n_evals=12), seed=1)
+    st = set(r.history["status"])
+    assert "infeasible" in st and "failed" not in st - {"infeasible"}
+
+    # 2) penalize：约束违反点返回有限惩罚分（status=ok，喂 GP 全量点）
+    obj2 = ProcessObjective(cmd, sp, name="c2", constraint_signal="违反",
+                            on_infeasible="penalize")
+    r2 = optimize(obj2, registry.get("gp_bo"), Budget(n_evals=20),
+                  cfg={"n_init": 6}, seed=1)
+    assert r2.error is None and r2.best["score"] < 0.05   # 找到 a≈0.8 近优
+
+    # 3) cEI（constrain 开关）：warmup 不因可行点稀疏而死锁
+    obj3 = ProcessObjective(cmd, sp, name="c3", constraint_signal="违反")
+    opt = registry.get("gp_bo")
+    r3 = optimize(obj3, opt, Budget(n_evals=20),
+                  cfg={"n_init": 6, "constrain": True}, seed=1)
+    assert r3.error is None and r3.best is not None
+    # 死锁修复的判据：GP 真跑过（_gpc 分类器拟合过 = 有过两类样本）
+    assert opt._gpc is not None, "cEI 未进入采集优化（warmup 死锁复发？）"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

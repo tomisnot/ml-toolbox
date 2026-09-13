@@ -76,9 +76,15 @@ def optimize(objective: Objective, optimizer: Optimizer,
                         status = "ok" if np.isfinite(s) else "failed"
                         if status == "failed":
                             s = np.inf
-                except Exception:
-                    s = np.full(objective.n_obj, np.inf) if multi else np.inf
-                    status = "failed"
+                except Exception as e:
+                    # 约束违反（黑盒主动拒绝）= 有用信息，单列 status；
+                    # 其余异常 = 真失败（崩溃/超时），censored。
+                    if not multi and getattr(objective, "has_constraints",
+                                            False) and objective.is_constraint_error(e):
+                        s, status = np.inf, "infeasible"
+                    else:
+                        s = np.full(objective.n_obj, np.inf) if multi else np.inf
+                        status = "failed"
                 results.append((p, s, status))
             # 一代全部评完再 tell（种群式算法的语义）
             optimizer.tell(
@@ -91,10 +97,11 @@ def optimize(objective: Objective, optimizer: Optimizer,
                     row.update({f"f{j}": float(s[j]) for j in range(len(s))})
                     row.update(status=status, ts=time.time() - t0)
                 else:
-                    if s < best:
+                    if status == "ok" and s < best:
                         best, best_params, stall = s, p, 0
-                    else:
+                    elif status == "ok":
                         stall += 1
+                    # infeasible/failed 不影响 best 与 stall（它们不是"评估结果"）
                     row.update(score=s, status=status, ts=time.time() - t0,
                                best_so_far=best)
                 rows.append(row)
