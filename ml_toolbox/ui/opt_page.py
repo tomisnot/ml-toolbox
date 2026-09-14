@@ -885,33 +885,14 @@ class OptWorkbench(QWidget):
         h = record.history
         if h.empty:
             return
-        cols = list(h.columns)
-        self.hist_table.clear()
-        self.hist_table.setColumnCount(len(cols))
-        self.hist_table.setHorizontalHeaderLabels(cols)
-        self.hist_table.setRowCount(len(h))
-        for i in range(len(h)):
-            for j, c in enumerate(cols):
-                v = h.iloc[i][c]
-                txt = f"{v:.4g}" if isinstance(v, (int, float, np.floating)) \
-                    else str(v)
-                it = QTableWidgetItem(txt)
-                if c == "status" and v == "failed":
-                    it.setForeground(Qt.red)
-                self.hist_table.setItem(i, j, it)
+        from .table_view import render_dataframe
+        render_dataframe(self.hist_table, h,
+                         red_when=lambda c, t: c == "status" and t == "failed")
 
     def _refresh_compare(self):
         if not self._records:
             return
         from ..opt.runner import compare_records
-        df = compare_records(list(self._records.values()))
-        self.hist_table.clear()
-        self.hist_table.setColumnCount(len(df.columns))
-        self.hist_table.setHorizontalHeaderLabels(list(df.columns))
-        self.hist_table.setRowCount(len(df))
-        for i in range(len(df)):
-            for j, c in enumerate(df.columns):
-                v = df.iloc[i][c]
-                txt = f"{v:.4g}" if isinstance(v, (int, float, np.floating)) \
-                    else str(v)
-                self.hist_table.setItem(i, j, QTableWidgetItem(txt))
+        from .table_view import render_dataframe
+        render_dataframe(self.hist_table,
+                         compare_records(list(self._records.values())))

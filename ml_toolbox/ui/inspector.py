@@ -137,17 +137,9 @@ class InspectPage(QWidget):
         return df if isinstance(df, pd.DataFrame) else None
 
     def _make_table(self, df: pd.DataFrame) -> QTableWidget:
-        tw = QTableWidget(len(df), df.shape[1])
-        tw.setHorizontalHeaderLabels([str(c) for c in df.columns])
-        tw.setVerticalHeaderLabels([str(i)[:24] for i in df.index])
-        for i in range(len(df)):
-            for j in range(df.shape[1]):
-                v = df.iat[i, j]
-                txt = f"{v:.4g}" if isinstance(v, (int, float, np.floating)) \
-                    else str(v)
-                tw.setItem(i, j, QTableWidgetItem(txt))
-        tw.resizeColumnsToContents()
-        return tw
+        from .table_view import render_dataframe
+        tw = QTableWidget()
+        return render_dataframe(tw, df, show_index=True)
 
     def _clear_body(self):
         while self._body.count():
