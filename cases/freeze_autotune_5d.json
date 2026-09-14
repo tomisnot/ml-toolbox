@@ -10,7 +10,7 @@
   "source_target": "target",
   "proc": {
     "mode": 1,
-    "params": "freq_mhz=7200..7500, intensity=0.3..1.0",
+    "params": "freq_mhz=7200..7500, intensity=0.3..1.0, alpha_deg=0..90, theta_deg=0..180, eps_deg=-45..45",
     "cmd": "python scripts\\freeze_blackbox.py --points {points_file} --out {out_file} --fast",
     "cwd": "D:\\学\\BaiduSyncdisk\\编程\\code\\python\\Energy Level",
     "parse": "score[:=]\\s*(-?\\d+(?:\\.\\d+)?)",
@@ -22,19 +22,20 @@
     "timeout": "1800"
   },
   "budget": {
-    "n_evals": "64",
+    "n_evals": "160",
     "stall": "0",
     "seed": "42",
     "workers": "8"
   },
   "optimizers": ["gp_bo"],
+  "opt_cfg_owner": "gp_bo",
   "optimizer_cfg": {
     "gp_bo": {
       "acq": "ei",
       "xi": 0.01,
       "beta": 2.0,
-      "n_init": 8,
-      "n_candidates": 4000,
+      "n_init": 16,
+      "n_candidates": 6000,
       "constrain": false
     }
   }

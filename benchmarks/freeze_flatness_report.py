@@ -48,7 +48,6 @@ def build_objective(cfg_proc: dict, space_spec):
                          "value": float(m.group(3))})
     return BatchProcessObjective(
         cfg_proc["cmd"], sp, cwd=cfg_proc.get("cwd", ""),
-        point_map={"freq_mhz": "freq_mhz", "intensity": "intensity"},
         point_extra=json.loads(cfg_proc.get("point_extra") or "{}"),
         score_field=cfg_proc.get("score_field", "C_dual"),
         minimize=not cfg_proc.get("maximize", True),
@@ -108,8 +107,13 @@ def main():
     cfg = json.load(open(args.config, encoding="utf-8"))
     proc = cfg["proc"]
     space_spec = [{"key": "freq_mhz", "low": 7200.0, "high": 7500.0},
-                  {"key": "intensity", "low": 0.3, "high": 1.0}]
+                  {"key": "intensity", "low": 0.3, "high": 1.0},
+                  {"key": "alpha_deg", "low": 0.0, "high": 90.0},
+                  {"key": "theta_deg", "low": 0.0, "high": 180.0},
+                  {"key": "eps_deg", "low": -45.0, "high": 45.0}]
     obj = build_objective(proc, space_spec)
+    # 历史行里存在的搜索维度（2D 基线 run 只有前两列；5D run 五列全在）
+    ANGLES = ("alpha_deg", "theta_deg", "eps_deg")
 
     hist, run_id = load_candidates(args)
     cands = []
@@ -127,14 +131,20 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     for rank, c in enumerate(cands):
         f0, i0 = float(c["freq_mhz"]), float(c["intensity"])
+        # 偏振角取候选行自身值（2D run 缺列 -> 黑盒默认 (0,0,0)）
+        fixed = {a: float(c[a]) for a in ANGLES if a in c.index
+                 and pd.notna(c[a])}
         ws = np.clip(np.linspace(f0 - args.dw, f0 + args.dw, args.nw),
                      7200.0, 7500.0)
         ivs = np.clip(np.linspace(i0 * (1 - args.di), i0 * (1 + args.di),
                                   args.ni), 0.3, 1.0)
-        plist = [{"freq_mhz": float(w), "intensity": float(I)}
+        plist = [{"freq_mhz": float(w), "intensity": float(I), **fixed}
                  for w in ws for I in ivs]
-        print(f"候选#{rank}: ω={f0:.1f} I={i0:.3f} -> 网格 {args.nw}×{args.ni}"
-              f" = {len(plist)} 点（workers={args.workers}）…", flush=True)
+        ang_txt = (" ".join(f"{k.split('_')[0]}={v:g}" for k, v in fixed.items())
+                   or "偏振默认(0,0,0)")
+        print(f"候选#{rank}: ω={f0:.1f} I={i0:.3f} ({ang_txt}) -> 网格 "
+              f"{args.nw}×{args.ni} = {len(plist)} 点（workers={args.workers}）…",
+              flush=True)
         # 按 workers 分块并行评估；失败/不可行点记 NaN（热图上留白）
         raw = []
         for j in range(0, len(plist), max(args.workers, 1)):
@@ -191,11 +201,14 @@ def main():
         fig.savefig(png, dpi=150)
         plt.close(fig)
         print(f"  图 → {png}")
-        pd.DataFrame({"freq_mhz": np.repeat(ws, args.ni),
-                      "intensity": np.tile(ivs, args.nw),
-                      "C_dual": [M[k // args.nw, k % args.nw]
-                                 for k in range(len(plist))]}) \
-            .to_csv(os.path.join(out_dir, f"flatness_{rank}.csv"), index=False)
+        df = pd.DataFrame({"freq_mhz": np.repeat(ws, args.ni),
+                           "intensity": np.tile(ivs, args.nw),
+                           "C_dual": [M[k // args.nw, k % args.nw]
+                                      for k in range(len(plist))]})
+        for a in ANGLES:
+            if a in fixed:
+                df[a] = fixed[a]
+        df.to_csv(os.path.join(out_dir, f"flatness_{rank}.csv"), index=False)
 
 
 if __name__ == "__main__":

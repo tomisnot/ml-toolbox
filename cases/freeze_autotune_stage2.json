@@ -10,14 +10,14 @@
   "source_target": "target",
   "proc": {
     "mode": 1,
-    "params": "freq_mhz=7200..7500, intensity=0.3..1.0",
+    "params": "freq_mhz=7200..7500, intensity=0.3..1.0, alpha_deg=0..90, theta_deg=0..180, eps_deg=-45..45",
     "cmd": "python scripts\\freeze_blackbox.py --points {points_file} --out {out_file} --fast --box 5 0.2",
     "cwd": "D:\\学\\BaiduSyncdisk\\编程\\code\\python\\Energy Level",
     "parse": "score[:=]\\s*(-?\\d+(?:\\.\\d+)?)",
     "score_field": "C_dual_worst",
     "maximize": true,
     "constraints": "S_ret_worst>=0.99",
-    "point_extra": "{\"pol\": \"椭圆偏\", \"ell\": {\"alpha_deg\": 0.0, \"theta_deg\": 0.0, \"eps_deg\": 0.0}, \"fwhm_ns\": 40.0}",
+    "point_extra": "{\"fwhm_ns\": 40.0}",
     "stagger": "6",
     "timeout": "5400"
   },
