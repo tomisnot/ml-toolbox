@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,8 @@ import time
 import numpy as np
 
 from .contracts import Objective, ParamSpace
+
+_LOG = logging.getLogger("ml_toolbox.opt.process")
 
 # 分数解析兜底：支持科学计数法（1.23e-4 / -5.6E+2）
 _SCORE_RE = r"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
@@ -258,36 +261,83 @@ class BatchProcessObjective(Objective):
         return base * self.penalty_mult + 1.0
 
     # ------------------------------------------------ 单进程求值
+    def _popen(self, cmd: str):
+        import subprocess
+        flags = 0
+        if os.name == "nt":
+            # 独立进程组：父进程被强杀时不连带；kill_all 可整树清理
+            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=self.cwd, shell=True, creationflags=flags)
+
+    @staticmethod
+    def _kill_tree(proc):
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(f"taskkill /F /T /PID {proc.pid}",
+                               capture_output=True, shell=True, timeout=10)
+            else:
+                proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def kill_all(self):
+        """中止所有在飞子进程（GUI 停止/关窗时调用）。"""
+        for p in list(getattr(self, "_procs", [])):
+            self._kill_tree(p)
+
     def _run_point(self, params: dict, pid: int):
         """-> (score_min_dir, status)。status: ok|infeasible|failed。"""
-        import subprocess
         pt = self._to_point(params, pid)
         tmpdir = tempfile.mkdtemp(prefix="optb_")
         pf = os.path.join(tmpdir, "pts.json")
         of = os.path.join(tmpdir, "res.json")
+        proc = None
         try:
             with open(pf, "w", encoding="utf-8") as f:
                 json.dump([pt], f, ensure_ascii=False)
             cmd = (self.cmd_template.replace("{points_file}", pf.replace("\\", "/"))
                    .replace("{out_file}", of.replace("\\", "/")))
+            proc = self._popen(cmd)
+            self._procs = getattr(self, "_procs", [])
+            self._procs.append(proc)
+            _LOG.info("黑盒启动 pid=%s params=%s", proc.pid,
+                      {k: (round(v, 3) if isinstance(v, float) else v)
+                       for k, v in params.items()})
             try:
-                r = subprocess.run(cmd, capture_output=True, cwd=self.cwd,
-                                   timeout=self.timeout, shell=True)
+                out_b, err_b = proc.communicate(timeout=self.timeout)
             except subprocess.TimeoutExpired:
+                self._kill_tree(proc)
                 self.last_error = f"超时 {self.timeout}s: {cmd}"
+                _LOG.warning("黑盒超时 pid=%s（%.0fs）", proc.pid, self.timeout)
                 return np.inf, "failed"
+            finally:
+                try:
+                    self._procs.remove(proc)
+                except ValueError:
+                    pass
             if not os.path.exists(of):
-                self.last_error = (f"无输出文件；rc={r.returncode} "
-                                   f"{ProcessObjective._dec(r.stderr)[-300:]}")
+                self.last_error = (f"无输出文件；rc={proc.returncode} "
+                                   f"{ProcessObjective._dec(err_b)[-300:]}")
+                _LOG.warning("黑盒无输出 rc=%s pid=%s", proc.returncode, proc.pid)
                 return np.inf, "failed"
             with open(of, encoding="utf-8", errors="replace") as f:
                 rows = json.load(f)
             row = rows[0] if isinstance(rows, list) and rows else rows
             if not row.get("ok", True):
                 self.last_error = f"黑盒报失败: {row.get('err', row)}"
+                _LOG.warning("黑盒报失败 pid=%s err=%s", proc.pid,
+                             row.get("err", "?"))
                 return np.inf, "failed"
             bad = self._violations(row)
             if bad:
+                _LOG.info("黑盒完成 pid=%s 约束违反=%s", proc.pid, bad)
                 if self.on_infeasible == "penalize":
                     s = float(row.get(self.score_field, np.nan))
                     if np.isfinite(s):
@@ -298,9 +348,11 @@ class BatchProcessObjective(Objective):
             s = float(row[self.score_field])
             v = s if self.minimize else -s
             self._worst_ok = max(self._worst_ok, v)
+            _LOG.info("黑盒完成 pid=%s %s=%.4f", proc.pid, self.score_field, s)
             return v, "ok"
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
+            _LOG.exception("黑盒评估异常")
             return np.inf, "failed"
         finally:
             for p in (pf, of):
@@ -328,14 +380,28 @@ class BatchProcessObjective(Objective):
         真并行在子进程层——黑盒内部单线程，无 GIL/BLAS 干扰）。"""
         from concurrent.futures import ThreadPoolExecutor
         n = len(plist)
+        done = [0]
+
+        def _progress(p):
+            done[0] += 1
+            cb = getattr(self, "on_progress", None)
+            if cb:
+                try:
+                    cb(done[0], n, p)
+                except Exception:
+                    pass
+
         if n == 1:
-            return [self._run_point(plist[0], 0)]
+            r = [self._run_point(plist[0], 0)]
+            _progress(plist[0])
+            return r
         results: list = [None] * n
 
         def go(i):
             if self.stagger > 0:
                 time.sleep(i * self.stagger)
             results[i] = self._run_point(plist[i], i)
+            _progress(plist[i])
 
         with ThreadPoolExecutor(max_workers=n) as ex:
             list(ex.map(go, range(n)))

@@ -57,6 +57,7 @@ class OptWorker(QThread):
     eval_done 逐条携带截至当前的 OptRecord，UI 增量刷新收敛曲线。
     """
     eval_done = pyqtSignal(object, int)           # record, i
+    progress = pyqtSignal(str)                    # 批内进度（黑盒点级完成）
     finished_ok = pyqtSignal(object)              # 最终 OptRecord
     failed = pyqtSignal(str)
 
@@ -72,12 +73,28 @@ class OptWorker(QThread):
     def request_stop(self):
         self._stop = True
 
+    def kill_inflight(self):
+        """杀掉在飞黑盒子进程（停止/关窗）：让 evaluate_many 立即返回。"""
+        try:
+            k = getattr(self.objective, "kill_all", None)
+            if k:
+                k()
+        except Exception:
+            pass
+
     def set_pause(self, v: bool):
         self._pause = v
 
     def run(self):
         from ..opt.runner import optimize
         try:
+            if hasattr(self.objective, "on_progress"):
+                self.objective.on_progress = (
+                    lambda done, total, p: self.progress.emit(
+                        f"黑盒评估 {done}/{total} 完成"
+                        + (f"（最新 ω={p.get('freq_mhz'):.1f} "
+                           f"I={p.get('intensity'):.3f}）"
+                           if "freq_mhz" in p else "")))
             rec = optimize(
                 self.objective, self.optimizer, self.budget, cfg=self.cfg,
                 seed=self.seed, workers=self.workers,

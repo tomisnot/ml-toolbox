@@ -485,6 +485,28 @@ class MainWindow(QMainWindow):
         self._cfg.overrides = overrides
         self._inspect_method(self._current_method)
 
+    def closeEvent(self, event):
+        """关窗前优雅收尾：中止在跑的 worker + 清理黑盒子进程。
+
+        否则 QThread 仍在跑就被销毁 -> Qt5Core fail-fast(0xc0000409)，
+        且黑盒子进程成孤儿继续占核（见 docs/pitfalls.md）。
+        """
+        import logging
+        _log = logging.getLogger("ml_toolbox.app")
+        try:
+            if getattr(self, "_worker", None) and self._worker.isRunning():
+                _log.info("关窗：中止 ML 侧 worker")
+                if hasattr(self._worker, "request_stop"):
+                    self._worker.request_stop()
+                self._worker.wait(5000)
+            op = getattr(self, "opt_page", None)
+            if op is not None:
+                op.shutdown()
+        except Exception as e:
+            _log.warning("关窗收尾异常：%s", e)
+        _log.info("=== GUI 关闭 ===")
+        event.accept()
+
 
 def MLMethod_summary_pages():
     from ..core.contracts import MLMethod

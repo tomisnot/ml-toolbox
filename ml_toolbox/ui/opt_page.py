@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import numpy as np
@@ -29,6 +30,8 @@ from ..opt.synth import synth_names, make_objective_from_synth
 from .widgets import MplCanvas
 from . import opt_plots
 from .worker import OptWorker
+
+_LOG = logging.getLogger("ml_toolbox.opt.ui")
 
 
 class OptWorkbench(QWidget):
@@ -703,6 +706,8 @@ class OptWorkbench(QWidget):
                         stall=int(self._stall.text() or 0))
         cfg = self._collect_opt_cfg(name)
         seed = int(self._seed.text() or 42)
+        _LOG.info("启动优化：optimizer=%s objective=%s budget=%s seed=%s",
+                  name, objective.name, budget.n_evals, seed)
         try:
             workers = int(self._workers.text() or 1)
         except ValueError:
@@ -710,6 +715,8 @@ class OptWorkbench(QWidget):
         self._worker = OptWorker(objective, optimizer, budget, cfg=cfg,
                                  seed=seed, workers=workers, parent=self)
         self._worker.eval_done.connect(self._on_eval)
+        self._worker.progress.connect(
+            lambda msg: self._prog.setText(f"运行中：{name} · {msg}"))
         self._worker.finished_ok.connect(self._on_one_done)
         self._worker.failed.connect(self._on_fail)
         self._worker.start()
@@ -718,6 +725,13 @@ class OptWorkbench(QWidget):
     def _on_eval(self, record, i):
         self._records[record.optimizer] = record
         self._refresh_live(record)
+        # 逐点检查点：中途崩溃不丢已完成评估（昂贵黑盒的保险）
+        if i % 4 == 3 or i == 0:
+            try:
+                from ..opt import persistence
+                persistence.save_record(record)
+            except Exception:
+                pass
 
     def _on_one_done(self, record):
         self._records[record.optimizer] = record
@@ -732,11 +746,13 @@ class OptWorkbench(QWidget):
         self._launch_next()
 
     def _on_fail(self, tb):
-        self._prog.setText("优化线程异常（见状态栏）")
+        _LOG.error("优化线程异常：%s", tb)
+        self._prog.setText("优化线程异常（详见 logs/ml_toolbox.log）")
         self._running = False
         self._reset_buttons()
 
     def _finish_all(self):
+        _LOG.info("全部优化器完成：%s", list(self._records))
         self._running = False
         self._reset_buttons()
         self._refresh_compare()
@@ -760,13 +776,27 @@ class OptWorkbench(QWidget):
         if self._worker:
             self._worker.request_stop()
             self._worker.set_pause(False)
+            self._worker.kill_inflight()      # 立即中断在飞黑盒进程
+            _LOG.info("用户点击停止（worker=%s running=%s）",
+                      self._worker.optimizer.name, self._worker.isRunning())
         self._queue.clear()
+        self._prog.setText("停止中：等待当前批次收尾…")
 
     def _reset_buttons(self):
         self.btn_run.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.btn_pause.setText("⏸ 暂停")
+
+    def shutdown(self):
+        """关窗前调用：中止 worker + 清理在飞黑盒子进程，避免孤儿进程/
+        QThread 销毁竞态（Qt5Core fail-fast 0xc0000409）。"""
+        if getattr(self, "_worker", None) and self._worker.isRunning():
+            _LOG.info("窗口关闭：中止运行中的优化 worker")
+            self._worker.request_stop()
+            self._worker.set_pause(False)
+            self._worker.kill_inflight()
+            self._worker.wait(8000)           # 给批内子进程收尾时间
 
     # ================================================== 刷新
     def _refresh_live(self, record):

@@ -287,3 +287,20 @@
   彩排期暴露 P1-P4；若直接上真黑盒，这些会以"调参没效果"的形式浪费实战预算。
 - **纪律**：接任何新黑盒，先 5 次评估预跑验"调用通/解析对/约束识别对"，
   再放开预算（见 docs/原子模拟对接.md §4 步骤 7）。
+
+### P6. GUI 静默消失：无日志可查 + 关窗销毁运行中 QThread + 黑盒子进程成孤儿
+- **症状**：实战跑 freeze（workers=8 并行子进程）约 24 分钟后 GUI 整个消失，
+  无 WER 崩溃转储、无 python.exe 错误事件、无系统重启/睡眠记录；
+  `%TEMP%\optb_*` 只剩 pts.json 无 res.json（子进程被连带杀死）。
+- **根因链**：① 工具箱此前**完全不写运行日志**，"分析一下"无从下手；
+  ② MainWindow 无 `closeEvent`，关窗/被外部关闭时 OptWorker(QThread) 仍在跑
+  即被销毁 → Qt5Core fail-fast `0xc0000409`（与项目记忆 §5.3 事故同机制）；
+  ③ 黑盒子进程用 `subprocess.run` 挂在 GUI 进程组下，父死子亡且无清理钩子。
+- **修法**：① app.py 起 `logs/ml_toolbox.log` + `faulthandler.enable(file=)`
+  把 native 崩溃栈也落盘；process.py 每个黑盒点启动/完成/失败带 pid 打日志；
+  ② `closeEvent` → `OptWorkbench.shutdown()`：request_stop + `kill_inflight()`
+  （taskkill /T 整树）+ `wait(8000)`；③ `_run_point` 改 Popen 登记进
+  `self._procs`，提供 `kill_all()`；④ `_on_eval` 每 4 点存一次 runs/ 检查点，
+  中途死也不丢已完成评估。
+- **教训**：昂贵黑盒实战（一次运行几十分钟）必须**先有可观测性再谈优化**——
+  日志、检查点、进程清理三件套是实战刚需，不是锦上添花。

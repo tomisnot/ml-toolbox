@@ -8,5 +8,11 @@ runs/
 # UI 截图自查临时产物
 checks/shots/
 
+# 本地测试运行日志（临时证据，不入库）
+tests/_*.log
+
+# GUI 运行日志（本地排错证据，不入库）
+logs/
+
 .vscode/
 
