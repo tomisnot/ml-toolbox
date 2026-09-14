@@ -189,6 +189,35 @@ def test_persistence_roundtrip():
     assert r.run_id in ids and r.run_id.startswith("opt-")
 
 
+def test_opt_record_visible_in_history():
+    """C2/M3a：优化记录经共享列举层对历史面板可见（写盘却无人看=已修）。"""
+    import tempfile
+    from ml_toolbox.core import runs
+    from ml_toolbox.opt import persistence
+    root = tempfile.mkdtemp(prefix="opt_hist_")
+    old = persistence.RUNS_DIR
+    try:
+        persistence.RUNS_DIR = root
+        sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-3, max=3)])
+        r = optimize(make_objective(lambda q: (q["x"] - 1) ** 2, sp, name="h"),
+                     registry.get("random_search"), Budget(n_evals=6), seed=2)
+        persistence.save_record(r)
+        # 空 ML 根 + 有 opt 记录 -> 合并列表应含这条、标 kind=优化、字段归一
+        rows = runs.list_all_records(ml_root=os.path.join(root, "_none_"),
+                                     opt_root=root)
+        hit = [x for x in rows if x["run_id"] == r.run_id]
+        assert hit, "优化记录未出现在统一历史列表（M3a 未修？）"
+        row = hit[0]
+        assert row["_kind"] == "优化"
+        assert row["name"] == r.optimizer
+        assert abs(row["value"] - r.best["score"]) < 1e-12
+        assert row["family"] == "opt" and row["dataset"] == r.objective
+    finally:
+        persistence.RUNS_DIR = old
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_history_to_dataset():
     """接缝3 物理载体：评估历史 -> Dataset（参数为 X，分数为 y）。"""
     sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-5, max=5),

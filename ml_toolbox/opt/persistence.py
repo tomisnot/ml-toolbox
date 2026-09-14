@@ -12,10 +12,9 @@ import os
 from datetime import datetime
 
 from .contracts import OptRecord
+from ..core import runs as _runs
 
-_root = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))))
-RUNS_DIR = os.environ.get("ML_TOOLBOX_OPT_RUNS", os.path.join(_root, "runs"))
+RUNS_DIR = _runs.resolve_dir("ML_TOOLBOX_OPT_RUNS")
 
 
 def save_record(rec: OptRecord) -> str:
@@ -53,16 +52,5 @@ def load_record(run_id: str) -> OptRecord:
 
 
 def list_records() -> list[dict]:
-    """只列优化运行（record.json 与 opt_record.json 互不混淆）。"""
-    if not os.path.isdir(RUNS_DIR):
-        return []
-    out = []
-    for rid in sorted(os.listdir(RUNS_DIR), reverse=True):
-        p = os.path.join(RUNS_DIR, rid, "opt_record.json")
-        if os.path.exists(p):
-            try:
-                with open(p, encoding="utf-8") as f:
-                    out.append(json.load(f))
-            except Exception:
-                continue
-    return out
+    """只列优化运行（record.json 与 opt_record.json 互不混淆）。机械层见 core.runs。"""
+    return _runs.list_meta(RUNS_DIR, "opt_record.json")

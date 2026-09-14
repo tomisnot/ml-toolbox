@@ -74,17 +74,17 @@ def load_run_record(run_id: str) -> RunRecord | None:
 
 
 class HistoryDialog(QDialog):
-    """历史运行列表；选中 -> load_requested(run_id)。"""
+    """历史运行列表（ML + 优化统一）；选中 -> load_requested(run_id, kind)。"""
 
-    load_requested = pyqtSignal(str)
+    load_requested = pyqtSignal(str, str)        # run_id, kind("ML"|"优化")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("实验历史（runs/）")
-        self.resize(760, 460)
+        self.resize(800, 460)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("每次遍历运行都自动存档；双击载入回看"
-                             "（核心图基于存档工件重绘，无需重训）。"))
+        lay.addWidget(QLabel("每次运行都自动存档；双击载入回看。ML 运行基于存档工件"
+                             "重绘核心图（无需重训）；优化运行载入评估历史到调参工作区。"))
         self._table = QTableWidget()
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -105,34 +105,42 @@ class HistoryDialog(QDialog):
         row.addStretch(1)
         row.addWidget(close)
         lay.addLayout(row)
-        self._ids: list[str] = []
+        self._ids: list[tuple] = []              # (run_id, kind)
         self._reload()
 
     def _reload(self):
-        recs = persistence.list_records()
-        cols = ["run_id", "method", "family", "dataset", "primary",
-                "值", "elapsed_s", "saved_at", "状态"]
+        from ..core import runs
+        recs = runs.list_all_records(persistence.RUNS_DIR,
+                                     _opt_runs_dir())
+        cols = ["类型", "run_id", "方法/优化器", "族/目标", "数据集/objective",
+                "primary", "值", "elapsed_s", "saved_at", "状态"]
         self._table.clear()
         self._table.setColumnCount(len(cols))
         self._table.setHorizontalHeaderLabels(cols)
         self._table.setRowCount(len(recs))
-        self._ids = [r.get("run_id", "") for r in recs]
+        self._ids = [(r.get("run_id", ""), r.get("_kind", "ML")) for r in recs]
         for i, r in enumerate(recs):
-            pm = r.get("primary_metric", "")
-            val = r.get("metrics", {}).get(pm, "")
-            vals = [r.get("run_id", ""), r.get("method", ""),
-                    r.get("family", ""), r.get("dataset", ""), pm,
+            val = r.get("value", "")
+            vals = [r.get("_kind", ""), r.get("run_id", ""),
+                    r.get("name", ""), r.get("family", ""),
+                    r.get("dataset", ""), r.get("primary", ""),
                     f"{val:.4g}" if isinstance(val, (int, float)) else str(val),
                     str(r.get("elapsed", "")), r.get("saved_at", ""),
                     "失败" if r.get("error") else "OK"]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
-                if j == 8 and v == "失败":
+                if j == 9 and v == "失败":
                     it.setForeground(Qt.red)
                 self._table.setItem(i, j, it)
         self._table.resizeColumnsToContents()
 
     def _emit(self, row):
         if 0 <= row < len(self._ids):
-            self.load_requested.emit(self._ids[row])
+            rid, kind = self._ids[row]
+            self.load_requested.emit(rid, kind)
             self.accept()
+
+
+def _opt_runs_dir() -> str:
+    from ..opt import persistence as opt_persistence
+    return opt_persistence.RUNS_DIR

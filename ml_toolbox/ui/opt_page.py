@@ -702,6 +702,19 @@ class OptWorkbench(QWidget):
             except Exception:
                 pass
 
+    def show_record(self, record):
+        """历史回看入口（M3a）：把一条已存档 OptRecord 灌进检视页。
+
+        与实时跑不同：无优化器实例（_opt_instances 空），代理切片页会显示
+        "仅 GP-BO 可用"占位——这是诚实的（存档不含 estimator/GP，同 ML 侧
+        "图基于工件重绘"的口径）。收敛/平行坐标/探索图只吃 history，可完整回看。
+        """
+        self._records = {record.optimizer: record}
+        self._refresh_live(record)
+        self._prog.setText(
+            f"回看优化运行 {record.run_id}（{record.optimizer} · "
+            f"{len(record.history)} 次评估）")
+
     def _on_one_done(self, record):
         self._records[record.optimizer] = record
         self._refresh_live(record)

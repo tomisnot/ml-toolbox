@@ -280,13 +280,19 @@ class MainWindow(QMainWindow):
     def _open_history(self):
         from .history import HistoryDialog, load_run_record
         dlg = HistoryDialog(self)
-        rec = {}
+        picked = {}
 
-        def _load(run_id):
-            rec["r"] = load_run_record(run_id)
+        def _load(run_id, kind):
+            picked["id"], picked["kind"] = run_id, kind
         dlg.load_requested.connect(_load)
         dlg.exec_()
-        r = rec.get("r")
+        if "id" not in picked:
+            return
+        run_id, kind = picked["id"], picked["kind"]
+        if kind == "优化":
+            self._load_opt_record(run_id)
+            return
+        r = load_run_record(run_id)
         if r is None:
             return
         self.records = [r]
@@ -295,6 +301,19 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(self.TAB_INSPECT)
         self.statusBar().showMessage(
             f"已载入历史运行 {r.run_id}（{r.method}）—— 图基于存档工件重绘")
+
+    def _load_opt_record(self, run_id: str):
+        """优化运行回看：载入评估历史到调参工作区（M3a：opt 记录写盘即可看）。"""
+        from ..opt import persistence as opt_persistence
+        try:
+            rec = opt_persistence.load_record(run_id)
+        except Exception:
+            self.statusBar().showMessage(f"优化记录载入失败：{run_id}")
+            return
+        self._set_mode(1)                      # 切到优化调参 perspective
+        self.opt_page.show_record(rec)
+        self.statusBar().showMessage(
+            f"已载入优化运行 {run_id}（{rec.optimizer}）—— 评估历史回看")
 
     def _predict_on_new(self):
         """用当前检视方法的已拟合模型，对新数据文件预测并导出预测表。

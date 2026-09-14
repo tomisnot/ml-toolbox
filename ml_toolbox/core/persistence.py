@@ -15,11 +15,10 @@ from datetime import datetime
 import numpy as np
 
 from .runner import RunRecord
+from . import runs as _runs
 
 # 项目根 = ml_toolbox 的上一级；可用环境变量 ML_TOOLBOX_RUNS 覆盖
-_root = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))))
-RUNS_DIR = os.environ.get("ML_TOOLBOX_RUNS", os.path.join(_root, "runs"))
+RUNS_DIR = _runs.resolve_dir("ML_TOOLBOX_RUNS")
 
 
 def save_record(rec: RunRecord) -> str:
@@ -75,14 +74,5 @@ def load_record(run_id: str) -> dict:
 
 
 def list_records() -> list[dict]:
-    if not os.path.isdir(RUNS_DIR):
-        return []
-    out = []
-    for rid in sorted(os.listdir(RUNS_DIR), reverse=True):
-        p = os.path.join(RUNS_DIR, rid, "record.json")
-        if os.path.exists(p):
-            try:
-                out.append(load_record(rid))
-            except Exception:
-                continue
-    return out
+    """列出全部 ML 运行元数据（新→旧）。机械层见 core.runs（M3/C2）。"""
+    return _runs.list_meta(RUNS_DIR, "record.json")
