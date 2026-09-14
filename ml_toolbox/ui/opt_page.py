@@ -213,6 +213,23 @@ class OptWorkbench(QWidget):
         self._workers.setToolTip("并行评估进程数（外部程序 JSON 批量模式有效；"
                                  "1=串行。建议 = 物理核数 × 0.7~1.0）")
         f3.addRow("并行评估数", self._workers)
+        # 热启动：复用旧 run 的评估历史（黑盒未变时 = 免费观测，不重评）
+        ws_row = QWidget()
+        wl = QHBoxLayout(ws_row)
+        wl.setContentsMargins(0, 0, 0, 0)
+        self._warm = QLineEdit("")
+        self._warm.setPlaceholderText("run_id 或 history.csv（可选）")
+        self._warm.setToolTip(
+            "把旧优化的评估历史直接喂给新优化器（objective 未变时有效）：\n"
+            "ok 点计入预算、不重新评估；failed 点只入历史不喂模型。\n"
+            "GP-BO / TPE 支持完整吸收；其余引擎忽略这些点（仍占预算）。")
+        wl.addWidget(self._warm)
+        wb = QPushButton("…")
+        wb.setFixedWidth(24)
+        wb.setToolTip("浏览选择旧 run 目录或 history.csv")
+        wb.clicked.connect(self._pick_warm)
+        wl.addWidget(wb)
+        f3.addRow("热启动", ws_row)
         form.addWidget(g3)
 
         # 参数子面板（选中优化器的 param_schema）——委托 ParamForm（C8）
@@ -377,7 +394,8 @@ class OptWorkbench(QWidget):
             "budget": {"n_evals": self._n_evals.text(),
                        "stall": self._stall.text(),
                        "seed": self._seed.text(),
-                       "workers": self._workers.text()},
+                       "workers": self._workers.text(),
+                       "warm_start": self._warm.text().strip()},
             "optimizers": self._selected_optimizers(),
             # 面板超参只归属当前选中的优化器（与 _launch_next 的运行语义一致）
             "opt_cfg_owner": getattr(self, "_param_owner", ""),
@@ -419,7 +437,8 @@ class OptWorkbench(QWidget):
             self._proc_max.setChecked(bool(cfg["proc"]["maximize"]))
         b = cfg.get("budget", {})
         for k, w in (("n_evals", self._n_evals), ("stall", self._stall),
-                     ("seed", self._seed), ("workers", self._workers)):
+                     ("seed", self._seed), ("workers", self._workers),
+                     ("warm_start", self._warm)):
             if k in b:
                 w.setText(str(b[k]))
         opts = cfg.get("optimizers")
@@ -462,6 +481,32 @@ class OptWorkbench(QWidget):
             self._prog.setText(f"已导入配置：{p}")
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"{type(e).__name__}: {e}")
+
+    def _pick_warm(self):
+        """热启动源选择：旧 run 目录 或 history.csv。"""
+        import os
+        from PyQt5.QtWidgets import QFileDialog
+        p = QFileDialog.getExistingDirectory(self, "选择旧优化 run 目录")
+        if not p:
+            p, _ = QFileDialog.getOpenFileName(
+                self, "或选择 history.csv", "", "CSV (*.csv)")
+        if p:
+            self._warm.setText(os.path.normpath(p))
+
+    def _warm_source(self):
+        """解析热启动输入 -> 路径（run_id / 目录 / csv），空 -> None。"""
+        from ..opt import persistence as _op
+        s = self._warm.text().strip()
+        if not s:
+            return None
+        import os
+        if os.path.exists(s):
+            return s
+        # 当作 run_id：拼到 opt 存档根目录
+        cand = os.path.join(_op.RUNS_DIR, s)
+        if os.path.isdir(cand):
+            return cand
+        raise ValueError(f"热启动源不存在：{s}（填 run_id / run 目录 / history.csv）")
 
     # ================================================== 运行控制
     def _selected_optimizers(self):
@@ -648,14 +693,22 @@ class OptWorkbench(QWidget):
                         stall=int(self._stall.text() or 0))
         cfg = self._collect_opt_cfg(name)
         seed = int(self._seed.text() or 42)
-        _LOG.info("启动优化：optimizer=%s objective=%s budget=%s seed=%s",
-                  name, objective.name, budget.n_evals, seed)
+        try:
+            warm = self._warm_source()
+        except ValueError as e:
+            self._prog.setText(str(e))
+            self._running = False
+            self._reset_buttons()
+            return
+        _LOG.info("启动优化：optimizer=%s objective=%s budget=%s seed=%s warm=%s",
+                  name, objective.name, budget.n_evals, seed, warm or "-")
         try:
             workers = int(self._workers.text() or 1)
         except ValueError:
             workers = 1
         self._worker = OptWorker(objective, optimizer, budget, cfg=cfg,
-                                 seed=seed, workers=workers, parent=self)
+                                 seed=seed, workers=workers, warm_start=warm,
+                                 parent=self)
         self._worker.eval_done.connect(self._on_eval)
         self._worker.progress.connect(
             lambda msg: self._prog.setText(f"运行中：{name} · {msg}"))

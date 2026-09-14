@@ -331,9 +331,11 @@ class BatchProcessObjective(Objective):
                 except ValueError:
                     pass
             if not os.path.exists(of):
-                self.last_error = (f"无输出文件；rc={proc.returncode} "
-                                   f"{ProcessObjective._dec(err_b)[-300:]}")
-                _LOG.warning("黑盒无输出 rc=%s pid=%s", proc.returncode, proc.pid)
+                tail = ProcessObjective._dec(err_b)[-300:]
+                self.last_error = f"无输出文件；rc={proc.returncode} {tail}"
+                # rc=-1(0xFFFFFFFF) 多为进程被外部强杀；stderr 尾巴是定位关键，必须进日志
+                _LOG.warning("黑盒无输出 rc=%s pid=%s stderr_tail=%r",
+                             proc.returncode, proc.pid, tail)
                 return np.inf, "failed"
             with open(of, encoding="utf-8", errors="replace") as f:
                 rows = json.load(f)

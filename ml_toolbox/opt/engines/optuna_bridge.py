@@ -71,6 +71,41 @@ class _OptunaBase(Optimizer):
             self._study.tell(self._trial, state=optuna.trial.TrialState.FAIL)
         self._trial = None
 
+    def warm_tell(self, params, score, status="ok"):
+        """历史点 -> study.add_trial（FrozenTrial）。
+
+        TPE 的密度估计只吃 (参数, 分数) 对，不依赖 ask 状态，可完整吸收；
+        预热计数 n_startup_trials 也因此正确递减。infeasible/failed ->
+        state=FAIL（无分数可喂，只占历史）。
+        """
+        dist, pv = {}, {}
+        for p in self.space._opt:
+            if p.key not in params:
+                continue
+            if p.kind == "int":
+                d = optuna.distributions.IntDistribution(int(p.min), int(p.max))
+            elif p.kind == "number":
+                d = (optuna.distributions.FloatDistribution(
+                         float(p.min), float(p.max), log=True)
+                     if p.log else
+                     optuna.distributions.FloatDistribution(
+                         float(p.min), float(p.max)))
+            elif p.kind == "bool":
+                d = optuna.distributions.CategoricalDistribution([True, False])
+            else:
+                d = optuna.distributions.CategoricalDistribution(
+                    [str(c) for c in p.choices])
+            dist[p.key] = d
+            pv[p.key] = params[p.key]
+        if status == "ok" and np.isfinite(score):
+            t = optuna.trial.create_trial(params=pv, distributions=dist,
+                                          value=float(score))
+        else:
+            t = optuna.trial.create_trial(
+                params=pv, distributions=dist,
+                state=optuna.trial.TrialState.FAIL)
+        self._study.add_trial(t)
+
 
 @register
 class TPE(_OptunaBase):

@@ -73,6 +73,11 @@ class GPBO(Optimizer):
             pts.append(self.space.sample(self._rng))
         return pts
 
+    def warm_tell(self, params, score, status="ok"):
+        # GP 的信念 = 纯观测集合，不依赖 ask 状态 -> 历史点直接走 tell 摄入
+        # （ok 进 GP、infeasible 进约束分类器、failed censored）。
+        self.tell(params, score, status)
+
     def _next_points(self, n: int):
         """-> list[dict]，长度 ≤ n（不足由调用方随机兜底）。"""
         constrain = bool(self.cfg.get("constrain", False))

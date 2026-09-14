@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 import traceback
 
@@ -27,7 +28,7 @@ def _run_id(optimizer: str, objective: str, seed: int) -> str:
 def optimize(objective: Objective, optimizer: Optimizer,
              budget: Budget | None = None, cfg: dict | None = None,
              seed: int = 42, on_eval=None, should_stop=None,
-             workers: int = 1) -> OptRecord:
+             workers: int = 1, warm_start=None) -> OptRecord:
     """跑一条完整优化轨迹。
 
     on_eval(record, i)     —— 每次评估后回调（UI 直播 / 进度打印）。
@@ -35,6 +36,10 @@ def optimize(objective: Objective, optimizer: Optimizer,
     workers              —— 并行评估点数（>1 时每轮 ask_batch(workers) 后交给
                             objective.evaluate_many 一批；序贯信息在"批"边界更新，
                             即每轮评估完才 tell，GP 看到的是上一轮的全部观测）。
+    warm_start           —— 复用旧评估历史（OptRecord / history.csv 路径 /
+                            list[dict]）。ok 行不重新评估、直接喂给优化器
+                            （objective 未变时 = 免费观测）；failed/infeasible 行
+                            只入历史不喂模型（censored，与 P10 纪律一致）。
     """
     budget = budget or Budget()
     cfg = cfg or {}
@@ -53,6 +58,17 @@ def optimize(objective: Objective, optimizer: Optimizer,
     try:
         optimizer.setup(objective.space, seed, cfg, budget)
         i = 0
+        if warm_start is not None:
+            # 预热点计入预算（标准 warm-start 语义：预算 = 总评估数，含已知）
+            i, b0, bp0 = _replay_warm(objective, optimizer, warm_start,
+                                      multi, rows)
+            if b0 < best:
+                best, best_params = b0, bp0
+            if rows:
+                rec.history = pd.DataFrame(rows)
+                rec.best = None if multi else _mk_best(best_params, best)
+                if on_eval:
+                    on_eval(rec, len(rows) - 1)
         while i < budget.n_evals:
             if should_stop and should_stop():
                 break
@@ -118,6 +134,59 @@ def optimize(objective: Objective, optimizer: Optimizer,
         rec.best = _mk_best(best_params, best)
     rec.elapsed = time.time() - t0
     return rec
+
+
+def _replay_warm(objective: Objective, optimizer: Optimizer,
+                 warm_start, multi: bool, rows: list):
+    """回放旧评估历史：ok 行喂优化器（不重新评估），其余只入历史。
+
+    -> (已占用预算数, 回放期 best, best_params)。
+    多目标暂不支持（f0..fk 列语义未定）。
+    """
+    import pandas as pd
+    if multi:
+        raise ValueError("warm_start 暂不支持多目标轨迹")
+    if isinstance(warm_start, OptRecord):
+        hist = warm_start.history
+    elif isinstance(warm_start, pd.DataFrame):
+        hist = warm_start
+    elif isinstance(warm_start, (str, bytes)) or hasattr(warm_start, "__fspath__"):
+        s = str(warm_start)
+        if s.lower().endswith(".csv"):
+            hist = pd.read_csv(s)
+        elif os.path.isdir(s) and os.path.exists(
+                os.path.join(s, "history.csv")):
+            hist = pd.read_csv(os.path.join(s, "history.csv"))
+        else:                                   # run_id：按 opt 存档读
+            from .persistence import load_record
+            hist = load_record(s).history
+    else:
+        hist = pd.DataFrame(list(warm_start))
+    if hist is None or len(hist) == 0:
+        return 0, np.inf, None
+    pcols = [d["key"] for d in objective.space.describe()]
+    space = objective.space
+    b = np.inf
+    bp = None
+    for _, r in hist.iterrows():
+        d = r.to_dict()
+        st = str(d.get("status", "ok"))
+        if st not in ("ok", "infeasible"):
+            st = "failed"                      # 环境失败等 = censored
+        try:
+            p = {k: d[k] for k in pcols}
+            s = float(d.get("score", np.inf))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if st == "failed" or not np.isfinite(s):
+            st, s = "failed", np.inf
+        # 与主循环同构：round-trip 到空间坐标（int 量化、text 固定项补齐）
+        p = space.from_vector(space.to_vector(p))
+        optimizer.warm_tell(p, s, status=st)
+        if st == "ok" and s < b:
+            b, bp = s, p
+        rows.append(dict(p, score=s, status=st, ts=0.0, best_so_far=b))
+    return len(rows), b, bp
 
 
 def _eval_one(objective: Objective, p: dict, multi: bool):

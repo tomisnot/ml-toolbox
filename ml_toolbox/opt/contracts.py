@@ -287,6 +287,15 @@ class Optimizer(abc.ABC):
         ...
 
     # ------------------------------------------------ 可选覆写
+    def warm_tell(self, params: dict, score: float, status: str = "ok"):
+        """消费历史评估点（runner warm_start 回放时调用，不经过 ask）。
+
+        默认 no-op：种群/单纯形类引擎的信念依赖 ask 出的代际结构，
+        无法凭空吸收外部观测。GP-BO（直接 append 观测）与 TPE
+        （study.add_trial）覆写它。
+        """
+        pass
+
     def ask_batch(self, n: int):
         """一次要 n 个候选点（runner 并行评估时用；workers>1 才调用）。
 
