@@ -29,6 +29,7 @@ from ..opt.contracts import Budget
 from ..opt.synth import synth_names, make_objective_from_synth
 from .widgets import MplCanvas
 from . import opt_plots
+from .param_form import ParamForm
 from .worker import OptWorker
 
 _LOG = logging.getLogger("ml_toolbox.opt.ui")
@@ -214,10 +215,10 @@ class OptWorkbench(QWidget):
         f3.addRow("并行评估数", self._workers)
         form.addWidget(g3)
 
-        # 参数子面板（选中优化器的 param_schema）
+        # 参数子面板（选中优化器的 param_schema）——委托 ParamForm（C8）
         g4 = QGroupBox("优化器超参")
-        self._param_form = QFormLayout(g4)
-        self._param_widgets: dict[str, tuple] = {}
+        self._pf_layout = QFormLayout(g4)
+        self._pf = ParamForm(self._pf_layout)
         form.addWidget(g4)
         form.addStretch(1)
         left.setWidget(host)
@@ -306,42 +307,24 @@ class OptWorkbench(QWidget):
             self._obj_info.setText(str(e))
 
     def _on_opt_change(self, name):
-        while self._param_form.rowCount():
-            self._param_form.removeRow(0)
-        self._param_widgets.clear()
-        self._param_owner = name              # 面板当前归属的优化器
+        # 控件构建/回收委托 ParamForm（C8）；owner 门控（O8）保留在此层
         o = opt_registry.get(name)
-        for p in o.param_schema:
-            w = self._make_param(p)
-            self._param_form.addRow(p.label or p.key, w)
-            self._param_widgets[p.key] = (p, w)
+        self._pf.build(o.param_schema, owner=name, show_default=True,
+                       field_width=90)
 
-    def _make_param(self, p):
-        if p.kind == "bool":
-            w = QCheckBox(); w.setChecked(bool(p.default)); return w
-        if p.kind == "select":
-            w = QComboBox(); w.addItems([str(c) for c in (p.choices or [])])
-            return w
-        w = QLineEdit(str(p.default)); w.setFixedWidth(90)
-        w.setToolTip(p.hint or f"[{p.min},{p.max}]")
-        return w
+    @property
+    def _param_owner(self):
+        return self._pf.owner
+
+    @property
+    def _param_widgets(self):
+        return self._pf.widgets
 
     def _collect_opt_cfg(self, name):
         """面板超参只归属于面板当前显示的优化器；其余优化器用默认值。"""
-        if name != getattr(self, "_param_owner", None):
+        if name != self._pf.owner:
             return {}
-        cfg = {}
-        for k, (p, w) in self._param_widgets.items():
-            if p.kind == "bool":
-                cfg[k] = w.isChecked()
-            elif p.kind == "select":
-                cfg[k] = w.currentText()
-            else:
-                try:
-                    cfg[k] = p.clean(w.text())
-                except ValueError:
-                    cfg[k] = p.default
-        return cfg
+        return self._pf.values()
 
     # ================================================== 配置导出 / 导入
     CFG_VERSION = 1
@@ -446,19 +429,9 @@ class OptWorkbench(QWidget):
         for n, oc in (cfg.get("optimizer_cfg") or {}).items():
             if n not in self._opt_boxes or not isinstance(oc, dict):
                 continue
-            if n != self._param_owner:
+            if n != self._pf.owner:
                 self._opt_sel.setCurrentText(n)     # _on_opt_change 重建面板
-            for k, v in oc.items():
-                pair = self._param_widgets.get(k)
-                if pair is None:
-                    continue
-                p, w = pair
-                if p.kind == "bool":
-                    w.setChecked(bool(v))
-                elif p.kind == "select":
-                    self._combo_set(w, v)
-                else:
-                    w.setText(str(v))
+            self._pf.set_values(oc)
         self._on_obj_kind(self._obj_kind.currentText())
 
     def _export_cfg(self):
