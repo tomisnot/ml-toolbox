@@ -260,6 +260,14 @@ class BatchProcessObjective(Objective):
             else 1.0
         return base * self.penalty_mult + 1.0
 
+    def is_constraint_error(self, exc: Exception) -> bool:
+        """串行路径的约束识别：evaluate 抛的 InfeasiblePoint = 约束违反。
+
+        不识别的话 runner 会记 failed（censored），cEI 分类器拿不到
+        不可行样本（架构审视 M13 指出的真缺陷）。
+        """
+        return isinstance(exc, InfeasiblePoint)
+
     # ------------------------------------------------ 单进程求值
     def _popen(self, cmd: str):
         import subprocess

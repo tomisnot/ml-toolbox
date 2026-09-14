@@ -644,6 +644,22 @@ def test_evaluate_many_default_serial():
     assert res[1][0] > res[0][0]
 
 
+def test_batch_infeasible_recognized():
+    """M13 修复回归：批量黑盒串行路径的约束违反记 infeasible（非 failed）。"""
+    from ml_toolbox.opt.process import BatchProcessObjective, InfeasiblePoint
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=0.0, max=1.0)])
+    obj = BatchProcessObjective("unused", sp, score_field="C_dual",
+                                constraints=[{"field": "S_ret", "op": ">=",
+                                              "value": 0.99}],
+                                on_infeasible="censor", name="m13")
+    assert obj.is_constraint_error(InfeasiblePoint("约束违反"))
+    assert not obj.is_constraint_error(RuntimeError("崩了"))
+    # runner 集成：直接喂一个必违反约束的 objective（monkeypatch 单点路径）
+    obj._run_point = lambda p, pid: (np.inf, "infeasible")
+    r = optimize(obj, registry.get("random_search"), Budget(n_evals=4), seed=1)
+    assert set(r.history["status"]) == {"infeasible"}, r.history["status"]
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
