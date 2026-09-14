@@ -230,6 +230,28 @@ class OptWorkbench(QWidget):
         wb.clicked.connect(self._pick_warm)
         wl.addWidget(wb)
         f3.addRow("热启动", ws_row)
+        # N3 锚点预检：正式跑前评一个已知答案的点，接口漂移当场拦截
+        self._pf_anchor = QLineEdit("")
+        self._pf_anchor.setPlaceholderText("freq_mhz=7350, intensity=0.65")
+        self._pf_anchor.setToolTip(
+            "锚点预检：启动正式优化前，先用当前配置评估这个已知点。\n"
+            "黑盒静默变更接口 / 解析失配 / cwd 错 -> 当场拦截，不烧预算。\n"
+            "留空 = 不预检。")
+        f3.addRow("预检锚点", self._pf_anchor)
+        pf2 = QWidget()
+        pf2l = QHBoxLayout(pf2)
+        pf2l.setContentsMargins(0, 0, 0, 0)
+        self._pf_expect = QLineEdit("")
+        self._pf_expect.setFixedWidth(70)
+        self._pf_expect.setPlaceholderText("期望")
+        self._pf_expect.setToolTip("期望分数（原始方向，如 C_dual）；留空=仅连通性检查")
+        self._pf_tol = QLineEdit("0.05")
+        self._pf_tol.setFixedWidth(56)
+        self._pf_tol.setToolTip("绝对容差")
+        pf2l.addWidget(self._pf_expect)
+        pf2l.addWidget(QLabel("±"))
+        pf2l.addWidget(self._pf_tol)
+        f3.addRow("预检期望", pf2)
         form.addWidget(g3)
 
         # 参数子面板（选中优化器的 param_schema）——委托 ParamForm（C8）
@@ -395,7 +417,10 @@ class OptWorkbench(QWidget):
                        "stall": self._stall.text(),
                        "seed": self._seed.text(),
                        "workers": self._workers.text(),
-                       "warm_start": self._warm.text().strip()},
+                       "warm_start": self._warm.text().strip(),
+                       "preflight_anchor": self._pf_anchor.text().strip(),
+                       "preflight_expect": self._pf_expect.text().strip(),
+                       "preflight_tol": self._pf_tol.text().strip()},
             "optimizers": self._selected_optimizers(),
             # 面板超参只归属当前选中的优化器（与 _launch_next 的运行语义一致）
             "opt_cfg_owner": getattr(self, "_param_owner", ""),
@@ -438,7 +463,10 @@ class OptWorkbench(QWidget):
         b = cfg.get("budget", {})
         for k, w in (("n_evals", self._n_evals), ("stall", self._stall),
                      ("seed", self._seed), ("workers", self._workers),
-                     ("warm_start", self._warm)):
+                     ("warm_start", self._warm),
+                     ("preflight_anchor", self._pf_anchor),
+                     ("preflight_expect", self._pf_expect),
+                     ("preflight_tol", self._pf_tol)):
             if k in b:
                 w.setText(str(b[k]))
         opts = cfg.get("optimizers")
@@ -521,6 +549,7 @@ class OptWorkbench(QWidget):
             return
         self._records.clear()
         self._opt_instances.clear()
+        self._warm_shown = False
         self._queue = list(opts)
         self._running = True
         self.btn_run.setEnabled(False)
@@ -706,20 +735,60 @@ class OptWorkbench(QWidget):
             workers = int(self._workers.text() or 1)
         except ValueError:
             workers = 1
+        try:
+            pre = self._preflight_spec()
+        except ValueError as e:
+            self._prog.setText(f"预检配置错误：{e}")
+            self._running = False
+            self._reset_buttons()
+            return
         self._worker = OptWorker(objective, optimizer, budget, cfg=cfg,
                                  seed=seed, workers=workers, warm_start=warm,
-                                 parent=self)
+                                 preflight=pre, parent=self)
         self._worker.eval_done.connect(self._on_eval)
         self._worker.progress.connect(
             lambda msg: self._prog.setText(f"运行中：{name} · {msg}"))
+        self._worker.preflight_done.connect(
+            lambda ok, msg, n=name: self._on_preflight(ok, msg, n))
         self._worker.finished_ok.connect(self._on_one_done)
         self._worker.failed.connect(self._on_fail)
         self._worker.start()
         self._prog.setText(f"运行中：{name}（剩余 {len(self._queue)} 个）")
 
+    def _on_preflight(self, ok, msg, name):
+        """预检结论：失败 = 中止整轮（不烧预算、复位运行态）。"""
+        _LOG.info("锚点预检 %s：%s", "通过" if ok else "失败", msg)
+        if ok:
+            self._prog.setText(f"预检通过：{msg} ｜ 继续 {name}…")
+            return
+        self._prog.setText(f"预检失败，已中止：{msg}")
+        self._queue = []
+        self._running = False
+        self._reset_buttons()
+
+    def _preflight_spec(self):
+        """预检三字段 -> (anchor_dict, expect, tol)；锚点空 -> None（不预检）。"""
+        text = self._pf_anchor.text().strip()
+        if not text:
+            return None
+        from ..opt.paramgrammar import parse_anchor
+        anchor = parse_anchor(text)
+        exp = self._pf_expect.text().strip()
+        expect = float(exp) if exp else None
+        try:
+            tol = float(self._pf_tol.text().strip() or "0.05")
+        except ValueError:
+            tol = 0.05
+        return (anchor, expect, tol)
+
     def _on_eval(self, record, i):
         self._records[record.optimizer] = record
         self._refresh_live(record)
+        # 热启动首帧：把回放数 + 指纹校验结论顶到状态栏（脏历史当场可见）
+        note = getattr(record, "warm_note", "")
+        if note and not getattr(self, "_warm_shown", False):
+            self._warm_shown = True
+            self._prog.setText(f"{note} ｜ 继续评估中…")
         # 逐点检查点：中途崩溃不丢已完成评估（昂贵黑盒的保险）
         if i % 4 == 3 or i == 0:
             try:
@@ -737,9 +806,11 @@ class OptWorkbench(QWidget):
         """
         self._records = {record.optimizer: record}
         self._refresh_live(record)
+        note = getattr(record, "warm_note", "")
         self._prog.setText(
             f"回看优化运行 {record.run_id}（{record.optimizer} · "
-            f"{len(record.history)} 次评估）")
+            f"{len(record.history)} 次评估）"
+            + (f" ｜ {note}" if note else ""))
 
     def _on_one_done(self, record):
         self._records[record.optimizer] = record

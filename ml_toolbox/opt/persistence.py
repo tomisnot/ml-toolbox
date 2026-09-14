@@ -26,6 +26,8 @@ def save_record(rec: OptRecord) -> str:
         "budget": rec.budget, "seed": rec.seed,
         "best": rec.best, "n_evals": len(rec.history),
         "elapsed": round(rec.elapsed, 3), "error": rec.error,
+        "fingerprint": getattr(rec, "fingerprint", ""),
+        "warm_note": getattr(rec, "warm_note", ""),
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "kind": "opt",
     }
@@ -48,7 +50,8 @@ def load_record(run_id: str) -> OptRecord:
                      space_desc=meta.get("space", []),
                      budget=meta.get("budget", {}), seed=meta.get("seed", 42),
                      history=hist, best=meta.get("best"),
-                     elapsed=meta.get("elapsed", 0.0), error=meta.get("error"))
+                     elapsed=meta.get("elapsed", 0.0), error=meta.get("error"),
+                     fingerprint=meta.get("fingerprint", ""))
 
 
 def list_records() -> list[dict]:

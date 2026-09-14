@@ -82,3 +82,30 @@ def parse_constraints(text: str) -> list:
         out.append({"field": m.group(1), "op": m.group(2),
                     "value": float(m.group(3))})
     return out
+
+
+_ANCHOR_TOK = re.compile(r"^([\w.]+)\s*=\s*(.+)$")
+
+
+def parse_anchor(text: str) -> dict:
+    """锚点定义 "freq_mhz=7350, intensity=0.65" -> {参数名: 值}。
+
+    值能转 float 就转（数值参数），否则保留字符串（select 参数）。
+    供 preflight 用：正式跑昂贵黑盒前，先评一个已知答案的点校验接口。
+    """
+    out = {}
+    for tok in (text or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = _ANCHOR_TOK.match(tok)
+        if not m:
+            raise ValueError(f"锚点无法解析：{tok!r}（期望 名=值, 名=值）")
+        v = m.group(2).strip()
+        try:
+            out[m.group(1)] = float(v)
+        except ValueError:
+            out[m.group(1)] = v
+    if not out:
+        raise ValueError("锚点为空，如 freq_mhz=7350, intensity=0.65")
+    return out

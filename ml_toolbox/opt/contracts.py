@@ -196,6 +196,23 @@ class Objective(abc.ABC):
         """
         return False
 
+    def fingerprint(self) -> str:
+        """objective 身份指纹：判定"两次评估用的是不是同一个黑盒"。
+
+        默认 = 类名 + 名字 + 方向 + 空间描述 的哈希（合成函数/Callable 够用）。
+        外部程序接入（ProcessObjective）覆写：加入命令模板与脚本内容哈希——
+        黑盒脚本改一行，指纹即变。warm_start 用它验证"历史点与新目标同源"，
+        防御"黑盒静默变更后复用脏历史"（pol/ell 事故类）。
+        """
+        import hashlib
+        import json
+        payload = json.dumps(
+            {"cls": type(self).__name__, "name": self.name,
+             "minimize": self.minimize,
+             "space": getattr(self, "space", None) and self.space.describe()},
+            sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     @abc.abstractmethod
     def evaluate(self, params: dict) -> float:
         """原始方向的一次评估。multi=True 时返回可迭代（各目标原始方向）。"""
@@ -339,6 +356,8 @@ class OptRecord:
     pareto: Optional[pd.DataFrame] = None    # 非支配解集（multi 时）
     elapsed: float = 0.0
     error: Optional[str] = None
+    fingerprint: str = ""                # objective 身份指纹（warm_start 安全阀）
+    warm_note: str = ""                  # 热启动来源 + 指纹校验结果（回看可见）
 
     @property
     def n_evals(self) -> int:

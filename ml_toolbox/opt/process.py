@@ -170,6 +170,56 @@ class ProcessObjective(Objective):
         except UnicodeDecodeError:
             return b.decode("gbk", errors="replace")
 
+    # ------------------------------------------------ 身份指纹
+    @staticmethod
+    def _py_paths(cmd: str) -> list:
+        """从命令模板提取 .py 路径：先取引号包裹的（可含空格），再取裸 token。
+
+        裸 token 用 `[\w./\\-]+`（不含空格）——否则 `python scripts\a.py`
+        会被连读成 `python scripts\a.py` 整串，join 后不存在，
+        内容哈希退化成 missing 占位 = 黑盒改代码检测不到（N2 失效）。
+        """
+        found, rest = [], cmd
+        for m in list(re.finditer(r'"([^"]+\.py)"', cmd)):
+            found.append(m.group(1))
+            rest = rest.replace(m.group(0), " ")
+        found += re.findall(r"([\w./\\-]+\.py)", rest)
+        return sorted(set(found))
+
+    @staticmethod
+    def _hash_scripts(cmd: str, cwd: str) -> str:
+        """cmd 模板里出现的 .py 路径逐个做内容哈希（黑盒改一行 -> 指纹变）。
+
+        文件读不到（相对路径歧义/跨机器）时以占位串参与哈希：宁可指纹不同
+        触发校验提示，不可静默相同放行脏历史。
+        """
+        import hashlib
+        h = hashlib.sha256()
+        for m in ProcessObjective._py_paths(cmd):
+            p = m if os.path.isabs(m) else os.path.join(cwd or ".", m)
+            try:
+                with open(p, "rb") as f:
+                    h.update(f.read())
+            except OSError:
+                h.update(b"<missing:" + p.encode("utf-8", "replace") + b">")
+        return h.hexdigest()[:12]
+
+    def _fp_payload(self) -> dict:
+        return {"cmd": self.cmd_template, "cwd": self.cwd or "",
+                "parse": self.parse.pattern,
+                "result_file": self.result_file, "score_key": self.score_key,
+                "constraint_signal": self.constraint_signal,
+                "on_infeasible": self.on_infeasible,
+                "scripts": self._hash_scripts(self.cmd_template, self.cwd or "")}
+
+    def fingerprint(self) -> str:
+        import hashlib
+        import json
+        base = super().fingerprint()
+        extra = json.dumps(self._fp_payload(), sort_keys=True,
+                           ensure_ascii=False, default=str)
+        return hashlib.sha256((base + extra).encode("utf-8")).hexdigest()[:16]
+
 
 class InfeasiblePoint(RuntimeError):
     """约束违反（黑盒输出判定）：该点不可行，但是有用信息。"""
@@ -384,6 +434,26 @@ class BatchProcessObjective(Objective):
         if st == "infeasible":
             raise InfeasiblePoint("约束违反")
         return v if self.minimize else -v
+
+    def fingerprint(self) -> str:
+        """批量黑盒指纹：cmd 模板 + 点构造映射 + 解析/约束 + 脚本内容哈希。
+
+        历史数据复用的安全阀——warm_start 前比对源 run 存档的指纹，
+        黑盒脚本（如 freeze_blackbox.py）改一行即判定不同源。
+        """
+        import hashlib
+        import json
+        base = Objective.fingerprint(self)
+        payload = {
+            "cmd": self.cmd_template, "cwd": self.cwd or "",
+            "point_map": self.point_map, "point_extra": self.point_extra,
+            "score_field": self.score_field, "constraints": self.constraints,
+            "on_infeasible": self.on_infeasible,
+            "scripts": ProcessObjective._hash_scripts(
+                self.cmd_template, self.cwd or "")}
+        extra = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           default=str)
+        return hashlib.sha256((base + extra).encode("utf-8")).hexdigest()[:16]
 
     def evaluate_many(self, plist: list) -> list:
         """并行一批：每点一个子进程，错峰启动（ThreadPool 只管调度，

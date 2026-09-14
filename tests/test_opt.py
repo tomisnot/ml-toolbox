@@ -759,6 +759,114 @@ def test_warm_start_replay():
     assert r3.error is None and len(r3.history) == len(hist)
 
 
+def test_objective_fingerprint():
+    """N2：objective 身份指纹 = warm_start 安全阀的数据基础。
+
+    要求：同配置稳定；改脚本内容/改 cmd/改方向 -> 指纹变；
+    存档 round-trip 带回指纹；warm_note 如实标注一致/不一致/无源指纹。
+    """
+    import tempfile
+    from ml_toolbox.opt import persistence
+    from ml_toolbox.opt.process import ProcessObjective
+    sp = ParamSpace([ParamSpec("a", "a", "number", 0.0, min=-3, max=3)])
+    script = os.path.join(tempfile.gettempdir(), "opt_fp_sim.py")
+    cmd = f'python "{script}" {{a}}'
+
+    def make():
+        return ProcessObjective(cmd, sp, name="fp")
+
+    with open(script, "w") as f:
+        f.write("import sys\nprint('score: 1.0')\n")
+    fp1 = make().fingerprint()
+    assert fp1 and make().fingerprint() == fp1, "同配置指纹必须稳定"
+    # 黑盒脚本改一行 -> 指纹变（pol/ell 事故类：接口漂移必须可检测）
+    with open(script, "w") as f:
+        f.write("import sys\nprint('score: 1.0')  # v2\n")
+    assert make().fingerprint() != fp1, "脚本内容变更未反映到指纹"
+    # cmd 模板变 -> 指纹变
+    with open(script, "w") as f:
+        f.write("import sys\nprint('score: 1.0')\n")
+    assert ProcessObjective(cmd + " --x", sp, name="fp").fingerprint() != fp1
+    # 方向变 -> 指纹变（同一黑盒，最大化/最小化是不同 objective）
+    assert ProcessObjective(cmd, sp, name="fp",
+                            minimize=False).fingerprint() != fp1
+    # 默认实现：CallableObjective 含空间描述，改界即变
+    o = make_objective(lambda q: q["a"] ** 2, sp, name="c")
+    sp2 = ParamSpace([ParamSpec("a", "a", "number", 0.0, min=-9, max=9)])
+    o2 = make_objective(lambda q: q["a"] ** 2, sp2, name="c")
+    assert o.fingerprint() == o.fingerprint() and o.fingerprint() != o2.fingerprint()
+    # 裸相对路径（真实 freeze 结构：cwd 含空格但 cmd 用相对 .py，无引号）
+    # ——旧正则把 "python scripts\a.py" 连读成整串 -> join 后不存在 -> 走
+    # missing 占位 -> 改脚本内容检测不到（N2 假阳性）。必须堵死。
+    root = os.path.join(tempfile.gettempdir(), "opt fp root")   # cwd 含空格
+    sub = os.path.join(root, "scripts")
+    os.makedirs(sub, exist_ok=True)
+    rel_script = os.path.join(sub, "sim.py")
+    with open(rel_script, "w") as f:
+        f.write("print('score: 1.0')\n")
+    obj_rel = ProcessObjective("python scripts/sim.py {a}", sp, name="rel",
+                               cwd=root)
+    fp_rel = obj_rel.fingerprint()
+    with open(rel_script, "w") as f:
+        f.write("print('score: 1.0')  # v2\n")
+    assert ProcessObjective("python scripts/sim.py {a}", sp, name="rel",
+                            cwd=root).fingerprint() != fp_rel, \
+        "裸相对路径下脚本内容变更未检测（missing 占位假阳性）"
+    # 存档 round-trip：指纹落盘读回
+    r = optimize(o, registry.get("random_search"), Budget(n_evals=4), seed=1)
+    assert r.fingerprint == o.fingerprint()
+    persistence.save_record(r)
+    assert persistence.load_record(r.run_id).fingerprint == r.fingerprint
+    # warm_note 三态：一致 / 不一致 / 源无指纹（裸 csv）
+    hist = r.history
+    r_ok = optimize(o, registry.get("random_search"), Budget(n_evals=4),
+                    seed=1, warm_start=hist)          # DataFrame 无源指纹
+    assert "未验证同源性" in r_ok.warm_note, r_ok.warm_note
+    r_match = optimize(o, registry.get("random_search"), Budget(n_evals=4),
+                       seed=1, warm_start=r)          # OptRecord 带一致指纹
+    assert "指纹一致" in r_match.warm_note, r_match.warm_note
+    r_mismatch = optimize(o2, registry.get("random_search"),
+                          Budget(n_evals=4), seed=1, warm_start=r)
+    assert "指纹不一致" in r_mismatch.warm_note, r_mismatch.warm_note
+    assert r_mismatch.error is None, "不一致应警告而非拒跑（裁量权在 UI）"
+
+
+def test_preflight_anchor():
+    """N3：锚点预检——接口漂移在烧预算前拦截；parse_anchor 文法。"""
+    from ml_toolbox.opt.runner import preflight
+    from ml_toolbox.opt.paramgrammar import parse_anchor
+    # 文法：数值转 float，非数值留字符串；空/非法抛错
+    a = parse_anchor("freq_mhz=7350, pol=pi, intensity=0.65")
+    assert a == {"freq_mhz": 7350.0, "pol": "pi", "intensity": 0.65}
+    for bad in ("", "  ", "abc"):
+        try:
+            parse_anchor(bad); assert False
+        except ValueError:
+            pass
+    # 正常 objective：锚点命中期望 -> ok
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-5, max=5)])
+    obj = make_objective(lambda q: (q["x"] - 2.0) ** 2, sp, name="pf")
+    ok, msg = preflight(obj, {"x": 2.0}, expect=0.0, tol=0.01)
+    assert ok, msg
+    # 偏离期望（模拟黑盒接口变了、分数对不上）-> 拦截
+    ok2, msg2 = preflight(obj, {"x": 2.0}, expect=5.0, tol=0.1)
+    assert not ok2 and "偏离" in msg2, msg2
+    # 不设期望：仅连通性检查（能评出有限分即过）
+    ok3, _ = preflight(obj, {"x": 3.0})
+    assert ok3
+    # 评估抛异常（黑盒崩/解析失配）-> 拦截，不抛出
+    def boom(q):
+        raise RuntimeError("no such table: literatureDME")
+    obj_bad = make_objective(boom, sp, name="pf_bad")
+    ok4, msg4 = preflight(obj_bad, {"x": 1.0})
+    assert not ok4 and "literatureDME" in msg4, msg4
+    # minimize=False 的目标：preflight 比对原始方向（evaluate 未翻转）
+    obj_max = make_objective(lambda q: -(q["x"] - 1.0) ** 2, sp, name="pfm",
+                             minimize=False)
+    ok5, _ = preflight(obj_max, {"x": 1.0}, expect=0.0, tol=0.01)
+    assert ok5, "预检应比对原始方向分数"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

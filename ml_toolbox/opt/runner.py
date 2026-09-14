@@ -48,7 +48,8 @@ def optimize(objective: Objective, optimizer: Optimizer,
     rec = OptRecord(run_id=_run_id(optimizer.name, objective.name, seed),
                     optimizer=optimizer.name, objective=objective.name,
                     space_desc=objective.space.describe(),
-                    budget=budget.to_dict(), seed=seed, multi=multi)
+                    budget=budget.to_dict(), seed=seed, multi=multi,
+                    fingerprint=objective.fingerprint())
     t0 = time.time()
     rows = []
     best = np.inf
@@ -60,8 +61,9 @@ def optimize(objective: Objective, optimizer: Optimizer,
         i = 0
         if warm_start is not None:
             # 预热点计入预算（标准 warm-start 语义：预算 = 总评估数，含已知）
-            i, b0, bp0 = _replay_warm(objective, optimizer, warm_start,
-                                      multi, rows)
+            i, b0, bp0, src_fp = _replay_warm(objective, optimizer,
+                                              warm_start, multi, rows)
+            rec.warm_note = _fp_check(rec.fingerprint, src_fp, len(rows))
             if b0 < best:
                 best, best_params = b0, bp0
             if rows:
@@ -136,18 +138,58 @@ def optimize(objective: Objective, optimizer: Optimizer,
     return rec
 
 
+def preflight(objective: Objective, anchor: dict, expect=None,
+              tol: float = 0.05):
+    """锚点预检（N3）：正式跑昂贵黑盒前，先评一个已知答案的点校验接口。
+
+    防御的事故：黑盒静默变更接口（pol/ell 事故类——旧字段被忽略、整轮搜
+    错空间）、解析正则失配、cwd/命令拼错。这些在 160 点预算里表现为"分数
+    全是 0 / 全失败"，跑完才发现 = 烧掉几小时。
+
+    anchor      —— 参数字典（parse_anchor 产出）；
+    expect      —— 期望分数（原始方向，即 maximize 目标给正方向值）；None 则
+                   只校验"能评出有限分"，不比对数值；
+    tol         —— 绝对容差。
+    -> (ok: bool, msg: str)。不抛异常（预检失败是结论不是崩溃）。
+    """
+    try:
+        p = objective.space.from_vector(objective.space.to_vector(anchor))
+    except Exception as e:
+        return False, f"锚点参数不合法：{type(e).__name__}: {e}"
+    try:
+        raw = objective.evaluate(p)          # 原始方向（绕过 minimize 翻转）
+    except Exception as e:
+        detail = getattr(objective, "last_error", "") or str(e)
+        return False, (f"锚点评估失败：{type(e).__name__}: "
+                       f"{str(detail)[-200:]}")
+    try:
+        raw_f = float(raw)
+    except (TypeError, ValueError):
+        return False, f"锚点返回非数值：{raw!r}"
+    if not np.isfinite(raw_f):
+        return False, f"锚点分数非有限：{raw_f}"
+    if expect is None:
+        return True, f"锚点可评估：score={raw_f:.6g}（未设期望值，仅连通性检查）"
+    if abs(raw_f - float(expect)) > tol:
+        return False, (f"锚点分数偏离：实得 {raw_f:.6g} ≠ 期望 {float(expect):.6g}"
+                       f"（容差 {tol}）——黑盒接口/解析可能已变")
+    return True, f"锚点校验通过：score={raw_f:.6g} ≈ 期望 {float(expect):.6g}"
+
+
 def _replay_warm(objective: Objective, optimizer: Optimizer,
                  warm_start, multi: bool, rows: list):
     """回放旧评估历史：ok 行喂优化器（不重新评估），其余只入历史。
 
-    -> (已占用预算数, 回放期 best, best_params)。
+    -> (已占用预算数, 回放期 best, best_params, 源 objective 指纹或 None)。
     多目标暂不支持（f0..fk 列语义未定）。
     """
     import pandas as pd
     if multi:
         raise ValueError("warm_start 暂不支持多目标轨迹")
+    src_fp = None
     if isinstance(warm_start, OptRecord):
         hist = warm_start.history
+        src_fp = getattr(warm_start, "fingerprint", "") or None
     elif isinstance(warm_start, pd.DataFrame):
         hist = warm_start
     elif isinstance(warm_start, (str, bytes)) or hasattr(warm_start, "__fspath__"):
@@ -155,15 +197,26 @@ def _replay_warm(objective: Objective, optimizer: Optimizer,
         if s.lower().endswith(".csv"):
             hist = pd.read_csv(s)
         elif os.path.isdir(s) and os.path.exists(
+                os.path.join(s, "opt_record.json")):
+            # run 目录：直接读存档（不依赖 RUNS_DIR 与目录名一致）
+            import json as _json
+            hist = pd.read_csv(os.path.join(s, "history.csv")) \
+                if os.path.exists(os.path.join(s, "history.csv")) \
+                else pd.DataFrame()
+            with open(os.path.join(s, "opt_record.json"),
+                      encoding="utf-8") as f:
+                src_fp = _json.load(f).get("fingerprint") or None
+        elif os.path.isdir(s) and os.path.exists(
                 os.path.join(s, "history.csv")):
             hist = pd.read_csv(os.path.join(s, "history.csv"))
         else:                                   # run_id：按 opt 存档读
             from .persistence import load_record
-            hist = load_record(s).history
+            r0 = load_record(s)
+            hist, src_fp = r0.history, r0.fingerprint or None
     else:
         hist = pd.DataFrame(list(warm_start))
     if hist is None or len(hist) == 0:
-        return 0, np.inf, None
+        return 0, np.inf, None, src_fp
     pcols = [d["key"] for d in objective.space.describe()]
     space = objective.space
     b = np.inf
@@ -186,7 +239,24 @@ def _replay_warm(objective: Objective, optimizer: Optimizer,
         if st == "ok" and s < b:
             b, bp = s, p
         rows.append(dict(p, score=s, status=st, ts=0.0, best_so_far=b))
-    return len(rows), b, bp
+    return len(rows), b, bp, src_fp
+
+
+def _fp_check(cur_fp: str, src_fp, n: int) -> str:
+    """热启动指纹校验结论（写进 warm_note，UI/存档可见）。
+
+    源无指纹（旧 run / 裸 csv）= 无法验证，如实标注；不同 = 黑盒已变，
+    历史可能是脏数据，强警告但不拒跑（用户可能确知接口兼容，如旧黑盒
+    忽略新字段的场景——拒绝的裁量权留给 UI 层）。
+    """
+    if n == 0:
+        return ""
+    if not src_fp:
+        return f"热启动 {n} 点：源无指纹（旧存档/裸 csv），未验证同源性"
+    if src_fp == cur_fp:
+        return f"热启动 {n} 点：objective 指纹一致 ✓"
+    return (f"⚠ 热启动 {n} 点：objective 指纹不一致（源 {src_fp} ≠ 当前 "
+            f"{cur_fp}）——黑盒或其配置已变更，历史可能是脏数据")
 
 
 def _eval_one(objective: Objective, p: dict, multi: bool):

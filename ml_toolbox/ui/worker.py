@@ -58,16 +58,18 @@ class OptWorker(QThread):
     """
     eval_done = pyqtSignal(object, int)           # record, i
     progress = pyqtSignal(str)                    # 批内进度（黑盒点级完成）
+    preflight_done = pyqtSignal(bool, str)        # N3 锚点预检结论
     finished_ok = pyqtSignal(object)              # 最终 OptRecord
     failed = pyqtSignal(str)
 
     def __init__(self, objective, optimizer, budget, cfg=None, seed=42,
-                 workers=1, warm_start=None, parent=None):
+                 workers=1, warm_start=None, preflight=None, parent=None):
         super().__init__(parent)
         self.objective, self.optimizer, self.budget = objective, optimizer, budget
         self.cfg, self.seed = cfg or {}, seed
         self.workers = max(int(workers), 1)
         self.warm_start = warm_start
+        self.preflight = preflight        # (anchor_dict, expect, tol) 或 None
         self._stop = False
         self._pause = False
 
@@ -87,8 +89,15 @@ class OptWorker(QThread):
         self._pause = v
 
     def run(self):
-        from ..opt.runner import optimize
+        from ..opt.runner import optimize, preflight as _pf
         try:
+            if self.preflight is not None:
+                anchor, expect, tol = self.preflight
+                self.progress.emit("锚点预检中…")
+                ok, msg = _pf(self.objective, anchor, expect, tol)
+                self.preflight_done.emit(ok, msg)
+                if not ok:
+                    return                    # 预检失败 = 不烧预算，UI 已收信号
             if hasattr(self.objective, "on_progress"):
                 self.objective.on_progress = (
                     lambda done, total, p: self.progress.emit(
