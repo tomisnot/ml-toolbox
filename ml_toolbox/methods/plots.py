@@ -217,3 +217,51 @@ def plot_ts_residual(ax, result):
     ax.axhline(0, color="k", lw=0.8)
     ax.set_xlabel("t"); ax.set_ylabel("residual")
     ax.grid(alpha=0.25)
+
+
+# ---------------------------------------------------------------- 兜底页（C3）
+def auto_pages(method, spec) -> list:
+    """方法未声明检视页时，按 task 给出兜底页（UI 永远有东西可显示）。
+
+    原住 core/runner.py，因依赖本模块绘图函数而构成 core→methods 反向依赖
+    （架构审视 M4）。现下沉到 methods 侧并经 registry 槽反向注册：
+    core.runner.auto_pages 退化为查表薄壳，依赖方向恢复为 methods→core。
+    """
+    from ..core.contracts import (PageSpec, TASK_SUPERVISED, TASK_CLUSTER,
+                                  TASK_MANIFOLD, TASK_ANOMALY, TASK_TIMESERIES)
+    t = method.task
+    if t == TASK_SUPERVISED:
+        if spec.target_kind == "regression":
+            return [PageSpec("fit", "拟合效果", "mpl", plot_fit_1d),
+                    PageSpec("resid", "残差诊断", "mpl", plot_residual),
+                    PageSpec("imp", "特征重要性", "mpl", plot_importance,
+                             hint="该方法无系数/重要性输出")]
+        return [PageSpec("cm", "混淆矩阵", "mpl", plot_confusion),
+                PageSpec("roc", "ROC / PR", "mpl", plot_roc,
+                         hint="该方法不输出概率（如 LinearSVC），无法画 ROC"),
+                PageSpec("pr", "PR 曲线", "mpl", plot_pr,
+                         hint="需要概率输出"),
+                PageSpec("imp", "特征重要性", "mpl", plot_importance,
+                         hint="该方法无系数/重要性输出")]
+    if t == TASK_CLUSTER:
+        return [PageSpec("emb", "聚类散点", "mpl", plot_scatter_emb),
+                PageSpec("sil", "轮廓系数", "mpl", plot_silhouette)]
+    if t == TASK_MANIFOLD:
+        return [PageSpec("emb", "降维散点", "mpl", plot_scatter_emb),
+                PageSpec("evr", "方差解释", "mpl", plot_explained_variance,
+                         hint="仅 PCA/LDA 等线性方法有方差解释概念")]
+    if t == TASK_ANOMALY:
+        return [PageSpec("score", "异常分数", "mpl", plot_anomaly_score)]
+    if t == TASK_TIMESERIES:
+        return [PageSpec("fc", "预测曲线", "mpl", plot_forecast),
+                PageSpec("res", "残差序列", "mpl", plot_ts_residual)]
+    return []
+
+
+def _register():
+    """methods 包加载时把兜底页提供者注册进 core.registry 的槽（C3）。"""
+    from ..core import registry
+    registry.register_page_provider(auto_pages)
+
+
+_register()

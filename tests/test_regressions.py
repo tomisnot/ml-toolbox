@@ -474,6 +474,34 @@ def test_parallel_njobs_contract():
             _os.environ["MLTB_NJOBS"] = saved
 
 
+def test_core_does_not_import_methods():
+    """C3/M4 永久断言：core 不得 import methods（依赖方向 methods→core）。
+
+    曾经的违规点：core.runner.auto_pages 直接 from ..methods import plots。
+    现 auto_pages 函数体下沉 methods/plots.py，经 registry 页提供者槽反向
+    注册；本断言读源码防回潮（不 import UI，保持核心门无 Qt）。
+    """
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(root, "ml_toolbox", "core", "runner.py"),
+              encoding="utf-8") as f:
+        src = f.read()
+    assert "from ..methods" not in src and "from .methods" not in src, \
+        "core/runner 重新 import methods——C3 依赖倒置回潮"
+    # 反向注册确实生效：load_builtin 后提供者已就位，旧代家族兜底页不断
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    registry.load_builtin()
+    assert registry.page_provider() is not None, "页提供者未注册"
+    from sklearn.datasets import make_regression
+    X, y = make_regression(60, 4, random_state=0)
+    spec = Pipeline.default().run(Dataset.from_arrays(X, y, "r"))
+    m = registry.get("ridge")                       # 旧代：无 inspect_pages
+    pages = m.inspect_pages(None) or runner.auto_pages(m, spec)
+    assert pages, "ridge 兜底页丢失（auto_pages 下沉后断链？）"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

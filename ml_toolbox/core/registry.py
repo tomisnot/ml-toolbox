@@ -6,6 +6,22 @@ from .contracts import MLMethod
 
 _REGISTRY: dict[str, type[MLMethod]] = {}
 
+# 兜底检视页提供者（C3：切断 core→methods 的依赖倒置点）。
+# 旧代家族（linear/ensemble/svm/knn/bayes）不声明 inspect_pages，其兜底页
+# 需要 methods.plots 的绘图函数——但 core 不能反向 import methods。解法：
+# methods 包加载时把 auto_pages 注册进这个槽，core.runner 只查表调用。
+_PAGE_PROVIDER = None
+
+
+def register_page_provider(fn):
+    """methods 侧注册兜底页提供者：fn(method, spec) -> list[PageSpec]。"""
+    global _PAGE_PROVIDER
+    _PAGE_PROVIDER = fn
+
+
+def page_provider():
+    return _PAGE_PROVIDER
+
 
 def register(cls: type[MLMethod]) -> type[MLMethod]:
     if not cls.name:

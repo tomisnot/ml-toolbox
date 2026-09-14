@@ -14,8 +14,7 @@ import pandas as pd
 
 from .contracts import (MLResult, MLMethod, RunConfig, DataSpec,
                         is_lower_better,
-                        TASK_SUPERVISED, TASK_CLUSTER, TASK_MANIFOLD,
-                        TASK_ANOMALY, TASK_TIMESERIES)
+                        TASK_SUPERVISED, TASK_TIMESERIES)
 from . import registry
 
 
@@ -143,33 +142,11 @@ def compare_table(records: list[RunRecord]) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- 任务适配
 def auto_pages(method: MLMethod, spec: DataSpec) -> list:
-    """方法未声明检视页时，按 task 给出兜底页（UI 永远有东西可显示）。"""
-    from .contracts import PageSpec
-    from ..methods import plots as _p
-    t = method.task
-    if t == TASK_SUPERVISED:
-        if spec.target_kind == "regression":
-            return [PageSpec("fit", "拟合效果", "mpl", _p.plot_fit_1d),
-                    PageSpec("resid", "残差诊断", "mpl", _p.plot_residual),
-                    PageSpec("imp", "特征重要性", "mpl", _p.plot_importance,
-                             hint="该方法无系数/重要性输出")]
-        return [PageSpec("cm", "混淆矩阵", "mpl", _p.plot_confusion),
-                PageSpec("roc", "ROC / PR", "mpl", _p.plot_roc,
-                         hint="该方法不输出概率（如 LinearSVC），无法画 ROC"),
-                PageSpec("pr", "PR 曲线", "mpl", _p.plot_pr,
-                         hint="需要概率输出"),
-                PageSpec("imp", "特征重要性", "mpl", _p.plot_importance,
-                         hint="该方法无系数/重要性输出")]
-    if t == TASK_CLUSTER:
-        return [PageSpec("emb", "聚类散点", "mpl", _p.plot_scatter_emb),
-                PageSpec("sil", "轮廓系数", "mpl", _p.plot_silhouette)]
-    if t == TASK_MANIFOLD:
-        return [PageSpec("emb", "降维散点", "mpl", _p.plot_scatter_emb),
-                PageSpec("evr", "方差解释", "mpl", _p.plot_explained_variance,
-                         hint="仅 PCA/LDA 等线性方法有方差解释概念")]
-    if t == TASK_ANOMALY:
-        return [PageSpec("score", "异常分数", "mpl", _p.plot_anomaly_score)]
-    if t == TASK_TIMESERIES:
-        return [PageSpec("fc", "预测曲线", "mpl", _p.plot_forecast),
-                PageSpec("res", "残差序列", "mpl", _p.plot_ts_residual)]
-    return []
+    """方法未声明检视页时，按 task 给出兜底页（UI 永远有东西可显示）。
+
+    C3：函数体已下沉 methods/plots.py（它持有绘图函数），经 registry 槽
+    反向注册。core 不再 import methods——依赖方向恢复为 methods→core。
+    提供者未注册（未 load_builtin 的纯后端场景）时返回空表，诚实降级。
+    """
+    provider = registry.page_provider()
+    return provider(method, spec) if provider else []
