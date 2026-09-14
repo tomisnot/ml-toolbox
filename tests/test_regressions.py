@@ -13,16 +13,21 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 
+SLOW = os.environ.get("MLTB_SLOW") == "1"
+_EPOCHS = 60 if SLOW else 30      # fast：够验证四页工件契约；slow：真实训练
+
 PASS = 0
 FAIL = []
 
 
 def check(name, fn):
     global PASS
+    import time
+    t0 = time.time()
     try:
         fn()
         PASS += 1
-        print(f"  ✓ {name}")
+        print(f"  ✓ {name} ({time.time() - t0:.1f}s)")
     except Exception as e:
         FAIL.append((name, e))
         print(f"  ✗ {name}: {type(e).__name__}: {str(e)[:200]}")
@@ -314,12 +319,12 @@ def test_neural_fit_and_artifacts():
     spec = Pipeline.default().run(Dataset.from_arrays(X, y, "nn"))
     m = registry.get("torch_mlp")
     r = runner.run_one(m, spec, RunConfig(diag=True,
-                                          overrides={"epochs": 60,
+                                          overrides={"epochs": _EPOCHS,
                                                      "lr": 0.01,
                                                      "latent_every": 4})).result
     assert r.ok, r.error
     a = r.artifacts
-    assert a["nn_history"]["loss"].shape[0] == 60
+    assert a["nn_history"]["loss"].shape[0] == _EPOCHS
     # 初始权重快照必须在（构造时采集，非 epoch 后）——否则 ΔW 视图恒空
     assert all(v is not None for v in a["nn_weights"]["first"].values())
     assert set(a["nn_weights"]["last"]) == set(a["nn_weights"]["first"])

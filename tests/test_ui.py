@@ -31,10 +31,12 @@ PASS, FAIL = 0, []
 
 def check(name, fn):
     global PASS
+    import time
+    t0 = time.time()
     try:
         fn()
         PASS += 1
-        print(f"  ✓ {name}")
+        print(f"  ✓ {name} ({time.time() - t0:.1f}s)")
     except Exception as e:
         FAIL.append((name, e))
         print(f"  ✗ {name}: {type(e).__name__}: {str(e)[:180]}")
@@ -277,10 +279,11 @@ def test_neural_pages():
     win = _win_get()
     from ml_toolbox.core import registry, runner
     from ml_toolbox.core.contracts import RunConfig
-    win._set_dataset(load_demo("breast_cancer"))
+    # iris（150×4）足够验证页面装配；breast_cancer 569 行让 IG 归因慢 3 倍
+    win._set_dataset(load_demo("iris"))
     app.processEvents()
     rec = runner.run_one(registry.get("torch_mlp"), win.spec,
-                         RunConfig(diag=True, overrides={"epochs": 15,
+                         RunConfig(diag=True, overrides={"epochs": 8,
                                                          "latent_every": 3}))
     assert rec.result.ok, rec.result.error
     win.records = [rec]
@@ -307,7 +310,6 @@ def test_neural_pages():
     app.processEvents()
     rp._toggle_play()
     assert rp._readout.text().startswith("epoch")
-    win._set_dataset(load_demo("iris"))
 
 
 def test_perspective_switch():
