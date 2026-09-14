@@ -60,7 +60,8 @@ ml_toolbox/
 ├── benchmarks/    数学建模基准（结果表在 benchmarks/results/）
 ├── checks/        离屏截图自查闭环
 └── docs/          项目定位.md（宪法）· 契约.md · 优化定位.md · 优化契约.md ·
-                   原子模拟对接.md（实战）· pitfalls.md（41 条）
+                   原子模拟对接.md（实战）· pitfalls.md（41 条）·
+                   架构审视与改造建议.md（宏观审视 + 改造提案）
 ```
 
 **依赖方向单向**：`ui → core + methods`，`methods → core`，`core → 无内部依赖`。
@@ -233,4 +234,5 @@ class MyMethod(MLMethod):
 - `docs/契约.md` —— 方法 / 数据 / 可视化 / 持久化四份契约
 - `docs/优化定位.md` —— 序贯优化子框架宪法（与 ML 兄弟框架 + 三接缝）
 - `docs/优化契约.md` —— 优化侧 ask-and-tell 契约 + 引擎表 + 三接缝桥
-- `docs/pitfalls.md` —— 36 条踩坑（症状→原因→修法），新坑按格式追加
+- `docs/pitfalls.md` —— 41 条踩坑（症状→原因→修法），新坑按格式追加
+- `docs/架构审视与改造建议.md` —— 宏观架构审视报告 + 改造提案（C1-C9，含验收与文档同步清单）
