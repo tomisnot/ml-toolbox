@@ -218,3 +218,35 @@ class GPBO(Optimizer):
         mu, sd = self._gpr.predict(V, return_std=True)
         xs = np.array([float(self.space.from_vector(v)[key]) for v in V])
         return xs, mu, sd
+
+    # ------------------------------------------------ 声明式检视页（C4）
+    def inspect_pages(self, record):
+        """通用页 + 代理切片页。plot 闭包捕获 self 的当前 GP 状态。
+
+        串台防护：UI 按 record.optimizer 取实例再调本方法（M6 语义不变），
+        故看 A 的运行时画的是 A 的 GP，不会串成 B。
+        """
+        from ...core.contracts import PageSpec
+        from ..plots import default_pages, plot_surrogate_1d
+
+        def _surrogate(ax, rec):
+            keys = [d["key"] for d in rec.space_desc]
+            if not keys:
+                return
+            best = rec.best or {}
+            other = {k: best.get(k) for k in keys
+                     if k != keys[0] and best.get(k) is not None}
+            out = self.surrogate_1d(keys[0], other)
+            if out is None:                       # GP 未拟合（预热不足）
+                ax.text(0.5, 0.5, "代理切片需 ≥1 次预热后（GP 未拟合）",
+                        ha="center", va="center", color="#888")
+                return
+            xs, mu, sd = out
+            ok = rec.history[rec.history["status"] == "ok"]
+            obs_x = ok[keys[0]].to_numpy() if keys[0] in ok else np.array([])
+            obs_y = ok["score"].to_numpy() if "score" in ok else np.array([])
+            plot_surrogate_1d(ax, (xs, mu, sd, obs_x, obs_y, keys[0]))
+
+        return default_pages(record) + [
+            PageSpec("surrogate", "代理切片", "mpl", _surrogate,
+                     hint="代理切片仅 GP-BO 可用")]

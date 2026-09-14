@@ -867,6 +867,47 @@ def test_preflight_anchor():
     assert ok5, "预检应比对原始方向分数"
 
 
+def test_opt_pages_declared():
+    """C4：优化侧检视页声明化——引擎自声明，UI 不再硬编码画布。
+
+    断言：① 任意 record 上 inspect_pages 返回非空且含曲面体检 table 页；
+    ② GP-BO 追加代理切片页（plot 闭包捕获实例）；③ 多目标 record 页组
+    自动切 Pareto；④ ui/opt_page.py 源码不再出现 canvas_* 硬编码。
+    """
+    import os as _os
+    sp = ParamSpace([ParamSpec("x", "x", "number", 0.0, min=-3, max=3),
+                     ParamSpec("y", "y", "number", 0.0, min=-3, max=3)])
+    obj = make_objective(lambda q: q["x"] ** 2 + q["y"] ** 2, sp, name="pg")
+    r = optimize(obj, registry.get("random_search"), Budget(n_evals=25),
+                 seed=1)
+    pages = registry.get("random_search").inspect_pages(r)
+    keys = [p.key for p in pages]
+    assert "conv" in keys and "health" in keys, keys
+    hp = [p for p in pages if p.key == "health"][0]
+    assert hp.kind == "table" and hp.data is not None
+    df = hp.data(r, force=True)
+    assert len(df) and "指标" in df.columns
+    # GP-BO 专属页
+    gp = registry.get("gp_bo")
+    rg = optimize(obj, gp, Budget(n_evals=16), cfg={"n_init": 5}, seed=2)
+    gkeys = [p.key for p in gp.inspect_pages(rg)]
+    assert "surrogate" in gkeys and "conv" in gkeys
+    # 多目标自动切 Pareto 组合
+    from ml_toolbox.opt.synth import make_objective_multi
+    mobj = make_objective_multi("zdt1", dim=3)
+    rm = optimize(mobj, registry.get("nsga_ii"), Budget(n_evals=60),
+                  cfg={"popsize": 15}, seed=3)
+    mkeys = [p.key for p in registry.get("nsga_ii").inspect_pages(rm)]
+    assert "pareto" in mkeys and "conv" not in mkeys
+    # UI 去硬编码：opt_page 不得再直接摆 canvas / 调绘图函数
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(root, "ml_toolbox", "ui", "opt_page.py"),
+              encoding="utf-8") as f:
+        src = f.read()
+    assert "canvas_conv" not in src and "opt_plots" not in src, \
+        "opt_page 回潮硬编码画布——C4 声明化被绕过"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

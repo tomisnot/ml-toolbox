@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""优化检视绘图函数（纯 matplotlib，零 Qt）——对标 methods/plots.py 的角色。
+"""优化检视绘图函数 + 默认页声明（opt 层，纯 matplotlib，零 Qt）。
 
-消费 OptRecord.history（DataFrame：参数列 + score/status/ts/best_so_far），
-对应优化工作区的检视页（docs/优化定位.md §7）：
-    plot_convergence   —— best-so-far 阶梯 + 全部评估散点（可叠多条轨迹对比）
-    plot_parallel      —— 参数×分数平行坐标（哪个参数敏感一眼可见）
-    plot_scatter2d     —— 前两个连续参数的探索地图（颜色=分数，形状=状态）
-    plot_surrogate_1d  —— GP 后验切片（需 optimizer 实例，仅 gp_bo 可用）
+C4：原住 ui/opt_plots.py，绘图知识与优化框架同层归置（对标 methods/plots.py
+在 ML 侧的角色）。优化器经 inspect_pages(record) 声明 PageSpec 列表，
+UI 只装配不预设——G2 纪律推广到优化侧，终结"UI 硬编码五 canvas + 逐页特判"。
+
+消费 OptRecord.history（DataFrame：参数列 + score/status/ts/best_so_far）。
+代理切片页需要 optimizer 实例（surrogate_1d），不属"record 自足页"，
+由 UI 按 supports_surrogate 能力标志追加（见 default_pages 说明）。
 """
 from __future__ import annotations
 
 import numpy as np
+
+from ..core.contracts import PageSpec
 
 _GREEN = "#2ca02c"
 _BLUE = "#1f77b4"
@@ -21,7 +24,13 @@ def _ok(record):
 
 
 def plot_convergence(ax, record, extra=None):
-    """收敛曲线：best-so-far 阶梯 + 评估散点。extra=[(label, history)] 叠加对比。"""
+    """收敛曲线：best-so-far 阶梯 + 评估散点。extra=[(label, history)] 叠加对比。
+
+    extra 缺省时读 record._overlay（UI 直播时注入的已完成轨迹——呈现层
+    上下文放 record 上，绘图函数保持自足，声明式装配不传第二参数）。
+    """
+    if extra is None:
+        extra = getattr(record, "_overlay", None)
     h = record.history
     if h.empty:
         ax.text(0.5, 0.5, "尚无评估", ha="center", va="center", color="#888")
@@ -150,3 +159,24 @@ def plot_surrogate_1d(ax, bundle):
     ax.set_title("代理模型切片（固定其余参数于当前最优）")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.25)
+
+
+# ---------------------------------------------------------------- 默认页声明
+def default_pages(record) -> list:
+    """所有优化运行的通用页（多目标自动切 Pareto 组合）。
+
+    代理切片页不在此列：它需要 optimizer 实例的 GP 状态，属"实例自足页"，
+    由 GP-BO.inspect_pages 追加（见 engines/bo.py）。曲面体检页对任何有
+    ≥10 个 ok 点的运行都有意义，故通用声明。
+    """
+    from .health import surface_health
+    common = [PageSpec("parallel", "平行坐标", "mpl", plot_parallel),
+              PageSpec("health", "曲面体检", "table",
+                       data=surface_health)]
+    if getattr(record, "multi", False):
+        return [PageSpec("pareto", "Pareto 前沿", "mpl", plot_pareto),
+                common[0], common[1]]
+    return [PageSpec("conv", "收敛曲线", "mpl", plot_convergence),
+            common[0],
+            PageSpec("scatter", "探索地图", "mpl", plot_scatter2d),
+            common[1]]

@@ -64,12 +64,21 @@ class InspectPage(QWidget):
         self._record: RunRecord | None = None
 
     # ------------------------------------------------ 装配
-    def show_result(self, record: RunRecord):
+    def show_result(self, record):
+        """装配一页。record 可为 ML 的 RunRecord 或优化的 OptRecord（C4）。
+
+        归一化：res = record.result（ML）或 record 自身（优化）；ok = res.ok
+        （ML）或 error is None（优化）；mpl 页把 res 传给 spec.plot——ML 的
+        plot 收 result、优化的 plot 收 record，各自消费，装配器不区分。
+        """
         self._record = record
         self._clear_body()
-        res = record.result
-        if not res.ok:
-            self._set_body(QLabel(f"运行失败：\n{(res.error or '')[:600]}"))
+        res = getattr(record, "result", record)
+        ok = getattr(res, "ok", None)
+        if ok is None:                          # OptRecord：无 .ok，看 error
+            ok = getattr(res, "error", None) is None
+        if not ok:
+            self._set_body(QLabel(f"运行失败：\n{(getattr(res, 'error', '') or '')[:600]}"))
             return
         kind = self.spec.kind
         if kind == "pg":
@@ -91,16 +100,18 @@ class InspectPage(QWidget):
             self.canvas.draw_result(self.spec.plot, res)
             self._set_body(self.canvas)
         elif kind == "table":
-            df = self._table_source(res)
+            df = self.spec.data(res) if self.spec.data is not None \
+                else self._table_source(res)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 self._set_body(self._make_table(df))
             else:
                 self._set_body(Placeholder(
                     self.spec.hint or f"artifacts['{self.spec.key}'] 无表格数据"))
         elif kind == "text":
+            diag = getattr(res, "diag", None)
             box = QPlainTextEdit()
             box.setReadOnly(True)
-            box.setPlainText(str(res.diag or {}) if res.diag
+            box.setPlainText(str(diag) if diag
                              else (self.spec.hint or "开启诊断开关后显示中间产物"))
             self._set_body(box)
         elif kind in PAGE_BUILDERS:
@@ -181,16 +192,27 @@ class InspectPage(QWidget):
                 out.extend(w.findChildren(pg.GraphicsLayoutWidget))
         return out
 
+    def _base_name(self) -> str:
+        """导出文件名前缀：ML=method，优化=optimizer（record 形态归一）。"""
+        r = self._record
+        return str(getattr(r, "method", None) or getattr(r, "optimizer", "run"))
+
     def _export_npz(self):
         if self._record is None:
             return
         p, _ = QFileDialog.getSaveFileName(
-            self, "导出数据", f"{self._record.method}_{self.spec.key}.npz",
+            self, "导出数据", f"{self._base_name()}_{self.spec.key}.npz",
             "NumPy (*.npz)")
         if not p:
             return
-        art = {k: v for k, v in self._record.result.artifacts.items()
+        res = getattr(self._record, "result", self._record)
+        art = {k: v for k, v in getattr(res, "artifacts", {}).items()
                if isinstance(v, np.ndarray)}
+        if not art:                             # 优化侧：history 数值列导出
+            h = getattr(res, "history", None)
+            if h is not None and len(h):
+                h.to_csv(p.rsplit(".", 1)[0] + ".csv", index=False)
+                return
         np.savez(p, **art)
 
 

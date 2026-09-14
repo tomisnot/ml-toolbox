@@ -322,8 +322,14 @@ class Optimizer(abc.ABC):
         return [self.ask() for _ in range(max(int(n), 1))]
 
     def inspect_pages(self, record: "OptRecord"):
-        """声明式检视页（复用 core.PageSpec 契约，UI 层同一装配器）。"""
-        return []
+        """声明式检视页（复用 core.PageSpec 契约，UI 层同一装配器）。
+
+        C4：默认给所有运行通用的页组（收敛/平行坐标/探索/曲面体检，多目标
+        自动切 Pareto）；有专属可视化的引擎覆写它追加（如 GP-BO 的代理切片，
+        plot 闭包捕获 self 的 GP 状态）。UI 按 record.optimizer 取实例调用。
+        """
+        from .plots import default_pages
+        return default_pages(record)
 
 
 # ================================================================ 预算与记录

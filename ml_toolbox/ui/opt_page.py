@@ -27,8 +27,8 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
 from ..opt import registry as opt_registry
 from ..opt.contracts import Budget
 from ..opt.synth import synth_names, make_objective_from_synth
-from .widgets import MplCanvas
-from . import opt_plots
+from ..opt.plots import default_pages
+from .inspector import MethodInspector
 from .param_form import ParamForm
 from .worker import OptWorker
 
@@ -264,20 +264,10 @@ class OptWorkbench(QWidget):
         left.setFixedWidth(300)
         lay.addWidget(left)
 
-        # ---- 右栏：检视页 + 历史表
+        # ---- 右栏：检视页（C4：声明式装配，复用 ML 侧 MethodInspector）+ 历史表
         right = QSplitter(Qt.Vertical)
-        self.tabs = QTabWidget()
-        self.canvas_conv = MplCanvas(width=8, height=5)
-        self.canvas_par = MplCanvas(width=8, height=5)
-        self.canvas_sc = MplCanvas(width=8, height=5)
-        self.canvas_pareto = MplCanvas(width=8, height=5)
-        self.canvas_sur = MplCanvas(width=8, height=5)
-        self.tabs.addTab(self._wrap(self.canvas_conv), "收敛曲线")
-        self.tabs.addTab(self._wrap(self.canvas_par), "平行坐标")
-        self.tabs.addTab(self._wrap(self.canvas_sc), "探索地图")
-        self.tabs.addTab(self._wrap(self.canvas_pareto), "Pareto 前沿")
-        self.tabs.addTab(self._wrap(self.canvas_sur), "代理切片")
-        right.addWidget(self.tabs)
+        self.inspector = MethodInspector()
+        right.addWidget(self.inspector)
 
         self.hist_table = QTableWidget()
         self.hist_table.horizontalHeader().setSectionResizeMode(
@@ -879,58 +869,17 @@ class OptWorkbench(QWidget):
 
     # ================================================== 刷新
     def _refresh_live(self, record):
-        if getattr(record, "multi", False):
-            # 多目标：Pareto 页 + 平行坐标（按 f0 着色）；其余页占位
-            self._draw(self.canvas_pareto, opt_plots.plot_pareto, record)
-            self._draw(self.canvas_par, opt_plots.plot_parallel, record)
-            for cv, msg in ((self.canvas_conv, "多目标无单一收敛曲线，看 Pareto 页"),
-                            (self.canvas_sc, "多目标探索看 Pareto 前沿页"),
-                            (self.canvas_sur, "多目标暂无代理切片")):
-                cv.draw_result(lambda ax, _r, m=msg: ax.text(
-                    0.5, 0.5, m, ha="center", va="center", color="#888"), None)
-            self._refresh_history(record)
-            return
-        # 收敛（叠加已完成的多条）
-        extra = [(k, r.history) for k, r in self._records.items()
-                 if r is not record and len(r.history)]
-        self._draw(self.canvas_conv, opt_plots.plot_convergence,
-                   record, extra=extra)
-        self._draw(self.canvas_par, opt_plots.plot_parallel, record)
-        self._draw(self.canvas_sc, opt_plots.plot_scatter2d, record)
-        self._refresh_surrogate(record)
-        self._refresh_history(record)
+        """C4：页声明归优化器（inspect_pages），UI 只装配。
 
-    def _draw(self, canvas, fn, *args, **kw):
-        try:
-            canvas.draw_result(lambda ax, _r: fn(ax, *args, **kw), None)
-        except Exception:
-            pass
-
-    def _refresh_surrogate(self, record):
-        # 绑定"当前展示记录"对应的优化器（M6：跑完 A 再跑 B，看 A 时代理页
-        # 不再串成 B 的 GP）；只问公开能力 supports_surrogate，不读私有 _gpr。
+        串台防护不变：按 record.optimizer 取实例再声明（看 A 画 A 的 GP）。
+        无实例（历史回看）走 default_pages——代理切片是实例自足页，
+        回看时诚实缺席（同 ML 侧"存档不含 estimator"口径）。
+        """
         o = self._opt_instances.get(record.optimizer)
-        if o is None or not getattr(o, "supports_surrogate", False) \
-                or not hasattr(o, "surrogate_1d"):
-            self.canvas_sur.draw_result(
-                lambda ax, _r: ax.text(0.5, 0.5,
-                    "代理切片仅 GP-BO 可用（且需 ≥1 次预热后）",
-                    ha="center", va="center", color="#888"), None)
-            return
-        keys = [d["key"] for d in record.space_desc]
-        if not keys:
-            return
-        best = record.best or {}
-        other = {k: best.get(k) for k in keys if k != keys[0] and best.get(k) is not None}
-        out = o.surrogate_1d(keys[0], other)
-        if out is None:                       # GP 未拟合（预热不足）
-            return
-        xs, mu, sd = out
-        ok = record.history[record.history["status"] == "ok"]
-        obs_x = ok[keys[0]].to_numpy() if keys[0] in ok else np.array([])
-        obs_y = ok["score"].to_numpy() if "score" in ok else np.array([])
-        self._draw(self.canvas_sur, opt_plots.plot_surrogate_1d,
-                   (xs, mu, sd, obs_x, obs_y, keys[0]))
+        pages = o.inspect_pages(record) if o is not None \
+            else default_pages(record)
+        self.inspector.show_record(record, pages)
+        self._refresh_history(record)
 
     def _refresh_history(self, record):
         h = record.history

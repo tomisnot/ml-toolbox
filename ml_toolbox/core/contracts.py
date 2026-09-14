@@ -245,6 +245,8 @@ class PageSpec:
     - kind="mpl" + plot(ax, result)：纯 matplotlib 绘制函数（方法层零 Qt）；
     - kind="pg"：交给 UI 的通用自适应组件（热图/散点缩放）；
     - kind="table"/"cards"：消费 result.artifacts 中的表格/摘要；
+    - data：table 页的替代数据源 fn(record)->DataFrame（优化侧 record 无
+      artifacts，C4 用它在声明时绑定计算；ML 侧留空走 artifacts 老路）；
     - plot=None 且无 artifacts：UI 显示 hint 语义化占位（模式 7）。
     """
     key: str
@@ -253,6 +255,7 @@ class PageSpec:
     plot: Optional[Callable] = None    # (fig_ax, result) -> None
     builder: Optional[Callable] = None  # (result, parent) -> QWidget（UI 层扩展用）
     hint: str = ""                  # 无数据时的语义化占位提示
+    data: Optional[Callable] = None    # (record) -> DataFrame（table 页数据源）
 
 
 # ---------------------------------------------------------------- 方法基类
