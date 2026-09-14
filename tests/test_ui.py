@@ -350,12 +350,16 @@ def test_opt_workbench():
     wb._refresh_live(rec)
     app.processEvents()
     assert wb.hist_table.rowCount() == 15
-    # GP-BO 代理切片路径
+    # GP-BO 代理切片路径（M6：代理页按 record.optimizer 取实例）
     gp = oreg.get("gp_bo")
     rec2 = optimize(obj, gp, Budget(n_evals=14), cfg={"n_init": 5}, seed=4)
-    wb._cur_opt = gp
     wb._records = {"gp_bo": rec2}
+    wb._opt_instances = {"gp_bo": gp}
     wb._refresh_live(rec2)
+    app.processEvents()
+    # 串台防护：记录属于 random_search 时，代理页不得用 gp_bo 的实例
+    wb._records = {"random_search": rec}
+    wb._refresh_live(rec)
     app.processEvents()
     # 多目标 Pareto 页路径（NSGA-II + ZDT1）
     try:

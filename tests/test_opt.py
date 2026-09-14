@@ -660,6 +660,30 @@ def test_batch_infeasible_recognized():
     assert set(r.history["status"]) == {"infeasible"}, r.history["status"]
 
 
+def test_paramgrammar_space_and_constraints():
+    """C6/M8：参数与约束文法解析下沉 opt/paramgrammar（含错误用例）。"""
+    from ml_toolbox.opt.paramgrammar import parse_space, parse_constraints
+    sp, mp = parse_space("freq=7200..7500, pol=π|σ+|σ-, ell.alpha_deg=-90..90, k=1..9#int")
+    assert sp.dim == 4
+    assert mp == {"alpha_deg": "ell.alpha_deg"}
+    assert sp.spec("pol").kind == "select" and len(sp.spec("pol").choices) == 3
+    assert sp.spec("k").kind == "int"
+    cs = parse_constraints("S_ret>=0.99, kick_m05>0.5, x<=1e-3")
+    assert cs[1] == {"field": "kick_m05", "op": ">", "value": 0.5}
+    assert cs[2]["value"] == 1e-3
+    for bad in ("bad", "a=1", "名=甲"):
+        try:
+            parse_space(bad)
+            assert False, f"非法参数定义应抛错：{bad}"
+        except ValueError:
+            pass
+    try:
+        parse_constraints("S_ret 大于 0.99")
+        assert False, "非法约束应抛错"
+    except ValueError:
+        pass
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

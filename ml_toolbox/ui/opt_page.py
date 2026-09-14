@@ -40,8 +40,8 @@ class OptWorkbench(QWidget):
         opt_registry.load_builtin()
         self._worker: OptWorker | None = None
         self._records: dict[str, "object"] = {}     # optimizer -> OptRecord
+        self._opt_instances: dict[str, "object"] = {}   # optimizer -> 实例（代理切片按记录取，修 M6 串台）
         self._queue: list[str] = []                 # 待跑优化器
-        self._cur_opt = None                        # 当前优化器实例（代理切片用）
         self._running = False
         self._build()
 
@@ -64,7 +64,8 @@ class OptWorkbench(QWidget):
         f0 = QFormLayout(g0)
         # 数据从哪来（显式呈现跨框架/跨进程依赖）：内部数据集 / 外部文件
         self._src_kind = QComboBox()
-        self._src_kind.addItems(["ML 内部数据集", "外部文件（csv/parquet）"])
+        self._add_items(self._src_kind, [("ML 内部数据集", "ml"),
+                                         ("外部文件（csv/parquet）", "file")])
         self._src_kind.currentTextChanged.connect(lambda *_: self.refresh_source_status())
         f0.addRow("来源", self._src_kind)
         self._src_path = QLineEdit()
@@ -87,8 +88,9 @@ class OptWorkbench(QWidget):
         g1 = QGroupBox("目标函数")
         f1 = QFormLayout(g1)
         self._obj_kind = QComboBox()
-        self._obj_kind.addItems(["合成函数", "ML 方法调参（AutoTuner）",
-                                 "外部程序（黑盒进程）"])
+        self._add_items(self._obj_kind, [("合成函数", "synth"),
+                                         ("ML 方法调参（AutoTuner）", "ml"),
+                                         ("外部程序（黑盒进程）", "proc")])
         self._obj_kind.currentTextChanged.connect(self._on_obj_kind)
         f1.addRow("类型", self._obj_kind)
         self._synth = QComboBox()
@@ -344,6 +346,21 @@ class OptWorkbench(QWidget):
     # ================================================== 配置导出 / 导入
     CFG_VERSION = 1
 
+    @staticmethod
+    def _add_items(cb, pairs):
+        """填充下拉框并给每项挂稳定 key（userData）。
+
+        M7：业务逻辑读 currentData()（key），不再用中文标签 startswith 判断
+        ——改文案不改行为。配置导出仍存中文标签（人类可读 + 向后兼容）。
+        """
+        from PyQt5.QtCore import QVariant
+        for text, key in pairs:
+            cb.addItem(text, QVariant(key))
+
+    def _combo_key(self, cb) -> str:
+        d = cb.currentData()
+        return d if isinstance(d, str) else ""
+
     def _combo_set(self, cb, text):
         i = cb.findText(str(text))
         if i >= 0:
@@ -485,6 +502,7 @@ class OptWorkbench(QWidget):
             QMessageBox.information(self, "未选优化器", "至少勾选一个优化器。")
             return
         self._records.clear()
+        self._opt_instances.clear()
         self._queue = list(opts)
         self._running = True
         self.btn_run.setEnabled(False)
@@ -500,12 +518,12 @@ class OptWorkbench(QWidget):
     # ------------------------------------------------ 数据源（显式呈现依赖）
     def _uses_source(self) -> bool:
         """AutoTuner 需要数据；合成函数/外部程序不需要（进程自产数据）。"""
-        return self._obj_kind.currentText().startswith("ML")
+        return self._combo_key(self._obj_kind) == "ml"
 
     def _current_source(self):
         """按数据源选择构造 DataSource。抛异常 = 未配置/不可读。"""
         from ..opt.sources import SpecSource, FileSource
-        if self._src_kind.currentText().startswith("ML"):
+        if self._combo_key(self._src_kind) == "ml":
             spec = getattr(self, "_spec", None)
             if spec is None or spec.y is None:
                 raise RuntimeError("ML 内部数据集未加载（先在 ML 模式打开数据）")
@@ -521,7 +539,7 @@ class OptWorkbench(QWidget):
         if g0 is None:
             return
         g0.setVisible(self._uses_source())
-        file_mode = self._src_kind.currentText().startswith("外部")
+        file_mode = self._combo_key(self._src_kind) == "file"
         for w in (self._src_path, self._lbl_path, self._src_target,
                   self._lbl_target):
             w.setVisible(file_mode)
@@ -536,10 +554,11 @@ class OptWorkbench(QWidget):
             self._src_status.setText("● " + str(e)[:160])
             self._src_status.setStyleSheet("color:#c0392b; font-size:11px;")
 
-    def _on_obj_kind(self, text):
-        synth = text.startswith("合成")
-        ml = text.startswith("ML")
-        proc = text.startswith("外部")
+    def _on_obj_kind(self, text=None):
+        key = self._combo_key(self._obj_kind)     # M7：按稳定 key 分支，不看文案
+        synth = key == "synth"
+        ml = key == "ml"
+        proc = key == "proc"
         self._synth.setVisible(synth)
         for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
             w.setVisible(ml)
@@ -584,58 +603,18 @@ class OptWorkbench(QWidget):
 
     @staticmethod
     def _proc_space(text: str):
-        """参数定义 -> ParamSpace。
+        """薄转发：文法解析已下沉 opt/paramgrammar（M8/C6）。
 
-        语法（逗号分隔）：
-          名=下界..上界          连续
-          名=整数下界..上界#int  整数
-          名=甲|乙|丙            离散 select
-          点内路径=...           批量模式映射（如 ell.alpha_deg=-90..90，
-                                 参数名 = 路径末段；亦支持 名:路径=...）
+        保留此入口仅为兼容既有调用点；解析逻辑与单测都在 opt 侧。
         """
-        import re
-        from ..core.contracts import ParamSpec
-        from ..opt.contracts import ParamSpace
-        specs, mapping = [], {}
-        for tok in text.split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            m = re.match(r"^([\w.]+)\s*(?::([\w.]+))?\s*=\s*(.+)$", tok)
-            if not m:
-                raise ValueError(f"参数定义无法解析：{tok!r}"
-                                 "（期望 名=下界..上界 / 名=甲|乙 / 路径=...）")
-            key, path, rhs = m.group(1), m.group(2), m.group(3).strip()
-            if path is None and "." in key:     # 点路径即字段名，末段做参数名
-                path, key = key, key.rsplit(".", 1)[-1]
-            if path:
-                mapping[key] = path
-            mm = re.match(r"^(-?[\d.eE+-]+)\s*\.\.\s*(-?[\d.eE+-]+)(#int)?$", rhs)
-            if mm:
-                lo, hi = float(mm.group(1)), float(mm.group(2))
-                if hi <= lo:
-                    raise ValueError(f"参数 {key} 上界须大于下界")
-                if mm.group(3):
-                    specs.append(ParamSpec(key, key, "int", int((lo + hi) / 2),
-                                           min=int(lo), max=int(hi)))
-                else:
-                    specs.append(ParamSpec(key, key, "number", (lo + hi) / 2,
-                                           min=lo, max=hi))
-            else:
-                choices = [c.strip() for c in rhs.split("|") if c.strip()]
-                if len(choices) < 2:
-                    raise ValueError(f"参数 {key} 取值非法：{rhs!r}")
-                specs.append(ParamSpec(key, key, "select", choices[0],
-                                       choices=choices))
-        if not specs:
-            raise ValueError("至少定义一个寻优参数，如 a=0..5")
-        return ParamSpace(specs), mapping
+        from ..opt.paramgrammar import parse_space
+        return parse_space(text)
 
     def _make_objective(self):
-        kind = self._obj_kind.currentText()
-        if kind.startswith("合成"):
+        key = self._combo_key(self._obj_kind)     # M7：按稳定 key 分支
+        if key == "synth":
             return make_objective_from_synth(self._synth.currentText())
-        if kind.startswith("ML"):
+        if key == "ml":
             from ..opt.bridges import AutoTunerObjective
             return AutoTunerObjective(
                 self._ml_method.currentText(), self._current_source(),
@@ -674,19 +653,9 @@ class OptWorkbench(QWidget):
 
     @staticmethod
     def _parse_constraints(text: str):
-        """"S_ret>=0.99, kick_m05>0.5" -> [{"field","op","value"}, ...]。"""
-        import re
-        out = []
-        for tok in (text or "").split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            m = re.match(r"^([\w.]+)\s*(>=|<=|>|<|==)\s*(-?[\d.eE+-]+)$", tok)
-            if not m:
-                raise ValueError(f"约束无法解析：{tok!r}（期望 字段>=数值）")
-            out.append({"field": m.group(1), "op": m.group(2),
-                        "value": float(m.group(3))})
-        return out
+        """薄转发：约束文法已下沉 opt/paramgrammar（M8/C6）。"""
+        from ..opt.paramgrammar import parse_constraints
+        return parse_constraints(text)
 
     def _launch_next(self):
         if not self._queue:
@@ -701,7 +670,7 @@ class OptWorkbench(QWidget):
             self._reset_buttons()
             return
         optimizer = opt_registry.get(name)
-        self._cur_opt = optimizer
+        self._opt_instances[name] = optimizer       # 按名存，代理页按记录取（M6）
         budget = Budget(n_evals=int(self._n_evals.text() or 40),
                         stall=int(self._stall.text() or 0))
         cfg = self._collect_opt_cfg(name)
@@ -828,8 +797,11 @@ class OptWorkbench(QWidget):
             pass
 
     def _refresh_surrogate(self, record):
-        o = self._cur_opt
-        if o is None or not hasattr(o, "surrogate_1d") or o._gpr is None:
+        # 绑定"当前展示记录"对应的优化器（M6：跑完 A 再跑 B，看 A 时代理页
+        # 不再串成 B 的 GP）；只问公开能力 supports_surrogate，不读私有 _gpr。
+        o = self._opt_instances.get(record.optimizer)
+        if o is None or not getattr(o, "supports_surrogate", False) \
+                or not hasattr(o, "surrogate_1d"):
             self.canvas_sur.draw_result(
                 lambda ax, _r: ax.text(0.5, 0.5,
                     "代理切片仅 GP-BO 可用（且需 ≥1 次预热后）",
@@ -841,7 +813,7 @@ class OptWorkbench(QWidget):
         best = record.best or {}
         other = {k: best.get(k) for k in keys if k != keys[0] and best.get(k) is not None}
         out = o.surrogate_1d(keys[0], other)
-        if out is None:
+        if out is None:                       # GP 未拟合（预热不足）
             return
         xs, mu, sd = out
         ok = record.history[record.history["status"] == "ok"]

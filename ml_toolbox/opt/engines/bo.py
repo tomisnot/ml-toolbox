@@ -29,6 +29,7 @@ class GPBO(Optimizer):
     display_name = "贝叶斯优化 GP"
     family = "bo"
     tags = ("sample-efficient", "surrogate", "expensive")
+    supports_surrogate = True        # UI 代理切片页据此显示（不问私有字段）
     param_schema = [
         ParamSpec("acq", "采集函数", "select", "ei",
                   choices=["ei", "ucb", "pi"],

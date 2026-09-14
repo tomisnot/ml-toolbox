@@ -258,8 +258,9 @@ class Optimizer(abc.ABC):
     display_name: ClassVar[str] = ""
     family: ClassVar[str] = ""           # baseline | bo | evo | schedule | local
     tags: ClassVar[tuple] = ()
-    batch: ClassVar[bool] = False        # True = 一代多点（并行评估友好）
+    batch: ClassVar[bool] = False        # 一代多点（并行评估友好）
     multi_objective: ClassVar[bool] = False
+    supports_surrogate: ClassVar[bool] = False   # 有代理切片可画（GP-BO=True）
     param_schema: ClassVar[list] = []    # 优化器自身超参——复用 ParamSpec！
 
     def __init__(self):
