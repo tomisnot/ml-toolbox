@@ -184,18 +184,19 @@ def capture_opt(win):
         r1 = optimize(obj, gp, Budget(n_evals=25), cfg={"n_init": 6}, seed=7)
         r2 = optimize(obj, oreg.get("random_search"), Budget(n_evals=25),
                       seed=7)
-        wb._cur_opt = gp
+        wb._opt_instances = {"gp_bo": gp}   # C4-1：代理页按 record.optimizer 取实例
         wb._records = {"gp_bo": r1, "random_search": r2}
         wb._refresh_live(r1)
         wb._refresh_compare()
         app.processEvents()
-        for i in range(wb.tabs.count()):
-            wb.tabs.setCurrentIndex(i)
+        tabs = wb.inspector.tabs            # C4-1：检视页改由声明式装配器持有
+        for i in range(tabs.count()):
+            tabs.setCurrentIndex(i)
             app.processEvents()
-            for c in wb.tabs.currentWidget().findChildren(MplCanvas):
+            for c in tabs.currentWidget().findChildren(MplCanvas):
                 c.draw()
             app.processEvents()
-            shots.append((f"opt_page_{i}", wb.tabs.currentWidget().grab()))
+            shots.append((f"opt_page_{i}", tabs.currentWidget().grab()))
         shots.append(("opt_full", win.grab()))
         # 多目标 Pareto 页
         from ml_toolbox.opt.synth import make_objective_multi
@@ -205,12 +206,15 @@ def capture_opt(win):
         wb._records = {"nsga_ii": mrec}
         wb._refresh_live(mrec)
         app.processEvents()
-        wb.tabs.setCurrentIndex(3)               # Pareto 页
-        app.processEvents()
-        for c in wb.tabs.currentWidget().findChildren(MplCanvas):
-            c.draw()
-        app.processEvents()
-        shots.append(("opt_pareto", wb.tabs.currentWidget().grab()))
+        pi = [i for i, p in enumerate(wb.inspector._pages)
+              if p.spec.key == "pareto"]
+        if pi:
+            wb.inspector.tabs.setCurrentIndex(pi[0])   # 按 key 定位（页序声明化）
+            app.processEvents()
+            for c in wb.inspector.tabs.currentWidget().findChildren(MplCanvas):
+                c.draw()
+            app.processEvents()
+            shots.append(("opt_pareto", wb.inspector.tabs.currentWidget().grab()))
     except Exception as e:
         print(f"优化工作区截图跳过: {e}")
     return shots
