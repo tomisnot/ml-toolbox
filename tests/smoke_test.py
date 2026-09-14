@@ -60,7 +60,15 @@ def check(name, ds, task_filter, cfg=None):
     spec = pipe.run(ds)
     methods = [m for m in registry.all_methods() if m.task == task_filter
                and m.can_handle(spec)]
+    # 环境豁免（C5）：受限环境（沙箱/CI）某些方法因并行核探测不可用，
+    # MLTB_SKIP_METHODS=umap,lightgbm 把它们移出并计 SKIP（不记失败）。
+    from ml_toolbox.core.parallel import skip_methods
+    skip = skip_methods()
+    skipped = [m.name for m in methods if m.name in skip]
+    methods = [m for m in methods if m.name not in skip]
     print(f"\n=== {name} | {len(methods)} 方法 | task={task_filter} ===")
+    if skipped:
+        print(f"  SKIP（MLTB_SKIP_METHODS）：{', '.join(skipped)}")
     recs = runner.run_batch([m.name for m in methods], spec, cfg)
     table = runner.compare_table(recs)
     fails = [r.method for r in recs if not r.result.ok]

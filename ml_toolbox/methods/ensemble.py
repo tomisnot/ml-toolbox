@@ -10,11 +10,11 @@ try:
 except Exception:            # 未安装/环境异常时降级，LightGBM 方法运行时才报错
     _lgb = None
 
-# ⚠ 元学习器（Voting/Stacking）外层 n_jobs 用 NJOBS（默认 1）：它们的成员
-# 模型本身已 n_jobs=-1 并行，外层再并行会嵌套超订，Windows OpenMP 线程池互相
-# 挤兑（曾致 stacking 偶发 access violation）。要外层并行设 MLTB_NJOBS=-1。
-import os as _os
-NJOBS = int(_os.environ.get("MLTB_NJOBS", "1"))
+# ⚠ 并行度单一控制点 = core.parallel（M5/C5）：成员模型 n_jobs 走 nj()（默认 -1），
+# 元学习器（Voting/Stacking）外层走 meta_nj()（默认 1——成员已并行，外层再并行
+# 会嵌套超订，Windows OpenMP 线程池互相挤兑，曾致 stacking 偶发 access violation）。
+# 受限环境设 MLTB_NJOBS=off（全串行 + 钉 numba），见 core/parallel.py。
+from ..core.parallel import nj, meta_nj, restricted
 
 from ..core.contracts import ParamSpec
 from ..core.registry import register
@@ -40,7 +40,8 @@ class RandomForest(SklearnSupervised):
 
     def make(self, p, kind):
         from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-        kw = dict(n_estimators=int(p["n_estimators"]), random_state=42, n_jobs=-1,
+        kw = dict(n_estimators=int(p["n_estimators"]), random_state=42,
+                  n_jobs=nj(),
                   max_depth=int(p["max_depth"]) or None,
                   min_samples_leaf=int(p["min_samples_leaf"]))
         if kind == "classification" and p["class_weight"] != "none":
@@ -63,7 +64,8 @@ class ExtraTrees(SklearnSupervised):
 
     def make(self, p, kind):
         from sklearn.ensemble import ExtraTreesRegressor, ExtraTreesClassifier
-        kw = dict(n_estimators=int(p["n_estimators"]), random_state=42, n_jobs=-1,
+        kw = dict(n_estimators=int(p["n_estimators"]), random_state=42,
+                  n_jobs=nj(),
                   max_depth=int(p["max_depth"]) or None)
         return (ExtraTreesClassifier(**kw) if kind == "classification"
                 else ExtraTreesRegressor(**kw))
@@ -160,7 +162,7 @@ class XGBoost(SklearnSupervised):
                   subsample=float(p["subsample"]),
                   colsample_bytree=float(p["colsample_bytree"]),
                   reg_lambda=float(p["reg_lambda"]),
-                  random_state=42, n_jobs=-1, verbosity=0)
+                  random_state=42, n_jobs=nj(), verbosity=0)
         if kind == "classification":
             return xgb.XGBClassifier(**kw)
         return xgb.XGBRegressor(**kw)
@@ -188,7 +190,11 @@ class LightGBM(SklearnSupervised):
                   min_child_samples=int(p["min_child_samples"]),
                   random_state=42, verbose=-1)
         # 注意：LightGBM 的 OpenMP 多线程在 Windows 子线程（QThread）中
-        # 会触发 access violation，故不并行（sklearn/xgboost 无此问题）
+        # 会触发 access violation，故不并行（sklearn/xgboost 无此问题）。
+        # 例外：MLTB_NJOBS=off 的受限环境里，loky 的核数子进程探测本身就会
+        # PermissionError——此时显式 n_jobs=1 跳过 joblib 路径（C5）。
+        if restricted():
+            kw["n_jobs"] = 1
         if kind == "classification":
             return lgb.LGBMClassifier(**kw)
         return lgb.LGBMRegressor(**kw)
@@ -225,8 +231,8 @@ class Voting(SklearnSupervised):
         if len(ests) < 2:
             raise ValueError(f"有效成员不足 2 个（kind={kind}，成员={names}）")
         if kind == "classification":
-            return VotingClassifier(ests, voting=p["voting"], n_jobs=-1)
-        return VotingRegressor(ests, n_jobs=-1)
+            return VotingClassifier(ests, voting=p["voting"], n_jobs=meta_nj())
+        return VotingRegressor(ests, n_jobs=meta_nj())
 
 
 @register
@@ -263,7 +269,7 @@ class Stacking(SklearnSupervised):
         if kind == "classification":
             final = LogisticRegression(max_iter=1000, C=float(p["final_alpha"]))
             return StackingClassifier(ests, final_estimator=final, cv=4,
-                                      n_jobs=NJOBS)
+                                      n_jobs=meta_nj())
         final = Ridge(alpha=float(p["final_alpha"]))
         return StackingRegressor(ests, final_estimator=final, cv=4,
-                                 n_jobs=NJOBS)
+                                 n_jobs=meta_nj())

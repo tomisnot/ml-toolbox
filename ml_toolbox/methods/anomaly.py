@@ -7,6 +7,7 @@ import pandas as pd
 
 from ..core.contracts import (MLMethod, RunConfig, PageSpec, ParamSpec,
                               TASK_ANOMALY)
+from ..core.parallel import nj
 from ..core.registry import register
 from . import plots
 
@@ -86,7 +87,7 @@ class IsolationForest(AnomalyMethod):
         return IsolationForest(n_estimators=int(p["n_estimators"]),
                                contamination=float(p["contamination"]),
                                max_samples=float(p["max_samples"]),
-                               random_state=42, n_jobs=-1)
+                               random_state=42, n_jobs=nj())
 
 
 @register

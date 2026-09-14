@@ -441,6 +441,34 @@ def test_autotune_restore_inverse():
     assert abs(obj.restore(0.42) - 0.42) < 1e-12
 
 
+# ---------------------------------------------------------------- C5：并行度契约化
+def test_parallel_njobs_contract():
+    """M5：MLTB_NJOBS 三态统一控制并行度（成员/元学习器语义分离）。"""
+    import os as _os
+    from ml_toolbox.core import parallel
+    saved = _os.environ.get("MLTB_NJOBS")
+    try:
+        _os.environ.pop("MLTB_NJOBS", None)
+        assert parallel.nj() == -1 and parallel.nj(1) == 1   # 未设 -> 调用点默认
+        assert parallel.meta_nj() == 1                        # 外层默认 1（L18）
+        assert not parallel.restricted()
+        _os.environ["MLTB_NJOBS"] = "off"
+        assert parallel.nj() == 1 and parallel.meta_nj() == 1
+        assert parallel.restricted()
+        _os.environ["MLTB_NJOBS"] = "auto"
+        assert parallel.nj() == -1
+        assert parallel.meta_nj() == 1                        # auto 不放行外层
+        _os.environ["MLTB_NJOBS"] = "4"
+        assert parallel.nj() == 4 and parallel.meta_nj() == 4
+        _os.environ["MLTB_NJOBS"] = "-1"                     # 显式 -1 才放行外层
+        assert parallel.meta_nj() == -1
+    finally:
+        if saved is None:
+            _os.environ.pop("MLTB_NJOBS", None)
+        else:
+            _os.environ["MLTB_NJOBS"] = saved
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

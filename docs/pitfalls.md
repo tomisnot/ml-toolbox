@@ -120,8 +120,8 @@
 - **症状**：smoke 遍历里 stacking 偶发失败（重跑即过），无稳定 traceback。
 - **原因**：Voting/Stacking 外层 `n_jobs=-1` × 成员模型（RF/XGB）`n_jobs=-1`
   = 嵌套超订，Windows OpenMP 线程池互相挤兑。
-- **修法**：元学习器外层用 `NJOBS`（默认 1，成员已并行），
-  外层并行需显式设 `MLTB_NJOBS=-1`。
+- **修法**：元学习器外层用 `core.parallel.meta_nj()`（默认 1，成员已并行），
+  外层并行需显式设 `MLTB_NJOBS=-1`。另一半见 L20（受限环境并行度不可控）。
 
 ### L19. est.classes_ 不是原始标签
 - **症状**：新实例 predict 返回 0/1/2 而非原始字符串标签。
@@ -130,6 +130,18 @@
 - **修法**：`result.classes_ = self._le.classes_`（fit 时随 result 携带）。
   注意每个自实现 predict 的方法族都要走这条约定（TorchMLP 曾漏，
   已补 `test_neural_fresh_predict_string_labels`）。
+
+### L20. 受限环境下 `n_jobs=-1` 触发 joblib/loky 子进程探测 → 整批方法失败
+- **症状**：沙箱/受限 CI 里 `PermissionError: [WinError 5]`（random_forest、
+  extra_trees、hist_gb、voting、stacking、iforest 等成片失败）；`umap` 直接
+  卡死（进程活着、CPU 不涨）。
+- **原因**：sklearn/umap 的并行后端用 `subprocess` 探测物理核数，禁止子进程的
+  环境里被拒；loky worker 反复重启表现为挂起。此前并行度硬编码在各方法里，
+  外部无法统一降级（= 架构审视 M5）。
+- **修法**：并行度收编到 `core.parallel`（C5）——`MLTB_NJOBS=off` 时成员模型
+  走 `nj()`=1、LightGBM 显式 `n_jobs=1` 跳过 joblib、numba 线程 import 即钉 1；
+  测试侧 `MLTB_SKIP_METHODS=umap,...` 按环境豁免（记 SKIP 不记失败）。
+  验证：`MLTB_NJOBS=off python tests/smoke_test.py` 全绿。
 
 ## 神经网络（方案 C）
 

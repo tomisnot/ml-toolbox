@@ -19,6 +19,11 @@ def register(cls: type[MLMethod]) -> type[MLMethod]:
 def get(name: str) -> MLMethod:
     cls = _REGISTRY.get(name)
     if cls is None:
+        if not _REGISTRY:
+            raise KeyError(
+                f"注册表为空——未注册的方法: {name}。"
+                "请先调用 ml_toolbox.core.registry.load_builtin() 载入内置方法族"
+                "（UI/runner 入口已自动调用；纯后端引用时需显式调用一次）")
         raise KeyError(f"未注册的方法: {name}（可用: {sorted(_REGISTRY)}）")
     return cls()
 
