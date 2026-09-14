@@ -536,7 +536,9 @@ class TargetDialog(QDialog):
         self._c.addItems(["（无）"] + list(columns))
         form2.addWidget(self._c, 1)
         lay.addLayout(form2)
-        lay.addWidget(QLabel("提示：数值且类别数 >20 视为回归，否则分类。"))
+        from ..core.contracts import REGRESSION_CARDINALITY
+        lay.addWidget(QLabel(f"提示：数值且类别数 >{REGRESSION_CARDINALITY} "
+                             "视为回归，否则分类。"))
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)

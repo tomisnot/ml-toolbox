@@ -383,6 +383,64 @@ def test_neural_persistence_nested():
         list(rec.result.artifacts["nn_layers"].columns)
 
 
+# ---------------------------------------------------------------- C1：方向/任务判定单一来源
+def test_metric_direction_single_source():
+    """M1：指标方向收编为 core.contracts.is_lower_better，三处消费者一致。"""
+    from ml_toolbox.core.contracts import is_lower_better, LOWER_IS_BETTER
+    # silhouette_deficit 曾被 gallery 漏掉（分叉点），现必须为越低越好
+    assert is_lower_better("silhouette_deficit")
+    for m in ("rmse", "mae", "mape"):
+        assert is_lower_better(m), m
+    for m in ("f1", "r2", "accuracy", "score"):
+        assert not is_lower_better(m), m
+    assert isinstance(LOWER_IS_BETTER, frozenset)
+    # 三处消费者确实改用同一函数（读源码文本，不 import UI 以保持核心门无 Qt）
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+
+    def _src(*p):
+        with open(_os.path.join(root, *p), encoding="utf-8") as f:
+            return f.read()
+
+    assert "is_lower_better" in _src("ml_toolbox", "core", "runner.py")
+    assert "is_lower_better" in _src("ml_toolbox", "ui", "gallery.py")
+    br = _src("ml_toolbox", "opt", "bridges.py")
+    assert "_LOWER_BETTER" not in br and "is_lower_better" in br
+
+
+def test_infer_kind_single_source():
+    """M10：任务判定收编为 core.contracts.infer_kind，dataset/pipeline 共用。"""
+    from ml_toolbox.core.contracts import (infer_kind, REGRESSION_CARDINALITY)
+    assert infer_kind(None) is None
+    # 基数 > 阈值 的数值列 -> 回归
+    yr = pd.Series(np.arange(REGRESSION_CARDINALITY + 5, dtype=float))
+    assert infer_kind(yr) == "regression"
+    # 低基数数值列 / 字符串列 -> 分类
+    yc = pd.Series([0, 1, 0, 1] * 3)
+    assert infer_kind(yc) == "classification"
+    ys = pd.Series(["a", "b", "c"] * 10)
+    assert infer_kind(ys) == "classification"
+    # pipeline 的 _infer_kind 是同一对象（别名，非第二份实现）
+    from ml_toolbox.core import pipeline
+    assert pipeline._infer_kind is infer_kind
+
+
+def test_autotune_restore_inverse():
+    """M2：AutoTunerObjective.restore 是 evaluate 方向的精确逆（替 to_maximize）。"""
+    from ml_toolbox.opt.bridges import AutoTunerObjective
+    from sklearn.datasets import make_classification
+    X, y = make_classification(60, 5, n_informative=3, n_redundant=1,
+                               random_state=0)
+    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(5)])
+    obj = AutoTunerObjective("logistic", X, pd.Series(y), cv_folds=2)
+    # f1 越大越好 -> evaluate 取负（最小化方向），restore 应还原为正
+    raw = 0.83
+    assert abs(obj.restore(-raw) - raw) < 1e-12
+    # 越低越好的指标（rmse）方向不翻
+    obj._metric = "rmse"
+    assert abs(obj.restore(0.42) - 0.42) < 1e-12
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

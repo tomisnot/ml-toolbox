@@ -15,8 +15,12 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .contracts import DataSpec
+from .contracts import DataSpec, infer_kind
 from .dataset import Dataset
+
+# 任务判定的唯一实现在 contracts.infer_kind（M10）；此处保留别名供
+# methods/* 既有 import 路径使用，避免每个方法族各存一份判定逻辑。
+_infer_kind = infer_kind
 
 
 # ---------------------------------------------------------------- 步骤基类
@@ -189,7 +193,7 @@ class FeatureSelectStep(Step):
         kind = self.params.get("score", "mi")
         X = df[num]
         y = df[target]
-        is_reg = pd.api.types.is_numeric_dtype(y) and y.nunique() > 20
+        is_reg = infer_kind(y) == "regression"
         if kind == "mi":
             fn = mutual_info_regression if is_reg else mutual_info_classif
             scores = fn(X.values, y.values,
@@ -313,11 +317,3 @@ class Pipeline:
                           + [self.test_size, self.stratify, self.time_split],
                           sort_keys=True, default=str)
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
-
-
-def _infer_kind(y) -> Optional[str]:
-    if y is None:
-        return None
-    if pd.api.types.is_numeric_dtype(y) and y.nunique() > 20:
-        return "regression"
-    return "classification"

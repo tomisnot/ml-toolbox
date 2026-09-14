@@ -80,12 +80,8 @@ class Dataset:
     def _target_kind(self) -> Optional[str]:
         if not self.target or self.target not in df_cols(self.frame):
             return None
-        s = self.frame[self.target]
-        if pd.api.types.is_numeric_dtype(s) and s.nunique() > 20:
-            return "regression"
-        if pd.api.types.is_numeric_dtype(s) and s.nunique() <= 20:
-            return "classification"
-        return "classification"
+        from .contracts import infer_kind    # 任务判定单一来源（M10）
+        return infer_kind(self.frame[self.target])
 
 
 def df_cols(frame) -> list:

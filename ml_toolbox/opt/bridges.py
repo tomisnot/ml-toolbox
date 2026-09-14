@@ -16,11 +16,7 @@ import numpy as np
 
 from .contracts import Objective, ParamSpace
 from ..core import registry as ml_registry
-from ..core.contracts import RunConfig
-
-
-# 越小越好的主指标（直接最小化）；其余指标取负
-_LOWER_BETTER = {"rmse", "mae", "mape", "silhouette_deficit"}
+from ..core.contracts import RunConfig, is_lower_better
 
 
 def method_param_space(method_name: str,
@@ -101,12 +97,11 @@ class AutoTunerObjective(Objective):
         if not np.isfinite(score):
             return float("inf")
         # 统一最小化：越大越好的指标取负
-        return score if self._metric in _LOWER_BETTER else -score
+        return score if is_lower_better(self._metric) else -score
 
-    def to_maximize(self, score_min):
-        """把最小化分数还原成原始指标值（展示用）。"""
-        return (-score_min if self._metric in _LOWER_BETTER else score_min) \
-            if self._metric not in _LOWER_BETTER else score_min
+    def restore(self, score_min):
+        """统一最小化分数 -> 原始指标值（展示/验收用；与 evaluate 互逆）。"""
+        return score_min if is_lower_better(self._metric) else -score_min
 
 
 def autotune(objective_or_name, X=None, y=None, optimizer=None,
@@ -128,10 +123,8 @@ def autotune(objective_or_name, X=None, y=None, optimizer=None,
     opt = optimizer or opt_registry.get("gp_bo")
     rec = optimize(obj, opt, budget, cfg=cfg, seed=seed)
     best_val = None
-    if rec.best:
-        bv = rec.best["score"]
-        lower = getattr(obj, "_metric", "score") in _LOWER_BETTER
-        best_val = bv if lower else -bv
+    if rec.best and hasattr(obj, "restore"):
+        best_val = obj.restore(rec.best["score"])
     return rec, (rec.best or {}), best_val
 
 

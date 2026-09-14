@@ -102,7 +102,8 @@ class CompareGallery(QWidget):
             v = r.result.metrics.get(r.result.primary_metric)
             return v if isinstance(v, (int, float)) and not np.isnan(v) \
                 else float("inf")
-        asc = ok[0][1].result.primary_metric in ("rmse", "mae", "mape") \
+        from ..core.contracts import is_lower_better
+        asc = is_lower_better(ok[0][1].result.primary_metric) \
             if ok else True
         ok.sort(key=_key, reverse=not asc)
         for n, (idx, r) in enumerate(ok):

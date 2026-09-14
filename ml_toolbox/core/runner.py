@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .contracts import (MLResult, MLMethod, RunConfig, DataSpec,
+                        is_lower_better,
                         TASK_SUPERVISED, TASK_CLUSTER, TASK_MANIFOLD,
                         TASK_ANOMALY, TASK_TIMESERIES)
 from . import registry
@@ -134,7 +135,7 @@ def compare_table(records: list[RunRecord]) -> pd.DataFrame:
         if not ok.empty:
             pm = ok["primary"].iloc[0]
             if pm in ok:
-                asc = pm in ("rmse", "mae", "mape", "silhouette_deficit")
+                asc = is_lower_better(pm)
                 df = pd.concat([ok.sort_values(pm, ascending=asc),
                                 df[~df["ok"]]], ignore_index=True)
     return df

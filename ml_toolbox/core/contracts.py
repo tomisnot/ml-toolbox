@@ -104,6 +104,35 @@ def derive_purposes(task: str, target_kind: Optional[str],
     return tuple(ordered)
 
 
+# ---------------------------------------------------------------- 指标方向
+# "越小越好"的指标集——单一事实来源（M1：曾三处各写一份且已分叉）。
+# 新增越低越好的指标只改这里，core.runner / ui.gallery / opt.bridges 全部跟随。
+LOWER_IS_BETTER = frozenset({"rmse", "mae", "mape", "silhouette_deficit"})
+
+
+def is_lower_better(metric: str) -> bool:
+    """该指标是否越小越好（决定对比表/画廊的排序方向、调参的统一最小化）。"""
+    return metric in LOWER_IS_BETTER
+
+
+# ---------------------------------------------------------------- 任务判定
+# 数值且唯一值 > 该阈值 -> 回归，否则分类（M10：曾三处独立实现 + UI 抄文案）。
+REGRESSION_CARDINALITY = 20
+
+
+def infer_kind(y) -> Optional[str]:
+    """从目标列推断回归/分类（唯一的任务判定入口）。
+
+    None -> None；非数值 -> classification；数值且基数 > REGRESSION_CARDINALITY
+    -> regression。pipeline / dataset / methods 一律调用此函数。
+    """
+    if y is None:
+        return None
+    if pd.api.types.is_numeric_dtype(y) and y.nunique() > REGRESSION_CARDINALITY:
+        return "regression"
+    return "classification"
+
+
 # ---------------------------------------------------------------- 数据视图
 @dataclass
 class DataSpec:
