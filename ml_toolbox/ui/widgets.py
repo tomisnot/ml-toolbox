@@ -36,7 +36,7 @@ class MplCanvas(FigureCanvas):
         except Exception as e:
             ax.clear()
             ax.text(0.5, 0.5, f"绘图失败: {e}", ha="center", va="center",
-                    color="firebrick", fontsize=9)
+                    color="firebrick", fontsize=18)
         self.draw_idle()
 
 
@@ -49,7 +49,7 @@ class Placeholder(QWidget):
         lab = QLabel(text)
         lab.setWordWrap(True)
         lab.setAlignment(Qt.AlignCenter)
-        lab.setStyleSheet("color:#888; font-size:12px; padding:24px;")
+        lab.setObjectName("placeholder")      # 主题定义见 theme.QSS
         lay.addWidget(lab)
 
 
@@ -87,11 +87,11 @@ class PGScatter(QWidget):
                                         brush=pg.mkBrush(palette[k % 10]),
                                         pen=None, name=str(v))
                 p.addItem(si)
-            p.addLegend(labelTextSize="8pt")
+            p.addLegend(labelTextSize="16pt")
         else:
             p.addItem(pg.ScatterPlotItem(x=x, y=y, size=6,
                                          brush=pg.mkBrush("#1f77b4"), pen=None))
         btn = QPushButton("⟲ 还原视图")
-        btn.setFixedWidth(110)
+        btn.setFixedWidth(220)
         btn.clicked.connect(lambda: p.getViewBox().autoRange())
         lay.addWidget(btn, 0, Qt.AlignLeft)

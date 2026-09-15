@@ -44,7 +44,7 @@ for _fn in ("msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"):
         _fid = QFontDatabase.addApplicationFont(_p)
         _fams = QFontDatabase.applicationFontFamilies(_fid)
         if _fams:
-            app.setFont(QFont(_fams[0], 10))
+            app.setFont(QFont(_fams[0], 20))
             print("UI 字体:", _fams[0])
             break
 

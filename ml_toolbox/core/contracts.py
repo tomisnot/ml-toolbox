@@ -105,6 +105,10 @@ def derive_purposes(task: str, target_kind: Optional[str],
 
 
 # ---------------------------------------------------------------- 指标方向
+# 全局文字缩放因子：UI 样式（ui.theme.css/pt）与所有绘图（matplotlib fontsize、
+# pyqtgraph fontScale）统一乘它；改这一处即可整体调大小。
+FONT_SCALE = 2
+
 # "越小越好"的指标集——单一事实来源（M1：曾三处各写一份且已分叉）。
 # 新增越低越好的指标只改这里，core.runner / ui.gallery / opt.bridges 全部跟随。
 LOWER_IS_BETTER = frozenset({"rmse", "mae", "mape", "silhouette_deficit"})

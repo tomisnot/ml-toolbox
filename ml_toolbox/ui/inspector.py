@@ -45,7 +45,7 @@ class InspectPage(QWidget):
 
         head = QHBoxLayout()
         title = QLabel(pagespec.title)
-        title.setStyleSheet("font-size:15px; font-weight:bold;")
+        title.setObjectName("pageHead")      # 主题定义见 theme.QSS
         head.addWidget(title)
         head.addStretch(1)
         btn_png = QPushButton("导出图")
@@ -53,7 +53,7 @@ class InspectPage(QWidget):
         btn_npz = QPushButton("导出数据")
         btn_npz.clicked.connect(self._export_npz)
         for b in (btn_png, btn_npz):
-            b.setStyleSheet("font-size:11px;")
+            b.setObjectName("mini")
             head.addWidget(b)
         lay.addLayout(head)
 
@@ -217,6 +217,7 @@ class MethodInspector(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("barePane")
         self.tabs.setDocumentMode(True)
         lay.addWidget(self.tabs)
         self._pages: list[InspectPage] = []

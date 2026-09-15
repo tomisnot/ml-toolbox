@@ -37,23 +37,23 @@ class StepCard(QFrame):
         prefix = "" if is_profile else f"步骤 {idx + 1} · "
         title = QLabel(prefix + step_desc.get("title", "?")
                        + ("（已跳过）" if skipped else ""))
-        title.setStyleSheet(f"font-weight:bold; font-size:13px; color:{color};")
+        title.setStyleSheet(f"font-weight:bold; font-size:26px; color:{color};")
         left.addWidget(title)
         kv = summary or {}
         detail = QLabel("   ".join(
             f"{k}: {v}" for k, v in kv.items() if k not in ("big_num", "diag")))
         detail.setWordWrap(True)
-        detail.setStyleSheet("font-size:11px; color:#555;")
+        detail.setObjectName("muted")
         left.addWidget(detail)
         params = step_desc.get("params") or {}
         if params:
             pl = QLabel("参数: " + ", ".join(f"{k}={v}" for k, v in params.items()))
-            pl.setStyleSheet("font-size:10px; color:#999;")
+            pl.setObjectName("faint")
             left.addWidget(pl)
         lay.addLayout(left, 1)
 
         big = QLabel(str(kv.get("big_num", "")))
-        big.setStyleSheet(f"font-size:19px; font-weight:bold; color:{color};")
+        big.setStyleSheet(f"font-size:38px; font-weight:bold; color:{color};")
         big.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lay.addWidget(big)
 

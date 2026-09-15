@@ -24,7 +24,7 @@ def plot_nn_dynamics(ax, result):
     if np.isfinite(h["val_loss"]).any():
         ax.plot(epochs, h["val_loss"], "r--", label="val loss", lw=1.4)
     ax.set_xlabel("epoch"); ax.set_ylabel("loss")
-    ax.legend(fontsize=7, loc="upper right")
+    ax.legend(fontsize=14, loc="upper right")
     ax.grid(alpha=0.25)
     # 副轴：lr + grad_norm
     ax2 = ax.twinx()
@@ -32,7 +32,7 @@ def plot_nn_dynamics(ax, result):
     ax2.plot(epochs, h["grad_norm"], "m:", label="grad norm", lw=1)
     ax2.set_yscale("log")
     ax2.set_ylabel("lr / grad norm (log)")
-    ax2.legend(fontsize=7, loc="lower right")
+    ax2.legend(fontsize=14, loc="lower right")
     ax.set_title("训练动态")
 
 
@@ -52,7 +52,7 @@ def plot_feature_attribution(ax, result):
     ax.barh(range(len(idx)), mean[idx], color=colors)
     ax.set_yticks(range(len(idx)))
     ax.set_yticklabels([str(names[i])[:22] if names is not None
-                        else f"f{i}" for i in idx], fontsize=7)
+                        else f"f{i}" for i in idx], fontsize=14)
     ax.axvline(0, color="k", lw=0.8)
     ax.set_xlabel("平均积分梯度归因（红=推高预测 蓝=压低）")
     ax.set_title("特征归因（Top 20，%d 个探针样本平均）" % len(attr))

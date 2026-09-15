@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
+from PyQt5.QtWidgets import (QFrame, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
                              QLineEdit, QLabel, QHBoxLayout, QPushButton,
                              QComboBox)
 
@@ -11,7 +11,7 @@ from ..core import registry
 from ..core.contracts import MLMethod, PURPOSE_LABELS
 
 
-class MethodBrowser(QWidget):
+class MethodBrowser(QFrame):
     """左栏：搜索 + 分组树。勾选方法 -> selection_changed(names)。"""
 
     selection_changed = pyqtSignal(list)
@@ -19,12 +19,13 @@ class MethodBrowser(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("card")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(6)
 
         head = QLabel("方法库")
-        head.setStyleSheet("font-size:14px; font-weight:bold;")
+        head.setObjectName("cardTitle")
         lay.addWidget(head)
 
         self._search = QLineEdit()
@@ -57,7 +58,7 @@ class MethodBrowser(QWidget):
         lay.addWidget(self._tree, 1)
 
         self._count = QLabel("")
-        self._count.setStyleSheet("font-size:11px; color:#777;")
+        self._count.setObjectName("muted")
         lay.addWidget(self._count)
 
         self._build()

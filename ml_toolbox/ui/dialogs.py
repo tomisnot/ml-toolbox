@@ -78,7 +78,7 @@ class PipelineDialog(QDialog):
         form = QHBoxLayout()
         form.addWidget(QLabel("test_size"))
         self._ts = QLineEdit(str(self._pipe.test_size))
-        self._ts.setFixedWidth(60)
+        self._ts.setFixedWidth(120)
         form.addWidget(self._ts)
         self._time = QCheckBox("按时间顺序切分（时序）")
         self._time.setChecked(self._pipe.time_split)

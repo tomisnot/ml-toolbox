@@ -20,7 +20,7 @@ def plot_fit_1d(ax, result):
     lo, hi = yt.min(), yt.max()
     ax.plot([lo, hi], [lo, hi], "k--", lw=0.8, alpha=0.5, label="理想 y=x")
     ax.set_xlabel("真实值"); ax.set_ylabel("预测值")
-    ax.legend(fontsize=8); ax.grid(alpha=0.25)
+    ax.legend(fontsize=16); ax.grid(alpha=0.25)
 
 
 def plot_residual(ax, result):
@@ -33,7 +33,7 @@ def plot_residual(ax, result):
     if sd > 0:
         ax.axhspan(-sd, sd, color="tab:orange", alpha=0.12, label="±1σ")
     ax.set_xlabel("预测值"); ax.set_ylabel("残差")
-    ax.legend(fontsize=8); ax.grid(alpha=0.25)
+    ax.legend(fontsize=16); ax.grid(alpha=0.25)
 
 
 def plot_importance(ax, result):
@@ -44,7 +44,7 @@ def plot_importance(ax, result):
     top = s.tail(20)
     ax.barh(range(len(top)), top.values, color="tab:green", alpha=0.8)
     ax.set_yticks(range(len(top)))
-    ax.set_yticklabels([str(i)[:28] for i in top.index], fontsize=7)
+    ax.set_yticklabels([str(i)[:28] for i in top.index], fontsize=14)
     ax.set_xlabel("importance"); ax.grid(alpha=0.25, axis="x")
 
 
@@ -58,12 +58,12 @@ def plot_confusion(ax, result):
     im = ax.imshow(cm, cmap="Blues")
     ax.set_xticks(range(len(labels)))
     ax.set_yticks(range(len(labels)))
-    ax.set_xticklabels([str(l)[:10] for l in labels], fontsize=7)
-    ax.set_yticklabels([str(l)[:10] for l in labels], fontsize=7)
+    ax.set_xticklabels([str(l)[:10] for l in labels], fontsize=14)
+    ax.set_yticklabels([str(l)[:10] for l in labels], fontsize=14)
     thresh = cm.max() / 2
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=7,
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=14,
                     color="white" if cm[i, j] > thresh else "black")
     ax.set_xlabel("预测"); ax.set_ylabel("真实")
 
@@ -90,7 +90,7 @@ def plot_roc(ax, result):
         return
     ax.plot([0, 1], [0, 1], "k--", lw=0.7, alpha=0.5)
     ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
-    ax.legend(fontsize=7); ax.grid(alpha=0.25)
+    ax.legend(fontsize=14); ax.grid(alpha=0.25)
 
 
 def plot_pr(ax, result):
@@ -108,7 +108,7 @@ def plot_pr(ax, result):
         ax.plot(rec, prec, lw=1.4,
                 label=f"AP={average_precision_score(yt, p):.3f}")
     ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
-    ax.legend(fontsize=7); ax.grid(alpha=0.25)
+    ax.legend(fontsize=14); ax.grid(alpha=0.25)
 
 
 # ---------------------------------------------------------------- 无监督
@@ -158,12 +158,12 @@ def plot_silhouette(ax, result):
         vals = np.sort(s_vals[labels == i])
         y_upper = y_lower + len(vals)
         ax.fill_betweenx(np.arange(y_lower, y_upper), 0, vals, alpha=0.7)
-        ax.text(-0.05, y_lower + 0.5 * len(vals), str(i), fontsize=7)
+        ax.text(-0.05, y_lower + 0.5 * len(vals), str(i), fontsize=14)
         y_lower = y_upper + 10
     ax.axvline(silhouette_score(np.asarray(X, float), labels),
                color="red", ls="--", lw=1, label="均值")
     ax.set_xlabel("silhouette value"); ax.set_ylabel("cluster")
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=14)
 
 
 def plot_explained_variance(ax, result):
@@ -175,7 +175,7 @@ def plot_explained_variance(ax, result):
     ax.plot(range(1, len(evr) + 1), np.cumsum(evr), "o-", color="k", lw=1,
             ms=3, label="累计")
     ax.set_xlabel("component"); ax.set_ylabel("variance ratio")
-    ax.legend(fontsize=7); ax.grid(alpha=0.25, axis="y")
+    ax.legend(fontsize=14); ax.grid(alpha=0.25, axis="y")
 
 
 def plot_anomaly_score(ax, result):
@@ -189,7 +189,7 @@ def plot_anomaly_score(ax, result):
     thr = a.get("threshold")
     if thr is not None:
         ax.axvline(float(thr), color="k", ls="--", lw=1, label=f"阈值={float(thr):.3f}")
-    ax.set_xlabel("anomaly score"); ax.legend(fontsize=7); ax.grid(alpha=0.25)
+    ax.set_xlabel("anomaly score"); ax.legend(fontsize=14); ax.grid(alpha=0.25)
 
 
 # ---------------------------------------------------------------- 时序
@@ -206,7 +206,7 @@ def plot_forecast(ax, result):
         ax.fill_between(t, f - ci, f + ci, color="tab:red", alpha=0.12,
                         label="95% 区间")
     ax.set_xlabel("t"); ax.set_ylabel("y")
-    ax.legend(fontsize=7); ax.grid(alpha=0.25)
+    ax.legend(fontsize=14); ax.grid(alpha=0.25)
 
 
 def plot_ts_residual(ax, result):

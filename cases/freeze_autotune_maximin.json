@@ -1,0 +1,41 @@
+{
+  "kind": "ml_toolbox.opt.workspace",
+  "version": 1,
+  "objective_kind": "外部程序（黑盒进程）",
+  "synth": "ackley",
+  "ml_method": "ridge",
+  "ml_cv": "3",
+  "source_kind": "ML 内部数据集",
+  "source_path": "",
+  "source_target": "target",
+  "proc": {
+    "mode": 1,
+    "params": "freq_mhz=7321..7345, intensity=0.57..0.87, alpha_deg=1..17, theta_deg=0..20, eps_deg=-24..0",
+    "cmd": "python scripts\\freeze_blackbox.py --points {points_file} --out {out_file} --fast --box 3 0.1",
+    "cwd": "D:\\学\\BaiduSyncdisk\\编程\\code\\python\\Energy Level",
+    "parse": "score[:=]\\s*(-?\\d+(?:\\.\\d+)?)",
+    "score_field": "C_dual_worst",
+    "maximize": true,
+    "constraints": "S_ret>=0.99",
+    "point_extra": "{\"fwhm_ns\": 40.0}",
+    "stagger": "4",
+    "timeout": "7200"
+  },
+  "budget": {
+    "n_evals": "40",
+    "stall": "0",
+    "seed": "42",
+    "workers": "8",
+    "warm_start": "",
+    "preflight_anchor": "freq_mhz=7335.7, intensity=0.72, alpha_deg=9.1, theta_deg=0, eps_deg=-12.3",
+    "preflight_expect": "",
+    "preflight_tol": "0.05"
+  },
+  "optimizers": ["tpe"],
+  "opt_cfg_owner": "tpe",
+  "optimizer_cfg": {
+    "tpe": {
+      "n_startup": 10
+    }
+  }
+}

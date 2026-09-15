@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """主窗口：两种对等工作模式（Perspective）——ML 方法试验台 / 优化调参。
 
-布局（简单模式原则：主界面只留必要控件，高级参数进语义位置面板）：
-  工具栏   [ML 方法试验台 | 优化调参] 模式切换 · 打开文件 / 演示数据 /
-           管道设置 / 历史 / 种子（ML 专属：对新数据预测 / 诊断 / 交叉验证）
-  ML 模式   左方法库 | 中（处理链|数据|对比|画廊|检视）| 右参数面板 + 遍历条
-  优化模式   OptWorkbench 全权接管（目标含合成/ML 调参/外部程序，数据源显式）
+UI 层次映射内部框架层次（重设计）：
+  顶栏      品牌 + 胶囊模式开关（兄弟框架的顶层状态切换）+ 数据工具
+            （打开/演示/管道/历史 共享；诊断/CV/种子/预测 ML 专属，按模式显隐）
+  ML 模式   左=方法库（注册表视图）| 中=阶段流导航 + 内容栈（数模工作流：
+            看数据→选模型→看细节→调参）| 右=参数面板（就地重跑）
+  优化模式   OptWorkbench 全权接管（四段流水线卡片 + 检视/历史）
 
 兄弟框架在 UI 上的语义：模式平级、共享数据工具栏；ML 专属控件按模式显隐。
 """
@@ -20,10 +21,9 @@ import pandas as pd
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                             QAction, QActionGroup, QFileDialog, QMessageBox,
-                            QComboBox, QLineEdit, QCheckBox, QLabel,
-                            QSplitter, QTabWidget, QStackedWidget,
-                            QTableWidget, QTableWidgetItem, QHeaderView,
-                            QPushButton, QApplication)
+                            QDialog, QComboBox, QLineEdit, QCheckBox, QLabel,
+                            QFrame, QSplitter, QStackedWidget,
+                            QTableWidget, QHeaderView, QPushButton, QApplication)
 
 from ..core import registry, runner, persistence
 from ..core.dataset import Dataset
@@ -36,14 +36,60 @@ from .inspector import MethodInspector
 from .method_browser import MethodBrowser
 from .param_panel import ParamPanel
 from .worker import BatchWorker, SingleWorker
+from . import theme
+
+
+class StageRail(QFrame):
+    """阶段导航：把数模工作流（看数据→选模型→看细节）做成带编号的竖排入口。
+
+    与内容栈联动：点条目切页，程序切页也回写选中态（双向同步）。
+    """
+
+    def __init__(self, groups, parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 12, 10, 12)
+        lay.setSpacing(4)
+        self._btns: dict[int, QPushButton] = {}
+        self._stack = None
+        for gi, (gtitle, entries) in enumerate(groups):
+            head = QLabel(f"—— {gtitle} ——")
+            head.setObjectName("railHead")      # 主题定义见 theme.QSS
+            lay.addWidget(head)
+            for idx, title in entries:
+                b = QPushButton(title)
+                b.setObjectName("railBtn")
+                b.setCheckable(True)
+                b.setCursor(Qt.PointingHandCursor)
+                b.clicked.connect(lambda _=False, k=idx: self._go(k))
+                lay.addWidget(b)
+                self._btns[idx] = b
+            if gi < len(groups) - 1:
+                lay.addSpacing(6)
+        lay.addStretch(1)
+
+    def bind(self, stack: QStackedWidget):
+        self._stack = stack
+        stack.currentChanged.connect(self._sync)
+        self._sync(stack.currentIndex())
+
+    def _go(self, idx):
+        if self._stack is not None:
+            self._stack.setCurrentIndex(idx)
+
+    def _sync(self, idx):
+        for k, b in self._btns.items():
+            b.setChecked(k == idx)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         registry.load_builtin()
-        self.setWindowTitle("ML Toolbox · 方法试验台 + 优化调参")
-        self.resize(1500, 900)
+        self.setWindowTitle("ML Toolbox · 机器学习 + 优化调参")
+        self.resize(1920, 1080)
+        theme.apply_to(self)
 
         self.dataset: Dataset | None = None
         self.spec = None
@@ -53,17 +99,121 @@ class MainWindow(QMainWindow):
         self._current_method = None
         self._cfg = RunConfig()
 
-        self._build_toolbar()
-        self._build_body()
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_header())
+
+        # Perspective 容器：0 = ML 工作区，1 = 优化工作区（兄弟框架，整区切换）
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_ml_page())
+        from .opt_page import OptWorkbench
+        self.opt_page = OptWorkbench(self)
+        self.stack.addWidget(self.opt_page)
+        root.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+
         self.statusBar().showMessage("就绪 —— 打开数据或加载演示数据集开始")
 
-    # ================================================== 工具栏
-    def _build_toolbar(self):
-        tb = self.addToolBar("main")
-        tb.setMovable(False)
+    # ================================================== 顶栏
+    def _build_header(self) -> QWidget:
+        # 两行顶栏（字号 x2 后单行放不下）：行1 = 品牌 + 模式开关 + 共享数据工具；
+        # 行2 = ML 专属控件（优化模式整行隐藏）
+        bar = QWidget()
+        bar.setObjectName("header")
+        root_lay = QVBoxLayout(bar)
+        root_lay.setContentsMargins(14, 8, 14, 8)
+        root_lay.setSpacing(6)
 
-        # ---- 模式切换（兄弟框架的 UI 语义：顶层对等，非 tab 附属）
-        self._mode_ml = QAction("ML 方法试验台", self, checkable=True)
+        lay = QHBoxLayout()
+        lay.setSpacing(10)
+        root_lay.addLayout(lay)
+
+        brand = QLabel("ML Toolbox")
+        brand.setObjectName("brand")
+        sub = QLabel("机器学习 · 优化调参")
+        sub.setObjectName("brandSub")
+        bw = QVBoxLayout()
+        bw.setSpacing(0)
+        bw.addWidget(brand)
+        bw.addWidget(sub)
+        lay.addLayout(bw)
+        lay.addSpacing(8)
+
+        # ---- 模式切换（兄弟框架的 UI 语义：顶层对等状态切换）
+        self._mode_switch = theme.ModeSwitch(["机器学习", "优化调参"])
+        self._mode_switch.mode_changed.connect(self._set_mode)
+        lay.addWidget(self._mode_switch)
+        lay.addStretch(1)
+
+        # ---- 共享数据工具
+        btn_open = QPushButton("打开数据…")
+        btn_open.clicked.connect(self._open_file)
+        lay.addWidget(btn_open)
+
+        self._demo = QComboBox()
+        self._demo.addItems(["演示数据…"] + demo_names())
+        self._demo.setMinimumWidth(240)
+        self._demo.activated.connect(self._load_demo)
+        lay.addWidget(self._demo)
+
+        btn_pipe = QPushButton("管道设置…")
+        btn_pipe.clicked.connect(self._open_pipeline_dialog)
+        lay.addWidget(btn_pipe)
+
+        btn_hist = QPushButton("历史…")
+        btn_hist.setToolTip("从 runs/ 回看历史运行（核心图基于存档工件重绘，无需重训）")
+        btn_hist.clicked.connect(self._open_history)
+        lay.addWidget(btn_hist)
+
+        # ---- 行2：ML 专属控件（优化模式下隐藏，pitfalls O9：隐藏包装控件）
+        ml_lay = QHBoxLayout()
+        ml_lay.setSpacing(10)
+        root_lay.addLayout(ml_lay)
+        self._ml_only_widgets: list = []
+
+        def _add(w):
+            ml_lay.addWidget(w)
+            self._ml_only_widgets.append(w)
+            return w
+
+        _add(QLabel("随机种子"))
+        self._seed = QLineEdit("42")
+        self._seed.setFixedWidth(92)
+        _add(self._seed)
+
+        self._cv_folds = QComboBox()
+        self._cv_folds.addItems(["3", "5", "10"])
+        self._cv_folds.setCurrentText("5")
+        self._cv_folds.setFixedWidth(96)
+        self._cv_folds.setEnabled(False)
+
+        self._cv = QCheckBox("交叉验证")
+        self._cv.setToolTip("开启后遍历额外跑 k 折 CV，对比视图显示 cv_*_mean±std（默认关，零开销）")
+
+        def _toggle_cv(v):
+            self._cv_folds.setEnabled(v)
+            self._cfg.extras["cv_folds"] = int(self._cv_folds.currentText()) if v else 0
+        self._cv.toggled.connect(_toggle_cv)
+        self._cv_folds.currentTextChanged.connect(
+            lambda t: self._cfg.extras.__setitem__("cv_folds", int(t)) if self._cv.isChecked() else None)
+        _add(self._cv)
+        _add(self._cv_folds)
+
+        self._diag = QCheckBox("诊断")
+        self._diag.setToolTip("零侵入：开启后方法把中间产物装进 diag 供检视（模式 7）")
+        self._diag.toggled.connect(lambda v: setattr(self._cfg, "diag", v))
+        _add(self._diag)
+
+        btn_pred = QPushButton("对新数据预测…")
+        btn_pred.setToolTip("用当前选中方法的已拟合模型预测新的 csv（同管道变换 -> 导出预测表）")
+        btn_pred.clicked.connect(self._predict_on_new)
+        _add(btn_pred)
+        ml_lay.addStretch(1)
+
+        # 兼容旧动作接口（测试/快捷键可 trigger 切模式）
+        self._mode_ml = QAction("机器学习", self, checkable=True)
         self._mode_opt = QAction("优化调参", self, checkable=True)
         self._mode_ml.setChecked(True)
         grp = QActionGroup(self)
@@ -72,99 +222,39 @@ class MainWindow(QMainWindow):
         grp.addAction(self._mode_opt)
         self._mode_ml.triggered.connect(lambda: self._set_mode(0))
         self._mode_opt.triggered.connect(lambda: self._set_mode(1))
-        tb.addAction(self._mode_ml)
-        tb.addAction(self._mode_opt)
-        tb.addSeparator()
-
-        act_open = QAction("打开数据…", self)
-        act_open.triggered.connect(self._open_file)
-        tb.addAction(act_open)
-
-        self._demo = QComboBox()
-        self._demo.addItems(["演示数据…"] + demo_names())
-        self._demo.activated.connect(self._load_demo)
-        tb.addWidget(self._demo)
-
-        act_pipe = QAction("管道设置…", self)
-        act_pipe.triggered.connect(self._open_pipeline_dialog)
-        tb.addAction(act_pipe)
-
-        act_hist = QAction("历史…", self)
-        act_hist.setToolTip("从 runs/ 回看历史运行（核心图基于存档工件重绘，无需重训）")
-        act_hist.triggered.connect(self._open_history)
-        tb.addAction(act_hist)
-
-        # ML 专属控件（优化模式下隐藏）。注意：QToolBar 布局时会重新 show
-        # 内嵌 widget，直接 hide(widget) 会被覆盖——必须 hide addWidget
-        # 返回的包装 QAction（pitfalls O9）。
-        self._ml_only_actions: list = []
-
-        act_pred = QAction("对新数据预测…", self)
-        act_pred.setToolTip("用当前选中方法的已拟合模型预测新的 csv（同管道变换 -> 导出预测表）")
-        act_pred.triggered.connect(self._predict_on_new)
-        tb.addAction(act_pred)
-        self._ml_only_actions.append(act_pred)
-
-        self._diag = QCheckBox("诊断")
-        self._diag.setToolTip("零侵入：开启后方法把中间产物装进 diag 供检视（模式 7）")
-        self._diag.toggled.connect(lambda v: setattr(self._cfg, "diag", v))
-        self._ml_only_actions.append(tb.addWidget(self._diag))
-
-        self._cv = QCheckBox("交叉验证")
-        self._cv.setToolTip("开启后遍历额外跑 k 折 CV，对比视图显示 cv_*_mean±std（默认关，零开销）")
-        self._cv_folds = QComboBox()
-        self._cv_folds.addItems(["3", "5", "10"])
-        self._cv_folds.setCurrentText("5")
-        self._cv_folds.setFixedWidth(48)
-        self._cv_folds.setEnabled(False)
-
-        def _toggle_cv(v):
-            self._cv_folds.setEnabled(v)
-            self._cfg.extras["cv_folds"] = int(self._cv_folds.currentText()) if v else 0
-        self._cv.toggled.connect(_toggle_cv)
-        self._cv_folds.currentTextChanged.connect(
-            lambda t: self._cfg.extras.__setitem__("cv_folds", int(t)) if self._cv.isChecked() else None)
-        self._ml_only_actions.append(tb.addWidget(self._cv))
-        self._ml_only_actions.append(tb.addWidget(self._cv_folds))
-
-        self._ml_only_actions.append(tb.addWidget(QLabel("  种子 ")))
-        self._seed = QLineEdit("42")
-        self._seed.setFixedWidth(46)
-        self._ml_only_actions.append(tb.addWidget(self._seed))
+        return bar
 
     def _set_mode(self, idx: int):
-        """Perspective 切换：主区域整体换 + ML 专属工具栏项显隐。"""
+        """Perspective 切换：主区域整体换 + ML 专属顶栏项显隐。"""
         self.stack.setCurrentIndex(idx)
+        self._mode_switch.set_mode(idx)
         ml = idx == 0
-        for a in self._ml_only_actions:
-            a.setVisible(ml)
+        for w in self._ml_only_widgets:
+            w.setVisible(ml)
         if not ml:
             self.opt_page.refresh_source_status()
 
     # ================================================== 主体
-    def _build_body(self):
-        # Perspective 容器：0 = ML 工作区，1 = 优化工作区（兄弟框架，整区切换）
-        self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_ml_page())
-        from .opt_page import OptWorkbench
-        self.opt_page = OptWorkbench(self)
-        self.stack.addWidget(self.opt_page)
-        self.setCentralWidget(self.stack)
-
     def _build_ml_page(self) -> QWidget:
         page = QWidget()
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
         lay = QHBoxLayout()
+        lay.setSpacing(8)
 
         self.browser = MethodBrowser()
         self.browser.selection_changed.connect(self._on_selection)
         self.browser.method_activated.connect(self._inspect_method)
 
-        self.tabs = QTabWidget()
+        # ---- 中部：阶段导航 + 内容栈（数模工作流顺序 = 内部执行顺序）
+        center = QHBoxLayout()
+        center.setSpacing(8)
+        self.tabs = QStackedWidget()
+        self.tabs.setObjectName("centerStack")
         self.chain_page = ChainPage()
         self.compare_table = QTableWidget()
+        from PyQt5.QtWidgets import QHeaderView
         self.compare_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents)
         self.compare_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -175,26 +265,35 @@ class MainWindow(QMainWindow):
         self.gallery.thumb_clicked.connect(self._show_from_gallery)
         from .data_page import DataPage
         self.data_page = DataPage()
-        self.tabs.addTab(self.chain_page, "处理链")
-        self.tabs.addTab(self.data_page, "数据检视")
-        self.tabs.addTab(self.compare_table, "对比视图")
-        self.tabs.addTab(self.gallery, "核心图对比")
-        self.tabs.addTab(self.inspector, "方法检视")
+        for w in (self.chain_page, self.data_page, self.compare_table,
+                  self.gallery, self.inspector):
+            self.tabs.addWidget(w)
         # 索引集中管理（pitfalls L14：勿再硬编码 setCurrentIndex 数字）
-        self.TAB_CHAIN = self.tabs.indexOf(self.chain_page)
-        self.TAB_DATA = self.tabs.indexOf(self.data_page)
-        self.TAB_COMPARE = self.tabs.indexOf(self.compare_table)
-        self.TAB_GALLERY = self.tabs.indexOf(self.gallery)
-        self.TAB_INSPECT = self.tabs.indexOf(self.inspector)
+        self.TAB_CHAIN = 0
+        self.TAB_DATA = 1
+        self.TAB_COMPARE = 2
+        self.TAB_GALLERY = 3
+        self.TAB_INSPECT = 4
+
+        self.rail = StageRail([
+            ("看数据", [(self.TAB_CHAIN, "处理链"), (self.TAB_DATA, "数据检视")]),
+            ("选模型", [(self.TAB_COMPARE, "对比视图"), (self.TAB_GALLERY, "核心图对比")]),
+            ("看细节", [(self.TAB_INSPECT, "方法检视")]),
+        ])
+        self.rail.bind(self.tabs)
+        center.addWidget(self.rail)
+        center.addWidget(self.tabs, 1)
+        center_w = QWidget()
+        center_w.setLayout(center)
 
         self.params = ParamPanel()
         self.params.rerun_requested.connect(self._rerun_current)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.browser)
-        splitter.addWidget(self.tabs)
+        splitter.addWidget(center_w)
         splitter.addWidget(self.params)
-        splitter.setSizes([230, 950, 320])
+        splitter.setSizes([560, 860, 500])
         splitter.setCollapsible(1, False)
         lay.addWidget(splitter)
         outer.addLayout(lay, 1)
@@ -204,14 +303,10 @@ class MainWindow(QMainWindow):
         bl = QHBoxLayout(bottom)
         bl.setContentsMargins(10, 2, 10, 6)
         self.btn_run = QPushButton("▶ 遍历运行所选方法")
-        self.btn_run.setStyleSheet(
-            "QPushButton{background:#2d6cdf;color:white;font-weight:bold;"
-            "padding:9px 18px;border-radius:5px;font-size:13px;}"
-            "QPushButton:hover{background:#1e54b8;}"
-            "QPushButton:disabled{background:#aab;}")
+        self.btn_run.setObjectName("primary")
         self.btn_run.clicked.connect(self._run_batch)
         self._progress = QLabel("")
-        self._progress.setStyleSheet("color:#555;")
+        self._progress.setObjectName("muted")
         bl.addWidget(self.btn_run)
         bl.addWidget(self._progress, 1)
         outer.addWidget(bottom)
@@ -296,6 +391,7 @@ class MainWindow(QMainWindow):
         r = load_run_record(run_id)
         if r is None:
             return
+        self._set_mode(0)
         self.records = [r]
         self._fill_compare_table()
         self._show_record(0)

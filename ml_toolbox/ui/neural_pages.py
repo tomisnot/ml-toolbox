@@ -43,7 +43,7 @@ class WeightsPage(QWidget):
         self._view.addItems(["最终权重", "初始权重", "更新幅度 ΔW"])
         top.addWidget(self._view)
         self._info = QLabel("")
-        self._info.setStyleSheet("color:#666; font-size:11px;")
+        self._info.setObjectName("muted")
         top.addWidget(self._info)
         lay.addLayout(top)
         self._heat = AdaptiveMatrixHeatmap()
@@ -98,7 +98,7 @@ class ReplayPage(QWidget):
         # 控制条
         ctrl = QHBoxLayout()
         self._play = QPushButton("▶ 播放")
-        self._play.setFixedWidth(80)
+        self._play.setFixedWidth(160)
         self._play.clicked.connect(self._toggle_play)
         ctrl.addWidget(self._play)
         self._slider = QSlider(Qt.Horizontal)
@@ -106,7 +106,7 @@ class ReplayPage(QWidget):
         self._slider.valueChanged.connect(self._show_frame)
         ctrl.addWidget(self._slider, 1)
         self._readout = QLabel("")
-        self._readout.setStyleSheet("font-weight:bold; min-width:150px;")
+        self._readout.setStyleSheet("font-weight:bold; min-width:300px;")
         ctrl.addWidget(self._readout)
         lay.addLayout(ctrl)
 
@@ -188,8 +188,8 @@ class ReplayPage(QWidget):
             if 0 <= ep < len(self._loss):
                 ax.axvline(ep, color="green", lw=1, alpha=0.7)
                 ax.plot([ep], [self._loss[ep]], "go", ms=5)
-        ax.set_xlabel("epoch"); ax.legend(fontsize=7)
-        ax.set_title("loss 游标", fontsize=9)
+        ax.set_xlabel("epoch"); ax.legend(fontsize=14)
+        ax.set_title("loss 游标", fontsize=18)
         self._loss_canvas.draw_idle()
 
     # ------------------------------------------------ 播放

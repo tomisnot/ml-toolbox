@@ -49,7 +49,7 @@ def plot_convergence(ax, record, extra=None):
     ax.set_xlabel("评估次数")
     ax.set_ylabel("分数（log 邻域）")
     ax.set_title("收敛曲线（越小越好）")
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=14)
     ax.grid(alpha=0.25)
 
 
@@ -78,12 +78,12 @@ def plot_parallel(ax, record):
     for j, k in enumerate(keys):
         ax.axvline(j, color="#ccc", lw=0.8)
     ax.set_xticks(xs)
-    ax.set_xticklabels(keys, fontsize=8, rotation=20)
+    ax.set_xticklabels(keys, fontsize=16, rotation=20)
     ax.set_yticks([0, 0.5, 1])
-    ax.set_yticklabels(["min", "", "max"], fontsize=8)
+    ax.set_yticklabels(["min", "", "max"], fontsize=16)
     ax.set_xlim(-0.5, len(keys) - 0.5)
     ax.set_title("参数×分数平行坐标（绿=好，红=差）")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=16)
 
 
 def plt_cmap():
@@ -98,7 +98,7 @@ def plot_scatter2d(ax, record):
     h = record.history
     if len(cont) < 2 or h.empty:
         ax.text(0.5, 0.5, "需要 ≥2 个连续参数（当前为 1D/类别空间，看平行坐标）",
-                ha="center", va="center", color="#888", fontsize=9)
+                ha="center", va="center", color="#888", fontsize=18)
         return
     a, b = cont[0], cont[1]
     ok = _ok(record)
@@ -115,10 +115,10 @@ def plot_scatter2d(ax, record):
     ax.set_xlabel(a)
     ax.set_ylabel(b)
     ax.set_title("探索地图（前两个连续参数）")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=16)
     try:
         import matplotlib.pyplot as plt
-        plt.colorbar(sc, ax=ax, shrink=0.8).set_label("score", fontsize=8)
+        plt.colorbar(sc, ax=ax, shrink=0.8).set_label("score", fontsize=16)
     except Exception:
         pass
 
@@ -128,7 +128,7 @@ def plot_pareto(ax, record):
     h = record.history
     if h is None or h.empty or "f0" not in h.columns:
         ax.text(0.5, 0.5, "多目标运行才有 Pareto 前沿（选 NSGA-II + ZDT）",
-                ha="center", va="center", color="#888", fontsize=9)
+                ha="center", va="center", color="#888", fontsize=18)
         return
     ok = h[h["status"] == "ok"]
     ax.scatter(ok["f0"], ok["f1"], s=14, color="#bbb", alpha=0.7,
@@ -142,7 +142,7 @@ def plot_pareto(ax, record):
     ax.set_xlabel("目标 f0")
     ax.set_ylabel("目标 f1")
     ax.set_title("Pareto 前沿（均最小化，绿=非支配）")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=16)
     ax.grid(alpha=0.25)
 
 
@@ -157,7 +157,7 @@ def plot_surrogate_1d(ax, bundle):
     ax.set_xlabel(label)
     ax.set_ylabel("score")
     ax.set_title("代理模型切片（固定其余参数于当前最优）")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=16)
     ax.grid(alpha=0.25)
 
 

@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton
 import pyqtgraph as pg
 
 
-def _wrap(s, width=14):
+def _wrap(s, width=8):
     s = str(s)
     if len(s) <= width:
         return s
@@ -67,7 +67,7 @@ class AdaptiveMatrixHeatmap(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground("w")
-        self.glw.ci.setContentsMargins(110, 10, 50, 110)
+        self.glw.ci.setContentsMargins(130, 10, 40, 130)
         self.plot = self.glw.addPlot(row=0, col=0)
         self.plot.setAspectLocked(True)
         self.plot.showGrid(x=True, y=True, alpha=0.15)
@@ -84,7 +84,7 @@ class AdaptiveMatrixHeatmap(QWidget):
         self.ax_b.setHeight(110)
         self.ax_l.setWidth(110)
         from PyQt5.QtGui import QFont
-        f = QFont("Microsoft YaHei", 7)
+        f = QFont("Microsoft YaHei", 14)
         for ax in (self.ax_b, self.ax_l):
             ax.setStyle(tickFont=f)
             ax.setStyle(hideOverlappingLabels=False, textFillLimits=[(0, 1.0)])
@@ -140,7 +140,7 @@ class AdaptiveMatrixHeatmap(QWidget):
         out = []
         for t in range(lo_i, hi_i + 1, step):
             nm = names[t] if t < len(names) else str(t)
-            out.append((t + 0.5, _wrap(nm) if detail else str(nm)[:12]))
+            out.append((t + 0.5, _wrap(nm) if detail else str(nm)[:8]))
         return [out]
 
     def _update_ticks(self):

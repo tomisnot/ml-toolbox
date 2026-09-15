@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """优化调参工作区（同窗口新增，docs/优化定位.md §7）。
 
-与 ML 工作区的镜像：左=目标函数+优化器库+预算+参数，右=检视页直播，
-底=▶开始/⏸暂停/⏹停止。核心差异 = 过程流：eval_done 逐条刷新收敛曲线。
-
-目标函数二选一（阶段2 先做合成函数；AutoTuner 在阶段4 接入）：
-  ① 合成/解析函数（数模标定靶子：Ackley/Rosenbrock/…）
-  ② ML 方法+数据集（预留，阶段4）
+UI 层次映射内部执行流（重设计）：
+  左配置区 = 四段卡片，顺序即 ask-and-tell 循环的装配顺序：
+    ① 目标函数（类型堆叠页：合成/ML 调参/外部程序）
+    ② 数据源（仅 AutoTuner 需要，跨框架依赖显式呈现）
+    ③ 优化器（多选=顺序对比）+ 超参
+    ④ 预算 / 种子 / 热启动 / 预检
+  右观察区 = 检视页直播（上）+ 评估历史（下）
+  底控制条 = ▶开始/⏸暂停/停止 + 进度 + 配置导入导出
 
 多优化器 = 顺序跑（G4 遍历哲学），各自流式刷新，最后叠加收敛曲线对比。
 """
@@ -18,11 +20,11 @@ import os
 import numpy as np
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
-                            QComboBox, QPushButton, QLabel, QLineEdit,
+from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
+                            QSplitter, QComboBox, QPushButton, QLabel, QLineEdit,
                             QCheckBox, QTableWidget, QTableWidgetItem,
                             QHeaderView, QTabWidget, QFormLayout, QFrame,
-                            QScrollArea, QGroupBox, QMessageBox)
+                            QStackedWidget, QGroupBox, QMessageBox, QScrollArea)
 
 from ..opt import registry as opt_registry
 from ..opt.contracts import Budget
@@ -31,14 +33,28 @@ from ..opt.plots import default_pages
 from .inspector import MethodInspector
 from .param_form import ParamForm
 from .worker import OptWorker
+from . import theme
 
 _LOG = logging.getLogger("ml_toolbox.opt.ui")
+
+
+class _AutoStack(QStackedWidget):
+    """高度跟随当前页：避免被最高的隐藏页撑出大片空白。"""
+
+    def sizeHint(self):
+        w = self.currentWidget()
+        return w.sizeHint() if w is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        w = self.currentWidget()
+        return w.minimumSizeHint() if w is not None else super().minimumSizeHint()
 
 
 class OptWorkbench(QWidget):
     def __init__(self, parent=None):
         super().__init__()
         opt_registry.load_builtin()
+        theme.apply_to(self)
         self._worker: OptWorker | None = None
         self._records: dict[str, "object"] = {}     # optimizer -> OptRecord
         self._opt_instances: dict[str, "object"] = {}   # optimizer -> 实例（代理切片按记录取，修 M6 串台）
@@ -47,61 +63,50 @@ class OptWorkbench(QWidget):
         self._build()
 
     # ================================================== 布局
+    @staticmethod
+    def _card(title: str) -> QGroupBox:
+        g = QGroupBox(title)
+        return g
+
     def _build(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
         lay = QHBoxLayout()
+        lay.setSpacing(8)
         outer.addLayout(lay, 1)
 
-        # ---- 左栏：目标 + 优化器 + 预算 + 参数
-        left = QScrollArea()
-        left.setWidgetResizable(True)
-        host = QFrame()
-        form = QVBoxLayout(host)
-        form.setSpacing(10)
+        # ============ 左：配置区（四段卡片，顺序=执行装配顺序） ============
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
 
-        g0 = QGroupBox("数据源")
-        f0 = QFormLayout(g0)
-        # 数据从哪来（显式呈现跨框架/跨进程依赖）：内部数据集 / 外部文件
-        self._src_kind = QComboBox()
-        self._add_items(self._src_kind, [("ML 内部数据集", "ml"),
-                                         ("外部文件（csv/parquet）", "file")])
-        self._src_kind.currentTextChanged.connect(lambda *_: self.refresh_source_status())
-        f0.addRow("来源", self._src_kind)
-        self._src_path = QLineEdit()
-        self._src_path.setPlaceholderText("数据文件路径（外部程序写入的 csv/parquet）")
-        self._src_path.editingFinished.connect(self.refresh_source_status)
-        self._lbl_path = QLabel("路径")
-        f0.addRow(self._lbl_path, self._src_path)
-        self._src_target = QLineEdit("target")
-        self._src_target.setFixedWidth(90)
-        self._src_target.editingFinished.connect(self.refresh_source_status)
-        self._lbl_target = QLabel("目标列")
-        f0.addRow(self._lbl_target, self._src_target)
-        self._src_status = QLabel("")
-        self._src_status.setStyleSheet("color:#888; font-size:11px;")
-        self._src_status.setWordWrap(True)
-        f0.addRow(self._src_status)
-        form.addWidget(g0)
-        self._src_group = g0
-
-        g1 = QGroupBox("目标函数")
-        f1 = QFormLayout(g1)
+        # ---- ① 目标函数（堆叠页：类型切换整页替换，无 hide/show 闪烁）
+        g1 = self._card("① 目标函数")
+        f1w = QVBoxLayout(g1)
+        f1w.setSpacing(8)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("类型"))
         self._obj_kind = QComboBox()
         self._add_items(self._obj_kind, [("合成函数", "synth"),
                                          ("ML 方法调参（AutoTuner）", "ml"),
                                          ("外部程序（黑盒进程）", "proc")])
         self._obj_kind.currentTextChanged.connect(self._on_obj_kind)
-        f1.addRow("类型", self._obj_kind)
+        row.addWidget(self._obj_kind, 1)
+        f1w.addLayout(row)
+
+        self._obj_stack = _AutoStack()
+        # 页 0：合成函数
+        p_synth = QWidget()
+        fs = QFormLayout(p_synth)
         self._synth = QComboBox()
-        self._obj_info = QLabel("")
-        self._obj_info.setStyleSheet("color:#666; font-size:11px;")
-        self._obj_info.setWordWrap(True)
         self._synth.addItems(synth_names())
         self._synth.currentTextChanged.connect(self._on_synth_change)
-        f1.addRow("函数", self._synth)
-        # ML 方法调参行（接缝2）：方法 + CV 折数
+        fs.addRow("函数", self._synth)
+        # 页 1：ML 方法调参（接缝2）
+        p_ml = QWidget()
+        fm = QFormLayout(p_ml)
         from ..core import registry as ml_registry
         ml_registry.load_builtin()
         self._ml_method = QComboBox()
@@ -110,19 +115,19 @@ class OptWorkbench(QWidget):
         self._ml_cv = QComboBox()
         self._ml_cv.addItems(["3", "5", "10"])
         self._ml_cv.setCurrentText("3")
-        self._lbl_method = QLabel("方法")
-        self._lbl_cv = QLabel("CV 折数")
-        f1.addRow(self._lbl_method, self._ml_method)
-        f1.addRow(self._lbl_cv, self._ml_cv)
-        # 外部程序行（评估侧接入）：参数定义 + 命令模板 + 解析式
+        self._ml_cv.setFixedWidth(128)
+        fm.addRow("方法", self._ml_method)
+        fm.addRow("CV 折数", self._ml_cv)
+        # 页 2：外部程序（评估侧接入）——线性表单，批量字段成对组合行
+        p_proc = QWidget()
+        fg = QFormLayout(p_proc)
+        fg.setVerticalSpacing(6)
         self._proc_mode = QComboBox()
         self._proc_mode.addItems(["stdout 单点（解析一个分数）",
                                   "JSON 批量（pts/res 文件，可并行）"])
         self._proc_mode.currentTextChanged.connect(lambda *_: self._on_proc_mode())
-        self._lbl_mode = QLabel("模式")
         self._proc_params = QLineEdit("a=0..5, b=0..5")
-        self._proc_params.setPlaceholderText("寻优参数：名=下界..上界 或 名=甲|乙|丙；"
-                                             "名:点内路径=... 支持嵌套字段")
+        self._proc_params.setPlaceholderText("寻优参数：名=下界..上界 或 名=甲|乙|丙")
         self._proc_cmd = QLineEdit("python sim.py --a {a} --b {b}")
         self._proc_cmd.setPlaceholderText("单点：{key} 占位注入；批量：{points_file}/{out_file}")
         self._proc_cwd = QLineEdit()
@@ -134,98 +139,152 @@ class OptWorkbench(QWidget):
         self._proc_max = QCheckBox("越大越好")
         self._proc_max.setChecked(True)
         self._proc_cons = QLineEdit()
-        self._proc_cons.setPlaceholderText("约束：S_ret>=0.99, kick>=0.5（逗号分隔，可空）")
+        self._proc_cons.setPlaceholderText("S_ret>=0.99, kick>=0.5（可空）")
         self._proc_extra = QLineEdit("{}")
-        self._proc_extra.setPlaceholderText('固定字段 JSON：{"pol":"椭圆偏","fwhm_ns":40}')
+        self._proc_extra.setPlaceholderText('固定字段 JSON：{"pol":"椭圆偏"}')
         self._proc_stagger = QLineEdit("4")
-        self._proc_stagger.setFixedWidth(70)
         self._proc_stagger.setToolTip("相邻子进程启动间隔秒（防共享数据库首访竞争）")
         self._proc_timeout = QLineEdit("1800")
-        self._proc_timeout.setFixedWidth(70)
         self._proc_timeout.setToolTip("单点评估超时（秒）")
-        self._lbl_pparams = QLabel("参数")
-        self._lbl_cmd = QLabel("命令")
-        self._lbl_cwd = QLabel("目录")
-        self._lbl_parse = QLabel("解析")
         self._lbl_score = QLabel("目标字段")
         self._lbl_cons = QLabel("约束")
-        self._lbl_extra = QLabel("固定字段")
-        self._lbl_stagger = QLabel("错峰(s)")
-        self._lbl_timeout = QLabel("超时(s)")
-        f1.addRow(self._lbl_mode, self._proc_mode)
-        f1.addRow(self._lbl_pparams, self._proc_params)
-        f1.addRow(self._lbl_cmd, self._proc_cmd)
-        f1.addRow(self._lbl_cwd, self._proc_cwd)
-        f1.addRow(self._lbl_parse, self._proc_parse)
-        f1.addRow(self._lbl_score, self._proc_score)
-        f1.addRow(self._lbl_cons, self._proc_cons)
-        f1.addRow(self._lbl_extra, self._proc_extra)
-        f1.addRow("", self._proc_max)
-        f1.addRow(self._lbl_stagger, self._proc_stagger)
-        f1.addRow(self._lbl_timeout, self._proc_timeout)
-        f1.addRow(self._obj_info)
-        self._proc_single_w = [self._proc_parse]
-        self._proc_batch_w = [self._proc_score, self._lbl_score, self._proc_cons,
-                              self._lbl_cons, self._proc_extra, self._lbl_extra,
-                              self._proc_max, self._proc_stagger, self._lbl_stagger]
-        for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv,
-                  self._proc_mode, self._lbl_mode,
-                  self._proc_params, self._lbl_pparams,
-                  self._proc_cmd, self._lbl_cmd,
-                  self._proc_cwd, self._lbl_cwd,
-                  self._proc_parse, self._lbl_parse,
-                  self._proc_timeout, self._lbl_timeout,
-                  *self._proc_batch_w):
-            w.setVisible(False)
-        self._on_synth_change(self._synth.currentText())
-        form.addWidget(g1)
+        self._lbl_parse = QLabel("解析")
+        self._lbl_stagger = QLabel("错峰/超时")
 
-        g2 = QGroupBox("优化器（多选=顺序对比）")
+        def _combo_row(*ws):
+            box = QWidget()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            for w in ws:
+                h.addWidget(w, 1)
+            return box
+
+        r_score = _combo_row(self._proc_score, self._proc_max)
+        r_cons = _combo_row(self._proc_cons, self._proc_extra)
+        r_time = _combo_row(self._proc_stagger, self._proc_timeout)
+        fg.addRow("模式", self._proc_mode)
+        fg.addRow("参数", self._proc_params)
+        fg.addRow("命令", self._proc_cmd)
+        fg.addRow("目录", self._proc_cwd)
+        fg.addRow(self._lbl_parse, self._proc_parse)
+        fg.addRow(self._lbl_score, r_score)
+        fg.addRow(self._lbl_cons, r_cons)
+        fg.addRow(self._lbl_stagger, r_time)
+        # stdout 单点模式独有 / JSON 批量模式独有（含标签与组合行）
+        self._proc_single_w = [self._lbl_parse, self._proc_parse]
+        self._proc_batch_w = [self._lbl_score, r_score,
+                              self._lbl_cons, r_cons,
+                              self._lbl_stagger, r_time]
+        self._obj_stack.addWidget(p_synth)
+        self._obj_stack.addWidget(p_ml)
+        self._obj_stack.addWidget(p_proc)
+        f1w.addWidget(self._obj_stack)
+        self._obj_info = QLabel("")
+        self._obj_info.setObjectName("muted")
+        self._obj_info.setWordWrap(True)
+        f1w.addWidget(self._obj_info)
+        lv.addWidget(g1)
+
+        # ---- ② 数据源（显式呈现跨框架依赖）
+        g0 = self._card("② 数据源")
+        f0 = QFormLayout(g0)
+        f0.setFieldGrowthPolicy(2)   # AllFieldsGrow（PyQt5 枚举兼容）
+        self._src_kind = QComboBox()
+        self._add_items(self._src_kind, [("ML 内部数据集", "ml"),
+                                         ("外部文件（csv/parquet）", "file")])
+        self._src_kind.currentTextChanged.connect(lambda *_: self.refresh_source_status())
+        f0.addRow("来源", self._src_kind)
+        self._src_path = QLineEdit()
+        self._src_path.setPlaceholderText("数据文件路径（外部程序写入的 csv/parquet）")
+        self._src_path.editingFinished.connect(self.refresh_source_status)
+        self._lbl_path = QLabel("路径")
+        f0.addRow(self._lbl_path, self._src_path)
+        self._src_target = QLineEdit("target")
+        self._src_target.setFixedWidth(180)
+        self._src_target.editingFinished.connect(self.refresh_source_status)
+        self._lbl_target = QLabel("目标列")
+        f0.addRow(self._lbl_target, self._src_target)
+        self._src_status = QLabel("")
+        self._src_status.setObjectName("srcStatus")
+        self._src_status.setStyleSheet("color:#888;")   # 未配置（灰）
+        self._src_status.setWordWrap(True)
+        f0.addRow(self._src_status)
+        lv.addWidget(g0)
+        self._src_group = g0
+
+        # ---- ③ 优化器（全宽双列：短名不截断；多选=顺序对比）
+        g2 = self._card("③ 优化器")
         f2 = QVBoxLayout(g2)
+        f2.setSpacing(4)
+        hint = QLabel("多选 = 顺序对比")
+        hint.setObjectName("muted")
+        f2.addWidget(hint)
         self._opt_boxes: dict[str, QCheckBox] = {}
-        for name in opt_registry.names():
+        names = opt_registry.names()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(2)
+        for i, name in enumerate(names):
             o = opt_registry.get(name)
-            cb = QCheckBox(f"{o.display_name}  ({name})")
+            cb = QCheckBox(o.display_name)
+            cb.setToolTip(name)
             cb.setChecked(name in ("gp_bo", "random_search"))
-            f2.addWidget(cb)
+            grid.addWidget(cb, i // 2, i % 2)
             self._opt_boxes[name] = cb
+        f2.addLayout(grid)
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("超参面板针对："))
         self._opt_sel = QComboBox()
-        self._opt_sel.addItems(opt_registry.names())
+        self._opt_sel.addItems(names)
         self._opt_sel.currentTextChanged.connect(self._on_opt_change)
-        f2.addWidget(QLabel("选中优化器（下方超参面板针对它）"))
-        f2.addWidget(self._opt_sel)
-        form.addWidget(g2)
+        sel_row.addWidget(self._opt_sel, 1)
+        f2.addLayout(sel_row)
+        lv.addWidget(g2)
 
-        g3 = QGroupBox("预算 / 种子")
+        # ---- ④ 预算 / 运行（次数+并行一行，停滞+种子+热启动预检各一行）
+        g3 = self._card("④ 预算 / 运行")
         f3 = QFormLayout(g3)
+        f3.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        q1 = QHBoxLayout()
         self._n_evals = QLineEdit("40")
-        self._n_evals.setFixedWidth(70)
-        f3.addRow("评估次数", self._n_evals)
-        self._stall = QLineEdit("0")
-        self._stall.setFixedWidth(70)
-        self._stall.setToolTip("连续无改善次数，0=不启用")
-        f3.addRow("停滞停止", self._stall)
-        self._seed = QLineEdit("42")
-        self._seed.setFixedWidth(70)
-        f3.addRow("种子", self._seed)
         self._workers = QLineEdit("1")
-        self._workers.setFixedWidth(70)
         self._workers.setToolTip("并行评估进程数（外部程序 JSON 批量模式有效；"
                                  "1=串行。建议 = 物理核数 × 0.7~1.0）")
-        f3.addRow("并行评估数", self._workers)
+        q1.addWidget(QLabel("次数"))
+        self._n_evals.setFixedWidth(112)
+        q1.addWidget(self._n_evals)
+        q1.addSpacing(10)
+        q1.addWidget(QLabel("并行"))
+        self._workers.setFixedWidth(92)
+        q1.addWidget(self._workers)
+        q1.addStretch(1)
+        f3.addRow(q1)
+        q2 = QHBoxLayout()
+        self._stall = QLineEdit("0")
+        self._stall.setToolTip("连续无改善次数，0=不启用")
+        self._seed = QLineEdit("42")
+        q2.addWidget(QLabel("停滞停止"))
+        self._stall.setFixedWidth(112)
+        q2.addWidget(self._stall)
+        q2.addSpacing(10)
+        q2.addWidget(QLabel("种子"))
+        self._seed.setFixedWidth(92)
+        q2.addWidget(self._seed)
+        q2.addStretch(1)
+        f3.addRow(q2)
         # 热启动：复用旧 run 的评估历史（黑盒未变时 = 免费观测，不重评）
         ws_row = QWidget()
         wl = QHBoxLayout(ws_row)
         wl.setContentsMargins(0, 0, 0, 0)
         self._warm = QLineEdit("")
-        self._warm.setPlaceholderText("run_id 或 history.csv（可选）")
+        self._warm.setPlaceholderText("run_id / history.csv（可选）")
         self._warm.setToolTip(
             "把旧优化的评估历史直接喂给新优化器（objective 未变时有效）：\n"
             "ok 点计入预算、不重新评估；failed 点只入历史不喂模型。\n"
             "GP-BO / TPE 支持完整吸收；其余引擎忽略这些点（仍占预算）。")
         wl.addWidget(self._warm)
         wb = QPushButton("…")
-        wb.setFixedWidth(24)
+        wb.setFixedWidth(48)
         wb.setToolTip("浏览选择旧 run 目录或 history.csv")
         wb.clicked.connect(self._pick_warm)
         wl.addWidget(wb)
@@ -242,29 +301,37 @@ class OptWorkbench(QWidget):
         pf2l = QHBoxLayout(pf2)
         pf2l.setContentsMargins(0, 0, 0, 0)
         self._pf_expect = QLineEdit("")
-        self._pf_expect.setFixedWidth(70)
+        self._pf_expect.setFixedWidth(140)
         self._pf_expect.setPlaceholderText("期望")
         self._pf_expect.setToolTip("期望分数（原始方向，如 C_dual）；留空=仅连通性检查")
         self._pf_tol = QLineEdit("0.05")
-        self._pf_tol.setFixedWidth(56)
+        self._pf_tol.setFixedWidth(112)
         self._pf_tol.setToolTip("绝对容差")
         pf2l.addWidget(self._pf_expect)
         pf2l.addWidget(QLabel("±"))
         pf2l.addWidget(self._pf_tol)
+        pf2l.addStretch(1)
         f3.addRow("预检期望", pf2)
-        form.addWidget(g3)
 
-        # 参数子面板（选中优化器的 param_schema）——委托 ParamForm（C8）
-        g4 = QGroupBox("优化器超参")
+        # ---- ⑤ 优化器超参（选中优化器的 param_schema）——委托 ParamForm（C8）
+        g4 = self._card("⑤ 超参")
         self._pf_layout = QFormLayout(g4)
+        self._pf_layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         self._pf = ParamForm(self._pf_layout)
-        form.addWidget(g4)
-        form.addStretch(1)
-        left.setWidget(host)
-        left.setFixedWidth(300)
-        lay.addWidget(left)
 
-        # ---- 右栏：检视页（C4：声明式装配，复用 ML 侧 MethodInspector）+ 历史表
+        # ④⑤ 竖排（不再并排：⑤ 超参卡独立成行，左栏变窄、超高走滚动条）
+        lv.addWidget(g3)
+        lv.addWidget(g4)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setFixedWidth(660)
+        lay.addWidget(left_scroll)
+
+        # ---- 右：观察区（C4：声明式装配，复用 ML 侧 MethodInspector）+ 历史表
         right = QSplitter(Qt.Vertical)
         self.inspector = MethodInspector()
         right.addWidget(self.inspector)
@@ -278,12 +345,11 @@ class OptWorkbench(QWidget):
         right.setSizes([520, 220])
         lay.addWidget(right, 1)
 
-        # ---- 底部控制条（覆盖到左栏下方）
+        # ---- 底部控制条：运行 + 进度 + 配置导入导出
+        bottom = QHBoxLayout()
+        bottom.setSpacing(8)
         self.btn_run = QPushButton("▶ 开始优化")
-        self.btn_run.setStyleSheet(
-            "QPushButton{background:#2d6cdf;color:white;font-weight:bold;"
-            "padding:8px 16px;border-radius:5px;}"
-            "QPushButton:disabled{background:#aab;}")
+        self.btn_run.setObjectName("primary")
         self.btn_run.clicked.connect(self._start)
         self.btn_pause = QPushButton("⏸ 暂停")
         self.btn_pause.setEnabled(False)
@@ -291,28 +357,25 @@ class OptWorkbench(QWidget):
         self.btn_stop = QPushButton("⏹ 停止")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
-        self.btn_export = QPushButton("📤 导出配置")
+        self.btn_export = QPushButton("导出配置")
         self.btn_export.setToolTip("把左栏全部设置（目标/数据源/优化器/预算）存成 JSON，"
                                    "下次导入即可复现同一次运行")
         self.btn_export.clicked.connect(self._export_cfg)
-        self.btn_import = QPushButton("📥 导入配置")
+        self.btn_import = QPushButton("导入配置")
         self.btn_import.setToolTip("从 JSON 配置文件恢复全部设置")
         self.btn_import.clicked.connect(self._import_cfg)
         self._prog = QLabel("选择目标函数与优化器，点开始")
-        self._prog.setStyleSheet("color:#555;")
+        self._prog.setObjectName("muted")
 
-        bottom = QHBoxLayout()
         bottom.addWidget(self.btn_run)
         bottom.addWidget(self.btn_pause)
         bottom.addWidget(self.btn_stop)
-        bottom.addStretch(1)
+        bottom.addWidget(self._prog, 1)
         bottom.addWidget(self.btn_import)
         bottom.addWidget(self.btn_export)
         outer.addLayout(bottom)
-        outer2 = QHBoxLayout()
-        outer2.addWidget(self._prog, 1)
-        outer.addLayout(outer2)
         self._on_opt_change(self._opt_sel.currentText())   # 初始填充超参面板
+        self._on_obj_kind()                                 # 初始堆叠页
 
     def _wrap(self, w):
         host = QWidget()
@@ -339,7 +402,7 @@ class OptWorkbench(QWidget):
         # 控件构建/回收委托 ParamForm（C8）；owner 门控（O8）保留在此层
         o = opt_registry.get(name)
         self._pf.build(o.param_schema, owner=name, show_default=True,
-                       field_width=90)
+                       field_width=180)
 
     @property
     def _param_owner(self):
@@ -586,35 +649,26 @@ class OptWorkbench(QWidget):
             src = self._current_source()
             X, y = src.fetch()                   # 真读一次 = 连接测试
             self._src_status.setText("● " + src.describe() + f" · 特征 {X.shape[1]} 维")
-            self._src_status.setStyleSheet("color:#2ca02c; font-size:11px;")
+            self._src_status.setStyleSheet("color:#2ca02c;")   # 已连接（绿）
         except Exception as e:
             self._src_status.setText("● " + str(e)[:160])
-            self._src_status.setStyleSheet("color:#c0392b; font-size:11px;")
+            self._src_status.setStyleSheet("color:#c0392b;")   # 读取失败（红）
 
     def _on_obj_kind(self, text=None):
         key = self._combo_key(self._obj_kind)     # M7：按稳定 key 分支，不看文案
         synth = key == "synth"
         ml = key == "ml"
         proc = key == "proc"
-        self._synth.setVisible(synth)
-        for w in (self._ml_method, self._lbl_method, self._ml_cv, self._lbl_cv):
-            w.setVisible(ml)
-        proc_widgets = [self._proc_mode, self._lbl_mode,
-                        self._proc_params, self._lbl_pparams,
-                        self._proc_cmd, self._lbl_cmd,
-                        self._proc_cwd, self._lbl_cwd,
-                        self._proc_timeout, self._lbl_timeout,
-                        self._proc_parse, self._lbl_parse,
-                        *self._proc_batch_w]
-        for w in proc_widgets:
-            w.setVisible(proc)
+        # 堆叠页整页替换（_AutoStack 高度跟随当前页，不留空白）
+        self._obj_stack.setCurrentIndex(0 if synth else 1 if ml else 2)
+        self._obj_stack.updateGeometry()
         if proc:
             self._on_proc_mode()
         if synth:
             self._on_synth_change(self._synth.currentText())
         elif ml:
             self._obj_info.setText("目标 = 方法在数据源上的 CV 主指标；"
-                                   "数据源在上方显式选择（内部数据集或外部文件）。")
+                                   "数据源在下方显式选择（内部数据集或外部文件）。")
         else:
             self._obj_info.setText("参数注入命令模板跑外部程序，从 stdout 解析分数。"
                                    "数据由程序自产，无需数据源。")
@@ -622,13 +676,14 @@ class OptWorkbench(QWidget):
 
     def _on_proc_mode(self):
         """外部程序子模式：stdout 单点 vs JSON 批量（并行）。"""
-        if not self._proc_mode.isVisible():
+        if self._obj_stack.currentIndex() != 2:
             return
         batch = self._proc_mode.currentIndex() == 1
-        self._proc_parse.setVisible(not batch)
-        self._lbl_parse.setVisible(not batch)
+        for w in self._proc_single_w:
+            w.setVisible(not batch)
         for w in self._proc_batch_w:
             w.setVisible(batch)
+        self._obj_stack.updateGeometry()
         if batch:
             self._workers.setText(self._workers.text() or "1")
             self._obj_info.setText("一批点写 pts.json → 黑盒进程 → 读 res.json。"

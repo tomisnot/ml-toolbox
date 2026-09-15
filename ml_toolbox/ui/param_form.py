@@ -39,7 +39,7 @@ class ParamForm:
               field_width: Optional[int] = None):
         """建控件。show_default=True 时数值框预填默认值（优化器超参面板观感），
         False 时空框 + "默认:…" 占位（ML 参数面板的三态观感）。
-        field_width：数值框固定像素宽（优化侧窄栏用 90，ML 侧 None=自适应）。"""
+        field_width：数值框固定像素宽（优化侧窄栏用 180，ML 侧 None=自适应）。"""
         overrides = overrides or {}
         self.clear()
         self.owner = owner

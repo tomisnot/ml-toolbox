@@ -32,11 +32,11 @@ class _Thumb(QFrame):
         lay.setSpacing(2)
 
         cap = QLabel(f"{record.result.method_name}")
-        cap.setStyleSheet("font-weight:bold; font-size:11px;")
+        cap.setObjectName("capTitle")
         pm = record.result.primary_metric
         val = record.result.metrics.get(pm)
         sub = QLabel(f"{pm}={val:.3f}" if isinstance(val, (int, float)) else pm)
-        sub.setStyleSheet("color:#2d6cdf; font-size:10px;")
+        sub.setObjectName("accent")
         lay.addWidget(cap)
         lay.addWidget(sub)
 
@@ -52,7 +52,7 @@ class _Thumb(QFrame):
             except Exception as e:
                 ax.clear(); ax.set_xticks([]); ax.set_yticks([])
                 ax.text(0.5, 0.5, f"绘错\n{str(e)[:30]}", ha="center",
-                        va="center", color="firebrick", fontsize=7)
+                        va="center", color="firebrick", fontsize=14)
         cv = FigureCanvas(fig)
         cv.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         lay.addWidget(cv, 1)
@@ -73,7 +73,7 @@ class CompareGallery(QWidget):
 
     thumb_clicked = pyqtSignal(int)
 
-    def __init__(self, parent=None, columns=4):
+    def __init__(self, parent=None, columns=2):
         super().__init__(parent)
         self._columns = columns
         outer = QVBoxLayout(self)

@@ -96,7 +96,7 @@ def test_heatmap_orientation():
     A = np.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]], float)
     h = AdaptiveMatrixHeatmap()
     h.set_data(A, ["r0", "r1", "r2"])
-    h.resize(500, 500)
+    h.resize(900, 900)   # 字号 x2 后轴区加宽，探测窗需更大保证格心不压网格线
     h.show()
     app.processEvents()
     lut = np.array(pg.colormap.get("viridis").getLookupTable(0.0, 1.0, 256))

@@ -10,26 +10,27 @@
 from __future__ import annotations
 
 from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QFormLayout, QPushButton,
-                            QLabel, QScrollArea, QFrame)
+from PyQt5.QtWidgets import (QFrame, QVBoxLayout, QFormLayout, QPushButton,
+                            QLabel, QScrollArea)
 
 from ..core.contracts import RunConfig
 from .param_form import ParamForm
 
 
-class ParamPanel(QWidget):
+class ParamPanel(QFrame):
     """一个方法的旋钮面板。set_method() 重建控件；collect() 读覆写。"""
 
     rerun_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("card")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(8)
 
         self._title = QLabel("（未选择方法）")
-        self._title.setStyleSheet("font-size:14px; font-weight:bold;")
+        self._title.setObjectName("cardTitle")
         lay.addWidget(self._title)
 
         scroll = QScrollArea()
@@ -42,16 +43,13 @@ class ParamPanel(QWidget):
         lay.addWidget(scroll, 1)
 
         self._btn = QPushButton("⟳ 应用并重跑")
-        self._btn.setStyleSheet(
-            "QPushButton{background:#2d6cdf;color:white;font-weight:bold;"
-            "padding:8px;border-radius:4px;}"
-            "QPushButton:hover{background:#1e54b8;}")
+        self._btn.setObjectName("primary")
         self._btn.clicked.connect(lambda: self.rerun_requested.emit())
         lay.addWidget(self._btn)
 
         self._status = QLabel("")
         self._status.setWordWrap(True)
-        self._status.setStyleSheet("font-size:11px; color:#c0392b;")
+        self._status.setObjectName("errText")
         lay.addWidget(self._status)
 
         self._pf = ParamForm(self._form, status_cb=self._status.setText)

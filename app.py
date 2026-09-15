@@ -56,7 +56,7 @@ def main():
             fid = QFontDatabase.addApplicationFont(p)
             fams = QFontDatabase.applicationFontFamilies(fid)
             if fams:
-                app.setFont(QFont(fams[0], 10))
+                app.setFont(QFont(fams[0], 20))
                 break
     win = MainWindow()
     win.show()
