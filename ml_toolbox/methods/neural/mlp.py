@@ -104,24 +104,33 @@ class TorchMLP(MLMethod):
                  else nn.MSELoss())
 
         model.train()
-        for ep in range(int(p["epochs"])):
-            tot = 0.0
-            for xb, yb in loader:
-                opt.zero_grad()
-                out = model(xb)
-                loss = lossf(out.squeeze(-1) if kind != "classification" else out, yb)
-                loss.backward()
-                opt.step()
-                tot += float(loss) * len(xb)
-            vl = None
-            if Xva is not None:
-                model.eval()
-                with torch.no_grad():
-                    o = model(Xva)
-                    vl = float(lossf(o.squeeze(-1) if kind != "classification"
-                                     else o, yva))
-                model.train()
-            rec.epoch(ep, tot / max(len(tr_idx), 1), vl, float(p["lr"]))
+        try:
+            for ep in range(int(p["epochs"])):
+                # 在 epoch 内保持 loss 为 device tensor，避免 CUDA 每个 batch
+                # 通过 float(loss) 同步；只在 recorder 需要标量时同步一次。
+                tot = torch.zeros((), dtype=torch.float32, device=dev)
+                for xb, yb in loader:
+                    opt.zero_grad()
+                    out = model(xb)
+                    loss = lossf(out.squeeze(-1) if kind != "classification"
+                                 else out, yb)
+                    loss.backward()
+                    opt.step()
+                    tot += loss.detach() * len(xb)
+                vl = None
+                if Xva is not None:
+                    model.eval()
+                    with torch.no_grad():
+                        o = model(Xva)
+                        vl = float(lossf(o.squeeze(-1)
+                                         if kind != "classification" else o, yva))
+                    model.train()
+                rec.epoch(ep, float(tot) / max(len(tr_idx), 1), vl,
+                          float(p["lr"]))
+        finally:
+            # hook 只服务 recorder probe；训练结束立即移除，避免每个训练
+            # batch 都经过一次无效 Python hook。
+            rec.close()
 
         res = self._new_result(target_kind=kind, params=p)
         res.est = model
