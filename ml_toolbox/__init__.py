@@ -5,3 +5,12 @@
 GUI 位于 ml_toolbox.ui，通过契约消费本包。
 """
 __version__ = "0.2.0"
+
+# Stable headless facade.  Importing the package remains Qt-free; GUI code is
+# still isolated under ml_toolbox.ui.
+from .api import API_VERSION, RunRequest, RunSnapshot, RunState, Session, TerminalReason
+
+__all__ = [
+    "__version__", "API_VERSION", "Session", "RunRequest", "RunSnapshot",
+    "RunState", "TerminalReason",
+]
