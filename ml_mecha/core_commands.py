@@ -34,7 +34,7 @@ def core_command_specs() -> list[CommandSpec]:
             output_schema={"type": "object",
                            "required": list(RECEIPT_REQUIRED_KEYS)},
             side_effect=host.side_effect != SIDE_EFFECT_NONE,
-            scope=(host.side_effect,),
+            scope=(host.name,),
             estimate_sec=DEFAULT_EST_SEC,
             cancel_supported=host.name != "prepare_dataset",
             approval_required=False,

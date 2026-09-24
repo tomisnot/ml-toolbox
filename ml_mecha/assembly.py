@@ -43,11 +43,13 @@ from mecha.authority import Mode
 from mecha.gate import Channel
 from mecha.history import History
 from mecha.monitor import Summarizer
+from mecha.scopes import ScopePolicy
 from mecha.surface import EntryKind
 from mecha.tools import ToolRegistry
 
 from ml_toolbox.api import Session
 
+from .commands import COMMANDS as HOST_COMMANDS
 from .core_commands import core_command_specs
 from .engine import MLEngine, make_state_writer
 from .summarizer import ml_summarizer
@@ -71,9 +73,11 @@ class MLMecha:
     都是同一个 ``Software`` 实例里的对象，本类只做"少打几个字"的转发。
     """
 
-    def __init__(self, software: Software, engine: MLEngine) -> None:
+    def __init__(self, software: Software, engine: MLEngine,
+                 scopes: ScopePolicy) -> None:
         self.software = software
         self.engine = engine
+        self.scopes = scopes
         self._closed = False
 
     # ---- 转发（同一实例，不是第二套） ----
@@ -214,9 +218,18 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
             core_spec, _core_command_handler(engine, core_spec.name))
     engine.bind_command_registry(software.commands, software.gate)
 
+    # 作用域写权：命令 scope 用 ML 自己的命令名（不透明字符串）。人类侧全给；
+    # AI 侧只给当前开放的四条命令——未来 export/predict 等新命令必须显式加授，
+    # 否则 AI 在副作用之前被 scope_denied（fail closed）。
+    scopes = ScopePolicy()
+    all_scopes = tuple(c.name for c in HOST_COMMANDS)
+    scopes.grant("human", *all_scopes)
+    scopes.grant("ai", *all_scopes)
+    software.commands.bind_scope_policy(scopes)
+
     if register_tools:
         register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai")
-    return MLMecha(software, engine)
+    return MLMecha(software, engine, scopes)
 
 
 def _core_command_handler(engine: MLEngine, name: str):

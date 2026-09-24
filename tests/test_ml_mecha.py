@@ -241,6 +241,24 @@ def test_commands_registered_in_core_registry(app):
     assert "source" in prep.parameters["required"]
 
 
+def test_scope_policy_denies_unlisted_command_scope(app):
+    """AI 未被授予的 scope 在副作用前 fail closed；显式授权后放行。"""
+    dataset_id = _prepared(app)
+    app.scopes.revoke("ai", "run_method")
+    denied = _as(app, app.ai_channel,
+                 {"command": "run_method", "method": "logistic",
+                  "dataset_id": dataset_id})
+    assert denied["ok"] is False
+    assert denied["error_kind"] == "scope_denied"
+    assert app.engine.session.export_state()["records"] == []
+
+    app.scopes.grant("ai", "run_method")
+    allowed = _as(app, app.ai_channel,
+                  {"command": "run_method", "method": "logistic",
+                   "dataset_id": dataset_id})
+    assert allowed["ok"] is True
+
+
 def test_write_tool_failures_are_tool_failure(app):
     """写工具失败必须是 ``is_error=True`` + ToolFailure kind，不是假成功。"""
     csv_path = Path(app.layout.root) / "outside.csv"
@@ -673,6 +691,7 @@ def main() -> int:
              test_prepare_dataset_csv_allowed_inside_dataset_roots,
              test_read_queries_are_registered_in_surface,
              test_commands_registered_in_core_registry,
+             test_scope_policy_denies_unlisted_command_scope,
              test_write_tool_failures_are_tool_failure,
              test_run_method_end_to_end_and_receipt_contract,
              test_resource_guard_rejects_without_escaping,
