@@ -159,17 +159,13 @@ class Session:
 
     def prepare(self, dataset: Dataset, *, pipeline: Pipeline | None = None,
                 diag: bool = False) -> DataSpec:
-        """Fit a fresh pipeline view for ``dataset``.
+        """Prepare a train-only DataSpec using the stable pipeline path.
 
-        This is a compatibility wrapper around ``Pipeline.run``.  The returned
-        ``DataSpec`` is still backed by the legacy step state; callers needing
-        cross-run immutability should use a fresh pipeline per prepared view
-        until ``FittedPipeline`` is introduced.
+        Legacy ``Pipeline.run`` remains available for compatibility, but the
+        Session facade uses :meth:`Pipeline.fit` so preprocessing state is
+        fitted only on the training partition by default.
         """
-        if not isinstance(dataset, Dataset):
-            raise TypeError("dataset must be a ml_toolbox.core.Dataset")
-        pipeline = pipeline or Pipeline.default()
-        return pipeline.run(dataset, diag=diag)
+        return self.prepare_fitted(dataset, pipeline=pipeline, diag=diag).spec
 
     def prepare_fitted(self, dataset: Dataset, *,
                        pipeline: Pipeline | None = None,

@@ -11,7 +11,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ml_toolbox.core import Dataset, Pipeline
-from ml_toolbox.core.pipeline import FittedPipeline
+from ml_toolbox.core.pipeline import FittedPipeline, ScaleStep
 
 
 def _dataset(mean: float, name: str) -> Dataset:
@@ -46,9 +46,23 @@ def test_fitted_pipeline_exposes_stable_id():
     assert fp.spec.meta["pipeline_id"] == fp.pipeline_id
 
 
+def test_fit_uses_train_only_scaler_state():
+    frame = pd.DataFrame({"a": [0.0] * 20 + [100.0] * 20,
+                          "target": np.arange(40, dtype=float)})
+    ds = Dataset(frame, name="leak", target="target")
+    fitted = Pipeline(steps=[ScaleStep()], time_split=True,
+                      test_size=0.5).fit(ds)
+    scaler = fitted._pipeline.steps[0].state_["scaler"]
+    assert abs(float(scaler.mean_[0])) < 1e-9
+    # The held-out extreme value is transformed, not used to fit the scaler.
+    assert float(fitted.spec.X.iloc[-1, 0]) > 5.0
+    assert fitted.spec.meta["fit_scope"] == "train_only"
+
+
 def main():
     tests = [test_fitted_pipeline_isolated_between_fits,
-             test_fitted_pipeline_exposes_stable_id]
+             test_fitted_pipeline_exposes_stable_id,
+             test_fit_uses_train_only_scaler_state]
     for fn in tests:
         fn()
         print("PASS", fn.__name__)

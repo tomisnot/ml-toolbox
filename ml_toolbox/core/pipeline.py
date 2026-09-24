@@ -256,15 +256,60 @@ class Pipeline:
         return cls(steps=[MissingStep(), EncodeStep(), ScaleStep(), SplitStep()])
 
     def fit(self, ds: Dataset, diag: bool = False) -> "FittedPipeline":
-        """Fit an isolated pipeline copy and return a reusable handle.
+        """Fit an isolated, train-only pipeline state and return its handle.
 
-        The legacy :meth:`run` method remains mutable for compatibility, while
-        this entry point prevents a later ``fit`` on the same Pipeline object
-        from overwriting the step state used by ``transform_new``.
+        Unlike legacy :meth:`run`, stateful steps learn only from the training
+        partition; the test partition is transformed with the frozen state.
         """
         fitted = copy.deepcopy(self)
-        spec = fitted.run(ds, diag=diag)
+        spec = fitted._fit_split_aware(ds, diag=diag)
         return FittedPipeline(fitted, spec)
+
+    def _fit_split_aware(self, ds: Dataset, diag: bool = False) -> DataSpec:
+        """Internal split-before-fit implementation used by :meth:`fit`."""
+        raw = ds.frame.copy().reset_index(drop=True)
+        y_raw = raw[ds.target] if ds.target and ds.target in raw.columns else None
+        train_idx, test_idx = self._split(raw, y_raw)
+        train = raw.iloc[train_idx].copy()
+        test = raw.iloc[test_idx].copy()
+        test_y = test[ds.target] if ds.target and ds.target in test.columns else None
+        if ds.target and ds.target in test.columns:
+            test = test.drop(columns=[ds.target])
+        chain = []
+        for st in self.steps:
+            if not st.enabled:
+                chain.append({"step": st.describe(), "skipped": True})
+                continue
+            if st.key == "split":
+                train, summary = st.apply(train, ds.target, diag=diag)
+                test = st.transform(test, None)
+            else:
+                train, summary = st.apply(train, ds.target, diag=diag)
+                test = st.transform(test, None)
+            chain.append({"step": st.describe(), "summary": summary})
+        target_cols = [ds.target] if ds.target else []
+        if ds.time_col:
+            target_cols.append(ds.time_col)
+        X_train = train.drop(columns=[c for c in target_cols if c and c in train.columns])
+        X_test = test.drop(columns=[c for c in target_cols if c and c in test.columns])
+        X_test = X_test.reindex(columns=X_train.columns, fill_value=0.0)
+        X = pd.concat([X_train, X_test]).sort_index()
+        y_parts = []
+        if y_raw is not None:
+            y_parts = [y_raw.iloc[train_idx], y_raw.iloc[test_idx]]
+            y = pd.concat(y_parts).sort_index()
+        else:
+            y = None
+        target_kind = _infer_kind(y)
+        return DataSpec(
+            X=X.reset_index(drop=True), y=y.reset_index(drop=True) if y is not None else None,
+            train_idx=train_idx, test_idx=test_idx, target_kind=target_kind,
+            n_classes=int(y.nunique()) if y is not None and target_kind == "classification" else 0,
+            meta={"chain": chain, "pipeline_id": self.fingerprint(),
+                  "dataset": ds.name, "source": ds.source,
+                  "n_features": int(X.shape[1]), "n_samples": int(len(raw)),
+                  "fit_scope": "train_only"},
+        )
 
     def run(self, ds: Dataset, diag: bool = False) -> DataSpec:
         """Dataset -> DataSpec（X, y, 划分索引, 处理链摘要）。"""
