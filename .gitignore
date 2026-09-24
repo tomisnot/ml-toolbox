@@ -8,6 +8,9 @@ runs/
 # UI 截图自查临时产物
 checks/shots/
 
+# 遗留独立仓库：不作为子模块/嵌套 git 仓库入库
+old/machine_learning/
+
 # 性能基准运行产物（本地证据，不入库）
 benchmarks/perf/results/
 

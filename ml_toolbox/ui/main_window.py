@@ -530,13 +530,13 @@ class MainWindow(QMainWindow):
     # ================================================== 检视 / 调参
     def _inspect_method(self, name: str):
         """单击方法库：立刻单独运行并检视（遍历的最小单元）。"""
-        if self.spec is None:
-            self.statusBar().showMessage("先加载数据，再点方法试跑")
-            return
         self._current_method = name
         m = registry.get(name)
         self._cfg.seed = self._seed_value()
-        self.params.set_method(m, self._cfg)
+        self.params.set_method(m, self._cfg)   # 先回写右栏：无数据时也要显示所选方法
+        if self.spec is None:
+            self.statusBar().showMessage("先加载数据，再点方法试跑")
+            return
         self._worker = SingleWorker(m, self.spec, self._cfg, self)
         self._worker.finished_ok.connect(lambda r: self._show_single(r))
         self._worker.failed.connect(self._on_worker_fail)

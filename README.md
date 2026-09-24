@@ -3,8 +3,9 @@
 一个**可被其他项目直接 import** 的机器学习工具箱，也是桌面软件：把"哪个方法好用"
 这件无法提前预测的事，变成"在统一界面里低成本遍历尝试"的工程流程。
 
-- 53 个方法 / 11 族（含神经网络 MLP，方案 C：训练过程可视化）
-- 8 个优化器 + 自动调参工作区（序贯优化，与 ML 三接缝互通）
+- 59 个方法 / 11 族（含神经网络 MLP，方案 C：训练过程可视化；
+  含 6 个量子启发方法，按建模任务分散归族，零新增依赖）
+- 9 个优化器 + 自动调参工作区（序贯优化，与 ML 三接缝互通；含横场量子退火 SQA）
 - 按**建模目的**（预测/判别/归因/分群/降维/综合评价/异常/代理模型/基线）筛选
 - 每个方法声明自己的核心图，UI 基类不预设图长什么样
 - 一份数据 + 一条可检视管道，全方法共享；实验自动存档可回看
@@ -13,7 +14,7 @@
 ```powershell
 pip install -r requirements.txt
 python app.py            # 启动界面
-python tests/run_all.py  # 质量门（smoke + 18 回归 + 17 UI + 30 优化）
+python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
 ```
 
 > 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
@@ -34,10 +35,14 @@ ml_toolbox/
 │   ├── persistence.py  runs/<id>/{record.json, artifacts.npz}
 │   └── demo.py         8 个离线演示数据集
 ├── methods/       11 个方法族 + plots.py（纯 matplotlib 绘图函数）
-│   └── neural/    神经网络（方案 C）：recorder 黑匣子 + TorchMLP + nnplots
+│   ├── neural/    神经网络（方案 C）：recorder 黑匣子 + TorchMLP + nnplots
+│   ├── quantum.py  6 个量子启发方法（qsvc/qlssvc/qkrr/qkmeans/qpca/qreservoir，
+│   │               按任务分归 svm/linear/cluster/manifold/timeseries 族）
+│   └── qsim.py     小规模量子态模拟器（numpy 态矢量/密度矩阵，零新依赖）
 ├── opt/           序贯优化子框架（兄弟框架，零 Qt）
 │   ├── contracts.py   ParamSpace / Objective / Optimizer(ask-tell) / OptRecord
-│   ├── engines/       baseline·bo(GP-BO)·evo(CMA-ES/NSGA-II)·local(NM)·optuna适配
+│   ├── engines/       baseline·bo(GP-BO)·evo(CMA-ES/NSGA-II)·local(NM)·
+│   │                  quantum(横场退火 SQA)·optuna适配
 │   ├── runner.py      optimize() 预算控制 + on_eval 直播回调
 │   ├── sources.py     数据侧接入：FileSource(热重读)/SpecSource/ArraySource
 │   ├── process.py     评估侧接入：ProcessObjective(外部程序黑盒，stdout 解析；
@@ -129,12 +134,12 @@ pred = registry.get(best["method"]).predict(Xte, rec.result)
 
 | 目的 | 数量 | 方法 |
 |---|---|---|
-| 预测 | 37 | 全部回归 + 时序 + 分类器（可预测类别，含 torch_mlp） |
-| 判别 | 21 | logistic, lda, qda, svc, linear_svc, nusvc, knn, 朴素贝叶斯×3, 树/集成×8, voting, stacking, torch_mlp, dummy |
+| 预测 | 41 | 全部回归 + 时序 + 分类器（可预测类别，含 torch_mlp；量子：qsvc/qlssvc/qkrr/qreservoir） |
+| 判别 | 23 | logistic, lda, qda, svc, linear_svc, nusvc, knn, 朴素贝叶斯×3, 树/集成×8, voting, stacking, torch_mlp, dummy, **qsvc, qlssvc** |
 | 归因解释 | 13 | linear_regression, ridge, lasso, elasticnet, bayesian_ridge, huber, theilsen, logistic, linear_svc, lda, random_forest, extra_trees, gpr, arima, ts_trend |
-| 分群 | 6 | kmeans, gmm, dbscan, hdbscan, agglomerative, spectral |
-| 降维 | 6 | pca, kernel_pca, lda_proj, tsne, umap, isomap |
-| 综合评价 | 2 | pca, lda_proj（方差/判别权重可作打分依据） |
+| 分群 | 7 | kmeans, gmm, dbscan, hdbscan, agglomerative, spectral, **qkmeans** |
+| 降维 | 7 | pca, kernel_pca, lda_proj, tsne, umap, isomap, **qpca** |
+| 综合评价 | 3 | pca, lda_proj, **qpca**（方差/判别权重可作打分依据） |
 | 异常检测 | 4 | iforest, lof, ocsvm, mahalanobis |
 | 代理模型 | 2 | gpr, bayesian_ridge（含不确定度，可喂优化算法） |
 | 参照基线 | 1 | dummy（任何模型都应赢它） |
@@ -142,8 +147,9 @@ pred = registry.get(best["method"]).predict(Xte, rec.result)
 > 目的由 `task + tags + family` 推导，方法可用 ClassVar `purposes` 显式覆盖。
 > 一个方法可挂多个目的（如 lasso = 预测 + 归因解释）。
 
-按族：linear 11 · ensemble 9 · cluster 6 · manifold 6 · timeseries 7 · bayes 4 ·
-anomaly 4 · svm 3 · knn 1 · baseline 1 · neural 1。
+按族：linear 12 · ensemble 9 · cluster 7 · manifold 7 · timeseries 8 · bayes 4 ·
+anomaly 4 · svm 5 · knn 1 · baseline 1 · neural 1（量子启发 6 方法分散在前 5 族，
+以 tag `quantum` 检索，不单独成族）。
 
 ## 四、界面速览
 
@@ -180,25 +186,29 @@ ML 五页对应数模工作流：**看数据**（处理链/数据检视）→ **
 
 | 命令 | 内容 |
 |---|---|
-| `python tests/run_all.py` | 一键门：smoke（53 方法 × 6 任务）+ 18 回归 + 17 UI + 30 优化 |
-| `python checks/ui_shot.py` | 离屏渲染真实界面 → 53 张 PNG → 按 checklist 视觉自查 |
+| `python tests/run_all.py` | 一键门：smoke（59 方法 × 6 任务）+ 30 回归 + 19 UI + 43 优化 |
+| `python checks/ui_shot.py` | 离屏渲染真实界面 → 59 张 PNG → 按 checklist 视觉自查 |
 | `python benchmarks/run_benchmarks.py` | 数模基准（Iris/Wine/Housing/blobs/异常/时序/digits） |
 | `python benchmarks/run_opt_bench.py` | 优化基准：GP-BO vs 随机搜索（标准函数全领先） |
 | `python benchmarks/run_autotune_bench.py` | AutoTuner 数模验收（digits 调参 ≥ 默认） |
 
 回归门覆盖的"静默 bug"（只有测试能抓到的那类）：热图朝向像素级验色、异常分数方向、
 标签编码跨实例、时间切分不泄漏未来、CV 零开销、参数三态、Qt 信号载荷污染、
-神经网络初始权重快照/嵌套工件存盘重组。
+神经网络初始权重快照/嵌套工件存盘重组、量子核解析锚点（n=1 必等 cos²((x−z)/2)）、
+DME 幂迭代与经典 PCA 首方向对齐、量子储层记忆容量、跨实例量子标签还原。
 
 ## 六、已知限制
 
 - 神经网络仅 MLP（全连接，分类/回归）；CNN/RNN/Transformer 等结构未覆盖，
   但方案 C 的 recorder + 注册页机制可直接复用；torch 为可选依赖，未装时该族跳过；
 - **自动调参 / 序贯优化子框架已落地（阶段 0-4）**——与 ML 工具箱"兄弟框架 +
-  共享内核 + 三接缝互通"：8 个优化器（自研 GP-BO/CMA-ES/NSGA-II/Nelder-Mead +
-  适配 TPE/ASHA）、UI 直播工作区、AutoTuner（自动调 ML 超参）、响应面回流。
+  共享内核 + 三接缝互通"：9 个优化器（自研 GP-BO/CMA-ES/NSGA-II/Nelder-Mead/
+  横场量子退火 SQA + 适配 TPE/ASHA）、UI 直播工作区、AutoTuner（自动调 ML 超参）、响应面回流。
   定位见 `docs/优化定位.md`，契约见 `docs/优化契约.md`。数模代理模型路径仍是
   `gpr/bayesian_ridge` 出响应面，再交给优化框架或外部算法；
+- **量子启发方法（6 个）为态矢量/密度矩阵级经典模拟**，非量子计算机接口、
+  不宣称量子加速（教材 §3.3.3/§4.2.4 本就说“计算困难≠学习有效”“量子行为≠加速”）；
+  n_qubits 上限钉死模拟成本，零新增依赖；变分量子线路/量子神经网络（需参数平移训练）暂未做；
 - 时序方法当前只消费 y 序列，**忽略外生特征 X**（`can_handle` 已要求有 y）；
 - 单次运行内 estimator 驻留内存，不支持断点续训；
 - Windows 优先验证（LightGBM×Qt 导入顺序铁律见 `docs/pitfalls.md` L1）。

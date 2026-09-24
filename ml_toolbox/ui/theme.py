@@ -135,7 +135,11 @@ QTabWidget#barePane::pane { border:none; background:transparent; }
 /* ---- 表格 / 树 ---- */
 QTreeWidget, QTableWidget, QListWidget { background:#ffffff;
     border:1px solid #e1e5ea; border-radius:8px; }
+QTreeWidget::item, QTableWidget::item, QListWidget::item { min-height:44px; }
 QTreeWidget::item:hover, QTableWidget::item:hover { background:#f0f5ff; }
+/* 选中行：必须显式定义，否则默认调色板画深蓝底 + 全局深色字 = 文字不可读 */
+QTreeWidget::item:selected, QTableWidget::item:selected,
+QListWidget::item:selected { background:#e8f0fe; color:#2d6cdf; }
 QHeaderView::section { background:#f4f6f9; border:none;
     border-right:1px solid #e6e9ee; border-bottom:1px solid #e6e9ee;
     padding:8px 12px; font-weight:600; color:#42505f; }

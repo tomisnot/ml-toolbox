@@ -506,6 +506,142 @@ def test_core_does_not_import_methods():
     assert pages, "ridge 兜底页丢失（auto_pages 下沉后断链？）"
 
 
+# ---------------------------------------------------------------- 量子启发方法
+def _qspec_reg(n=60, d=4, seed=0, cls=False):
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    rng = np.random.RandomState(seed)
+    X = rng.randn(n, d)
+    y = (X[:, 0] > 0).astype(int) if cls else X[:, 0] * 2 + np.sin(X[:, 1])
+    return Pipeline.default().run(Dataset.from_arrays(X, y, name="q"))
+
+
+def test_quantum_methods_registered_in_families():
+    """量子启发方法“归到该归的族”：不单独成族，tags 带 quantum。"""
+    from ml_toolbox.core import registry
+    registry.load_builtin()
+    expect = {"qsvc": "svm", "qlssvc": "svm", "qkrr": "linear",
+              "qkmeans": "cluster", "qpca": "manifold",
+              "qreservoir": "timeseries"}
+    fams = registry.families()
+    for nm, fam in expect.items():
+        assert nm in fams.get(fam, []), f"{nm} 应在族 {fam}，实归 {fams.get(fam)}"
+        m = registry.get(nm)
+        assert "quantum" in m.tags, f"{nm} 缺 quantum 标签"
+    # 没有新增名为 quantum 的 ML 族（量子启发不单独成族）
+    assert "quantum" not in fams, "ML 侧不应出现 quantum 独立族"
+
+
+def test_quantum_feature_map_analytic_kernel():
+    """n=1 保真度核必须等于解析式 cos²((x−z)/2)（书式 3.79）。
+
+    编码约定（qubit 位序 / Ry 角度 / 归一）一旦漂移，核值会错但方法不报错——
+    这是只有断言能抓的静默 bug。
+    """
+    from ml_toolbox.methods import qsim
+    xs = np.linspace(0, np.pi, 6)
+    S = qsim.feature_map_states(xs.reshape(-1, 1))
+    K = qsim.fidelity_kernel(S)
+    ana = np.cos((xs[:, None] - xs[None, :]) / 2) ** 2
+    assert np.allclose(K, ana, atol=1e-9), "n=1 量子核偏离解析 cos²((x−z)/2)"
+    # 保真度核必须 PSD（式 3.70-3.72）
+    S4 = qsim.feature_map_states(np.random.RandomState(1).rand(12, 3) * np.pi)
+    ev = np.linalg.eigvalsh(qsim.fidelity_kernel(S4))
+    assert ev.min() > -1e-9, "量子核非半正定"
+
+
+def test_quantum_shots_reproducible():
+    """同 seed+shots 的核矩阵逐位一致（反演测试采样可复现）。"""
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+    registry.load_builtin()
+    spec = _qspec_reg(50, cls=True)
+    a = runner.run_one(registry.get("qsvc"), spec,
+                       RunConfig(seed=7, overrides={"shots": 200}))
+    b = runner.run_one(registry.get("qsvc"), spec,
+                       RunConfig(seed=7, overrides={"shots": 200}))
+    assert np.allclose(a.result.artifacts["q_kernel"],
+                       b.result.artifacts["q_kernel"])
+
+
+def test_quantum_supervised_fresh_instance_string_labels():
+    """qsvc：换新实例仅凭 result 预测，仍返回原始字符串标签（L19 同类）。"""
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    registry.load_builtin()
+    rng = np.random.RandomState(0)
+    X = np.vstack([rng.randn(30, 2) + 1.5, rng.randn(30, 2) - 1.5])
+    y = np.array(["cat"] * 30 + ["dog"] * 30)
+    spec = Pipeline.default().run(Dataset.from_arrays(X, y, name="s"))
+    rec = runner.run_one(registry.get("qsvc"), spec, RunConfig(seed=42))
+    assert rec.result.ok, rec.result.error
+    fresh = registry.get("qsvc")                 # 全新未拟合实例
+    pred = fresh.predict(spec.X, rec.result)
+    assert set(np.unique(pred)) <= {"cat", "dog"}, \
+        f"跨实例预测未还原原始标签：{set(np.unique(pred))}"
+
+
+def test_qpca_matches_classical_pca():
+    """DME 幂迭代首方向与经典 PCA 第一主成分对齐（子空间正确性）。"""
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    registry.load_builtin()
+    rng = np.random.RandomState(3)
+    t = rng.randn(120)
+    X = np.column_stack([t * 3 + 0.1 * rng.randn(120), t * 3 + 0.1 * rng.randn(120),
+                         0.2 * rng.randn(120)])
+    spec = Pipeline.default().run(Dataset.from_arrays(X, None, name="p"))
+    rec = runner.run_one(registry.get("qpca"), spec, RunConfig(seed=42))
+    assert rec.result.ok, rec.result.error
+    from sklearn.decomposition import PCA
+    Xtr = spec.X.to_numpy(float)[spec.train_idx]      # qpca 在训练段拟合
+    pc1 = PCA(n_components=1, random_state=0).fit(Xtr).components_[0]
+    emb = rec.result.artifacts["embedding"][:, 0]
+    # 嵌入投影方向应与 PC1 高度相关（|corr| 接近 1）
+    proj = Xtr @ pc1
+    assert len(emb) == len(proj), "嵌入行数与训练段不一致"
+    assert abs(np.corrcoef(emb, proj)[0, 1]) > 0.95, "DME 首方向偏离经典 PCA"
+
+
+def test_qreservoir_memory_and_forecast():
+    """量子储层：产出有限 rmse + 记忆容量谱（读出/滚动外推契约）。"""
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    registry.load_builtin()
+    t = np.arange(160.0)
+    s = 0.3 * t + 8 * np.sin(2 * np.pi * t / 12) + np.random.RandomState(1).randn(160) * 0.5
+    spec = Pipeline.default().run(Dataset.from_arrays(s.reshape(-1, 1), s, name="ts"))
+    rec = runner.run_one(registry.get("qreservoir"), spec, RunConfig(seed=42))
+    assert rec.result.ok, rec.result.error
+    assert np.isfinite(rec.result.metrics["rmse"]), "rmse 非有限"
+    mc = rec.result.artifacts["qrc_mc"]
+    assert len(mc) > 0 and np.nanmax(mc) > 0, "记忆容量谱为空/全零"
+
+
+def test_sqa_engine_registered_family_quantum():
+    """opt 侧：量子退火引擎注册在 family=quantum，单点 ask/tell 能收敛。"""
+    from ml_toolbox.opt import registry as oreg
+    from ml_toolbox.opt.contracts import ParamSpace, Budget, make_objective
+    from ml_toolbox.core.contracts import ParamSpec
+    from ml_toolbox.opt.runner import optimize
+    oreg.load_builtin()
+    assert "quantum_anneal" in oreg.families().get("quantum", []), \
+        "量子退火应注册在 opt family=quantum"
+    space = ParamSpace([ParamSpec(f"x{i}", "", "number", 0.0, min=-2, max=2)
+                        for i in range(3)])
+    obj = make_objective(lambda p: sum(p[k] ** 2 for k in ["x0", "x1", "x2"]),
+                         space, name="sphere")
+    r = optimize(obj, oreg.get("quantum_anneal"), Budget(n_evals=80), seed=42)
+    assert r.error is None and r.best is not None
+    assert float(r.best["score"]) < 1.0, "SQA 未把球函数降到 1.0 以下"
+
+
 def main():
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
