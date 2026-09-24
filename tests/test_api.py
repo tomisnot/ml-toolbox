@@ -42,6 +42,8 @@ def test_session_methods_prepare_and_run():
     assert snap.state is RunState.SUCCEEDED
     assert snap.terminal_reason is TerminalReason.COMPLETED
     assert snap.run_id == rec.run_id
+    assert snap.to_dict()["state"] == "succeeded"
+    assert snap.to_dict()["terminal"] is True
     assert s.record(rec.run_id) is rec
 
     pred = s.predict(rec, spec.X.head(5))
@@ -87,12 +89,15 @@ def test_session_batch_and_explicit_save():
 def test_run_config_conversion_isolated():
     overrides = {"C": 2.0}
     extras = {"cv_folds": 2}
+    s = Session(load_builtin=False)
     req = RunRequest(method="logistic", overrides=overrides, extras=extras)
     overrides["C"] = 99.0
     extras["cv_folds"] = 99
     cfg = req.config()
     assert cfg.overrides["C"] == 2.0
     assert cfg.extras["cv_folds"] == 2
+    assert req.to_dict()["overrides"] == {"C": 2.0}
+    assert s.last_state() is None
 
 
 def main():

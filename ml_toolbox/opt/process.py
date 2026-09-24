@@ -331,9 +331,15 @@ class ProcessObjective(Objective):
         if os.name == "nt":
             # 独立进程组：父进程被强杀时不连带；kill_all 可整树清理
             flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        child_env = None
+        if self.env_extra:
+            child_env = os.environ.copy()
+            child_env.update({str(k): str(v)
+                              for k, v in self.env_extra.items()})
         return subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=self.cwd, shell=self.shell, creationflags=flags)
+            cwd=self.cwd, shell=self.shell, env=child_env,
+            creationflags=flags)
 
     @staticmethod
     def _kill_tree(proc):

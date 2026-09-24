@@ -80,6 +80,12 @@ class RunRequest:
         object.__setattr__(self, "overrides", dict(self.overrides))
         object.__setattr__(self, "extras", dict(self.extras))
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"request_id": self.request_id, "method": self.method,
+                "overrides": dict(self.overrides), "extras": dict(self.extras),
+                "diag": bool(self.diag), "seed": int(self.seed),
+                "persist": bool(self.persist)}
+
     def config(self) -> RunConfig:
         return RunConfig(
             overrides=dict(self.overrides),
@@ -99,6 +105,14 @@ class RunSnapshot:
     terminal_reason: TerminalReason | None = None
     run_id: str | None = None
     message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"request_id": self.request_id, "method": self.method,
+                "state": self.state.value,
+                "terminal_reason": (self.terminal_reason.value
+                                    if self.terminal_reason else None),
+                "run_id": self.run_id, "message": self.message,
+                "terminal": self.terminal}
 
     @property
     def terminal(self) -> bool:
