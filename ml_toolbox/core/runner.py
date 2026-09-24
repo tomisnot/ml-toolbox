@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -16,6 +18,8 @@ from .contracts import (MLResult, MLMethod, RunConfig, DataSpec,
                         is_lower_better,
                         TASK_SUPERVISED, TASK_TIMESERIES)
 from . import registry
+from .resources import (ResourceBudget, ResourceBudgetExceeded,
+                        ResourceEstimate, check_resources)
 
 
 @dataclass
@@ -31,53 +35,120 @@ class RunRecord:
     config: dict
     result: MLResult
     started_at: float = field(default_factory=time.time)
+    # wall-clock 分段耗时（秒）。legacy_elapsed 与 MLResult.elapsed 保持一致；
+    # total 包含 evaluate/CV。CV 内会再次 fit，故各阶段不应简单相加。
+    timings: dict = field(default_factory=dict)
+    # 仅在 extras["resource_guard"] 启用且通过/触发估算时存在。
+    resource_estimate: ResourceEstimate | None = None
 
 
 def _run_id(method: str, seed: int) -> str:
     return f"{method}-{int(time.time() * 1000) % 10_000_000}-{seed}"
 
 
+class _StageTimer:
+    """极低开销 wall-clock 分段计时器。"""
+
+    def __init__(self):
+        self.values: dict[str, float] = {}
+
+    @contextmanager
+    def stage(self, name: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.values[name] = self.values.get(name, 0.0) \
+                + max(0.0, time.perf_counter() - t0)
+
+    def ensure(self, *names: str):
+        for name in names:
+            self.values.setdefault(name, 0.0)
+
+
+def _resource_guard(method: MLMethod, spec: DataSpec,
+                    cfg: RunConfig) -> ResourceEstimate | None:
+    """执行 extras.resource_guard；未配置时零额外估算开销。"""
+    guard = cfg.extras.get("resource_guard")
+    if guard is None or guard is False:
+        return None
+    options = dict(guard) if isinstance(guard, dict) else {}
+    budget = ResourceBudget.from_mapping(options)
+    X = spec.X
+    shape = getattr(X, "shape", (0, 0))
+    n_samples, n_features = int(shape[0]), int(shape[1]) if len(shape) > 1 else 0
+    params = method.params(cfg)
+    return check_resources(
+        method, n_samples, n_features, params=params,
+        n_qubits=options.get("n_qubits"), budget=budget,
+        safety_factor=float(options.get("safety_factor", 1.0)),
+    )
+
+
 def run_one(method: MLMethod, spec: DataSpec,
             cfg: RunConfig | None = None) -> RunRecord:
+    """运行一个方法并返回向后兼容的 ``MLResult.elapsed`` 与分段 timings。
+
+    ``MLResult.elapsed`` 保持旧语义：fit + predict 阶段（以及 split/guard）
+    的 wall-clock；``RunRecord.timings['total']`` 额外包含 evaluate/CV。
+    """
     cfg = cfg or RunConfig()
-    t0 = time.time()
+    wall0 = time.time()
+    perf0 = time.perf_counter()
+    timer = _StageTimer()
+    resource_estimate = None
     try:
-        Xtr, Xte, ytr, yte = spec.split()
-        res = method.fit(Xtr, ytr, cfg, diag=cfg.diag)
+        with timer.stage("guard"):
+            resource_estimate = _resource_guard(method, spec, cfg)
+        with timer.stage("split"):
+            Xtr, Xte, ytr, yte = spec.split()
+        with timer.stage("fit"):
+            res = method.fit(Xtr, ytr, cfg, diag=cfg.diag)
         if res.ok and method.task == TASK_SUPERVISED:
-            try:
-                res.artifacts.update(method.fit_extra_artifacts(Xte, res))
-                pred = method.predict(Xte, res)
-                res.artifacts["y_true"] = np.asarray(yte)
-                res.artifacts["y_pred"] = np.asarray(pred)
-            except Exception:
-                res.error = "predict 失败:\n" + traceback.format_exc(limit=6)
+            with timer.stage("predict"):
+                try:
+                    res.artifacts.update(method.fit_extra_artifacts(Xte, res))
+                    pred = method.predict(Xte, res)
+                    res.artifacts["y_true"] = np.asarray(yte)
+                    res.artifacts["y_pred"] = np.asarray(pred)
+                except Exception:
+                    res.error = "predict 失败:\n" + traceback.format_exc(limit=6)
         elif res.ok and method.task == TASK_TIMESERIES:
             pass  # fit 内部已产出 forecast/actual
+    except ResourceBudgetExceeded as e:
+        res = MLResult(method_name=method.name, task=method.task, error=str(e))
+        resource_estimate = e.estimate
     except Exception:
         res = MLResult(method_name=method.name, task=method.task,
                        error=traceback.format_exc(limit=10))
+
+    # 旧字段语义保持不变：评估/CV 之前结算 elapsed。
     res.target_kind = res.target_kind or spec.target_kind
-    res.elapsed = time.time() - t0
+    res.elapsed = time.time() - wall0
     if res.ok:
-        try:
-            if method.task == TASK_SUPERVISED and "y_pred" in res.artifacts:
-                res.metrics.update(method.evaluate(res, spec.X, spec.y))
-        except Exception:
-            res.metrics = dict(res.metrics)
+        with timer.stage("evaluate"):
+            try:
+                if method.task == TASK_SUPERVISED and "y_pred" in res.artifacts:
+                    res.metrics.update(method.evaluate(res, spec.X, spec.y))
+            except Exception:
+                res.metrics = dict(res.metrics)
         # 可选交叉验证（cfg.extras['cv_folds']>0 时才跑，默认零开销 —— P3）
         cv_folds = int(cfg.extras.get("cv_folds", 0) or 0)
         if cv_folds >= 2 and method.task == TASK_SUPERVISED:
-            try:
-                cv = method.cross_validate(spec.X, spec.y, cfg, cv_folds)
-                for k, v in cv.items():
-                    if k == "cv_scores":
-                        res.diag = dict(res.diag or {})
-                        res.diag["cv_scores"] = v
-                    else:
-                        res.metrics[k] = v
-            except Exception:
-                pass
+            with timer.stage("cv"):
+                try:
+                    cv = method.cross_validate(spec.X, spec.y, cfg, cv_folds)
+                    for k, v in cv.items():
+                        if k == "cv_scores":
+                            res.diag = dict(res.diag or {})
+                            res.diag["cv_scores"] = v
+                        else:
+                            res.metrics[k] = v
+                except Exception:
+                    pass
+    timer.ensure("guard", "split", "fit", "predict", "evaluate", "cv")
+    timer.values["legacy_elapsed"] = res.elapsed
+    timer.values["total"] = max(0.0, time.perf_counter() - perf0)
     return RunRecord(run_id=_run_id(method.name, cfg.seed),
                      method=method.name, family=method.family,
                      task=method.task, target_kind=spec.target_kind,
@@ -86,7 +157,25 @@ def run_one(method: MLMethod, spec: DataSpec,
                      config={"overrides": dict(cfg.overrides),
                              "diag": cfg.diag, "seed": cfg.seed,
                              "extras": dict(cfg.extras)},
-                     result=res)
+                     result=res, timings=dict(timer.values),
+                     resource_estimate=resource_estimate)
+
+
+def save_timed(rec: RunRecord, saver: Callable[[RunRecord], object] | None = None):
+    """执行持久化并把耗时写入 ``rec.timings['serialize']``。
+
+    默认延迟导入 ``core.persistence.save_record``，避免 runner <-> persistence
+    循环导入。 saver 主要用于批处理/测试注入；失败时耗时仍会记录。
+    """
+    if saver is None:
+        from .persistence import save_record as saver
+    t0 = time.perf_counter()
+    try:
+        return saver(rec)
+    finally:
+        elapsed = max(0.0, time.perf_counter() - t0)
+        rec.timings["serialize"] = elapsed
+        rec.timings["total"] = rec.timings.get("total", 0.0) + elapsed
 
 
 def run_batch(names: list[str], spec: DataSpec,
