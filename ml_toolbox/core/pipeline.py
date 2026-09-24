@@ -53,23 +53,29 @@ class MissingStep(Step):
     key, title = "missing", "缺失值处理"
 
     def apply(self, df, target, diag=False):
-        before = int(df.isna().sum().sum())
-        miss_rate = (df.isna().mean() * 100)
-        drop_cols = [c for c in df.columns
+        # Target is excluded from drop/fill: preprocessing must not delete or
+        # impute the label column.
+        target_col = df[target].copy() if target is not None and target in df.columns else None
+        candidate = df.drop(columns=[target] if target is not None and target in df.columns else [])
+        before = int(candidate.isna().sum().sum())
+        miss_rate = (candidate.isna().mean() * 100)
+        drop_cols = [c for c in candidate.columns
                      if miss_rate[c] > self.params.get("drop_threshold", 50)]
-        df = df.drop(columns=drop_cols)
-        num = df.select_dtypes(include=[np.number]).columns
-        cat = df.select_dtypes(exclude=[np.number]).columns
+        num = candidate.select_dtypes(include=[np.number]).columns
+        cat = candidate.select_dtypes(exclude=[np.number]).columns
         strategy = self.params.get("strategy", "median")
         fills = {}
         for c in num:
-            v = df[c].median() if strategy == "median" else df[c].mean()
-            df[c] = df[c].fillna(v)
+            v = candidate[c].median() if strategy == "median" else candidate[c].mean()
+            candidate[c] = candidate[c].fillna(v)
             fills[c] = float(v)
         for c in cat:
-            v = df[c].mode().iloc[0] if not df[c].mode().empty else "unknown"
-            df[c] = df[c].fillna(v)
+            v = candidate[c].mode().iloc[0] if not candidate[c].mode().empty else "unknown"
+            candidate[c] = candidate[c].fillna(v)
             fills[c] = str(v)
+        df = candidate
+        if target_col is not None:
+            df[target] = target_col
         self.state_ = {"drop_cols": drop_cols, "fills": fills}
         summary = {"input_missing": before, "dropped_cols": len(drop_cols),
                    "filled_cols": len(fills), "strategy": strategy,
@@ -83,7 +89,7 @@ class MissingStep(Step):
         df = df.drop(columns=[c for c in self.state_["drop_cols"]
                               if c in df.columns])
         for c, v in self.state_["fills"].items():
-            if c in df.columns:
+            if c in df.columns and c != target:
                 df[c] = df[c].fillna(v)
         return df
 
@@ -132,8 +138,9 @@ class EncodeStep(Step):
             if c in cat:
                 if mode == "ordinal":
                     cats = self.state_.get("cats", {}).get(c)
-                    codes = pd.Categorical(df[c], categories=cats).codes
-                    out[c] = np.asarray(codes, float)
+                    codes = np.asarray(pd.Categorical(df[c], categories=cats).codes, float)
+                    codes[codes < 0] = np.nan
+                    out[c] = codes
                 else:
                     out = pd.concat(
                         [out, pd.get_dummies(df[c], prefix=c, dtype=float)],
@@ -180,6 +187,9 @@ class FeatureSelectStep(Step):
     key, title = "feature_select", "特征筛选"
 
     def apply(self, df, target, diag=False):
+        # Clear state first: a skipped fit must never expose a previous keep
+        # vector to transform (stale state caused train/test column mismatch).
+        self.state_ = {}
         if target is None or target not in df.columns:
             return df, {"big_num": "无目标列，跳过"}
         from sklearn.feature_selection import (mutual_info_classif,
@@ -208,8 +218,10 @@ class FeatureSelectStep(Step):
         keep = [c for c, s in sorted(zip(num, scores),
                                      key=lambda t: -t[1])[:k]]
         dropped = [c for c in num if c not in keep]
+        passthrough = [c for c in df.columns if c != target and c not in num]
         out = df.drop(columns=dropped)
-        self.state_ = {"keep": keep, "scores": dict(zip(num, scores.tolist()))}
+        self.state_ = {"keep": keep, "passthrough": passthrough,
+                       "scores": dict(zip(num, scores.tolist()))}
         summary = {"kept": len(keep), "dropped": len(dropped),
                    "big_num": f"保留 {len(keep)} 特征"}
         if diag:
@@ -220,8 +232,9 @@ class FeatureSelectStep(Step):
         keep = self.state_.get("keep")
         if not keep:
             return df
-        cols = [c for c in keep if c in df.columns]
-        if target and target in df.columns:
+        passthrough = self.state_.get("passthrough", [])
+        cols = [c for c in df.columns if c in keep or c in passthrough]
+        if target and target in df.columns and target not in cols:
             cols.append(target)
         return df[cols]
 
@@ -267,12 +280,15 @@ class Pipeline:
 
     def _fit_split_aware(self, ds: Dataset, diag: bool = False) -> DataSpec:
         """Internal split-before-fit implementation used by :meth:`fit`."""
-        raw = ds.frame.copy().reset_index(drop=True)
+        raw = ds.frame.copy()
+        if self.time_split and ds.time_col and ds.time_col in raw.columns:
+            # A time split is only valid when rows are chronological.
+            raw = raw.sort_values(ds.time_col, kind="mergesort")
+        raw = raw.reset_index(drop=True)
         y_raw = raw[ds.target] if ds.target and ds.target in raw.columns else None
         train_idx, test_idx = self._split(raw, y_raw)
         train = raw.iloc[train_idx].copy()
         test = raw.iloc[test_idx].copy()
-        test_y = test[ds.target] if ds.target and ds.target in test.columns else None
         if ds.target and ds.target in test.columns:
             test = test.drop(columns=[ds.target])
         chain = []
@@ -280,18 +296,17 @@ class Pipeline:
             if not st.enabled:
                 chain.append({"step": st.describe(), "skipped": True})
                 continue
-            if st.key == "split":
-                train, summary = st.apply(train, ds.target, diag=diag)
-                test = st.transform(test, None)
-            else:
-                train, summary = st.apply(train, ds.target, diag=diag)
-                test = st.transform(test, None)
+            train, summary = st.apply(train, ds.target, diag=diag)
+            test = st.transform(test, None)
             chain.append({"step": st.describe(), "summary": summary})
         target_cols = [ds.target] if ds.target else []
         if ds.time_col:
             target_cols.append(ds.time_col)
         X_train = train.drop(columns=[c for c in target_cols if c and c in train.columns])
         X_test = test.drop(columns=[c for c in target_cols if c and c in test.columns])
+        missing_cols = [c for c in X_train.columns if c not in X_test.columns]
+        extra_cols = [c for c in X_test.columns if c not in X_train.columns]
+        schema_mismatch = bool(missing_cols or extra_cols)
         X_test = X_test.reindex(columns=X_train.columns, fill_value=0.0)
         X = pd.concat([X_train, X_test]).sort_index()
         y_parts = []
@@ -308,7 +323,10 @@ class Pipeline:
             meta={"chain": chain, "pipeline_id": self.fingerprint(),
                   "dataset": ds.name, "source": ds.source,
                   "n_features": int(X.shape[1]), "n_samples": int(len(raw)),
-                  "fit_scope": "train_only"},
+                  "fit_scope": "train_only",
+                  "schema_mismatch": schema_mismatch,
+                  "missing_columns": missing_cols,
+                  "extra_columns": extra_cols},
         )
 
     def run(self, ds: Dataset, diag: bool = False) -> DataSpec:
@@ -347,13 +365,14 @@ class Pipeline:
         """对新数据套用 run() 时冻结的统计量，输出与 spec.X 同构的特征矩阵。
         （数模场景：训练集跑管道 -> 测试集同变换 -> 模型预测 -> 交表）"""
         df = frame.copy()
+        # The output schema is feature-only; never impute or pass through the
+        # target column, even if the caller supplies one.
+        if target and target in df.columns:
+            df = df.drop(columns=[target])
         for st in self.steps:
             if not st.enabled:
                 continue
-            df = st.transform(df, target)
-        # 与 run() 相同的列剔除
-        if target and target in df.columns:
-            df = df.drop(columns=[target])
+            df = st.transform(df, None)
         return df
 
     def _split(self, df, y):

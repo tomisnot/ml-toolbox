@@ -94,6 +94,7 @@ class MainWindow(QMainWindow):
         self.dataset: Dataset | None = None
         self.spec = None
         self.pipeline = Pipeline.default()
+        self._fitted_pipeline = None
         self.records: list = []
         self._worker = None
         self._current_method = None
@@ -358,7 +359,11 @@ class MainWindow(QMainWindow):
         if self.dataset is None:
             return
         try:
-            self.spec = self.pipeline.run(self.dataset, diag=self._cfg.diag)
+            # Train-only path: scaler/imputer/encoder/feature-select state is
+            # fitted on the training partition only; test rows are transform.
+            self._fitted_pipeline = self.pipeline.fit(
+                self.dataset, diag=self._cfg.diag)
+            self.spec = self._fitted_pipeline.spec
         except Exception:
             QMessageBox.warning(self, "管道执行失败", traceback.format_exc(limit=6))
             return
@@ -439,7 +444,8 @@ class MainWindow(QMainWindow):
                 new = pd.read_excel(p)
             else:
                 new = pd.read_parquet(p)
-            Xnew = self.pipeline.transform_new(new, target=self.dataset.target)
+            Xnew = (self._fitted_pipeline or self.pipeline).transform_new(
+                new, target=self.dataset.target)
             m = registry.get(rec.method)
             pred = m.predict(Xnew, rec.result)
         except Exception as e:

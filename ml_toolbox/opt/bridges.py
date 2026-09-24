@@ -151,7 +151,8 @@ def response_surface(opt_record, method_name: str = "ridge"):
 def _quick_spec(ds: Dataset):
     """Dataset -> DataSpec（响应面：分数是连续目标，强制回归 + 禁分层）。"""
     from ..core.pipeline import Pipeline
-    spec = Pipeline(steps=Pipeline.default().steps, stratify=False).run(ds)
+    spec = Pipeline(steps=Pipeline.default().steps,
+                    stratify=False).fit(ds).spec
     spec.target_kind = "regression"      # 分数列会被 _infer_kind 误判为分类
     spec.n_classes = 0
     return spec
