@@ -540,7 +540,7 @@ def test_constrained_process_objective():
     from ml_toolbox.opt.process import ProcessObjective
     # 约束：a>=0.5 才可行（模拟软件拒绝，退出码 3 + 信号词）
     script = os.path.join(tempfile.gettempdir(), "opt_constrained_sim.py")
-    with open(script, "w") as f:
+    with open(script, "w", encoding="utf-8") as f:
         f.write("import sys\na=float(sys.argv[1])\n"
                 "if a < 0.5:\n    print('违反约束', file=sys.stderr); sys.exit(3)\n"
                 "print('score: %.4f' % ((a-0.8)**2))\n")
