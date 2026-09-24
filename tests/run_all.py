@@ -18,6 +18,12 @@ SCRIPTS = ["smoke_test.py", "test_regressions.py", "test_ui.py", "test_opt.py"]
 
 
 def main():
+    # 子进程输出按 UTF-8 捕获，但 Windows 控制台可能是 GBK；统一使用
+    # 可编码的 UTF-8 + replace，避免 U+FFFD 在汇总阶段掩盖真实测试结果。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
     t_all = time.time()
     procs = {}
     for s in SCRIPTS:
