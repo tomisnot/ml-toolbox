@@ -79,7 +79,8 @@ class ProcessObjective(Objective):
                  *, mode: str | None = None,
                  point_map: dict | None = None, point_extra: dict | None = None,
                  score_field: str = "C_dual", constraints: list | None = None,
-                 stagger: float = 0.0):
+                 stagger: float = 0.0,
+                 strict_schema: bool = True):
         if mode is None:
             mode = "json" if "{points_file}" in cmd_template else "stdout"
         if mode not in ("stdout", "json"):
@@ -103,6 +104,7 @@ class ProcessObjective(Objective):
         self.point_extra = dict(point_extra or {})
         self.score_field = score_field
         self.constraints = list(constraints or [])
+        self.strict_schema = bool(strict_schema)
         self.stagger = float(stagger)
         self._worst_ok = -float("inf")      # 历史最差可行分（最小化方向）
         self.last_cmd = ""                  # UI 展示/排错用
@@ -171,7 +173,9 @@ class ProcessObjective(Objective):
             try:
                 v = self._get_nested(row, c["field"])
             except (KeyError, TypeError):
-                continue                     # 字段缺失不判（黑盒版本差异容错）
+                if self.strict_schema:
+                    bad.append(f"{c['field']} 字段缺失")
+                continue                     # 旧行为：字段缺失不判（黑盒版本差异容错）
             op = c.get("op", ">=")
             ok = {"<=": v <= c["value"], ">=": v >= c["value"],
                   "<": v < c["value"], ">": v > c["value"],
@@ -179,6 +183,17 @@ class ProcessObjective(Objective):
             if not ok:
                 bad.append(f"{c['field']}={v:.4g} {op} {c['value']} 不满足")
         return bad
+
+    def _missing_constraint_fields(self, row: dict) -> list:
+        if not self.strict_schema:
+            return []
+        missing = []
+        for c in self.constraints:
+            try:
+                self._get_nested(row, c["field"])
+            except (KeyError, TypeError):
+                missing.append(str(c["field"]))
+        return missing
 
     # ------------------------------------------------ 统一评估入口（C4-2）
     def _run_point(self, params: dict, pid) -> tuple:
@@ -246,7 +261,21 @@ class ProcessObjective(Objective):
             with open(of, encoding="utf-8", errors="replace") as f:
                 rows = json.load(f)
             row = rows[0] if isinstance(rows, list) and rows else rows
-            if not row.get("ok", True):
+            missing = self._missing_constraint_fields(row)
+            if missing:
+                self.last_error = f"黑盒输出缺少约束字段: {missing}"
+                _LOG.warning("黑盒缺少约束字段 pid=%s missing=%s", proc.pid,
+                             missing)
+                return np.inf, "failed"
+            if self.strict_schema:
+                if not isinstance(row, dict) or "ok" not in row:
+                    self.last_error = f"黑盒输出缺少 ok 字段: {row}"
+                    _LOG.warning("黑盒缺少 ok 字段 pid=%s row=%s", proc.pid, row)
+                    return np.inf, "failed"
+                ok_flag = row.get("ok", False)
+            else:
+                ok_flag = row.get("ok", True)
+            if not ok_flag:
                 self.last_error = f"黑盒报失败: {row.get('err', row)}"
                 _LOG.warning("黑盒报失败 pid=%s err=%s", proc.pid,
                              row.get("err", "?"))
