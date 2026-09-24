@@ -25,8 +25,9 @@ from __future__ import annotations
 
 __all__ = ["engine", "validator", "summarizer", "tools", "assembly"]
 
-#: 本适配器写入 mecha History 的**命令事件键前缀**（ML 词汇，不进 mecha 核心）。
-COMMAND_EVENT_PREFIX = "ml.command."
+#: 本适配器写入 mecha History 的**域运行事件键**（ML 词汇，不进 mecha 核心）。
+#: 命令审计本身由 mecha 核心写 ``command.<name>``，这里只写领域结果摘要。
+COMMAND_EVENT_PREFIX = "ml.run"
 
 #: 本适配器声明的**状态键前缀**（ML 词汇，不进 mecha 核心）。
 STATE_KEY_PREFIX = "current."

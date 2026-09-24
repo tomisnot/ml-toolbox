@@ -70,6 +70,10 @@ DEFAULT_OPS_PER_SEC = 2.0e7
 #: 保护性上限：单条命令估时不超过 24 小时（超过即"该走 Job 而不是同步"）。
 MAX_EST_SEC = 86_400.0
 
+#: 核心 CommandSpec 的默认估时声明（秒）。真实估算仍走 :meth:`MLEngine.estimate`；
+#: 核心 ``estimate`` 只做"声明存在 + 形状对"的守卫。
+DEFAULT_EST_SEC = 0.5
+
 #: 回执/History 里最多列几个列名（宽表不截断 = 把表头塞进事件）。
 MAX_LISTED_COLUMNS = 64
 
@@ -227,6 +231,8 @@ class MLEngine(Engine):
         self._dataset_seq = 0
         self._lock = threading.RLock()
         self._surface_query: Callable[..., Any] | None = None
+        self._commands: Any | None = None
+        self._command_gate: Any | None = None
         self._validator = MLValidator(
             self, allowed_export_roots=self._allowed_export_roots,
             max_batch_methods=max_batch_methods,
@@ -490,10 +496,63 @@ class MLEngine(Engine):
             **opts: Any) -> Mapping[str, Any]:
         """受控命令分派。
 
-        ``context`` 由框架传入（可能为 None——只读命令不需要取消语义）；
-        取消只在批量/对比里按方法边界检查（ML 单次 fit 是同步长计算，
-        本层不假装能中断）。
+        装配后命令声明注册进 mecha 核心 ``CommandRegistry``（唯一命令审计 +
+        result_ref）；未绑定的裸引擎回退本地分派，便于单测。
         """
+        command = str(spec.get("command", ""))
+        if self._commands is not None and command in self._commands.names():
+            return self._invoke_core_command(command, spec, context)
+        return self._dispatch(spec, context)
+
+    def _invoke_core_command(self, command: str, spec: Mapping[str, Any],
+                             context: ExecutionContext | None) -> Mapping[str, Any]:
+        """经核心 CommandRegistry 调用命令（审计/result_ref 由核心写）。"""
+        args = {k: v for k, v in spec.items() if k != "command"}
+        args["reason"] = f"ml_mecha:{command}"
+        args["call_id"] = _call_id()
+        result = self._commands.invoke(
+            command, args, context=context, gate=self._command_gate,
+            channel=active_channel())
+        if result.get("is_error"):
+            failure = result.get("error") or {}
+            info = failure.get("info") or {}
+            payload = result.get("value")
+            if isinstance(payload, Mapping) and payload:
+                # 宿主回执原样返回：run_ids / warnings 不能在失败路径丢失，
+                # 否则被守卫拦下的运行无法与 ML run store 对账。
+                out = dict(payload)
+                out.setdefault("error_kind", str(info.get("kind") or ""))
+                out.setdefault("error", str(failure.get("message") or ""))
+                out.setdefault("error_hint", str(info.get("hint") or ""))
+                out.setdefault("error_suggest", str(info.get("suggest") or ""))
+                return out
+            exc = MechaError(
+                str(failure.get("message") or "命令失败"),
+                kind=str(info.get("kind") or "command_failed"),
+                hint=str(info.get("hint") or ""),
+                suggest=str(info.get("suggest") or ""))
+            return self._failure(command, exc, [])
+        return dict(result["value"])
+
+    def run_core_command(self, command_name: str, *, context: Any,
+                         **kwargs: Any) -> Any:
+        """核心命令 handler：把受控命令体包成 ``CommandResult`` + result_ref。"""
+        from mecha.commands import CommandResult
+
+        receipt = self._dispatch({"command": command_name, **kwargs}, context)
+        ref = {"kind": "ml_command", "command": command_name,
+               "run_ids": list(receipt.get("run_ids", []))}
+        if receipt.get("ok"):
+            return CommandResult(ok=True, values=dict(receipt), result_ref=ref)
+        exc = MechaError(
+            str(receipt.get("error") or "命令失败"),
+            kind=str(receipt.get("error_kind") or "command_failed"),
+            hint=str(receipt.get("error_hint") or ""),
+            suggest=str(receipt.get("error_suggest") or ""))
+        return CommandResult(ok=False, values=dict(receipt), error=exc,
+                             result_ref=ref)
+
+    def _dispatch(self, spec: Mapping[str, Any], context: Any) -> Mapping[str, Any]:
         try:
             self._validator.validate_spec(spec, commands=command_map())
         except MechaError as exc:
@@ -589,7 +648,7 @@ class MLEngine(Engine):
             spec,
         )
         summary = self._execute_one(entry, request, call_id=_call_id())
-        self._append_command_event("ml.command.run_method", summary, spec)
+        self._append_command_event("ml.run", summary, spec)
         warning = summary.warning
         return {
             "ok": summary.ok,
@@ -643,7 +702,7 @@ class MLEngine(Engine):
             runs.append(item.compact())
             if item.warning:
                 warnings.append(f"{name}: {item.warning}")
-            self._append_command_event("ml.command.run_method", item, spec)
+            self._append_command_event("ml.run", item, spec)
         primary = next((r["primary_metric"] for r in runs if r["ok"]), "")
         metrics: dict[str, Any] = {}
         for r in runs:
@@ -700,7 +759,7 @@ class MLEngine(Engine):
                          "error": item.warning})
             if item.warning:
                 warnings.append(f"{name}: {item.warning}")
-            self._append_command_event("ml.command.run_method", item, spec)
+            self._append_command_event("ml.run", item, spec)
         winner = _pick_winner(rows, primary)
         return {
             "ok": bool(runs) and all(r["ok"] for r in runs),
@@ -963,6 +1022,11 @@ class MLEngine(Engine):
         """注入 ``Surface.query``：只读查询统一走 mecha 注册项分派。"""
         self._surface_query = query_fn
 
+    def bind_command_registry(self, commands: Any, gate: Any) -> None:
+        """注入核心 ``CommandRegistry`` + ``Gate``：受控命令经核心命令面调用。"""
+        self._commands = commands
+        self._command_gate = gate
+
     def _failure(self, command: str, exc: MechaError,
                  warnings: list[str]) -> Mapping[str, Any]:
         return {
@@ -1170,4 +1234,5 @@ __all__ = [
     "MLEngine", "DatasetEntry", "RunSummary", "RECEIPT_REQUIRED_KEYS",
     "ChannelRequired", "make_state_writer", "use_channel", "clear_channel",
     "active_channel", "DEFAULT_MAX_DATASET_ROWS", "DEFAULT_OPS_PER_SEC",
+    "DEFAULT_EST_SEC",
 ]

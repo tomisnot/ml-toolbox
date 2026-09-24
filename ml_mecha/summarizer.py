@@ -24,8 +24,10 @@ from typing import Any
 from mecha.history import Event, fold
 from mecha.monitor import Claim
 
-#: 命令事件键前缀（与 ``ml_mecha.__init__`` 同源；这里独立定义避免循环 import）。
-COMMAND_EVENT_PREFIX = "ml.command."
+#: 域运行事件键（不是命令审计；命令审计是核心的 ``command.<name>``）。
+DOMAIN_RUN_EVENT = "ml.run"
+#: 兼容旧别名（本模块只在本文件内使用）。
+COMMAND_EVENT_PREFIX = DOMAIN_RUN_EVENT
 
 #: 状态键（概括层只复述这些；同名键在原始史里由 Gate 写入）。
 STATE_KEY_DATASET = "current.dataset_id"

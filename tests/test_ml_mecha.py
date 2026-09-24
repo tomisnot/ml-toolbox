@@ -228,6 +228,19 @@ def test_read_queries_are_registered_in_surface(app):
     assert app.engine.query("method_detail", name="logistic")["name"] == "logistic"
 
 
+def test_commands_registered_in_core_registry(app):
+    """ML 4 条受控命令注册进核心 CommandRegistry（双宿主消费核心机制）。"""
+    names = set(app.software.commands.names())
+    assert names == {"prepare_dataset", "run_method", "run_method_batch",
+                     "compare_methods"}
+    spec = app.software.commands.spec("run_method")
+    assert spec is not None and spec.side_effect is True
+    assert set(spec.output_schema["required"]) == set(RECEIPT_REQUIRED_KEYS)
+    # prepare_dataset 的必填参数来自 ML 声明，核心不持有 ML 领域语义
+    prep = app.software.commands.spec("prepare_dataset")
+    assert "source" in prep.parameters["required"]
+
+
 def test_write_tool_failures_are_tool_failure(app):
     """写工具失败必须是 ``is_error=True`` + ToolFailure kind，不是假成功。"""
     csv_path = Path(app.layout.root) / "outside.csv"
@@ -365,12 +378,21 @@ def test_history_attribution_actor_and_call_id(app):
     assert receipt["ok"] is True
 
     events = app.history.events()
-    command_events = [e for e in events if e.key == "ml.command.run_method"]
-    assert command_events, "命令事件没进 History"
-    event = command_events[-1]
-    assert event.actor == "ml-ai"
-    assert event.call_id == "call-abc123"
-    assert event.value["run_id"] == receipt["run_id"]
+    # 命令审计由 mecha 核心写（第二宿主真实消费 Command Surface）
+    audit_events = [e for e in events if e.key == "command.run_method"]
+    assert audit_events, "核心命令审计没进 History"
+    audit = audit_events[-1]
+    assert audit.actor == "ml-ai"
+    assert audit.call_id == "call-abc123"
+    assert audit.value["result_ref"]["run_ids"] == [receipt["run_id"]]
+
+    # 域运行摘要（ml.run）保留 run 引用与标量指标，供 Monitor 复述
+    run_events = [e for e in events if e.key == "ml.run"]
+    assert run_events, "域运行摘要没进 History"
+    run_event = run_events[-1]
+    assert run_event.actor == "ml-ai"
+    assert run_event.call_id == "call-abc123"
+    assert run_event.value["run_id"] == receipt["run_id"]
 
     state_events = [e for e in events if e.key.startswith("current.")]
     assert state_events, "状态键没进 History"
@@ -386,7 +408,8 @@ def test_history_attribution_actor_and_call_id(app):
     for e in events:
         payload = json.dumps(e.value, ensure_ascii=False, default=str)
         assert len(payload) < 2000, f"事件 {e.key} 体过大，疑似内联大对象"
-        assert "y_pred" not in payload and "artifacts" not in payload
+        assert "y_pred" not in payload
+        assert "artifacts.npz" not in payload
 
     # 基线：ML 侧）确实握着真数组（证明"引用"不是因为没有数据）
     record = app.engine.session.record(receipt["run_id"])
@@ -649,6 +672,7 @@ def main() -> int:
              test_prepare_dataset_csv_fails_closed_without_dataset_roots,
              test_prepare_dataset_csv_allowed_inside_dataset_roots,
              test_read_queries_are_registered_in_surface,
+             test_commands_registered_in_core_registry,
              test_write_tool_failures_are_tool_failure,
              test_run_method_end_to_end_and_receipt_contract,
              test_resource_guard_rejects_without_escaping,

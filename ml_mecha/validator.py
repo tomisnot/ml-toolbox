@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from mecha.commands import AUDIT_KEY_PREFIX
 from mecha.errors import GateDenied, InvalidSpec, MechaError, UnknownKey
 
 #: ML adapter 声明并可写的状态键全表（R2：这些键只属于 ML，不进 mecha 核心）。
@@ -328,16 +329,27 @@ class MLValidator:
     # ---- Gate 注入的 validate（key, value） ----
 
     def validate_state(self, key: str, value: Any) -> None:
-        """``mecha.gate.Validator`` 实现：只认 ML 状态键；命令键当场拒。"""
+        """``mecha.gate.Validator`` 实现：只认 ML 状态键 + 核心命令审计键。"""
         if not isinstance(key, str) or not key.strip():
             raise UnknownKey.typo(key, STATE_KEYS,
                                   message="状态键必须是非空字符串",
                                   hint="可写键见 MLValidator.STATE_KEYS")
-        if key.startswith("ml.") or key.startswith("command."):
+        if key.startswith(AUDIT_KEY_PREFIX):
+            # 核心命令面的审计事件（command.<name>）不是域状态：只校验形状，
+            # 不在 ML 域键白名单里额外定义一份命令表（那是核心的事）。
+            if not isinstance(value, Mapping):
+                raise GateDenied(
+                    f"命令审计键 {key!r} 的值必须是映射，收到 "
+                    f"{type(value).__name__}",
+                    kind="bad_audit_value",
+                    hint="CommandRegistry 审计值是操作语义映射",
+                )
+            return
+        if key.startswith("ml."):
             raise GateDenied(
-                f"键 {key!r} 是命令/事件词汇，不是域状态键",
+                f"键 {key!r} 是域事件词汇，不是域状态键",
                 kind="key_not_writable",
-                hint="命令副作用走引擎命令面；域状态键见 STATE_KEYS",
+                hint="域状态键见 STATE_KEYS",
                 suggest="current.method",
             )
         if key not in STATE_KEYS:

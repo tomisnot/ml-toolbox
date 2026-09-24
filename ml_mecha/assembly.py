@@ -48,6 +48,7 @@ from mecha.tools import ToolRegistry
 
 from ml_toolbox.api import Session
 
+from .core_commands import core_command_specs
 from .engine import MLEngine, make_state_writer
 from .summarizer import ml_summarizer
 from .tools import register_ml_tools
@@ -203,12 +204,26 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
 
     # 引擎的写路径：唯一入口是 Gate（引擎自己无快照、无第二条写口）。
     engine.bind_state_writer(make_state_writer(software.gate))
-    # 命令事件不是域状态：直接进 History（只存摘要与 run_id 引用）。
+    # 域运行摘要（ml.run）不是命令审计：直接进 History（只存摘要与 run_id 引用）。
     engine.bind_command_events(_history_event_writer(software.history))
+
+    # 受控命令注册进核心 Command Surface：命令审计（command.<name>）与
+    # result_ref 由核心写；这是"第二宿主真实消费核心通用机制"的落点。
+    for core_spec in core_command_specs():
+        software.commands.register(
+            core_spec, _core_command_handler(engine, core_spec.name))
+    engine.bind_command_registry(software.commands, software.gate)
 
     if register_tools:
         register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai")
     return MLMecha(software, engine)
+
+
+def _core_command_handler(engine: MLEngine, name: str):
+    """核心命令 handler：只接收声明过的参数 + 显式 context。"""
+    def handler(*, context, **kwargs):
+        return engine.run_core_command(name, context=context, **kwargs)
+    return handler
 
 
 def _history_event_writer(history: History):
