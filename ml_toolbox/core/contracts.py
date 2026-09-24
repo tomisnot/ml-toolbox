@@ -128,11 +128,13 @@ def infer_kind(y) -> Optional[str]:
     """从目标列推断回归/分类（唯一的任务判定入口）。
 
     None -> None；非数值 -> classification；数值且基数 > REGRESSION_CARDINALITY
-    -> regression。pipeline / dataset / methods 一律调用此函数。
+    -> regression。接受 pandas Series、NumPy ndarray、列表等一维目标输入；
+    pipeline / dataset / methods 一律调用此函数。
     """
     if y is None:
         return None
-    if pd.api.types.is_numeric_dtype(y) and y.nunique() > REGRESSION_CARDINALITY:
+    ys = y if isinstance(y, pd.Series) else pd.Series(y)
+    if pd.api.types.is_numeric_dtype(ys) and ys.nunique() > REGRESSION_CARDINALITY:
         return "regression"
     return "classification"
 

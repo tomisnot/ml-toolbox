@@ -425,6 +425,10 @@ def test_infer_kind_single_source():
     assert infer_kind(yc) == "classification"
     ys = pd.Series(["a", "b", "c"] * 10)
     assert infer_kind(ys) == "classification"
+    # 外部调用者可直接传 ndarray/list，不应因 ndarray 没有 nunique 崩溃
+    assert infer_kind(np.arange(REGRESSION_CARDINALITY + 5, dtype=float)) == "regression"
+    assert infer_kind(np.array([0, 1, 0, 1])) == "classification"
+    assert infer_kind(["a", "b", "c"]) == "classification"
     # pipeline 的 _infer_kind 是同一对象（别名，非第二份实现）
     from ml_toolbox.core import pipeline
     assert pipeline._infer_kind is infer_kind
