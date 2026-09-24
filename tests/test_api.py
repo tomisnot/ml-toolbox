@@ -33,6 +33,8 @@ def test_session_methods_prepare_and_run():
     assert s.describe()["api_version"] == API_VERSION
 
     spec = s.prepare(_dataset(), pipeline=Pipeline.default())
+    fitted = s.prepare_fitted(_dataset(), pipeline=Pipeline.default())
+    assert fitted.spec.meta["pipeline_id"]
     req = RunRequest(method="logistic", overrides={"C": 1.0}, seed=17)
     rec = s.run(spec, req)
     assert rec.result.ok, rec.result.error

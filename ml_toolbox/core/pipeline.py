@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import abc
+import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -254,6 +255,17 @@ class Pipeline:
     def default(cls) -> "Pipeline":
         return cls(steps=[MissingStep(), EncodeStep(), ScaleStep(), SplitStep()])
 
+    def fit(self, ds: Dataset, diag: bool = False) -> "FittedPipeline":
+        """Fit an isolated pipeline copy and return a reusable handle.
+
+        The legacy :meth:`run` method remains mutable for compatibility, while
+        this entry point prevents a later ``fit`` on the same Pipeline object
+        from overwriting the step state used by ``transform_new``.
+        """
+        fitted = copy.deepcopy(self)
+        spec = fitted.run(ds, diag=diag)
+        return FittedPipeline(fitted, spec)
+
     def run(self, ds: Dataset, diag: bool = False) -> DataSpec:
         """Dataset -> DataSpec（X, y, 划分索引, 处理链摘要）。"""
         df = ds.frame.copy()
@@ -317,3 +329,27 @@ class Pipeline:
                           + [self.test_size, self.stratify, self.time_split],
                           sort_keys=True, default=str)
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class FittedPipeline:
+    """Immutable-by-ownership handle for one prepared pipeline state.
+
+    The contained Pipeline is private and deep-copied by :meth:`Pipeline.fit`.
+    Callers should use this handle for ``transform_new`` rather than reaching
+    into the original mutable Pipeline's step objects.
+    """
+
+    _pipeline: Pipeline = field(repr=False)
+    spec: DataSpec
+
+    @property
+    def pipeline_id(self) -> str:
+        return str(self.spec.meta.get("pipeline_id", ""))
+
+    def transform_new(self, frame: pd.DataFrame,
+                      target: str | None = None) -> pd.DataFrame:
+        return self._pipeline.transform_new(frame, target)
+
+    def fingerprint(self) -> str:
+        return self.pipeline_id or self._pipeline.fingerprint()

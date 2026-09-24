@@ -157,6 +157,19 @@ class Session:
         pipeline = pipeline or Pipeline.default()
         return pipeline.run(dataset, diag=diag)
 
+    def prepare_fitted(self, dataset: Dataset, *,
+                       pipeline: Pipeline | None = None,
+                       diag: bool = False):
+        """Return an isolated :class:`FittedPipeline` handle for later transform.
+
+        This is the state-safe companion to :meth:`prepare`; the handle's
+        ``spec`` can be passed directly to :meth:`run`.
+        """
+        if not isinstance(dataset, Dataset):
+            raise TypeError("dataset must be a ml_toolbox.core.Dataset")
+        pipeline = pipeline or Pipeline.default()
+        return pipeline.fit(dataset, diag=diag)
+
     def run(self, spec: DataSpec, request: RunRequest | str, *,
             progress: Callable[[int, int, str], None] | None = None,
             saver: Callable[[RunRecord], object] | None = None) -> RunRecord:
