@@ -310,6 +310,30 @@ class Session:
         return {"api_version": API_VERSION, "seed": self.seed,
                 "method_count": len(registry.names())}
 
+    def export_state(self) -> dict[str, Any]:
+        """Return a JSON-friendly, read-only export of session bookkeeping.
+
+        Run records are summarized, not serialized; estimator/live artifacts
+        remain internal until the versioned persistence envelope is added.
+        """
+        with self._lock:
+            return {
+                "api_version": API_VERSION,
+                "seed": self.seed,
+                "snapshots": [s.to_dict() for s in self._snapshots.values()],
+                "records": [{
+                    "run_id": r.run_id,
+                    "method": r.method,
+                    "family": r.family,
+                    "task": r.task,
+                    "ok": bool(r.result.ok),
+                    "error": r.result.error,
+                    "primary_metric": r.result.primary_metric,
+                    "metrics": dict(r.result.metrics),
+                    "params": dict(r.result.params),
+                } for r in self._records.values()],
+            }
+
     def _transition(self, request: RunRequest, state: RunState,
                     reason: TerminalReason | None = None, *,
                     run_id: str | None = None, message: str = "") -> None:

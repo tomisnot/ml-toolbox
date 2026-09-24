@@ -101,11 +101,26 @@ def test_run_config_conversion_isolated():
     assert s.last_state() is None
 
 
+def test_session_export_state_summarizes_requests():
+    s = Session(seed=17)
+    spec = s.prepare(_dataset(), pipeline=Pipeline.default())
+    req = RunRequest(method="logistic", seed=17)
+    rec = s.run(spec, req)
+    state = s.export_state()
+    assert state["api_version"] == API_VERSION
+    assert state["snapshots"][-1]["request_id"] == req.request_id
+    row = next(x for x in state["records"] if x["run_id"] == rec.run_id)
+    assert row["ok"] is True
+    assert row["method"] == "logistic"
+    assert "f1" in row["metrics"]
+
+
 def main():
     tests = [test_session_methods_prepare_and_run,
              test_session_method_failure_and_resource_guard,
              test_session_batch_and_explicit_save,
-             test_run_config_conversion_isolated]
+             test_run_config_conversion_isolated,
+             test_session_export_state_summarizes_requests]
     for fn in tests:
         fn()
         print("PASS", fn.__name__)
