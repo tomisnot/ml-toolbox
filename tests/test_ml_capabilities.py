@@ -117,7 +117,7 @@ def _fake_tool(name: str, *, binds: bool):
 
 # ---------------------------------------------------------------- 1. 覆盖面
 def test_map_covers_commands_queries_tools_exactly(app):
-    """清单 = 4 命令 + 4 查询 + 7 工具；每条都与独立来源交叉核对，无缺无多。"""
+    """清单 = 4 命令 + 4 查询 + 11 工具；每条都与独立来源交叉核对，无缺无多。"""
     rows = ml_capability_map()
 
     for row in rows:
@@ -148,9 +148,9 @@ def test_map_covers_commands_queries_tools_exactly(app):
     schema_names = [schema["name"] for schema in app.tools.schemas()]
     assert [row["declared_name"] for row in tool_rows] == tool_names
     assert sorted(tool_names) == schema_names
-    assert len(tool_rows) == 7
+    assert len(tool_rows) == 11
 
-    assert len(rows) == 15
+    assert len(rows) == 19
 
 
 # ---------------------------------------------------------------- 2. 命令字段
@@ -200,7 +200,12 @@ def test_tool_rows_match_registry_schemas(app):
             assert row["scope"] == ()
     write_rows = {row["declared_name"] for row in tool_rows if row["side_effect"]}
     assert write_rows == write_commands & set(_tool_names())
-    assert len(write_rows) == 3                       # 3 写工具 / 4 只读工具
+    assert len(write_rows) == 4                       # 4 写工具 / 7 只读或调度面
+    # job 调度面（submit_run/read_job/cancel_run）**没有同名命令**，故不计入
+    # write_rows；submit_run 的写路径在它提交的 run_method 命令里（见 04 文档
+    # 「job 调度面」小节）。这里显式钉住这个事实，避免哪天被误当成只读。
+    assert {"submit_run", "read_job", "cancel_run"} <= set(_tool_names())
+    assert not ({"submit_run", "read_job", "cancel_run"} & write_rows)
 
 
 # ---------------------------------------------------------------- 4. L7 对偶

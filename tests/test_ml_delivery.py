@@ -16,6 +16,17 @@
 6. 端口文件起写止删（看门人/发现机制依赖它），且**被强杀后留下的陈旧端口文件
    会被启动时清掉**（Windows 的强杀不跑 ``finally``——这是实测得出的坑）。
 
+P1 追加（工具面补齐 + 看门人机械件）：
+
+7. 批量工具：**部分成功不是工具失败**（成功项的 ``run_id`` 不许被丢掉），
+   全部失败才 fail loud；
+8. job 三件套：``submit_run`` → ``read_job`` 拿到终态与 ``result_ref``；
+   ``cancel_run`` 对不可取消命令结构化拒（``job_not_cancellable``）；
+9. ``--dataset-roots`` 授权面（**真子进程** + MCP）：不给 roots ⇒ csv 来源
+   fail closed；给了才允许；
+10. 看门人机械件：dsh 端口 3080 硬跳过；**D13 就绪判据拒绝陈旧端口文件**；
+    交接（terminate + 等退出）后写租约真的释放、同根可再起一台权威。
+
 运行：``python -m pytest tests/test_ml_delivery.py -q``
 也可直接 ``python tests/test_ml_delivery.py``（自带 main，与仓内其它 test_*.py 同形；
 **故意不 import pytest**，直跑入口不需要它）。
@@ -34,8 +45,10 @@ import asyncio
 import contextlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -55,18 +68,24 @@ from ml_mecha.assembly import assemble_ml_mecha                 # noqa: E402
 from ml_mecha.mcp_host import McpHost, build_mcp_server         # noqa: E402
 
 #: 工具面全量（``ToolRegistry.schemas()`` 按 name 排序）。
-TOOL_NAMES = ("compare_methods", "describe_dataset", "describe_method",
-              "describe_methods", "describe_run", "prepare_dataset", "run_method")
+TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
+              "describe_method", "describe_methods", "describe_run",
+              "prepare_dataset", "read_job", "run_method", "run_method_batch",
+              "submit_run")
 
-#: 每个工具的必填项（唯一来源 = 各自 ``execute`` 的签名，无默认值即必填）。
+#: 每个工具的必填项（写工具取**命令声明**，只读与 job 调度面取闭包签名）。
 EXPECTED_REQUIRED = {
+    "cancel_run": ["job_id"],
     "compare_methods": ["methods"],
     "describe_dataset": [],
     "describe_method": ["name"],
     "describe_methods": [],
     "describe_run": [],
     "prepare_dataset": ["source"],
+    "read_job": ["job_id"],
     "run_method": ["method"],
+    "run_method_batch": ["methods"],
+    "submit_run": ["method"],
 }
 
 _SYNTHETIC = {"kind": "synthetic", "task": "classification", "n_samples": 120}
@@ -97,6 +116,50 @@ def _authority(root, *, open_gate: bool = False, **kw):
 
 def _run(coro, timeout: float = _TIMEOUT):
     return asyncio.run(asyncio.wait_for(coro, timeout))
+
+
+def _frame(n: int = 160, d: int = 5, seed: int = 11):
+    """判据用的分类小表（csv 授权面测试要真的落一个文件）。"""
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.RandomState(seed)
+    x = rng.randn(n, d)
+    y = (x[:, 0] + 0.5 * x[:, 1] > 0).astype(int)
+    frame = pd.DataFrame(x, columns=[f"f{i}" for i in range(d)])
+    frame["target"] = y
+    return frame
+
+
+def _spawn_authority_proc(root, *, extra_args=()):
+    """起一台**真子进程**权威（``app_entry.py --authority``）；调用方负责收尾。"""
+    cmd = [sys.executable, str(REPO / "app_entry.py"), "--authority",
+           "--root", str(root), *extra_args]
+    return subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+@contextlib.contextmanager
+def _spawned_authority(root, *, open_gate: bool = True, extra_args=()):
+    """真子进程权威 + 就绪等待（走 launcher 的 D13 判据），yield ``(url, proc)``。
+
+    用真子进程而不是进程内装配，是因为 ``--dataset-roots`` 是 **CLI 授权面**：
+    只有经 ``app_entry.py`` 的参数路径才证明它真的接上了。
+    """
+    import launcher
+
+    args = list(extra_args)
+    if not open_gate:
+        args.append("--no-open-gate")
+    proc = _spawn_authority_proc(root, extra_args=args)
+    try:
+        ok, port, reason = launcher.await_authority(proc, Path(root) / ".mcp-port",
+                                                    timeout=90.0)
+        assert ok is True, f"权威未就绪：{reason}"
+        yield f"http://127.0.0.1:{port}/mcp", proc
+    finally:
+        launcher._terminate_group([proc])
+        launcher.await_exit([proc], timeout=20)
 
 
 def _list_tools(url: str):
@@ -284,6 +347,209 @@ def test_stale_port_file_from_killed_run_is_replaced_on_start():
             ml.close()
 
 
+# ------------------------------------------------------- P1：job 调度面
+def test_batch_tool_preserves_partial_success():
+    """批量工具：部分成功**不是**工具失败（成功项的 run_id 不许被丢掉）。
+
+    怎么造"部分成功"：``ridge`` 之类的**事前**不兼容会整批被拒（那是总失败），
+    真正逐方法隔离的是**运行期**失败——这里用极小的 kernel 预算卡住 ``svc``，
+    ``logistic`` 照跑。engine 的 ``_execute_isolated`` 把后者隔离成 ok=False。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-batch-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            (p_err, p_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(_SYNTHETIC)})])
+            assert p_err is False, p_txt
+            dataset_id = json.loads(p_txt)["dataset_id"]
+
+            err, txt = _call_tools(host.url, [
+                ("run_method_batch", {"methods": ["logistic", "svc"],
+                                      "dataset_id": dataset_id,
+                                      "resource_guard": {"max_kernel_mb": 0.000001}})])[0]
+            body = json.loads(txt)
+            assert err is False, txt                  # 部分成功 ⇒ 不是 is_error
+            assert body["ok"] is False, body           # 但如实报"有失败"
+            assert body["failed_methods"] == ["svc"], body
+            # 成功项的 run_id 真的在（这正是"不整批转异常"的意义）
+            assert len(body["run_ids"]) == 2, body
+            assert body["runs"][0]["run_id"], body["runs"][0]
+            assert body["runs"][0]["ok"] is True, body["runs"][0]
+            assert body["runs"][1]["ok"] is False, body["runs"][1]
+
+            # 全部失败（事前不兼容 ⇒ 整批被拒）仍是写工具纪律的 fail loud
+            all_bad = _call_tools(host.url, [
+                ("run_method_batch", {"methods": ["ridge"],
+                                      "dataset_id": dataset_id})])[0]
+            assert all_bad[0] is True, all_bad
+            assert json.loads(all_bad[1])["error"]["info"]["kind"], all_bad[1]
+
+
+def test_job_tools_submit_read_and_result_ref():
+    """``submit_run`` → ``read_job`` 拿到终态与 ``result_ref``（含 run_id）。"""
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-job-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            (p_err, p_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(_SYNTHETIC)})])
+            assert p_err is False, p_txt
+            dataset_id = json.loads(p_txt)["dataset_id"]
+
+            err, txt = _call_tools(host.url, [
+                ("submit_run", {"method": "logistic", "dataset_id": dataset_id})])[0]
+            assert err is False, txt
+            submitted = json.loads(txt)
+            assert submitted["job_id"], submitted
+            assert submitted["command"] == "run_method", submitted
+            assert submitted["cancel_supported"] is True, submitted
+
+            # 轮询到终态（read_job 的 wait_s 是可选便利，这里用它少转几圈）
+            job = submitted["job_id"]
+            final = {}
+            for _ in range(60):
+                err, txt = _call_tools(host.url, [
+                    ("read_job", {"job_id": job, "wait_s": 1})])[0]
+                assert err is False, txt
+                final = json.loads(txt)
+                if final["state"] in ("done", "failed", "cancelled"):
+                    break
+            assert final["state"] == "done", final
+            assert final["result_ref"].get("run_ids"), final
+            assert final["result_ref"]["command"] == "run_method", final
+            assert final["error"] == "", final
+
+            # 未知任务编号：结构化拒，不是假成功
+            err, txt = _call_tools(host.url, [("read_job", {"job_id": "job-9999"})])[0]
+            assert err is True, txt
+            assert json.loads(txt)["error"]["info"]["kind"] == "unknown_job", txt
+
+
+def test_cancel_run_rejects_uncancellable_job():
+    """``cancel_run`` 对不可取消的命令**结构化拒**（job_not_cancellable）。
+
+    ``prepare_dataset`` 在核心命令面声明 ``cancel_supported=False``。要拿到一个
+    "不可取消的 job"，用宿主自己的 ``submit``（同一个 seam，不是绕过工具面）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-cancel-") as td:
+        with _authority(td, open_gate=True) as (ml, host):
+            job = ml.submit({"command": "prepare_dataset", "name": "u",
+                             "source": dict(_SYNTHETIC)}, side="ai")
+            assert job.cancel_supported is False, job.to_dict()
+            ml.wait_job(job, 30)
+
+            err, txt = _call_tools(host.url, [("cancel_run", {"job_id": job.id})])[0]
+            assert err is True, txt
+            body = json.loads(txt)
+            assert body["error"]["info"]["kind"] == "job_not_cancellable", body
+
+            # 可取消的 job：cancel_run 受理并给出请求前后状态（不谎报"已取消"）
+            ok_job = ml.submit({"command": "run_method", "method": "logistic",
+                                "dataset_id": ml.engine.dataset_ids()[-1]}, side="ai")
+            err, txt = _call_tools(host.url, [("cancel_run", {"job_id": ok_job.id})])[0]
+            assert err is False, txt
+            body = json.loads(txt)
+            assert body["cancel_requested"] is True, body
+            assert "state_before" in body and "state" in body, body
+
+
+# ------------------------------------------------------- P1：数据根授权面
+def test_dataset_roots_authorization_is_fail_closed():
+    """``--dataset-roots``：不给就 fail closed，给了才允许 csv（真子进程 + MCP）。"""
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-roots-") as td:
+        root = Path(td)
+        data_dir = root / "data"
+        data_dir.mkdir()
+        csv_path = data_dir / "train.csv"
+        _frame().to_csv(csv_path, index=False)
+
+        # (a) 不给 roots：csv 来源必须在副作用前被拒
+        with _spawned_authority(root, open_gate=True) as (url, _proc):
+            err, txt = _call_tools(url, [("prepare_dataset", {
+                "source": {"kind": "csv", "path": str(csv_path),
+                           "target": "target"}})])[0]
+            assert err is True, txt
+            assert json.loads(txt)["error"]["info"]["kind"] == \
+                "dataset_roots_required", txt
+
+        # (b) 给了 roots：同一份 csv 可以准备（授权面是人显式给的）
+        with tempfile.TemporaryDirectory(prefix="ml-delivery-roots-ok-") as td2:
+            with _spawned_authority(Path(td2), open_gate=True,
+                                    extra_args=["--dataset-roots", str(data_dir)]) as (url, _p):
+                err, txt = _call_tools(url, [("prepare_dataset", {
+                    "source": {"kind": "csv", "path": str(csv_path),
+                               "target": "target"}})])[0]
+                assert err is False, txt
+                body = json.loads(txt)
+                assert body["dataset_id"], body
+                assert body["n_rows"] > 0, body
+
+
+# ------------------------------------------------------- P1：看门人机械件
+def test_launcher_pick_dsh_port_skips_official_3080():
+    """dsh 端口从 3081 起找，**3080 硬跳过**（官方实例的端口永不占）。"""
+    import launcher
+
+    for _ in range(5):
+        port = launcher.pick_dsh_port()
+        assert port != 3080, port
+        assert 3081 <= port <= 3090, port
+
+
+def test_launcher_await_authority_rejects_stale_port_file():
+    """D13 就绪判据：**陈旧端口文件不算就绪**——必须内容新鲜 + HTTP 在听。
+
+    这条直接钉住"只判文件存在"的假绿：先放一个陈旧 ``.mcp-port``（指向一个
+    没人听的端口），若看门人只看存在性，它会立刻返回就绪并把 dsh 指向死端口。
+    """
+    import launcher
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-ready-") as td:
+        root = Path(td)
+        pf = root / ".mcp-port"
+        # 陈旧文件：内容是 1（几乎肯定没人听），且 mtime 早于 spawn
+        pf.write_text("1", encoding="utf-8")
+        time.sleep(0.05)
+        pf.write_text("1", encoding="utf-8")          # 内容不变，只更新 mtime
+        stale_mtime = pf.stat().st_mtime
+
+        proc = _spawn_authority_proc(root, extra_args=["--no-open-gate"])
+        try:
+            ok, port, reason = launcher.await_authority(proc, pf, timeout=90.0)
+            assert ok is True, reason
+            assert port > 1, port
+            assert port != 1, "把陈旧端口当成就绪了"
+            assert pf.read_text(encoding="utf-8").strip() == str(port)
+            assert pf.stat().st_mtime >= stale_mtime
+            assert launcher._probe_http("127.0.0.1", port), port
+
+            # 交接纪律：terminate + 等退出 ⇒ 写租约释放（同根可再起一台权威）
+            launcher._terminate_group([proc])
+            launcher.await_exit([proc], timeout=20)
+            assert proc.poll() is not None, "等退出后进程必须真的没了"
+            second = _spawn_authority_proc(root, extra_args=["--no-open-gate"])
+            try:
+                assert second.poll() is None
+                ok2, port2, reason2 = launcher.await_authority(second, pf, timeout=90.0)
+                assert ok2 is True, reason2
+                assert port2 != port, (port, port2)
+            finally:
+                launcher._terminate_group([second])
+                launcher.await_exit([second], timeout=20)
+        finally:
+            launcher._terminate_group([proc])
+            launcher.await_exit([proc], timeout=10)
+
+        # await_authority 对"起不来的权威"必须如实失败，不假装就绪
+        class _Dead:
+            returncode = 3
+
+            @staticmethod
+            def poll():
+                return 3
+
+        ok3, port3, reason3 = launcher.await_authority(_Dead(), pf, timeout=5.0)
+        assert ok3 is False and port3 is None
+        assert "退出" in reason3, reason3
+
+
 _TESTS = [
     test_required_from_signature_and_declaration_survives,
     test_mcp_host_exposes_every_declared_tool_over_http,
@@ -292,6 +558,12 @@ _TESTS = [
     test_open_gate_write_tools_run_and_call_id_is_attributed,
     test_port_file_written_on_start_and_removed_on_stop,
     test_stale_port_file_from_killed_run_is_replaced_on_start,
+    test_batch_tool_preserves_partial_success,
+    test_job_tools_submit_read_and_result_ref,
+    test_cancel_run_rejects_uncancellable_job,
+    test_dataset_roots_authorization_is_fail_closed,
+    test_launcher_pick_dsh_port_skips_official_3080,
+    test_launcher_await_authority_rejects_stale_port_file,
 ]
 
 

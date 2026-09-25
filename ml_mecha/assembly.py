@@ -333,12 +333,18 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
     scopes.grant("ai", *all_scopes)
     software.commands.bind_scope_policy(scopes)
 
+    # 先构造宿主句柄：job 类工具（submit_run/read_job/cancel_run）需要它作
+    # Job 服务 seam（通道与 call_id 由 MLMecha.submit 带进后台线程）。构造是
+    # 纯赋值、无副作用，故提前到注册工具之前不影响其它装配顺序。
+    ml = MLMecha(software, engine, scopes)
+
     if register_tools:
-        register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai")
+        register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai",
+                          host=ml)
     # ToolHost 契约的真实消费者：装配时把模型可见投影交给宿主传输面校验
     # （白名单形状不对会当场 fail loud），宿主调工具走 MLMecha.call_tool。
     software.toolhost.declare(software.tools.schemas())
-    return MLMecha(software, engine, scopes)
+    return ml
 
 
 def _core_command_handler(engine: MLEngine, name: str):

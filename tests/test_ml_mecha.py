@@ -55,9 +55,10 @@ from ml_mecha.engine import (RECEIPT_REQUIRED_KEYS, clear_channel,  # noqa: E402
 from ml_mecha.summarizer import ml_summarizer       # noqa: E402
 from ml_mecha.validator import STATE_KEYS           # noqa: E402
 
-TOOL_NAMES = ("describe_methods", "describe_method", "describe_dataset",
-              "describe_run", "prepare_dataset", "run_method",
-              "compare_methods")
+TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
+              "describe_method", "describe_methods", "describe_run",
+              "prepare_dataset", "read_job", "run_method", "run_method_batch",
+              "submit_run")
 
 
 # ---------------------------------------------------------------- 夹具

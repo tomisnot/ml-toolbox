@@ -1,0 +1,352 @@
+# -*- coding: utf-8 -*-
+"""ML Toolbox 看门人（launcher）：两模式启动与交接的**唯一编排者**。
+
+心智模型（与 EL 的两模式收拢同构，见 ``docs/mecha/07-交付形态-双模式与dsh桥.md``）：
+
+- **本地 GUI 模式**：纯本地软件（``app_entry.py --gui``），写权在人，不起任何端点。
+- **AI 模式**：headless 权威（``app_entry.py --authority``，写权自动落 AI）
+  + dsh 前台（AI 界面）。dsh 的启动在 P2 填（``_spawn_dsh`` 已留口子），
+  所以本阶段 AI 模式只有权威在跑。
+
+看门人常驻（无窗口，日志进本控制台），职责三条：
+
+1. 启动弹窗选一次模式 → spawn 对应进程组。
+2. 轮询 ``.mode-request``（任一子进程写它 = 切换意图）→ 交接：terminate 当前组、
+   **等进程真退出**（journal 写租约随进程释放，否则新权威被 ``writer_lease_held`` 拒）、
+   按新模式 spawn、清请求文件。
+3. 主进程自然退出且无切换请求 → 收尾退出。
+
+## 就绪判据（D13：**不照抄** EL 的"只判端口文件存在"）
+
+Windows 上 ``terminate()`` / ``taskkill /F`` **不跑** Python 的 ``finally``，强杀后
+``.mcp-port`` 会残留；只判"文件存在"会让看门人立刻去起 dsh（P2）并连**已死的端口**
+——"起得来但看不见"。三条一起用：
+
+1. spawn 前**快照**端口文件（内容 + mtime）；
+2. 轮询到**新鲜**（文件先消失过 / mtime 变新 / 内容变化）**且** ``/mcp`` 上有 HTTP
+   响应（TCP 连得上还不够——同端口上可能是别的东西在听）；
+3. 超时（``READY_TIMEOUT``）→ **明确报错且不 spawn dsh**（不静默退回默认端口）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PY = sys.executable
+APP = str(HERE / "app_entry.py")
+
+#: 子进程写：切换意图（gui / ai）
+MODE_REQUEST = HERE / ".mode-request"
+#: 看门人写：当前模式（供人 / 判据看）
+MODE_STATE = HERE / ".mode-state"
+#: 权威写：实际 MCP 端口（发现用）
+MCP_PORT_FILE = HERE / ".mcp-port"
+#: 看门人写：运行期描述符（模式 / pid / 端口，单一真源）
+RUNTIME_JSON = HERE / ".ml-mecha-runtime.json"
+
+GUI, AI = "gui", "ai"
+
+#: 等权威就绪的上限（秒）：装配 + cache + 起 uvicorn，装配要十几秒。
+READY_TIMEOUT = 90.0
+#: 交接时等旧进程真退出的上限（秒）；超时才 kill（防租约没放干净）。
+EXIT_TIMEOUT = 15.0
+
+_FLAGS = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+
+
+def _log(msg: str) -> None:
+    print("[launcher] %s" % msg, flush=True)
+
+
+# ---------------------------------------------------------------- 进程组
+def _spawn(cmd) -> subprocess.Popen:
+    """起一个子进程，输出继承本控制台（权威日志/dsh 进度可见）。"""
+    return subprocess.Popen(cmd, cwd=str(HERE), creationflags=_FLAGS)
+
+
+def start_group(mode: str):
+    """按模式 spawn 进程组，返回 ``(procs, primary, ready)``。
+
+    ``primary`` = 主进程索引：它自然退出且无切换请求 ⇒ 看门人收尾。
+    ``ready`` = 就绪信息 dict（AI 模式下含权威端口）。
+    """
+    if mode == GUI:
+        return [_spawn([PY, APP, "--gui"])], 0, {}
+    auth = _spawn([PY, APP, "--authority"])
+    ok, port, reason = await_authority(auth, MCP_PORT_FILE)
+    if not ok:
+        # 不静默降级：权威没就绪就不起 dsh，并把原因说清楚（D13 第 3 条）。
+        _log("⚠ 权威未就绪：%s" % reason)
+        return [auth], 0, {"ready": False, "reason": reason}
+    dsh = _spawn_dsh(port, MCP_PORT_FILE)
+    procs = [auth] if dsh is None else [auth, dsh]
+    # primary：有 dsh 时是 dsh（关掉 AI 界面即结束）；本阶段无 dsh 时是权威。
+    return procs, (1 if dsh is not None else 0), {"ready": True, "mcp_port": port}
+
+
+def _spawn_dsh(mcp_port: int, port_file: Path):
+    """起 dsh（AI 界面）——**P2 填**：生成带端口的 overlay 再起。
+
+    形状（P2 落地时照 ``07`` §4 P2 判据与 Lead 实测的 patch 形态）：
+    ``dsh --profile web --patch runtime/dsh-ml-mcp.patch.yml --port <3081+>``，
+    patch 里 ``- insert:`` 包住 ``@deepseek-ai/dsh-mcp-client`` 条目。
+    """
+    _log("（P2 未接入）dsh 启动口子在此：MCP http://127.0.0.1:%d/mcp，"
+         "端口文件 %s" % (mcp_port, port_file))
+    return None
+
+
+# ---------------------------------------------------------------- 就绪判据
+def _read_port(port_file: Path):
+    """读端口文件：返回 ``(content, mtime)``；不存在返回 ``(None, None)``。"""
+    try:
+        if not port_file.exists():
+            return None, None
+        content = port_file.read_text(encoding="utf-8").strip()
+        return (content or None), port_file.stat().st_mtime
+    except OSError:
+        return None, None
+
+
+def _probe_http(host: str, port: int, timeout: float = 1.0) -> bool:
+    """``/mcp`` 上有 HTTP 响应即算在听（4xx 也是响应；连不上/超时不算）。
+
+    TCP 连得上还不够——同一端口上可能是别的东西在听。这里用 stdlib 做一次
+    真实 HTTP 请求；MCP 层握手（initialize）由交付判据用真正的 MCP 客户端验
+    （``tests/test_ml_delivery.py``），看门人不耦合 MCP SDK。
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except OSError:
+        return False
+    try:
+        urllib.request.urlopen("http://%s:%d/mcp" % (host, port), timeout=timeout)
+        return True
+    except urllib.error.HTTPError:
+        return True                      # 有 HTTP 响应 = 服务在听
+    except Exception:                    # noqa: BLE001 - 网络层的任何失败都算没就绪
+        return False
+
+
+def await_authority(proc, port_file: Path, *, timeout: float = READY_TIMEOUT,
+                    host: str = "127.0.0.1"):
+    """等权威就绪：端口文件**新鲜** + ``/mcp`` 有 HTTP 响应。
+
+    返回 ``(ok, port, reason)``；``ok=False`` 时 ``reason`` 是给人看的短句。
+    """
+    before_content, before_mtime = _read_port(port_file)
+    saw_missing = before_content is None
+    deadline = time.time() + max(1.0, float(timeout))
+    last = "尚未写入端口文件"
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False, None, "权威进程已退出（exit=%s）" % proc.returncode
+        content, mtime = _read_port(port_file)
+        if content is None:
+            saw_missing = True
+            last = "尚未写入端口文件"
+        else:
+            fresh = (saw_missing or mtime != before_mtime
+                     or content != before_content)
+            if not fresh:
+                last = "端口文件还是上一次的旧值（%s）" % content
+            else:
+                try:
+                    port = int(content)
+                except ValueError:
+                    last = "端口文件内容不是端口：%r" % content
+                else:
+                    if _probe_http(host, port):
+                        return True, port, ""
+                    last = "端口 %d 上还没有 HTTP 响应" % port
+        time.sleep(0.25)
+    return False, None, "等权威就绪超时（%.0fs）：%s" % (timeout, last)
+
+
+# ---------------------------------------------------------------- dsh 端口
+def pick_dsh_port(preferred: int = 3081, tries: int = 10) -> int:
+    """从 ``preferred`` 起找第一个可绑定回环端口；**3080 硬跳过**。
+
+    3080 是官方 dsh 的端口，项目实例永不占（注释即机制，不靠默认值兜底）。
+    """
+    for port in range(preferred, preferred + tries):
+        if port == 3080:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+    return preferred
+
+
+# ---------------------------------------------------------------- 交接
+def _terminate_group(procs) -> None:
+    for p in procs:
+        if p is None:
+            continue
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+def await_exit(procs, timeout: float = EXIT_TIMEOUT) -> None:
+    """等进程**真退出**（写租约随进程释放）。超时才 kill。"""
+    deadline = time.time() + timeout
+    for p in procs:
+        if p is None:
+            continue
+        while p.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        if p.poll() is None:
+            try:
+                p.kill()
+            except Exception:                              # noqa: BLE001
+                pass
+
+
+def read_request():
+    """读切换意图；非法内容返回 ``None``（不猜）。"""
+    try:
+        if MODE_REQUEST.exists():
+            value = MODE_REQUEST.read_text(encoding="utf-8").strip().lower()
+            return value if value in (GUI, AI) else None
+    except OSError:
+        pass
+    return None
+
+
+def clear_request() -> None:
+    try:
+        if MODE_REQUEST.exists():
+            MODE_REQUEST.unlink()
+    except OSError:
+        pass
+
+
+def write_state(mode: str) -> None:
+    try:
+        MODE_STATE.write_text(mode, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def write_runtime(**fields) -> None:
+    """写运行期描述符（模式 / pid / 端口）——端口发现的单一真源。"""
+    payload = {"mode": "", "pid": os.getpid(), "authority_pid": None,
+               "mcp_port": None, "dsh_port": None}
+    payload.update({k: v for k, v in fields.items() if k in payload})
+    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        RUNTIME_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- 模式选择
+def choose_mode():
+    """弹窗选模式。PyQt5 **惰性导入**——本模块被 import（判据）时不得碰 Qt。"""
+    from PyQt5.QtWidgets import QApplication, QMessageBox
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    box = QMessageBox()
+    box.setWindowTitle("ML Toolbox · 选择启动模式")
+    box.setIcon(QMessageBox.Question)
+    box.setText("请选择本次启动的模式：")
+    box.setInformativeText(
+        "AI 模式：软件在后台当权威（写权自动交给 AI），前台起 AI 界面——\n"
+        "你在对话里驱动 ML 工具，右侧只读监控看它每笔操作；想收回控制权就把\n"
+        "控制权切回 GUI 模式。\n\n"
+        "本地 GUI 模式：纯本地软件，写权在你手上，AI 完全看不见这台软件；\n"
+        "想用 AI 就经看门人切到 AI 模式。\n\n"
+        "两种模式共用同一份实验记录（runs/），切换时状态原样交接、不断档。")
+    ai_button = box.addButton("AI 模式", QMessageBox.AcceptRole)
+    gui_button = box.addButton("本地 GUI 模式", QMessageBox.ActionRole)
+    box.addButton("退出", QMessageBox.RejectRole)
+    box.setDefaultButton(gui_button)
+    box.exec_()
+    clicked = box.clickedButton()
+    if clicked is ai_button:
+        return AI
+    if clicked is gui_button:
+        return GUI
+    return None
+
+
+# ---------------------------------------------------------------- 主循环
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+    clear_request()
+    mode = choose_mode()
+    if mode is None:
+        _log("未选模式，退出。")
+        return 0
+    _log("启动 %s 模式。" % ("GUI（人在开）" if mode == GUI else "AI（AI 在开）"))
+    procs, primary, ready = start_group(mode)
+    write_state(mode)
+    write_runtime(mode=mode,
+                  authority_pid=(procs[0].pid if mode == AI and procs else None),
+                  mcp_port=ready.get("mcp_port"), dsh_port=pick_dsh_port())
+    if mode == AI and not ready.get("ready"):
+        _log("AI 模式未能就绪（%s）；收尾。" % ready.get("reason"))
+        _terminate_group(procs)
+        await_exit(procs, timeout=8)
+        return 1
+
+    try:
+        while True:
+            time.sleep(0.5)
+            requested = read_request()
+            if requested and requested != mode:
+                _log("收到切换请求：%s → %s，交接中…" % (mode, requested))
+                _terminate_group(procs)
+                await_exit(procs)
+                clear_request()
+                procs, primary, ready = start_group(requested)
+                mode = requested
+                write_state(mode)
+                write_runtime(mode=mode,
+                              authority_pid=(procs[0].pid
+                                             if mode == AI and procs else None),
+                              mcp_port=ready.get("mcp_port"),
+                              dsh_port=pick_dsh_port())
+                _log("已切到 %s 模式。" % mode)
+                continue
+            prim = procs[primary] if primary < len(procs) else procs[0]
+            if prim is not None and prim.poll() is not None:
+                _log("主进程已退出（%s 模式结束），收尾。" % mode)
+                break
+    except KeyboardInterrupt:
+        _log("\nCtrl+C —— 收尾所有子进程。")
+    finally:
+        _terminate_group(procs)
+        await_exit(procs, timeout=8)
+        clear_request()
+        for path in (MODE_STATE, RUNTIME_JSON):
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
