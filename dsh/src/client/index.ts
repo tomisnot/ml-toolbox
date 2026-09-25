@@ -6,19 +6,23 @@
  *  2. 右栏 tab body（`MonitorTabBody`）→ 轮询 ML 权威的**只读**监控端点，
  *     三页：飞行记录仪（写事件）/ 配置态 / 运行记录。
  *  3. **监控地址参数化**：`MONITOR_URL` 不再是硬编码常量——经注入的
- *     `resolveMonitorBase()` 调 host 半的 `/ml-monitor-url` command 取，
- *     地址来自权威写的运行期描述符（每次启动端口都可能不同）。
+ *     `resolveMonitorBase()` 去取 dsh **同源**只读路由 `/ml-toolbox/monitor-url`
+ *     （host 半读权威写的运行期描述符后返回 `{base}`）。
  *
- * ⚠ 与 EL 的两处有意差异：
- *  - EL 把 `http://127.0.0.1:8767` 硬编码在**两端**（端点侧默认参数 + 面板侧常量），
- *    两处一漂移就是"面板空白但没人报错"的假绿。ML 只有一个来源（描述符）。
- *  - EL 的「→ GUI」按钮（`/re0-gui`）**不在本轮**：切回 GUI 在 P2 走看门人控制台，
- *    按钮属 P3（见 `docs/mecha/07-...md` §4）。
+ * ⚠ **为什么不再走 command**（真机教训）：早先经
+ * `remote.commands.execute(sessionId, '/ml-monitor-url')` 取地址，挂了两处——
+ * ① command 的返回类型是 `RemoteResult<CommandExecution>`，地址在
+ * `value.result.text`，按 `value.text` 读永远取不到（真机面板显示"监控端点未知"）；
+ * ② 每次取地址都会往会话里写 `command/run` + `command/done`，污染聊天记录。
+ * 现在走同源 `fetch`：无包装、无跨源、无会话副作用。
+ *
+ * ⚠ 与 EL 的另一处有意差异：EL 把 `http://127.0.0.1:8767` 硬编码在**两端**
+ * （端点侧默认参数 + 面板侧常量），两处一漂移就是"面板空白但没人报错"的假绿。
+ * ML 只有一个来源（权威写的运行期描述符），由 host 半经同源路由转出。
  *
  * ⚠ 本目录经 tsdown 打成 CJS + `__ModuleLoader__.load` 包装；改源码后须
- * `npm run bundle` 并重启 dsh 才生效（dsh 的 web client 只吃合并包）。
+ * `npm run bundle` 并**重启 dsh** 才生效（dsh 的 web client 只吃合并包）。
  */
-import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { Context } from '@deepseek-ai/cordis'
 import { MonitorTabBody } from './MonitorTabBody'
 import { CockpitButton, type CockpitInjected } from './buttons'
@@ -26,16 +30,37 @@ import { CockpitButton, type CockpitInjected } from './buttons'
 /** Cordis 插件名（与 host 半、package.json 一致）。 */
 export const name = 'ml-toolbox-monitor'
 
-/** slots（按钮 + tab body）+ layout（开右栏）+ 右栏 tab 服务 + remote.commands。 */
-export const inject = ['slots', 'layout', 'sidebarRight', 'sidebarRightTabs',
-                       'remote', 'remote.commands']
+/** slots（按钮 + tab body）+ layout（开右栏）+ 右栏 tab 服务。 */
+export const inject = ['slots', 'layout', 'sidebarRight', 'sidebarRightTabs']
 
 /** 右栏 tab 的 kind/id（改名自 EL 的 `re0-cockpit`）。 */
 const TAB_ID = 'ml-toolbox-monitor'
 
-/** tab body 的注入面：解析监控端点基址（由 host 半命令提供，非硬编码）。 */
+/** host 半注册的同源只读路由（地址查询）。 */
+export const ADDRESS_ROUTE = '/ml-toolbox/monitor-url'
+
+/** tab body 的注入面：解析监控端点基址（由 host 半的同源路由提供）。 */
 export interface MonitorInjected {
   resolveMonitorBase(): Promise<string>
+}
+
+/**
+ * 取监控端点基址：同源 `fetch` → `{base}`。
+ *
+ * 任何一步不对都**抛错**（面板会显示"监控端点未知：…"）——不回落到任何默认端口。
+ * 负例见判据：喂旧的 command 返回形状（`{ok, value}`）必须失败。
+ *
+ * ``doFetch`` 可注入，方便判据在 Node 里喂真形状与各种失败形状。
+ */
+export async function fetchMonitorBase(
+  doFetch: typeof fetch = fetch,
+): Promise<string> {
+  const res = await doFetch(ADDRESS_ROUTE, { cache: 'no-store' })
+  if (!res.ok) throw new Error(`地址路由返回 ${res.status}`)
+  const data: any = await res.json()
+  const base = data && typeof data.base === 'string' ? data.base : ''
+  if (!base) throw new Error('地址路由的返回里没有 base（形状不对？）')
+  return base.trim().replace(/\/+$/, '')
 }
 
 export async function apply(ctx: Context): Promise<void> {
@@ -65,9 +90,9 @@ export async function apply(ctx: Context): Promise<void> {
         ),
     )
 
-    // 右栏 tab 类型 + body。`sidebar.right.pane.tab` 是 **session 作用域**的
-    // slot（dsh slots 契约），因此 inject 会拿到框架解析好的 sessionId——
-    // 面板正是靠它去发 /ml-monitor-url。
+    // 右栏 tab 类型 + body。`sidebar.right.pane.tab` 是 session 作用域 slot，
+    // inject 会拿到框架解析好的 sessionId——本插件用不到它（地址走同源路由），
+    // 保留形参只是匹配 slot 契约。
     const releaseTab = (ctx as any).sidebarRightTabs?.register?.({
       id: TAB_ID,
       kind: TAB_ID,
@@ -78,21 +103,7 @@ export async function apply(ctx: Context): Promise<void> {
         {
           name: 'sidebar.right.pane.tab',
           key: TAB_ID,
-          inject: (sessionId: SessionId): MonitorInjected => ({
-            resolveMonitorBase: async () => {
-              const r = await ctx.remote!.commands!.execute(
-                sessionId, '/ml-monitor-url', [])
-              if (!r.ok) throw new Error(r.error.message)
-              // `r.value` 的形状未由 EL 钉死（它只判 undefined）⇒ 防御性提取，
-              // 拿不到就抛错让面板显示"地址未知"，绝不回落硬编码端口。
-              const value: any = r.value
-              const text = typeof value === 'string'
-                ? value
-                : (value && typeof value.text === 'string' ? value.text : '')
-              if (!text) throw new Error('命令未返回监控地址')
-              return text.trim().replace(/\/+$/, '')
-            },
-          }),
+          inject: (): MonitorInjected => ({ resolveMonitorBase: fetchMonitorBase }),
         } as any,
         MonitorTabBody as any,
       ))

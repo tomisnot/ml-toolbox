@@ -114,9 +114,9 @@ def _log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------- 进程组
-def _spawn(cmd) -> subprocess.Popen:
+def _spawn(cmd, env=None) -> subprocess.Popen:
     """起一个子进程，输出继承本控制台（权威日志/dsh 进度可见）。"""
-    return subprocess.Popen(cmd, cwd=str(HERE), creationflags=_FLAGS)
+    return subprocess.Popen(cmd, cwd=str(HERE), creationflags=_FLAGS, env=env)
 
 
 def start_group(mode: str):
@@ -278,9 +278,12 @@ def _spawn_dsh(mcp_port: int):
     for patch in patches:
         cmd += ["--patch", patch]
     cmd += ["--port", str(port)]
+    # 显式告诉面板插件"数据根在哪"：只靠 dsh 的 cwd 会隐式耦合，cwd 不对时
+    # 面板会去读**别处**（甚至残留）的运行期文件。见 dsh/src/index.ts 的 ML_ROOT_ENV。
+    env = {**os.environ, "MLTB_ML_ROOT": str(HERE)}
     _log("起 dsh（本实例 :%d，避开官方 3080）；overlay=%s"
          % (port, " + ".join(patches) or "(无)"))
-    return _spawn(cmd)
+    return _spawn(cmd, env=env)
 
 
 # ---------------------------------------------------------------- 就绪判据

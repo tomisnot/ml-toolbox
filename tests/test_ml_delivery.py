@@ -767,7 +767,11 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
     assert not re.search(r"127\.0\.0\.1:\d+", client_code), \
         "客户端里出现了硬编码的 loopback 端口"
     assert "resolveMonitorBase" in client_code, "监控地址必须经注入的解析器取"
-    assert "/ml-monitor-url" in client_code, "必须经 host 半命令取地址"
+    # 地址走**同源路由**（不是 command：命令返回值形状脆弱且会写会话记录）
+    assert "/ml-toolbox/monitor-url" in client_code, "客户端必须 fetch 同源地址路由"
+    assert "commands.execute" not in client_code, \
+        "客户端不得再经 commands.execute 取地址（会污染会话 + 形状脆弱）"
+    assert "remote.commands" not in client_code, "客户端不该再依赖 remote.commands"
 
     body = (dsh_dir / "src" / "client" / "MonitorTabBody.tsx").read_text(
         encoding="utf-8")
@@ -816,20 +820,67 @@ const bundle = join(process.env.MLTB_BUNDLE, 'index.mjs')
 const mod = await import(pathToFileURL(bundle).href)
 const root = process.argv[2]
 const out = { name: mod.name, inject: mod.inject, hasApply: typeof mod.apply === 'function' }
-try {
-  out.url = mod.resolveMonitorBase(root)
-  out.errored = false
-} catch (err) {
-  out.errored = true
-  out.error = String((err && err.message) || err)
+
+// --- apply：捕获 webServer.register 的路由 + disposer ---
+let route = null
+let disposed = false
+let disposer = null
+const ctx = {
+  effect: async (fn) => { disposer = fn(); return disposer },
+  webServer: { register: (r) => { route = r; return () => { disposed = true } } },
+  logger: { info() {}, warn() {}, error() {} },
 }
-// 空目录必须**抛错**（不许回落硬编码端口）
+await mod.apply(ctx)
+out.routeKind = route && route.kind
+out.routePath = route && route.path
+out.handlerIsFn = !!(route && typeof route.handler === 'function')
+
+// --- stub req/res：handler 拥有完整响应生命周期 ---
+function callHandler() {
+  const chunks = []
+  const res = {
+    statusCode: 0,
+    headers: {},
+    setHeader(k, v) { this.headers[k] = v },
+    end(body) { if (body) chunks.push(Buffer.from(body)) },
+  }
+  route.handler({ method: 'GET', url: route.path, headers: {} }, res)
+  return { status: res.statusCode, headers: res.headers,
+           body: Buffer.concat(chunks).toString('utf8') }
+}
+
+// (a) 描述符就位 → 200 + {base}
+process.env.MLTB_ML_ROOT = root
+const okRes = callHandler()
+out.okStatus = okRes.status
+out.okContentType = okRes.headers['Content-Type']
+out.okCacheControl = okRes.headers['Cache-Control']
+try { out.okBase = JSON.parse(okRes.body).base } catch { out.okBase = null }
+
+// (b) 描述符缺失（把根指到空目录）→ 非 200 + 可读错误 JSON
 const empty = mkdtempSync(join(tmpdir(), 'mltb-empty-'))
+process.env.MLTB_ML_ROOT = empty
+const badRes = callHandler()
+out.badStatus = badRes.status
 try {
-  out.emptyDirUrl = mod.resolveMonitorBase(empty)
-} catch (err) {
-  out.emptyDirThrew = true
-}
+  const parsed = JSON.parse(badRes.body)
+  out.badHasError = typeof parsed.error === 'string' && parsed.error.length > 0
+  out.badError = parsed.error
+  out.badHasBase = 'base' in parsed
+} catch { out.badHasError = false }
+
+// (c) 环境变量与 cwd 都读不到 → 直接函数必须抛错（不许回落硬编码端口）
+delete process.env.MLTB_ML_ROOT
+process.chdir(empty)
+try {
+  out.emptyDirUrl = mod.resolveMonitorBase()
+} catch { out.emptyDirThrew = true }
+
+// (d) disposer 真的撤掉路由
+out.disposedBefore = disposed
+if (typeof disposer === 'function') disposer()
+out.disposedAfter = disposed
+
 console.log('RESULT ' + JSON.stringify(out))
 """
 
@@ -858,8 +909,7 @@ const fakeRequire = (id) =>
 
 const exported = mod.factory(fakeRequire)
 const regs = []
-const calls = []
-let tabDesc = null
+let bodyDesc = null
 const ctx = {
   effect: async (fn) => fn(),
   slots: {
@@ -868,36 +918,66 @@ const ctx = {
       regs.push({ slot: desc.name, id: desc.id ?? null, key: desc.key ?? null,
                   comp: comp && comp.name,
                   hasInject: typeof desc.inject === 'function' })
-      if (desc.name === 'sidebar.right.pane.tab') tabDesc = desc
+      if (desc.name === 'sidebar.right.pane.tab') bodyDesc = desc
       return () => {}
     },
   },
   layout: { openRightbar: () => {} },
-  sidebarRight: { openTab: (id) => calls.push(['openTab', id]) },
+  sidebarRight: { openTab: () => {} },
   sidebarRightTabs: { register: (d) => { regs.push({ tab: d.id, kind: d.kind }); return () => {} } },
-  remote: { commands: { execute: async (...a) => {
-    calls.push(['execute', ...a]);
-    return { ok: true, value: 'http://127.0.0.1:4242' } } } },
   logger: { info() {}, warn() {}, error() {} },
 }
 await exported.apply(ctx)
 
-const out = { loaded: true, name: exported.name, inject: exported.inject, regs, calls }
-if (tabDesc && typeof tabDesc.inject === 'function') {
-  const injected = tabDesc.inject('sess-1')
-  out.injectedKeys = Object.keys(injected || {})
-  try {
-    out.resolvedUrl = await injected.resolveMonitorBase()
-  } catch (err) {
-    out.resolveError = String((err && err.message) || err)
-  }
+const out = { loaded: true, name: exported.name, inject: exported.inject, regs,
+              hasFetchMonitorBase: typeof exported.fetchMonitorBase === 'function' }
+out.injectedKeys = Object.keys(bodyDesc.inject() || {})
+
+// ① 真形状：200 + {base}
+const calls = []
+const goodFetch = async (url, init) => {
+  calls.push([url, init])
+  return { ok: true, status: 200, json: async () => ({ base: 'http://127.0.0.1:50062' }) }
 }
+out.goodBase = await exported.fetchMonitorBase(goodFetch)
+out.goodCalls = calls
+
+// ② 失败形状：404
+try {
+  await exported.fetchMonitorBase(async () => ({ ok: false, status: 404,
+                                                 json: async () => ({}) }))
+  out.notOkThrew = false
+} catch (err) { out.notOkThrew = true; out.notOkError = String(err.message) }
+
+// ③ 负例：喂**旧的 command 返回形状**必须失败（证明不再依赖命令返回值）
+const oldShape = { ok: true, value: { commandId: 'c1',
+                                      result: { kind: 'success',
+                                                text: 'http://127.0.0.1:9999' } } }
+try {
+  out.oldShapeUrl = await exported.fetchMonitorBase(
+    async () => ({ ok: true, status: 200, json: async () => oldShape }))
+  out.oldShapeThrew = false
+} catch (err) { out.oldShapeThrew = true; out.oldShapeError = String(err.message) }
+
+// ④ 空 base 也必须失败
+try {
+  await exported.fetchMonitorBase(async () => ({ ok: true, status: 200,
+                                                 json: async () => ({ base: '' }) }))
+  out.emptyBaseThrew = false
+} catch { out.emptyBaseThrew = true }
+
+// ⑤ 经注入面调用（面板真的会用这条路）
+out.viaInject = await bodyDesc.inject().resolveMonitorBase(goodFetch)
 console.log('RESULT ' + JSON.stringify(out))
 """
 
 
-def test_panel_host_half_resolves_monitor_url_from_runtime_descriptor():
-    """HOST 半（真产物）能从运行期描述符解析地址；空目录必须**抛错**、不猜端口。"""
+def test_panel_host_half_serves_monitor_url_route():
+    """HOST 半（真产物）：注册**同源只读路由**，200 给 `{base}`、读不到就非 200。
+
+    这是真机 bug 的回归判据：地址不再经 command 返回（那个形状
+    `value.result.text` 曾让我们读成 `value.text`，面板永远"监控端点未知"）。
+    """
     if not _node_available():
         print("    （跳过：PATH 里没有 node）")
         return
@@ -917,29 +997,45 @@ def test_panel_host_half_resolves_monitor_url_from_runtime_descriptor():
                 write_runtime(root, mode="ai", mcp_port=host.port,
                               monitor_port=mon_port)
                 rc, out, err = _run_node(_HOST_HALF_JS, root)
-                assert rc == 0, (rc, out[-800:], err[-800:])
+                assert rc == 0, (rc, out[-1200:], err[-1200:])
                 got = _payload(out)
+
                 assert got["name"] == "ml-toolbox-monitor", got
-                assert got["inject"] == ["commands"], got
+                # 依赖换成 webserver（不再有 commands）
+                assert got["inject"] == ["webServer"], got
                 assert got["hasApply"] is True, got
-                assert got["errored"] is False, got
-                # 地址必须等于**权威真写的那个端口**（不是猜的/默认的）
-                assert got["url"] == f"http://127.0.0.1:{mon_port}", got
-                assert got.get("emptyDirThrew") is True, \
-                    "空目录读不到端口时必须抛错——回落硬编码端口就是 EL 的假绿"
+                # 路由形状必须精确（dsh 契约：绝对路径、无尾斜杠、exact）
+                assert got["routeKind"] == "exact", got
+                assert got["routePath"] == "/ml-toolbox/monitor-url", got
+                assert got["handlerIsFn"] is True, got
+
+                # (a) 描述符就位 → 200 + {base} == 权威真写的端口
+                assert got["okStatus"] == 200, got
+                assert got["okBase"] == f"http://127.0.0.1:{mon_port}", got
+                assert "application/json" in (got["okContentType"] or ""), got
+                assert got["okCacheControl"] == "no-store", got
+
+                # (b) 描述符缺失 → 非 200 + 可读错误（**不许回落硬编码端口**）
+                assert got["badStatus"] == 503, got
+                assert got["badHasError"] is True, got
+                assert got["badHasBase"] is False, got
+                assert "监控端点未知" in got["badError"], got
+                assert got["emptyDirThrew"] is True, got
+
+                # (d) disposer 撤路由
+                assert got["disposedBefore"] is False, got
+                assert got["disposedAfter"] is True, got
             finally:
                 monitor.stop()
                 ml.close()
 
 
-def test_panel_client_half_loads_registers_and_injects_resolver():
-    """CLIENT 半（真产物）能在无浏览器环境下装载、apply、并经命令解析地址。
+def test_panel_client_half_uses_same_origin_fetch_not_command():
+    """CLIENT 半（真产物）：地址走同源 `fetch` → `{base}`；旧 command 形状必须失败。
 
-    这是 R19 的**自动化代理**：浏览器里发生的事拆成可断言的三步——
-    ① bundle 是合法的 ``__ModuleLoader__.load`` 包并能被 factory 求值；
-    ② ``apply(ctx)`` 注册了会话头按钮 + tab 类型 + tab body；
-    ③ tab body 的 ``inject(sessionId)`` 给出 ``resolveMonitorBase()``，
-       它真的发出 ``/ml-monitor-url`` 命令并取回地址（**不是硬编码**）。
+    真机 bug 的第二个回归点：喂**真形状**（`{ok, status, json}`）+ 一条**负例**
+    （旧的 `RemoteResult` `{ok, value:{result:{text}}}` 必须失败），这样"又把地址
+    读成命令返回值"会被判据当场抓住。
     """
     if not _node_available():
         print("    （跳过：PATH 里没有 node）")
@@ -952,26 +1048,41 @@ def test_panel_client_half_loads_registers_and_injects_resolver():
     got = _payload(out)
     assert got.get("loaded") is True, got
     assert got["name"] == "ml-toolbox-monitor", got
-    assert "slots" in got["inject"] and "remote.commands" in got["inject"], got
+
+    # 依赖面：不再需要 remote.commands（那正是污染会话与形状脆弱的来源）
+    assert "slots" in got["inject"], got
+    assert "remote" not in got["inject"], got
+    assert "remote.commands" not in got["inject"], got
 
     regs = got["regs"]
     header = [r for r in regs if r.get("slot") == "conversation.session.header.actions"]
     assert header and header[0]["comp"] == "CockpitButton", regs
     assert header[0]["id"] == "ml-toolbox-monitor", header
-    assert [r for r in regs if r.get("tab")], regs
-    assert regs[[i for i, r in enumerate(regs) if r.get("tab")][0]]["tab"] \
-        == "ml-toolbox-monitor", regs
+    tab = next(r for r in regs if r.get("tab"))
+    assert tab["tab"] == "ml-toolbox-monitor", regs
     body = [r for r in regs if r.get("slot") == "sidebar.right.pane.tab"]
     assert body and body[0]["comp"] == "MonitorTabBody", regs
     assert body[0]["key"] == "ml-toolbox-monitor", body
-    assert body[0]["hasInject"] is True, body
+    assert got["injectedKeys"] == ["resolveMonitorBase"], got
 
-    # ③ 地址解析：真的发了命令，且拿到命令返回的地址
-    assert got.get("injectedKeys") == ["resolveMonitorBase"], got
-    assert got.get("resolvedUrl") == "http://127.0.0.1:4242", got
-    executes = [c for c in got["calls"] if c[0] == "execute"]
-    assert executes and executes[0][1] == "sess-1", got["calls"]
-    assert executes[0][2] == "/ml-monitor-url", got["calls"]
+    # ① 真形状：200 + {base}
+    assert got["hasFetchMonitorBase"] is True, got
+    assert got["goodBase"] == "http://127.0.0.1:50062", got
+    assert got["goodCalls"][0][0] == "/ml-toolbox/monitor-url", got["goodCalls"]
+    assert got["goodCalls"][0][1] == {"cache": "no-store"}, got["goodCalls"]
+    assert got["viaInject"] == "http://127.0.0.1:50062", got
+
+    # ② 失败形状
+    assert got["notOkThrew"] is True, got
+    assert "404" in got["notOkError"], got
+
+    # ③ 负例：旧的 command 返回形状必须**失败**（喂进去也不该被当成地址）
+    assert got["oldShapeThrew"] is True, \
+        f"旧的 command 返回形状被当成地址了：{got.get('oldShapeUrl')!r}"
+    assert got["oldShapeError"], got
+
+    # ④ 空 base 也必须失败
+    assert got["emptyBaseThrew"] is True, got
 
 
 def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
@@ -1016,7 +1127,9 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
             cmd += ["--port", str(dsh_port), "--no-open"]
             dsh_proc = subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True,
-                                        encoding="utf-8", errors="replace")
+                                        encoding="utf-8", errors="replace",
+                                        env={**os.environ,
+                                             "MLTB_ML_ROOT": str(root)})
 
             deadline = time.time() + 120
             serving = False
@@ -1035,6 +1148,21 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
 
             time.sleep(3)                      # 给插件加载/工具同步留出时间
             assert dsh_proc.poll() is None, "dsh 在启动后几秒内退出了"
+
+            # ---- 端到端真证据：dsh **同源路由**返回的 base 必须指向权威真写的端口 ----
+            from ml_mecha.runtime import MONITOR_PORT_FILE, read_port
+            real_monitor_port = read_port(root / MONITOR_PORT_FILE)
+            assert real_monitor_port, "权威没写 .ml-monitor-port"
+            code, _, body = _http_get(
+                f"http://127.0.0.1:{dsh_port}/ml-toolbox/monitor-url")
+            assert code == 200, (code, body[:300])
+            route_payload = json.loads(body)
+            assert route_payload.get("base") == \
+                f"http://127.0.0.1:{real_monitor_port}", route_payload
+            # 顺着这个 base 真去读一次监控面（证明它可直接用，不只是字符串对）
+            code, _, body = _http_get(f"{route_payload['base']}/status")
+            assert code == 200, (code, body[:300])
+            assert json.loads(body)["mode"] == "ai", body[:200]
 
             launcher._kill_tree(dsh_proc)
             try:
@@ -1076,8 +1204,8 @@ _TESTS = [
     test_monitor_endpoint_rejects_stale_port_file,
     test_generated_dsh_patch_composes_with_real_dsh,
     test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port,
-    test_panel_host_half_resolves_monitor_url_from_runtime_descriptor,
-    test_panel_client_half_loads_registers_and_injects_resolver,
+    test_panel_host_half_serves_monitor_url_route,
+    test_panel_client_half_uses_same_origin_fetch_not_command,
     test_dsh_mounts_profile_with_all_overlays_and_stays_alive,
 ]
 

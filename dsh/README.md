@@ -8,12 +8,45 @@
 
 | 半 | 文件 | 职责 |
 |---|---|---|
-| HOST | `src/index.ts` → `lib/index.mjs` | 注册 `/ml-monitor-url`：把 ML 只读监控端点地址回给 client 半（地址读自权威写的运行期描述符，**没有硬编码默认值**） |
+| HOST | `src/index.ts` → `lib/index.mjs` | 在 dsh **同源** webserver 上注册只读路由 `/ml-toolbox/monitor-url`，返回 `{base: 'http://127.0.0.1:<监控端口>'}`（端口读自权威写的运行期描述符，**没有硬编码默认值**） |
 | CLIENT | `src/client/*` → `lib/client.js` | 会话头「◈ 监控」按钮 + 右栏 tab（三页：飞行记录仪 / 配置态 / 运行记录），轮询权威的只读端点 |
 
 **不移植** EL 的 `dsh/src/host/mcp-bridge.ts`（自愈 MCP 桥）。那条桥是为治
 dsh 内置客户端的 streamable-http "HTTP 世代"死区而写的；ML 先靠"权威与 dsh
 同生共死 + 每次启动重生成 overlay"绕开它。**什么时候该上它**见下面的观测程序。
+
+## 为什么是"同源路由"，不是"一个 command"（真机教训）
+
+第一版注册的是 `/ml-monitor-url` **command**，由 client 经
+`remote.commands.execute(sessionId, …)` 取地址。真机上挂在两处：
+
+1. **返回值形状脆弱**：command 的返回类型是
+   `RemoteResult<CommandExecution | undefined>`，而
+   `CommandExecution = { commandId, result: CommandResult }`、
+   `CommandResult = { kind:'success', text? } | { kind:'error', text }`
+   ⇒ 地址在 `r.value.result.text`。当时按 `r.value.text` 读 ⇒ **永远取不到**，
+   面板显示"监控端点未知：命令未返回监控地址"。（当时那条自测把 `r.value`
+   按错形状 stub 了，所以**自测绿、真机必挂**——自证假绿。）
+2. **取一次地址会污染会话**：每次 `commands.execute` 都会往会话里写
+   `command/run` + `command/done` 两条记录，而面板只是想知道一个端口。
+
+改为挂在 dsh 同源 webserver 上的只读路由：
+`webServer.register({kind:'exact', path:'/absolute/no/trailing/slash', handler})`
+（handler 拥有完整响应生命周期，返回 disposer）。面板直接 `fetch` 同源路径：
+无返回值包装、无跨源、无会话副作用。
+
+> **判据现在喂真形状**（`{ok, status, json}`）+ 一条**负例**：把旧的 command
+> 返回形状喂进去**必须失败**。这样"又把地址读成命令返回值"会被当场抓住。
+
+## 数据根从哪来（`MLTB_ML_ROOT`）
+
+host 半读运行期描述符时会先看环境变量 **`MLTB_ML_ROOT`**，没有才用
+`process.cwd()`。看门人起 dsh 时显式设置它。
+
+**为什么不只靠 cwd**：cwd 是隐式耦合——dsh 从别处起（或 cwd 不是 ML 仓根）时，
+host 半会去读**另一个**数据根的文件，甚至读到上一次会话的**残留**描述符
+（排查真机问题时实测到：面板拿到一个早已退出的实例的端口）。显式环境变量把
+"我的数据根在哪"讲清楚。
 
 ## 构建（一次性）
 
@@ -33,17 +66,27 @@ npm run bundle       # → lib/index.mjs（host 半）+ lib/client.js（client �
 没构建也能用：`launcher.py` 只在 `lib/index.mjs` 存在时才追加本插件 overlay，
 否则打一条"面板插件未构建"的降级日志——AI 模式照常，只是没有右栏面板。
 
+> ⚠ **改了 `src/` 之后必须 `npm run bundle` 并重启 dsh**：client 半是浏览器里的
+> 合并包，dsh 不会热加载它。面板行为没变时，先怀疑"bundle 没重建 / dsh 没重启"。
+
 ## 怎么被加载
 
-`launcher.py` 起 dsh 时带两份 overlay：
+`launcher.py` 起 dsh 时带**三份** overlay：
 
 ```powershell
-dsh --profile web --patch ./dsh/cordis.patch.yml --patch runtime/dsh-ml-mcp.patch.yml --port 3081
+dsh --profile web --patch ./dsh/cordis.patch.yml `
+                --patch ./dsh/cordis.project.patch.yml `
+                --patch runtime/dsh-ml-mcp.patch.yml --port 3081
 ```
 
 - `dsh/cordis.patch.yml`（**入库**）：加载本插件（`name: './lib/index.mjs'`，相对本文件）。
+- `dsh/cordis.project.patch.yml`（**入库**）：**项目隔离**——还原 webserver 的
+  host/port 表达式，让 `--port` 生效。**不加它就会去抢官方实例的 `:3080`**
+  （共享 profile 把 port 钉成字面量，而同 id 的 patch 是整块替换 config）。
 - `runtime/dsh-ml-mcp.patch.yml`（**生成物，不入库**）：每次启动按实际 MCP 端口重写，
   内含 `@deepseek-ai/dsh-mcp-client` 条目（`- insert:` 包住）。
+
+环境变量：`MLTB_ML_ROOT` = ML 仓根（launcher 显式设置，见上一节）。
 
 ## 参数化：监控地址从哪来
 
@@ -52,9 +95,9 @@ dsh --profile web --patch ./dsh/cordis.patch.yml --patch runtime/dsh-ml-mcp.patc
 
 ```
 权威启动 → 写 .ml-monitor-port + .ml-mecha-runtime.json（单一真源）
-   → client 半的 tab body（session 作用域 slot，拿到 sessionId）
-   → inject 的 resolveMonitorBase() → remote.commands.execute('/ml-monitor-url')
-   → host 半读描述符 → 返回 http://127.0.0.1:<实际端口>
+   → client 半的 tab body（session 作用域 slot）
+   → inject 的 resolveMonitorBase() → 同源 fetch('/ml-toolbox/monitor-url')
+   → host 半读描述符（根 = MLTB_ML_ROOT 或 cwd）→ 返回 {base: "http://127.0.0.1:<实际端口>"}
 ```
 
 读不到就**如实显示"监控端点未知"+ 重试**，绝不回落某个默认端口。
