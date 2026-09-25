@@ -357,6 +357,10 @@ def test_static_capabilities_module_does_not_hand_copy_names():
 # ---------------------------------------------------------------- 直跑入口
 def main() -> int:
     """不装 pytest 时的直跑入口（与仓内其他 test_*.py 同形）。"""
+    # 默认控制台可能是 GBK（本机 cp936）：✓/✗ 会让直跑入口在第一个测试之前
+    # 就崩掉（exit 1），真实失败被编码崩溃掩盖（最终验收审查 R18/D14）。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     import tempfile
 
     tests = [

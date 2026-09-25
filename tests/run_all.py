@@ -24,6 +24,7 @@ MECHA_PRESENT = os.path.isdir(MECHA_ROOT)
 if MECHA_PRESENT:
     SCRIPTS.append("test_ml_mecha.py")
     SCRIPTS.append("test_ml_capabilities.py")
+    SCRIPTS.append("test_ml_delivery.py")
 
 
 def main():
