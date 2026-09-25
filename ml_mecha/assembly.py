@@ -27,10 +27,13 @@
 
 ## Known Limitations and Deferred Work
 
-- 长任务仍是**同步**执行：ML 的 fit 在调用线程里跑完。mecha 的 Job Contract
-  尚未与宿主引擎对接（见汇报的接口缺口），本层不假装有 job 语义。
+- 长任务现在可以经 :meth:`MLMecha.submit` 异步跑（mecha Job Contract），但
+  **取消是协作式的**：检查点在命令入口与批量/对比的方法边界，单次 fit 计算
+  不可中断；job 元数据也**不跨进程**（进程重启后找回 job 仍需落 History）。
 - 跨进程写租约由 mecha local Log Provider 提供（``.ml-mecha`` 目录）；多进程
   同时写同一数据目录会被拒，这是有意的 fail closed。
+- Approval 未接命令：``approval_required`` 只是核心声明，导出/删除类命令尚未
+  出现，本装配点不接审批闸（诚实推迟）。
 """
 from __future__ import annotations
 
@@ -40,12 +43,13 @@ from typing import Any
 
 from mecha.assembly import Software, assemble
 from mecha.authority import Mode
+from mecha.errors import MechaError
 from mecha.gate import Channel
 from mecha.history import History
 from mecha.monitor import Summarizer
 from mecha.scopes import ScopePolicy
 from mecha.surface import EntryKind
-from mecha.tools import ToolRegistry
+from mecha.tools import CURRENT_CALL_ID, ToolRegistry
 
 from ml_toolbox.api import Session
 
@@ -138,19 +142,41 @@ class MLMecha:
     def submit(self, spec: Mapping[str, Any], *, side: str = "ai"):
         """把一条 ML 受控命令提交成 mecha job。
 
-        命令在**后台线程**里跑；操作者通道必须显式带过去（contextvars 不跨
-        线程），因此 worker 自己在通道上下文里调 ``engine.run``。job 的
-        ``result_ref`` 从回执的 run_ids 提取，与命令审计互引。
+        **submit 不扩权**：``side`` 只是"这次用哪条**既有**通道"的选择器，写权
+        仍由 ``Authority`` 的当前 mode 决定——``mode=AI`` 时选 ``side="human"``
+        照样被 Gate 以 ``authority_mode_mismatch`` 拒（本方法不碰 mode、不开关闸）。
+        ``side`` 只接受 ``{"human", "ai"}``，其它值当场 ``bad_side``（见下）。
+
+        命令在**后台线程**里跑；操作者通道与本次请求的 ``call_id`` 必须显式
+        带过去（contextvars 不跨线程），因此 worker 自己在两个上下文里调
+        ``engine.run``：通道定写权与归因，``call_id`` 让 job 路径的命令审计
+        与操作者行为史互引（第三轮审查 P2-5）。
         """
+        if side not in ("human", "ai"):
+            # 选 MechaError 而不是 ValueError：与库内其它拒绝同形（结构化
+            # ``kind`` + hint + suggest），调用方（含 AI 可达面）拿到的是可
+            # 教学失败而不是裸异常；装配点的其它拒绝也都是 MechaError。
+            raise MechaError(
+                f"submit 的 side 只能是 'human' 或 'ai'，收到 {side!r}",
+                kind="bad_side",
+                hint="side 选择用哪条既有通道（写权仍由 Authority 的 mode 决定）；"
+                     "它不是权限等级，写 'root' 之类的值不会获得更多权限",
+                suggest="side='ai'（AI 通道）或 side='human'（人类通道）",
+            )
         command = str(spec.get("command", ""))
         channel = self.software.channels[side]
+        # 提交线程里捕获本次请求的 call_id；后台线程的 contextvar 是空的。
+        # 没设过就是 ""（人类/脚本路径），不是伪造一个。
+        call_id = CURRENT_CALL_ID.get()
 
         def worker(ctx):
-            token = use_channel(channel)
+            channel_token = use_channel(channel)
+            call_token = CURRENT_CALL_ID.set(call_id)
             try:
                 return self.engine.run(dict(spec), context=ctx)
             finally:
-                clear_channel(token)
+                CURRENT_CALL_ID.reset(call_token)
+                clear_channel(channel_token)
 
         def ref(receipt):
             if not isinstance(receipt, Mapping):

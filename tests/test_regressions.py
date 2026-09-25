@@ -643,6 +643,11 @@ def test_sqa_engine_registered_family_quantum():
 
 
 def main():
+    # 默认控制台可能是 GBK（本机 cp936）：✓/✗ 会让直跑入口在**失败分支**打印时
+    # 崩成 UnicodeEncodeError，把真实的失败详情一起吞掉（第三轮审查 P2-9）。
+    # 与 tests/run_all.py / tests/test_ml_mecha.py::main() 同款加固。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     tests = [(k[5:], v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     print(f"回归测试 {len(tests)} 项")

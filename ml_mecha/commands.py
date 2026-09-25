@@ -117,8 +117,12 @@ COMMANDS: tuple[CommandSpec, ...] = (
             CommandParam("resource_guard", "object", False, "资源预算守卫声明"),
             CommandParam("device", "string", False, "计算设备声明（auto/cpu/cuda[:n]）"),
         ),
-        writes_state=("current.method", "current.overrides", "current.seed",
-                      "current.device", "current.resource_guard"),
+        # 声明必须**逐键等于**实际写入：run_method 的 `_write_state` 也写
+        # `current.dataset_id`（隐含数据集解析），漏声明就是声明漂移
+        # （第三轮审查 P2-7）。双向对账见
+        # `tests/test_ml_mecha.py::test_writes_state_declaration_matches_actual_history`。
+        writes_state=("current.dataset_id", "current.method", "current.overrides",
+                      "current.seed", "current.device", "current.resource_guard"),
         side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
         risk=RISK_LOW,
         extra_receipt_keys=("run_id", "elapsed_s", "error"),

@@ -498,8 +498,19 @@ class MLEngine(Engine):
 
         装配后命令声明注册进 mecha 核心 ``CommandRegistry``（唯一命令审计 +
         result_ref）；未绑定的裸引擎回退本地分派，便于单测。
+
+        取消语义（审查 P1-3 残余）：``context.cancelled`` 在**命令入口**先查一次
+        ——已取消就当场返回结构化失败回执（``error_kind="cancelled"``），
+        **不写域状态、不产生 run、不写 ``ml.run``、不写 ``command.<name>`` 审计**。
+        批量/对比另在每个方法边界复查（见对应命令体）。
+
+        **诚实声明**：取消是协作式的，检查点只有"命令入口"和"方法与方法之间"。
+        ``Session.run`` 的一次 fit 计算内部**不可中断**——ML 方法层没有协作式
+        取消点，本层不假装能打断正在跑的训练（不谎报可中断性）。
         """
         command = str(spec.get("command", ""))
+        if _is_cancelled(context):
+            return self._cancelled_receipt(command)
         if self._commands is not None and command in self._commands.names():
             return self._invoke_core_command(command, spec, context)
         return self._dispatch(spec, context)
@@ -553,6 +564,12 @@ class MLEngine(Engine):
                              result_ref=ref)
 
     def _dispatch(self, spec: Mapping[str, Any], context: Any) -> Mapping[str, Any]:
+        command_hint = str(spec.get("command", "")) if isinstance(spec, Mapping) else ""
+        if _is_cancelled(context):
+            # 命令入口的第二道（核心 ``CommandRegistry.invoke`` 直连 handler 时
+            # 走不到 ``run``）：取消态绝不做域工作。此处核心审计已由 invoke
+            # 写过一条 ``ok=False`` 的记录——那是核心如实记账，不是本层伪造。
+            return self._cancelled_receipt(command_hint)
         try:
             self._validator.validate_spec(spec, commands=command_map())
         except MechaError as exc:
@@ -627,6 +644,12 @@ class MLEngine(Engine):
         }
 
     def _cmd_run_method(self, spec: dict[str, Any], context: Any) -> Mapping[str, Any]:
+        """在已准备的数据视图上运行一个方法。
+
+        取消检查点：**命令入口**（:meth:`run` / :meth:`_dispatch`）与批量/对比的
+        **方法边界**。单方法体内部**没有**取消检查——``Session.run`` 的一次 fit
+        计算不可中断（方法层无协作式取消点），这里如实写清，不假装可中断。
+        """
         dataset_id = str(spec.get("dataset_id") or self._last_dataset_id() or "")
         self._validator.check_dataset_ref(dataset_id)
         entry = self.dataset_entry(dataset_id)
@@ -1042,6 +1065,23 @@ class MLEngine(Engine):
             "error_suggest": exc.suggest,
         }
 
+    def _cancelled_receipt(self, command: str) -> Mapping[str, Any]:
+        """命令入口即被取消时的结构化失败回执（键齐 ``RECEIPT_REQUIRED_KEYS``）。
+
+        取消发生在**任何副作用之前**，所以这里只有话，没有事实要撤销：
+        不写域状态、不产生 run、不写 ``ml.run``、不写 ``command.<name>`` 审计
+        （核心审计由 ``CommandRegistry.invoke`` 在 handler 之前写，因此本检查
+        必须挡在 ``invoke`` **之前**——见 :meth:`run`）。
+        """
+        return self._failure(command, MechaError(
+            "命令在入口处已被取消：本次调用没有执行",
+            kind="cancelled",
+            hint="取消是协作式的——命令入口与批量/对比的每个方法边界各查一次；"
+                 "单次 fit 计算中不可中断（诚实声明，不假装能打断）",
+            suggest="清掉取消标志后重新提交；被取消的调用不留域状态、不产生 run、"
+                    "也不写命令审计",
+        ), [])
+
     # ------------------------------------------------------------ 内部：估算
     def _estimate_run(self, spec: Mapping[str, Any]) -> dict[str, Any]:
         method = str(spec.get("method", ""))
@@ -1134,6 +1174,14 @@ class MLEngine(Engine):
 
 
 # ---------------------------------------------------------------- 模块工具
+def _is_cancelled(context: Any) -> bool:
+    """读执行上下文的取消标志（``context`` 可为 None 或鸭子类型替身）。
+
+    只在命令入口/方法边界查——取消是**协作式**的，没有抢占式中断。
+    """
+    return bool(getattr(context, "cancelled", False))
+
+
 def _call_id() -> str:
     """读 mecha 的请求作用域 call_id（AI 侧互引；人类侧为空字符串）。"""
     try:

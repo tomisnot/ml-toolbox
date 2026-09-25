@@ -43,9 +43,10 @@ if MECHA_ROOT.is_dir() and str(MECHA_ROOT) not in sys.path:
     sys.path.insert(0, str(MECHA_ROOT))
 
 from mecha.authority import Mode                    # noqa: E402
-from mecha.errors import GateDenied                 # noqa: E402
+from mecha.errors import GateDenied, MechaError     # noqa: E402
 from mecha.gate import Channel                      # noqa: E402
 from mecha.monitor import Claim, Monitor            # noqa: E402
+from mecha.surface import ExecutionContext          # noqa: E402
 from mecha.tools import CURRENT_CALL_ID, check_tool_name  # noqa: E402
 
 from ml_mecha.assembly import READ_QUERIES, assemble_ml_mecha  # noqa: E402
@@ -283,6 +284,162 @@ def test_job_contract_failure_has_no_fake_ref(app):
     assert status["state"] == "done", status
     assert job.result["ok"] is False
     assert status.get("result_ref") is None
+
+
+def test_cancelled_command_entry_is_a_noop_failure(app):
+    """取消语义（第三轮 P1-3 残余）：入口已取消 ⇒ 结构化失败，零副作用零审计。
+
+    这是"取消真的省了工作"的可执行判据：取消**不是**把成功回执改个标签，
+    而是命令根本没开始——不产 run、不写 ``ml.run``、不写 ``command.<name>``
+    审计、History 零新增。最后用同一条调用（不取消）做对照，防止上面的
+    "什么都没发生"断言因为别的原因（比如命令本来就跑不动）而空转。
+    """
+    dataset_id = _prepared(app)
+
+    before = len(app.history.events())
+    records_before = len(app.engine.session.export_state()["records"])
+
+    ctx = ExecutionContext()
+    ctx.request_cancel()
+    receipt = _as(app, app.ai_channel,
+                  {"command": "run_method", "method": "logistic",
+                   "dataset_id": dataset_id}, context=ctx)
+
+    # 1) 回执形状：必填键齐 + 机读 kind + 可读说明
+    assert receipt["ok"] is False
+    assert receipt["error_kind"] == "cancelled"
+    for key in RECEIPT_REQUIRED_KEYS:
+        assert key in receipt, key
+    assert receipt["run_ids"] == []
+    assert any("取消" in str(w) for w in receipt["warnings"]), receipt["warnings"]
+
+    # 2) 零副作用：不产 run、不写 ml.run、不写 command.<name>、History 零新增
+    assert len(app.engine.session.export_state()["records"]) == records_before
+    events = app.history.events()
+    assert len(events) == before, [e.key for e in events[before:]]
+    assert [e for e in events if e.key == "ml.run"] == []
+    assert [e for e in events if e.key == "command.run_method"] == []
+
+    # 3) 对照片：同一调用不取消 ⇒ 成功且真的产 run / 写史（防断言空转）
+    ok = _as(app, app.ai_channel,
+             {"command": "run_method", "method": "logistic",
+              "dataset_id": dataset_id}, context=ExecutionContext())
+    assert ok["ok"] is True, ok
+    assert ok["run_ids"], ok
+    assert len(app.engine.session.export_state()["records"]) == records_before + 1
+    after = app.history.events()
+    assert [e for e in after if e.key == "ml.run"]
+    assert [e for e in after if e.key == "command.run_method"]
+
+
+def test_job_path_carries_call_id_into_audit(app):
+    """P2-5 回归：job 路径的命令审计必须保住调用方的 ``call_id``。
+
+    contextvars 不跨线程，所以 ``submit`` 必须在提交线程里**捕获**再在 worker
+    内 ``set``。先跑一条不设 call_id 的对照（审计必须为空串），证明下面读到的
+    ``job-call-1`` 不是某处写死的常量。
+    """
+    dataset_id = _prepared(app)
+
+    plain = app.submit({"command": "run_method", "method": "logistic",
+                        "dataset_id": dataset_id})
+    assert app.wait_job(plain, 20)["state"] == "done"
+    plain_audit = [e for e in app.history.events()
+                   if e.key == "command.run_method"][-1]
+    assert plain_audit.call_id == "", plain_audit.call_id
+
+    CURRENT_CALL_ID.set("job-call-1")
+    try:
+        job = app.submit({"command": "run_method", "method": "logistic",
+                          "dataset_id": dataset_id})
+    finally:
+        CURRENT_CALL_ID.set("")
+
+    status = app.wait_job(job, 20)
+    assert status["state"] == "done", status
+    assert job.result["ok"] is True, job.result
+
+    audit = [e for e in app.history.events() if e.key == "command.run_method"][-1]
+    assert audit.actor == "ml-ai"
+    assert audit.call_id == "job-call-1", audit.call_id
+    # 域运行摘要与命令审计互引同一个 call_id（两处同源）
+    run_event = [e for e in app.history.events() if e.key == "ml.run"][-1]
+    assert run_event.call_id == "job-call-1", run_event.call_id
+
+
+def test_submit_side_is_validated_and_does_not_widen_authority(app):
+    """P2-2 回归：``side`` 只选**既有**通道，不扩权；非法值当场拒。
+
+    ``side="ai"`` 在 ``mode=AI`` 下正常；``side="human"`` 在同一时刻仍被
+    Authority 以 ``authority_mode_mismatch`` 拒——证明 submit 只是通道选择器，
+    没有第二套授权逻辑（选 human 不会换来人类写权）。
+    """
+    with pytest.raises(MechaError) as exc:
+        app.submit({"command": "run_method", "method": "logistic",
+                    "dataset_id": "whatever"}, side="root")
+    assert exc.value.kind == "bad_side"
+    assert app.list_jobs() == []        # 非法 side 不留半拉子 job
+
+    dataset_id = _prepared(app)
+    assert app.mode is Mode.AI
+
+    good = app.submit({"command": "run_method", "method": "logistic",
+                       "dataset_id": dataset_id}, side="ai")
+    status = app.wait_job(good, 20)
+    assert status["state"] == "done", status
+    assert good.result["ok"] is True, good.result
+
+    # 不扩权：mode=AI 下人类通道照样被拒（不是"选了 human 就能写"）
+    human_side = app.submit({"command": "run_method", "method": "logistic",
+                             "dataset_id": dataset_id}, side="human")
+    human_status = app.wait_job(human_side, 20)
+    assert human_status["state"] == "done", human_status
+    assert human_side.result["ok"] is False, human_side.result
+    assert human_side.result["error_kind"] == "authority_mode_mismatch"
+
+
+def test_writes_state_declaration_matches_actual_history(app):
+    """P2-7 防复发：声明的 ``writes_state`` 必须**逐键等于**实际写入的键集合。
+
+    做法是机械对账而不是读代码：四条命令各跑一次，收集它在 History 里
+    实际写下的 ``current.*`` 键（actor=ml-ai 的那些），与该命令声明的集合
+    比双向相等——多声明（谎报会写）少声明（偷偷写）都判红。
+    """
+    from ml_mecha.commands import command_map
+
+    app.switch_ai()                     # AI 侧持有全部 4 条 scope，四条都真跑
+
+    def _actual(spec):
+        mark = len(app.history.events())
+        receipt = _as(app, app.ai_channel, spec)
+        assert receipt["ok"] is True, receipt
+        keys = {e.key for e in app.history.events()[mark:]
+                if e.actor == "ml-ai" and e.key.startswith("current.")}
+        return receipt, keys
+
+    prep, prep_keys = _actual({
+        "command": "prepare_dataset", "name": "declared",
+        "source": {"kind": "frame", "frame": _frame(), "target": "target"}})
+    dataset_id = prep["dataset_id"]
+
+    observed = {"prepare_dataset": prep_keys}
+    for spec in ({"command": "run_method", "method": "logistic",
+                  "dataset_id": dataset_id},
+                 {"command": "run_method_batch", "methods": ["logistic", "svc"],
+                  "dataset_id": dataset_id},
+                 {"command": "compare_methods", "methods": ["logistic", "svc"],
+                  "dataset_id": dataset_id}):
+        _receipt, keys = _actual(spec)
+        observed[spec["command"]] = keys
+
+    declared = {name: set(spec.writes_state)
+                for name, spec in command_map().items()}
+    assert set(observed) == set(declared)
+    assert observed == declared, {
+        name: {"declared_only": sorted(declared[name] - observed[name]),
+               "written_only": sorted(observed[name] - declared[name])}
+        for name in declared
+        if declared[name] != observed[name]}
 
 
 def test_write_tool_failures_are_tool_failure(app):
@@ -729,6 +886,10 @@ def main() -> int:
              test_scope_policy_denies_unlisted_command_scope,
              test_job_contract_runs_command_async,
              test_job_contract_failure_has_no_fake_ref,
+             test_cancelled_command_entry_is_a_noop_failure,
+             test_job_path_carries_call_id_into_audit,
+             test_submit_side_is_validated_and_does_not_widen_authority,
+             test_writes_state_declaration_matches_actual_history,
              test_write_tool_failures_are_tool_failure,
              test_run_method_end_to_end_and_receipt_contract,
              test_resource_guard_rejects_without_escaping,
