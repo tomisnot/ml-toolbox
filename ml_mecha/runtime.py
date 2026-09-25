@@ -54,46 +54,12 @@ def resolve(root: str | Path, name: str) -> Path:
 
 
 # ---------------------------------------------------------------- 端口文件
-def read_port(path: str | Path | None) -> int | None:
-    """读裸端口；不存在 / 空 / 非数字都返回 ``None``（不猜）。"""
-    if path is None:
-        return None
-    try:
-        raw = Path(path).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return int(raw) if raw.isdigit() else None
-
-
-def write_port_file(path: str | Path | None, port: int) -> None:
-    """写裸端口。``path`` 为 ``None`` 时什么都不做（调用方可能不要发现文件）。"""
-    if path is None:
-        return
-    try:
-        Path(path).write_text(str(int(port)), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def clear_port_file(path: str | Path | None, expected: int | None = None) -> None:
-    """删端口文件。
-
-    ``expected=None`` → 无条件删（**启动前**清陈旧文件，见模块 docstring 的论证）；
-    ``expected=<端口>`` → 只在内容仍是该端口时删（**收尾**时不误删新主人写的）。
-    """
-    if path is None:
-        return
-    target = Path(path)
-    try:
-        if not target.exists():
-            return
-        if expected is not None:
-            raw = target.read_text(encoding="utf-8").strip()
-            if raw and raw != str(int(expected)):
-                return
-        target.unlink()
-    except OSError:
-        pass
+# 端口文件的**语义**（含"启动前无条件清 / 收尾只删自己的"这条带安全论证的规则）
+# 已上提为框架能力 ``mecha.portfile``：本模块只**再导出**同名函数，不再自己写一遍
+# ——两家各写一次就是两处可各自漂移的安全论证（写租约 ⇒ 同根无别的活宿主 ⇒ 陈旧
+# 文件必属死进程；Windows 强杀不跑 ``finally``）。调用方签名与语义不变。
+from mecha.portfile import (clear_port_file, read_port,  # noqa: E402 - 见上
+                            write_port_file)
 
 
 # ---------------------------------------------------------------- 描述符

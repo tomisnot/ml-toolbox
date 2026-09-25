@@ -78,8 +78,9 @@ from mcp.client.streamable_http import streamable_http_client   # noqa: E402
 
 from ml_mecha.assembly import assemble_ml_mecha                 # noqa: E402
 from ml_mecha.mcp_host import (McpHost, build_mcp_server,       # noqa: E402
-                               command_declared_required,
-                               tool_input_schema)
+                               command_declared_required)
+# 框架助手直接用框架入口——shim 不再转一手（理由见 ml_mecha/mcp_host.py:151-155）。
+from mecha.providers.mcp import tool_input_schema               # noqa: E402
 
 #: 工具面全量（``ToolRegistry.schemas()`` 按 name 排序）。
 TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
@@ -319,10 +320,15 @@ class _StubToolHost:
 
 
 def _defaulted_of(ml, name: str):
-    """该工具**真实**算出来的 ``defaulted``（与注册路径同一条调用）。"""
+    """该工具**真实**算出来的 ``defaulted``（与注册路径同一条调用）。
+
+    ⚠ 迁移后断言对象是**框架行为**（``mecha.providers.mcp.tool_input_schema``，
+    ``ml_mecha.mcp_host`` 只是再导出）：`defaulted` 的权威来源是声明、必填来自
+    ML 的 ``RequiredSource``（命令声明）。签名形状也随之改为关键字传 ``execute``。
+    """
     schema = next(s for s in ml.tools.schemas() if s["name"] == name)
     _input_schema, defaulted = tool_input_schema(
-        name, schema, ml.tools.get(name).execute,
+        name, schema, execute=ml.tools.get(name).execute,
         declared_required=command_declared_required(ml, name))
     return set(defaulted), schema
 
@@ -331,7 +337,7 @@ def _tool_input_schema(ml, name: str):
     """该工具协议层的 ``inputSchema``（同一条调用；穷举判据用它取必填集合）。"""
     schema = next(s for s in ml.tools.schemas() if s["name"] == name)
     input_schema, _defaulted = tool_input_schema(
-        name, schema, ml.tools.get(name).execute,
+        name, schema, execute=ml.tools.get(name).execute,
         declared_required=command_declared_required(ml, name))
     return input_schema
 
@@ -579,13 +585,13 @@ def test_null_shim_single_source_mutant_is_detected():
     贡献任何一项，这一点由 ``test_null_shim_authority_is_declaration_only`` 永久断言
     （那种假实现只会让 ``defaulted`` 变小，已被第一条突变体覆盖）。
 
-    ⚠ 本判据直接点名 ``ml_mecha.mcp_host`` 的私有函数：它针对的是**迁移前的实现**。
-    extras 落地后若该名字消失，请把本判据改写成"框架侧对应的来源函数"或删除
-    （迁移时必须显式决定，不许静默丢）。
+    ⚠ 迁移后本判据打的是**框架函数** ``mecha.providers.mcp._declaration_defaulted``
+    （``ml_mecha.mcp_host`` 只是再导出，自己不再有这份实现）——断言对象从"自家实现"
+    改为"框架行为"，强度不变（仍是同一个 seam 观测点 + 同一对突变方向）。
     """
     from unittest import mock
 
-    import ml_mecha.mcp_host as _mcp_host
+    import mecha.providers.mcp as _mcp_provider
 
     def probe(mutant_patch, tool, base, param, *, normally_defaulted, mutant_keeps_null):
         """在突变体下探测：归属是否**翻转**、观测是否与正常判据相反。
@@ -607,11 +613,11 @@ def test_null_shim_single_source_mutant_is_detected():
                     assert null[param] is None, (tool, param, null)
 
     # 杀掉声明侧：所有 defaulted 失守（剥 null 的判据会红）
-    probe(mock.patch.object(_mcp_host, "_declaration_defaulted", lambda _d: set()),
+    probe(mock.patch.object(_mcp_provider, "_declaration_defaulted", lambda _d: set()),
           "run_method", {"method": "logistic"}, "persist",
           normally_defaulted=True, mutant_keeps_null=True)
     # 滥收（真默认为 None 的也进 defaulted）：清空语义失守（保 null 的判据会红）
-    probe(mock.patch.object(_mcp_host, "_declaration_defaulted",
+    probe(mock.patch.object(_mcp_provider, "_declaration_defaulted",
                             lambda _d: {"overrides"}),
           "run_method", {"method": "logistic"}, "overrides",
           normally_defaulted=False, mutant_keeps_null=False)
@@ -1061,6 +1067,83 @@ def test_monitor_endpoint_rejects_stale_port_file():
             ml.close()
 
 
+def test_monitor_runs_route_fails_loud_instead_of_faking_empty():
+    """D6（迁移裁决）：``/runs`` 取数失败 ⇒ **500 + 结构化错误体**，不得伪造空表。
+
+    迁移前本路由是 ``try: … except Exception: return []``——"读不到"与"确实没有数据"
+    变得不可区分，正是两家判据纪律反复在防的假绿。现在取数异常由框架归一化成
+    ``500 {ok:false, error:{message, info:{kind,…}}}``，面板据此显示可读错误。
+
+    两件事必须**同时**成立才算这条判据合格（只测 500 会漏掉"合法空表也被当错误"）：
+    ``runs/`` 不存在 ⇒ 200 + 空表（``list_meta`` 的合法语义）；取数抛错 ⇒ 500。
+    """
+    from unittest import mock
+
+    from ml_mecha.monitor_http import MonitorEndpoint
+    from ml_mecha.runtime import MONITOR_PORT_FILE
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-runs-") as td:
+        root = Path(td)
+        pf = root / MONITOR_PORT_FILE
+        with _authority(root, open_gate=True) as (ml, host):
+            monitor = MonitorEndpoint(ml, mcp_port=host.port, port_file=pf)
+            try:
+                monitor.start()
+                base = f"http://127.0.0.1:{monitor.port}"
+
+                # ① 合法空表：把存档根指到不存在的目录 ⇒ 200 + 空表（不是错误）
+                #    （不能靠"临时数据根"来制造空表：runs/ 是**进程级**路径，
+                #     由 ML_TOOLBOX_RUNS/项目根决定，与权威的数据根无关。）
+                from ml_toolbox.core import persistence
+                with mock.patch.object(persistence, "RUNS_DIR",
+                                       str(root / "no-such-runs")):
+                    code, _, body = _http_get(base + "/runs?limit=5")
+                    runs = json.loads(body)
+                    assert code == 200 and runs["runs"] == [], body[:200]
+                    assert runs["source"] == "runs/", runs
+
+                # ② 取数失败：响亮失败（500 + 结构化 kind），绝不降级成空表
+                with mock.patch.object(persistence, "list_records",
+                                       side_effect=OSError("磁盘读不到")):
+                    code, _, body = _http_get(base + "/runs")
+                assert code == 500, (code, body[:300])
+                payload = json.loads(body)
+                assert payload["ok"] is False, payload
+                assert payload["error"]["info"]["kind"] == "monitor_internal_error", \
+                    payload["error"]
+                assert "磁盘读不到" in payload["error"]["message"], payload["error"]
+                assert "runs" not in payload, \
+                    "错误回执里不得再出现「看起来正常」的空表键"
+            finally:
+                monitor.stop()
+                ml.close()
+
+
+def test_monitor_extra_routes_are_registered_and_core_routes_untouched():
+    """两条 ML 附加路由经框架 ``add_route`` 注册，且不覆盖四个核心路由。"""
+    from ml_mecha.monitor_http import MonitorEndpoint
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-routes-") as td:
+        root = Path(td)
+        with _authority(root, open_gate=True) as (ml, host):
+            monitor = MonitorEndpoint(ml, mcp_port=host.port,
+                                      port_file=root / ".ml-monitor-port")
+            try:
+                assert monitor.routes() == ["/runs", "/summary"], monitor.routes()
+                # 重名 fail loud（核心路由不可覆盖；两条附加路由不可重注册）
+                for path in ("/status", "/summary"):
+                    try:
+                        monitor._endpoint.add_route(path, lambda _q: {})
+                    except Exception as exc:                     # noqa: BLE001
+                        assert "duplicate_route" in str(exc) or "重名" in str(exc) \
+                            or "已注册" in str(exc), exc
+                    else:                                        # pragma: no cover
+                        raise AssertionError(f"{path} 重名注册竟然成功了")
+            finally:
+                monitor.stop()
+                ml.close()
+
+
 # ------------------------------------------------------- P2：dsh overlay 生成
 def test_generated_dsh_patch_composes_with_real_dsh():
     """生成的 overlay 必须真能被 dsh 组合（`- insert:` + 端口 + 超时）。
@@ -1139,6 +1222,26 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
         encoding="utf-8")
     for label in ("飞行记录仪", "配置态", "运行记录"):
         assert label in body, f"面板缺少页签 {label!r}"
+
+
+def test_panel_runs_page_shows_readable_error_instead_of_blank():
+    """D6 的面板侧：``/runs`` 取数失败要显示**可读错误**，不能渲染成空表。
+
+    只看源码文本（面板是注入浏览器的合并包，值级判据在 host 半的 Node 代理里更
+    合适），但断言的是**行为分支存在**：附加路由的 HTTP 状态被判过、错误有独立状态位、
+    运行记录页把错误摆成人话，并且不再把"某一条附加路由失败"当成"权威离线"。
+    """
+    body = (REPO / "dsh" / "src" / "client" / "MonitorTabBody.tsx").read_text(
+        encoding="utf-8")
+    assert "archiveError" in body, "缺少附加路由失败的状态位"
+    assert "res.ok" in body, "附加路由没有判 HTTP 状态（500 会被当成空表）"
+    assert "磁盘存档读取失败" in body, "运行记录页没有可读的错误文案"
+    assert "不是空的" in body, "错误态没有与「确实没有数据」区分开"
+    # 失败必须与"权威离线"分开：核心路由失败才置 offline
+    head, _, tail = body.partition("附加路由：各自失败各自显示")
+    assert tail, "轮询里没有把核心路由与附加路由分开处理"
+    assert "setOffline(true)" not in tail or "readJson('/runs" in tail, \
+        "附加路由失败仍然会把整块面板打成「权威离线」"
 
 
 # ------------------------------------------------------- P3：面板的自动化代理验收
@@ -1569,8 +1672,11 @@ _TESTS = [
     test_launcher_await_authority_rejects_stale_port_file,
     test_monitor_shapes_match_el_cockpit_contract,
     test_monitor_endpoint_rejects_stale_port_file,
+    test_monitor_runs_route_fails_loud_instead_of_faking_empty,
+    test_monitor_extra_routes_are_registered_and_core_routes_untouched,
     test_generated_dsh_patch_composes_with_real_dsh,
     test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port,
+    test_panel_runs_page_shows_readable_error_instead_of_blank,
     test_panel_host_half_serves_monitor_url_route,
     test_panel_client_half_uses_same_origin_fetch_not_command,
     test_dsh_mounts_profile_with_all_overlays_and_stays_alive,

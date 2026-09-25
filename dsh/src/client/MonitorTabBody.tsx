@@ -144,7 +144,8 @@ function cfgPage(groups: Record<string, Sub[]>, orphans: Row[]): string {
 }
 
 /** 运行记录（ML 独有第三页）：History 最近的运行 + 磁盘存档，两个来源并列。 */
-function runsPage(summary: Record<string, any>, archived: ArchiveRow[]): string {
+function runsPage(summary: Record<string, any>, archived: ArchiveRow[],
+                  fetchError: string = ''): string {
   const recent: RunRow[] = (summary?.recent_runs as RunRow[]) || []
   const headline = String(summary?.headline || '')
   const disputed = summary?.disputed
@@ -162,15 +163,23 @@ function runsPage(summary: Record<string, any>, archived: ArchiveRow[]): string 
         `<td style="color:#8b949e">${esc(r.actor)}${r.ok === false ? ' · 失败' : ''}</td></tr>`).join('') +
       `</table>`
     : `<div class="mltb-hint">本次会话还没有运行记录。</div>`
-  const archiveTable = archived.length
-    ? `<h4>磁盘存档 runs/（跨重启可见）</h4><table>` + archived.map((r) =>
-        `<tr><td>${esc(r.run_id)}</td><td>${esc(r.method)}</td>` +
-        `<td>${esc(r.primary_metric)}=${esc(r.value)}</td>` +
-        `<td style="color:#8b949e">${esc(r.saved_at)}${r.error ? ' · ' + esc(r.error) : ''}</td></tr>`).join('') +
-      `</table>`
-    : `<div class="mltb-hint">磁盘上没有落盘的运行。**注意：存档为空不等于没跑过**——` +
-      `运行只在 persist=True（或 GUI 批量成功）时写入 runs/。</div>`
-  return head + disputed + counts + recentTable + archiveTable
+  // ⚠ 取数失败**不得**渲染成"空表"：空表与"读不到"必须可区分（D6）。
+  // 端点现在对附加路由失败回 500 + 结构化错误体；这里把它摆成人能读的错误。
+  const archiveBlock = fetchError
+    ? `<h4>磁盘存档 runs/（跨重启可见）</h4>` +
+      `<div class="mltb-native-msg" style="color:#cf222e">磁盘存档读取失败：` +
+      `${esc(fetchError)}</div>` +
+      `<div class="mltb-hint">这一格**不是空的**，是没读到——权威的存档读取出错了，` +
+      `上面是它的原话。修好后重开面板即可（不要把它当成"没跑过"）。</div>`
+    : archived.length
+      ? `<h4>磁盘存档 runs/（跨重启可见）</h4><table>` + archived.map((r) =>
+          `<tr><td>${esc(r.run_id)}</td><td>${esc(r.method)}</td>` +
+          `<td>${esc(r.primary_metric)}=${esc(r.value)}</td>` +
+          `<td style="color:#8b949e">${esc(r.saved_at)}${r.error ? ' · ' + esc(r.error) : ''}</td></tr>`).join('') +
+        `</table>`
+      : `<div class="mltb-hint">磁盘上没有落盘的运行。**注意：存档为空不等于没跑过**——` +
+        `运行只在 persist=True（或 GUI 批量成功）时写入 runs/。</div>`
+  return head + disputed + counts + recentTable + archiveBlock
 }
 
 export function MonitorTabBody({ resolveMonitorBase }: {
@@ -188,6 +197,7 @@ export function MonitorTabBody({ resolveMonitorBase }: {
   const [orphans, setOrphans] = useState<Row[]>([])
   const [summary, setSummary] = useState<Record<string, any>>({})
   const [archived, setArchived] = useState<ArchiveRow[]>([])
+  const [archiveError, setArchiveError] = useState('')
 
   // 地址解析：**不硬编码**——问 host 半要（地址来自权威的运行期描述符）。
   const resolve = useCallback(async () => {
@@ -212,16 +222,26 @@ export function MonitorTabBody({ resolveMonitorBase }: {
   useEffect(() => { void resolve() }, [resolve])
 
   // 轮询：/history（写事件，含 mode）+ /config（结构树）+ /summary + /runs。
+  // ⚠ 两条**附加**路由（/summary、/runs）的失败必须与"权威离线"区分开：它们现在
+  // 会回 500 + 结构化错误体（D6：不伪造空表），所以这里逐条判 HTTP 状态，
+  // 把错误摆成人能读的文本，而不是让整块面板显示"权威离线"或一张空表。
   useEffect(() => {
     if (!base) return
     let dead = false
+    const readJson = async (path: string) => {
+      const res = await fetch(`${base}${path}`)
+      const body = await res.json().catch(() => null)
+      if (!res.ok) {
+        const msg = body?.error?.message || body?.error || `HTTP ${res.status}`
+        throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+      }
+      return body
+    }
     const poll = async () => {
       try {
-        const [h, c, s, r] = await Promise.all([
-          fetch(`${base}/history?since_seq=0`).then((x) => x.json()),
-          fetch(`${base}/config`).then((x) => x.json()),
-          fetch(`${base}/summary`).then((x) => x.json()),
-          fetch(`${base}/runs?limit=50`).then((x) => x.json()),
+        const [h, c] = await Promise.all([
+          readJson('/history?since_seq=0'),
+          readJson('/config'),
         ])
         if (dead) return
         setOffline(false)
@@ -229,11 +249,26 @@ export function MonitorTabBody({ resolveMonitorBase }: {
         setEvents(h.events ?? [])
         setGroups(c.groups ?? {})
         setOrphans(c.orphans ?? [])
-        setSummary({ ...(s.summary ?? {}), disputed: s.disputed,
-                     dispute_reason: s.dispute_reason })
-        setArchived(r.runs ?? [])
       } catch {
         if (!dead) setOffline(true)
+        return
+      }
+      // 附加路由：各自失败各自显示（不影响核心三页）
+      try {
+        const s = await readJson('/summary')
+        if (dead) return
+        setSummary({ ...(s.summary ?? {}), disputed: s.disputed,
+                     dispute_reason: s.dispute_reason })
+      } catch { /* 概括失败：保留上一份读数，运行记录页另有磁盘存档的错误位 */ }
+      try {
+        const r = await readJson('/runs?limit=50')
+        if (dead) return
+        setArchived(r.runs ?? [])
+        setArchiveError('')
+      } catch (err) {
+        if (dead) return
+        setArchived([])
+        setArchiveError((err as Error)?.message || String(err))
       }
     }
     void poll()
@@ -300,7 +335,7 @@ export function MonitorTabBody({ resolveMonitorBase }: {
         `<div class="mltb-hint" style="color:#57606a">${offline ? '连不上权威（软件没在 AI 模式跑？）' : '暂无写事件——AI/人每改一个键都会出现在这里'}</div>`}</div>`
     : page === 'cfg'
       ? `<div class="mltb-page"><h4>配置态</h4>${cfgPage(groups, orphans)}</div>`
-      : `<div class="mltb-page"><h4>运行记录</h4>${runsPage(summary, archived)}</div>`
+      : `<div class="mltb-page"><h4>运行记录</h4>${runsPage(summary, archived, archiveError)}</div>`
 
   return (
     <div ref={ref} onClick={onClick}
