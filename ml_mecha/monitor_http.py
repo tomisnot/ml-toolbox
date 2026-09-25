@@ -177,6 +177,9 @@ def start_monitor_endpoint(ml: Any, *, host: str = "127.0.0.1", port: int = 0,
     return endpoint
 
 
+#: 公开面：端点壳 + ML 的取数函数 + 历史公开名 ``MONITOR_PORT_FILE``。
+#: 框架的 ``CORE_ROUTES`` / ``MonitorSource`` / ``start_monitor_endpoint`` **不再**
+#: 从这里转发——本仓没有它们的消费者（判据要用就直接 ``from mecha.cockpit import …``）。
 __all__ = ["MonitorEndpoint", "start_monitor_endpoint", "history_records",
            "activity_records", "config_tree", "summary_view", "archived_runs",
-           "MONITOR_PORT_FILE", "CORE_ROUTES"]
+           "MONITOR_PORT_FILE"]
