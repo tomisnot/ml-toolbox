@@ -30,6 +30,9 @@
 - 长任务现在可以经 :meth:`MLMecha.submit` 异步跑（mecha Job Contract），但
   **取消是协作式的**：检查点在命令入口与批量/对比的方法边界，单次 fit 计算
   不可中断；job 元数据也**不跨进程**（进程重启后找回 job 仍需落 History）。
+  声明为不可取消的命令（``cancel_supported=False``，如数据准备类）经
+  :meth:`MLMecha.cancel_job` 会被结构化拒（``job_not_cancellable``）——
+  闸门只负责"拒收做不到的取消"，不代表可取消的命令真能被中途打断。
 - 跨进程写租约由 mecha local Log Provider 提供（``.ml-mecha`` 目录）；多进程
   同时写同一数据目录会被拒，这是有意的 fail closed。
 - Approval 未接命令：``approval_required`` 只是核心声明，导出/删除类命令尚未
@@ -151,6 +154,13 @@ class MLMecha:
         带过去（contextvars 不跨线程），因此 worker 自己在两个上下文里调
         ``engine.run``：通道定写权与归因，``call_id`` 让 job 路径的命令审计
         与操作者行为史互引（第三轮审查 P2-5）。
+
+        **可取消性随命令声明走**（第三轮审查：声明不被消费就只是注释）：装配点
+        从核心命令面取该命令的 ``CommandSpec.cancel_supported`` 交给 Job
+        Registry——``False`` 的命令（如数据准备类）调 ``cancel_job`` 会被结构化
+        拒（``job_not_cancellable``），不静默接受一个做不到的取消。命令不在核心
+        命令面时**不在这里发明新拒绝**：既有失败路径是 worker 内的分派产
+        ``ok=False`` 的教学回执（含 did-you-mean），故取不到声明就沿用 Job 默认。
         """
         if side not in ("human", "ai"):
             # 选 MechaError 而不是 ValueError：与库内其它拒绝同形（结构化
@@ -164,6 +174,8 @@ class MLMecha:
                 suggest="side='ai'（AI 通道）或 side='human'（人类通道）",
             )
         command = str(spec.get("command", ""))
+        declared = self.software.commands.spec(command)
+        cancel_supported = True if declared is None else declared.cancel_supported
         channel = self.software.channels[side]
         # 提交线程里捕获本次请求的 call_id；后台线程的 contextvar 是空的。
         # 没设过就是 ""（人类/脚本路径），不是伪造一个。
@@ -187,6 +199,7 @@ class MLMecha:
                     "run_ids": list(receipt.get("run_ids", []))}
 
         return self.software.jobs.submit(worker, command=command,
+                                         cancel_supported=cancel_supported,
                                          result_ref_fn=ref)
 
     def wait_job(self, job, timeout: float | None = None) -> dict:

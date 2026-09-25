@@ -367,10 +367,96 @@ def test_job_path_carries_call_id_into_audit(app):
     assert run_event.call_id == "job-call-1", run_event.call_id
 
 
+def test_uncancellable_command_cancel_job_is_rejected(app):
+    """第三轮审查：``cancel_supported`` 从死声明变成真契约（不可取消侧）。
+
+    ``prepare_dataset`` 的核心声明是 ``cancel_supported=False``（见
+    ``ml_mecha/core_commands.py``）：装配点必须把这条声明带进 job，``cancel_job``
+    必须被结构化拒（``job_not_cancellable``），且**不静默取消**——被拒之后命令
+    照常跑完、数据集真的建出来。
+
+    拒收与 job 状态无关（只读声明字段），所以这里连"完成后再取消"也断言被拒：
+    判据不靠赌时序，不会有 flaky。最后用同一条命令**不取消**做对照，证明上面的
+    "建成功"不是因为取消路径整体坏了。
+    """
+    frame_source = {"kind": "frame", "frame": _frame(), "target": "target"}
+    app.switch_human()                  # prepare_dataset 走人类侧写权
+    job = app.submit({"command": "prepare_dataset", "name": "nc",
+                      "source": dict(frame_source)}, side="human")
+
+    # 声明被带进 job（轮询面直接可读，不用猜默认值）
+    assert job.cancel_supported is False
+    assert job.to_dict()["cancel_supported"] is False
+
+    with pytest.raises(MechaError) as exc:
+        app.cancel_job(job)
+    assert exc.value.kind == "job_not_cancellable", exc.value
+    assert exc.value.hint.strip(), exc.value
+
+    # 被拒 ≠ 被打断：job 照常完成，数据集真的建出来了
+    status = app.wait_job(job, 30)
+    assert status["state"] == "done", status
+    assert job.result["ok"] is True, job.result
+    assert job.result["dataset_id"] in app.engine.dataset_ids()
+
+    # 终态之后照样拒（拒的是"这个命令不可取消"，不是某个瞬间的竞态）
+    with pytest.raises(MechaError) as exc2:
+        app.cancel_job(job)
+    assert exc2.value.kind == "job_not_cancellable", exc2.value
+
+    # 对照片：同一条命令不取消 ⇒ 成功且建出**另一个**数据集（防断言空转）
+    ok_job = app.submit({"command": "prepare_dataset", "name": "nc-control",
+                         "source": dict(frame_source)}, side="human")
+    ok_status = app.wait_job(ok_job, 30)
+    assert ok_status["state"] == "done", ok_status
+    assert ok_job.result["ok"] is True, ok_job.result
+    assert ok_job.result["dataset_id"] != job.result["dataset_id"]
+
+
+def test_cancellable_command_cancel_job_is_not_rejected(app):
+    """对偶：``cancel_supported=True`` 的命令，``cancel_job`` 不得报不可取消。
+
+    取消是协作式的（检查点只在命令入口与方法边界），所以这里**不断言**终态一定
+    是 ``cancelled``——那条竞态由命令体判据负责。本判据只钉"闸门没有被错误关上"：
+    提交后取消不抛 ``job_not_cancellable``，且 job 最终落到一个合法终态。
+    """
+    dataset_id = _prepared(app)
+    job = app.submit({"command": "run_method", "method": "logistic",
+                      "dataset_id": dataset_id})
+    assert job.cancel_supported is True
+    assert job.to_dict()["cancel_supported"] is True
+
+    try:
+        app.cancel_job(job)
+    except MechaError as e:                      # noqa: PERF203 - 就是要看 kind
+        raise AssertionError(f"可取消的命令取消被拒：{e.kind}: {e}") from e
+
+    status = app.wait_job(job, 30)
+    assert status["state"] in ("done", "cancelled"), status
+    if status["state"] == "done":
+        # 取消来晚了是合法结局（请求先于/晚于终点都行）；此时回执必须完整
+        assert job.result["ok"] is True, job.result
+
+
+def test_submit_unknown_command_keeps_existing_failure_path(app):
+    """``submit`` 不为未知命令发明新拒绝：既有失败路径原样保留。
+
+    核心命令面查不到该命令时（``commands.spec(...) is None``），装配点**不**
+    在这里抛错——既有路径是 worker 内的分派产 ``ok=False`` 的教学回执
+    （``error_kind="unknown_command"``），job 照常到终态；此时没有声明可读，
+    可取消性沿用 Job 默认。
+    """
+    app.switch_ai()
+    job = app.submit({"command": "no_such_command_xyz"})
+    status = app.wait_job(job, 20)
+    assert status["state"] == "done", status
+    assert job.result["ok"] is False, job.result
+    assert job.result["error_kind"] == "unknown_command", job.result
+    assert job.cancel_supported is True, "取不到声明时应沿用 Job 默认"
+
+
 def test_submit_side_is_validated_and_does_not_widen_authority(app):
     """P2-2 回归：``side`` 只选**既有**通道，不扩权；非法值当场拒。
-
-    ``side="ai"`` 在 ``mode=AI`` 下正常；``side="human"`` 在同一时刻仍被
     Authority 以 ``authority_mode_mismatch`` 拒——证明 submit 只是通道选择器，
     没有第二套授权逻辑（选 human 不会换来人类写权）。
     """
@@ -889,6 +975,9 @@ def main() -> int:
              test_cancelled_command_entry_is_a_noop_failure,
              test_job_path_carries_call_id_into_audit,
              test_submit_side_is_validated_and_does_not_widen_authority,
+             test_uncancellable_command_cancel_job_is_rejected,
+             test_cancellable_command_cancel_job_is_not_rejected,
+             test_submit_unknown_command_keeps_existing_failure_path,
              test_writes_state_declaration_matches_actual_history,
              test_write_tool_failures_are_tool_failure,
              test_run_method_end_to_end_and_receipt_contract,
