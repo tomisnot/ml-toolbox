@@ -259,6 +259,32 @@ def test_scope_policy_denies_unlisted_command_scope(app):
     assert allowed["ok"] is True
 
 
+def test_job_contract_runs_command_async(app):
+    """ML 长命令经 mecha Job Contract 跑：状态、result_ref、审计归因都可查。"""
+    dataset_id = _prepared(app)
+    job = app.submit({"command": "run_method", "method": "logistic",
+                      "dataset_id": dataset_id})
+    status = app.wait_job(job, 20)
+    assert status["state"] == "done", status
+    assert status["command"] == "run_method"
+    assert status["result_ref"]["run_ids"] == [job.result["run_id"]]
+    assert job.result["ok"] is True
+    audit = [e for e in app.history.events() if e.key == "command.run_method"]
+    assert audit and audit[-1].actor == "ml-ai"
+    assert any(j["id"] == job.id for j in app.list_jobs())
+
+
+def test_job_contract_failure_has_no_fake_ref(app):
+    """失败命令不伪造 result_ref；job 状态仍完成（回执 ok=False）。"""
+    app.switch_ai()
+    job = app.submit({"command": "run_method", "method": "logistic",
+                      "dataset_id": "no-such-dataset"})
+    status = app.wait_job(job, 20)
+    assert status["state"] == "done", status
+    assert job.result["ok"] is False
+    assert status.get("result_ref") is None
+
+
 def test_write_tool_failures_are_tool_failure(app):
     """写工具失败必须是 ``is_error=True`` + ToolFailure kind，不是假成功。"""
     csv_path = Path(app.layout.root) / "outside.csv"
@@ -692,6 +718,8 @@ def main() -> int:
              test_read_queries_are_registered_in_surface,
              test_commands_registered_in_core_registry,
              test_scope_policy_denies_unlisted_command_scope,
+             test_job_contract_runs_command_async,
+             test_job_contract_failure_has_no_fake_ref,
              test_write_tool_failures_are_tool_failure,
              test_run_method_end_to_end_and_receipt_contract,
              test_resource_guard_rejects_without_escaping,

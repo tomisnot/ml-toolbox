@@ -51,7 +51,7 @@ from ml_toolbox.api import Session
 
 from .commands import COMMANDS as HOST_COMMANDS
 from .core_commands import core_command_specs
-from .engine import MLEngine, make_state_writer
+from .engine import MLEngine, clear_channel, make_state_writer, use_channel
 from .summarizer import ml_summarizer
 from .tools import register_ml_tools
 
@@ -129,6 +129,49 @@ class MLMecha:
     def lock(self, side: str = "human") -> None:
         """人类侧锁死写权（任何通道都不可写域状态）。"""
         self.software.authority.switch_mode(Mode.LOCKED, side)
+
+    # ---- Job Contract：长命令提交为后台 job（可轮询/可取消/带 result_ref） ----
+    @property
+    def jobs(self):
+        return self.software.jobs
+
+    def submit(self, spec: Mapping[str, Any], *, side: str = "ai"):
+        """把一条 ML 受控命令提交成 mecha job。
+
+        命令在**后台线程**里跑；操作者通道必须显式带过去（contextvars 不跨
+        线程），因此 worker 自己在通道上下文里调 ``engine.run``。job 的
+        ``result_ref`` 从回执的 run_ids 提取，与命令审计互引。
+        """
+        command = str(spec.get("command", ""))
+        channel = self.software.channels[side]
+
+        def worker(ctx):
+            token = use_channel(channel)
+            try:
+                return self.engine.run(dict(spec), context=ctx)
+            finally:
+                clear_channel(token)
+
+        def ref(receipt):
+            if not isinstance(receipt, Mapping):
+                return None
+            if not receipt.get("run_ids"):
+                return None
+            return {"kind": "ml_command", "command": command,
+                    "run_ids": list(receipt.get("run_ids", []))}
+
+        return self.software.jobs.submit(worker, command=command,
+                                         result_ref_fn=ref)
+
+    def wait_job(self, job, timeout: float | None = None) -> dict:
+        """等待 job 结束并返回状态（``result_ref`` 在其中）。"""
+        return self.software.jobs.wait(job.id, timeout)
+
+    def cancel_job(self, job) -> None:
+        self.software.jobs.cancel(job.id)
+
+    def list_jobs(self) -> list[dict]:
+        return self.software.jobs.list()
 
     def close(self) -> None:
         """关停：释放 History 写租约（幂等）。"""
