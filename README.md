@@ -25,9 +25,10 @@ python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
 
 ### AI 模式（可选）：运行后在 dsh 界面指挥 AI 调用 ML
 
+安装步骤（两步，含"必须在仓根执行"等注意）**只有一处权威**：
+[docs/交付说明.md](docs/交付说明.md) §1–§2。这里只给启动：
+
 ```powershell
-pip install -e ".[ai]"                # MCP 工具服务 + 只读监控端点（mcp / uvicorn）
-pip install -e D:\code-nosync\mecha   # AI 模式依赖 mecha（兄弟仓，editable，不 vendor）
 python launcher.py                    # 看门人：弹窗选「本地 GUI 模式」/「AI 模式」
 ```
 
