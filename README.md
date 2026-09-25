@@ -19,10 +19,14 @@ python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
 
 > 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
 > `pip install optuna`；二者均为可选依赖，未装时其余方法/自研优化器照常可用。
+> 依赖声明有两处、**分工明确**：`requirements.txt` 是「跑起来」的安装清单（GUI 全量，
+> 主路径），`pyproject.toml` 是包元数据 + 按用途分组的 extras（`ai` / `neural` / `optuna`）
+> ——AI 模式的三项依赖以前**一个都没声明**，现在至少有了声明处。
 
 ### AI 模式（可选）：运行后在 dsh 界面指挥 AI 调用 ML
 
 ```powershell
+pip install -e ".[ai]"                # MCP 工具服务 + 只读监控端点（mcp / uvicorn）
 pip install -e D:\code-nosync\mecha   # AI 模式依赖 mecha（兄弟仓，editable，不 vendor）
 python launcher.py                    # 看门人：弹窗选「本地 GUI 模式」/「AI 模式」
 ```

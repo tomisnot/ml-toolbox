@@ -1,0 +1,78 @@
+# -*- coding: utf-8 -*-
+# ML Toolbox 包元数据（B3）。
+#
+# 为什么此前没有、现在补：本仓只有 requirements.txt，而 **AI 模式的三项依赖
+# （mecha / mcp / uvicorn）一个都没声明**——今天能跑只是因为这台机器恰好装好了；
+# 换机器或重建环境时表现为"import 失败"，查起来要半天（环境漂移）。
+#
+# ## 与 requirements.txt 的分工（**有意分工，不是两份真相**）
+#   - `requirements.txt` = 「把整台软件跑起来」的安装清单（GUI 全量 + 版本下限），
+#     仍是 README / docs/交付说明.md 里的主路径，**本次不动**；
+#   - 本文件 = 包元数据 + 可安装性 + **按用途分组的 extras**（AI / 神经网络 / 优化引擎）。
+#   两边列出的直接依赖**口径一致**，且都按"代码实际 import"取证（不写"将来可能需要"）。
+#
+# ## `mecha` 为什么**不**写在这里（判断题，已上报主代理）
+# 它是本机**兄弟仓的可编辑安装**（`D:\code-nosync\mecha`），不是 PyPI 包。
+# 在 pyproject 里写 `file://` 绝对/相对路径会把"环境漂移"从"未声明"换成"路径失效"
+# （换机器、换盘符、换目录名就崩），而且 PEP 508 直接引用对环境变量支持不可靠。
+# 现阶段的安装方式是显式的两步（见 README「AI 模式」与 docs/交付说明.md §2）：
+#     pip install -e ".[ai]"                 # MCP SDK + uvicorn（本文件声明）
+#     pip install -e D:\code-nosync\mecha    # mecha 兄弟仓（不 vendor）
+# EL 侧的先例同款：它把本地 mecha 写在 requirements.txt 的 `-e <相对路径>` 里，
+# 也没有 pyproject。**要不要把 mecha 也写进 requirements.txt（EL 同款）/换别的机制，
+# 由主代理裁决**——本文件先不替它做决定。
+#
+# ## 未声明的东西（不是遗漏）
+#   - `license`：仓库里**没有 LICENSE 文件**，不擅自替项目选一个许可；
+#     要发布时先定许可，再在这里声明（`license = ...`）。
+#   - `[project.scripts]`：入口仍是仓库根的 `python launcher.py`（看门人）/
+#     `python app.py`（GUI）/ `app_entry.py --authority`（headless 权威）。
+#     控制台脚本会改变交付形态（需要把根级脚本变成可导入模块），本次不做。
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-toolbox"
+description = "机器学习方法试验台：可 import 的方法库 + PyQt5 桌面软件 + AI 模式（mecha 宿主）"
+readme = "README.md"
+requires-python = ">=3.10"
+#: 版本**单一来源**：ml_toolbox/__init__.py 的 __version__（不在这里再抄一份，
+#: 免得多出第三个会漂移的版本号——见 docs/team/01 的 R10）。
+dynamic = ["version"]
+#: 直接依赖 = 代码里**实际 import** 的第三方（逐文件取证；不含仅传递依赖）。
+#: scipy 刻意不列：全仓零直接 import（sklearn/statsmodels 会传递带来它）——
+#: 与 requirements.txt 的口径差异已上报主代理。
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",       # HDBSCAN 需要 1.3+
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "statsmodels>=0.14",
+    "umap-learn>=0.5",
+    "PyQt5>=5.15",
+    "pyqtgraph>=0.13.1",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+#: AI 模式：MCP 工具服务（streamable-http）+ 只读监控端点。边界与 mecha 自己声明的
+#: `mecha[mcp]` 对齐（`mcp>=2.2,<3`：`MCPServer` 与 `_tool_manager.get_tool` 是 2.2
+#: 的形状；`uvicorn` 是被**直接** import 的，不是仅传递依赖）。
+ai = ["mcp>=2.2,<3", "uvicorn>=0.30"]
+#: 神经网络方法族（torch_mlp）。未装时其余方法照常可用。
+neural = ["torch>=2.0"]
+#: 优化框架的 TPE/ASHA 引擎适配。未装时自研引擎照常可用。
+optuna = ["optuna>=3.0"]
+
+[tool.setuptools.packages.find]
+#: 只发两个 Python 包。显式 include（不用 flat-layout 自动发现）：
+#: `dsh/` 是 Node 插件（无 __init__.py）、`tests/`/`checks/`/`benchmarks/` 不是包、
+#: `old/machine_learning/` 是带自己 .git 的历史归档——自动发现会把它们卷进来或直接
+#: 报"Multiple top-level packages discovered"。
+include = ["ml_mecha*", "ml_toolbox*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ml_toolbox.__version__"}
