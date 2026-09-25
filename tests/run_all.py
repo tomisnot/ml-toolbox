@@ -17,10 +17,11 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = ["smoke_test.py", "test_regressions.py", "test_ui.py", "test_opt.py"]
-#: mecha host adapter 集成判据。mecha 是同级仓；缺它时跳过并明确报告，
-#: 不用假绿替代（与 mecha 自己“缺真依赖即红”的纪律方向一致）。
+#: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
+#: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。
 MECHA_ROOT = os.environ.get("MECHA_ROOT", r"D:\code-nosync\mecha")
-if os.path.isdir(MECHA_ROOT):
+MECHA_PRESENT = os.path.isdir(MECHA_ROOT)
+if MECHA_PRESENT:
     SCRIPTS.append("test_ml_mecha.py")
     SCRIPTS.append("test_ml_capabilities.py")
 
@@ -63,7 +64,10 @@ def main():
     if failed:
         print("❌ 失败:", ", ".join(failed))
         return 1
-    print("✅ 全部通过（smoke + regressions + ui + opt + ml_mecha + ml_capabilities）")
+    ran = " + ".join(s[:-3] for s in SCRIPTS)     # 按实跑集合拼装，不硬编码
+    if not MECHA_PRESENT:
+        print(f"⚠️ 跳过 mecha 集成判据（MECHA_ROOT 不存在：{MECHA_ROOT}）")
+    print(f"✅ 全部通过（{ran}）")
     return 0
 
 

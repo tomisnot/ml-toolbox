@@ -40,6 +40,7 @@
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,26 @@ class MLMecha:
     @property
     def tools(self) -> ToolRegistry:
         return self.software.tools
+
+    @property
+    def toolhost(self):
+        """工具面的宿主传输 seam（ToolHost 契约的真实消费者）。
+
+        本适配层同时持有 ``tools``（定义）与 ``toolhost``（传输）：装配时用
+        ``toolhost.declare(tools.schemas())`` 校验投影，宿主调工具走
+        :meth:`call_tool`。两者指向同一张注册表（``toolhost.registry is tools``），
+        不造第二真值。
+        """
+        return self.software.toolhost
+
+    @property
+    def artifacts(self):
+        """宿主产物托管（Artifact 契约的真实消费者：``ml.run`` 事件落 locator）。"""
+        return self.software.artifacts
+
+    def call_tool(self, name: str, args: Mapping[str, Any] | None = None) -> dict:
+        """经 ToolHost 调一次工具（失败已归一化为 ``is_error`` 回执，不抛穿）。"""
+        return dict(self.software.toolhost.call(name, dict(args or {})))
 
     @property
     def authority(self):
@@ -291,7 +312,10 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
     # 引擎的写路径：唯一入口是 Gate（引擎自己无快照、无第二条写口）。
     engine.bind_state_writer(make_state_writer(software.gate))
     # 域运行摘要（ml.run）不是命令审计：直接进 History（只存摘要与 run_id 引用）。
-    engine.bind_command_events(_history_event_writer(software.history))
+    # 每条的紧凑 JSON 同时经 Artifact Contract 落盘，事件里只留**不透明 locator**
+    # ——这是 Artifact 机制在第二宿主上的真实消费者（大结果不进 History）。
+    engine.bind_command_events(
+        _history_event_writer(software.history, software.artifacts))
 
     # 受控命令注册进核心 Command Surface：命令审计（command.<name>）与
     # result_ref 由核心写；这是"第二宿主真实消费核心通用机制"的落点。
@@ -311,6 +335,9 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
 
     if register_tools:
         register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai")
+    # ToolHost 契约的真实消费者：装配时把模型可见投影交给宿主传输面校验
+    # （白名单形状不对会当场 fail loud），宿主调工具走 MLMecha.call_tool。
+    software.toolhost.declare(software.tools.schemas())
     return MLMecha(software, engine, scopes)
 
 
@@ -321,10 +348,18 @@ def _core_command_handler(engine: MLEngine, name: str):
     return handler
 
 
-def _history_event_writer(history: History):
+def _history_event_writer(history: History, artifacts):
+    """``ml.run`` 写入器：紧凑 JSON 落 Artifact，事件只带不透明 locator。"""
     def write(key: str, value: Mapping[str, Any], call_id: str = "",
               actor: str = "unknown") -> None:
-        history.append(key, dict(value), actor, "ml_mecha:command", call_id)
+        payload = dict(value)
+        run_id = str(payload.get("run_id") or "")
+        if run_id:
+            locator = artifacts.put(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                kind="ml_run_summary", name=run_id)
+            payload["artifact_locator"] = locator
+        history.append(key, payload, actor, "ml_mecha:command", call_id)
     return write
 
 

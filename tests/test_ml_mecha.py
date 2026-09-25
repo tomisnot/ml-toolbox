@@ -528,6 +528,36 @@ def test_writes_state_declaration_matches_actual_history(app):
         if declared[name] != observed[name]}
 
 
+def test_toolhost_is_the_tool_transport_seam(app):
+    """ToolHost 契约在 ML 宿主上有真实消费者：定义面同一张表、调用经宿主 seam。"""
+    assert app.toolhost.registry is app.tools          # 同一对象，非第二真值
+    assert app.toolhost.schemas() == app.tools.schemas()
+    result = app.call_tool("describe_methods", {"family": "linear"})
+    assert result["is_error"] is False
+    assert result["value"]["method_count"] > 0
+    bad = app.call_tool("no_such_tool", {})
+    assert bad["is_error"] is True
+
+
+def test_run_event_carries_artifact_locator(app):
+    """Artifact 契约在 ML 宿主上有真实消费者：ml.run 事件只带不透明 locator。"""
+    dataset_id = _prepared(app)
+    receipt = _as(app, app.ai_channel,
+                  {"command": "run_method", "method": "logistic",
+                   "dataset_id": dataset_id})
+    assert receipt["ok"] is True
+    events = [e for e in app.history.events() if e.key == "ml.run"]
+    assert events, "没有 ml.run 事件"
+    locator = events[-1].value.get("artifact_locator")
+    assert locator, f"事件缺 artifact_locator：{events[-1].value}"
+    assert "artifact-" in locator and "/" not in locator and "\\" not in locator
+    assert app.artifacts.exists(locator)
+    meta = app.artifacts.describe(locator)
+    assert meta["kind"] == "ml_run_summary"
+    blob = json.loads(app.artifacts.retrieve(locator).decode("utf-8"))
+    assert blob["run_id"] == receipt["run_id"]
+
+
 def test_write_tool_failures_are_tool_failure(app):
     """写工具失败必须是 ``is_error=True`` + ToolFailure kind，不是假成功。"""
     csv_path = Path(app.layout.root) / "outside.csv"
@@ -853,8 +883,9 @@ def test_static_ml_domain_keys_absent_from_mecha_core():
     中性示例（``do_thing`` / ``compute_summary``），但不许出现真宿主命令名——
     所以这里改成**子串**扫描：核心若真把命令名写进可见文本，判据必红。
     """
-    if not MECHA_ROOT.is_dir():
-        pytest.skip(f"mecha 仓不在位：{MECHA_ROOT}")
+    assert MECHA_ROOT.is_dir(), (
+        f"mecha 仓不在位：{MECHA_ROOT}（缺真依赖必须红，不 skip——"
+        "最终验收审查 M1：skip 会让核心领域词守卫静默失效）")
     core = sorted((MECHA_ROOT / "mecha").rglob("*.py"))
     assert core, "mecha 核心源码为空？"
 
@@ -979,6 +1010,8 @@ def main() -> int:
              test_cancellable_command_cancel_job_is_not_rejected,
              test_submit_unknown_command_keeps_existing_failure_path,
              test_writes_state_declaration_matches_actual_history,
+             test_toolhost_is_the_tool_transport_seam,
+             test_run_event_carries_artifact_locator,
              test_write_tool_failures_are_tool_failure,
              test_run_method_end_to_end_and_receipt_contract,
              test_resource_guard_rejects_without_escaping,
