@@ -20,6 +20,22 @@ python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
 > 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
 > `pip install optuna`；二者均为可选依赖，未装时其余方法/自研优化器照常可用。
 
+### AI 模式（可选）：运行后在 dsh 界面指挥 AI 调用 ML
+
+```powershell
+pip install -e D:\code-nosync\mecha   # AI 模式依赖 mecha（兄弟仓，editable，不 vendor）
+python launcher.py                    # 看门人：弹窗选「本地 GUI 模式」/「AI 模式」
+```
+
+选 **AI 模式** 后会起 headless 权威（写权出厂 LOCKED、由人类侧开闸）+ 本地 MCP 工具服务
++ dsh 界面（本实例绑 3081，3080 留给官方 dsh）；在 dsh 里用自然语言让 AI 调
+`describe_methods` / `prepare_dataset` / `run_method` / `submit_run` / `read_job`，
+点会话头「◈ 监控」看只读驾驶舱（飞行记录仪 / 配置态 / 运行记录）。
+模式切换用看门人控制台敲 `gui` / `ai` / `quit`。
+
+- 使用者请看 [docs/交付说明.md](docs/交付说明.md)（安装、启动、示例、排错）；
+- 维护者请看 [docs/维护接手.md](docs/维护接手.md)（地图、改哪里、门禁、限制）。
+
 ---
 
 ## 一、架构
@@ -246,3 +262,7 @@ class MyMethod(MLMethod):
 - `docs/优化契约.md` —— 优化侧 ask-and-tell 契约 + 引擎表 + 三接缝桥
 - `docs/pitfalls.md` —— 43 条踩坑（症状→原因→修法），新坑按格式追加
 - `docs/架构审视与改造建议.md` —— 宏观架构审视报告 + 改造提案（C1-C9，含验收与文档同步清单）
+- `docs/交付说明.md` —— **使用者**：AI 模式安装/启动/示例对话/故障排查
+- `docs/维护接手.md` —— **维护者**：目录地图、改哪里、门禁、排错、已知限制
+- `docs/mecha/07-交付形态-双模式与dsh桥.md` —— 交付形态设计与实施记录（P0–P4 / 风险 / 决策）
+- `docs/mecha/00–06` —— 双宿主接入宪章、计划、落地记录、三轮对抗审查与最终验收
