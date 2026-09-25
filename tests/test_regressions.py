@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""回归测试（checklist.md C 关）：核心契约 + 关键坑的永久断言。
+"""回归测试（外部资产 `D:\\desktop\\UI design\\checklist.md` 的 C 关）：核心契约 + 关键坑的永久断言。
 
 运行：python tests/test_regressions.py
 """

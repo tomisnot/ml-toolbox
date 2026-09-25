@@ -208,7 +208,7 @@ ML 五页对应数模工作流：**看数据**（处理链/数据检视）→ **
 | 命令 | 内容 |
 |---|---|
 | `python tests/run_all.py` | 一键门：smoke（59 方法 × 6 任务）+ 30 回归 + 19 UI + 43 优化 |
-| `python checks/ui_shot.py` | 离屏渲染真实界面 → 59 张 PNG → 按 checklist 视觉自查 |
+| `python checks/ui_shot.py` | 离屏渲染真实界面 → 59 张 PNG → 按 `D:\desktop\UI design\checklist.md`（外部资产）视觉自查 |
 | `python benchmarks/run_benchmarks.py` | 数模基准（Iris/Wine/Housing/blobs/异常/时序/digits） |
 | `python benchmarks/run_opt_bench.py` | 优化基准：GP-BO vs 随机搜索（标准函数全领先） |
 | `python benchmarks/run_autotune_bench.py` | AutoTuner 数模验收（digits 调参 ≥ 默认） |
