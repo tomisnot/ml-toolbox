@@ -29,11 +29,12 @@ P1 追加（工具面补齐 + 看门人机械件）：
 
 迁移前置（P3，给 mecha extras 的 MCP 投影迁移当安全网）：
 
-11. **null 垫片逐参数判据**：``defaulted``（真实默认非 None 的参数）必须取
-    「闭包签名 ∪ 声明 default」的**并集**——显式 ``null`` 被剥（真实默认生效）、
-    真值原样过线、真默认本就是 ``None`` 的参数**必须保留**显式 null；另有
-    ``defaulted`` 全表快照 + 单来源突变体的灵敏度（致死性）判据。
-    契约见 ``D:\\code-nosync\\_mecha-extraction\\mcp-contract.md`` §8.1。
+11. **null 垫片逐参数判据**：``defaulted``（真实默认非 None 的参数）的**唯一权威
+    来源是声明**（R8-2a，包装 `**kwargs` 会遮住内层闭包默认）——显式 ``null`` 被剥
+    （真实默认生效）、真值原样过线、真默认本就是 ``None`` 的参数**必须保留**显式
+    null；并把规则当全函数穷举（每个可选参数落进唯一一格）+ 单来源/滥收突变体的
+    灵敏度（致死性）判据。契约见 ``D:\\code-nosync\\_mecha-extraction\\mcp-contract.md``
+    §8.1。
 
 运行：``python -m pytest tests/test_ml_delivery.py -q``
 也可直接 ``python tests/test_ml_delivery.py``（自带 main，与仓内其它 test_*.py 同形；
@@ -271,16 +272,18 @@ def test_required_from_signature_and_declaration_survives():
 
 # ------------------------------------------- 1b. null 垫片（迁移前置判据）
 #
-# 为什么单列一节：``defaulted``（"真实默认非 None"的参数名集合）必须取
-# 「闭包签名 ∪ 声明 default」的**并集**（契约见 `_mecha-extraction/mcp-contract.md`
-# §8.1 R8-2）。只取一边，就会有一类工具的默认值静默消失——**症状是模型侧行为变差
-# 而不是报错**：`persist`/`diag` 只在声明里有 default，`family`/`dataset_id` 只在
-# 未包装的闭包签名里有，两边都漏就没人发现。``test_required_from_signature_and_
-# declaration_survives`` 只断言 inputSchema 的形状，抓不到"显式 null 盖掉真实默认"。
+# 契约（`_mecha-extraction/mcp-contract.md` §8.1 R8-1/R8-2/R8-2a）：
+# ``defaulted`` = 「**声明**了非 None default」的参数集合；handler 收到显式 null 时
+# 丢弃该键，让被调函数的真实默认生效。
 #
-# 这一节把「被调函数看到的是真实默认」钉成**逐参数可测**的事实，供 mecha extras
-# 迁移验收；``test_null_shim_single_source_mutant_is_detected`` 是这一节的
-# **致死性证据**（单来源/滥收的假实现必然被它抓到）。
+# 为什么单列一节 + 为什么权威必须是**声明**：早期实现用「声明 ∪ 闭包签名」双来源，
+# 而写工具的 ``execute=wrap(execute)`` 包装（``def wrapped(**kwargs)``）会让**内层
+# 闭包默认全部不可见** ⇒ 有一类参数两个来源同时落空，显式 null 会以 ``None`` 到达
+# 工具体（症状是模型侧行为变差而非报错，端到端判据抓不到）。R8-2a 之后每个"真实默认
+# 非 None"的参数都在声明里写出 default，于是：**来源唯一、包装是否透明不再影响正确性**。
+#
+# 这一节把规则钉成**全函数**（每个可选参数落进唯一一格）并给出判据灵敏度证据；
+# ``test_null_shim_single_source_mutant_is_detected`` 是致死性证据。
 
 #: ``_StubToolHost.call`` 的固定回执（判据只关心 seam 收到的 args，不关心结果值）。
 _STUB_VALUE = {"ok": True, "stub": True}
@@ -324,12 +327,23 @@ def _defaulted_of(ml, name: str):
     return set(defaulted), schema
 
 
-def _real_default(ml, tool: str, param: str):
-    """该参数**可见的**真实默认：声明里的 ``default`` 优先，否则闭包签名。
+def _tool_input_schema(ml, name: str):
+    """该工具协议层的 ``inputSchema``（同一条调用；穷举判据用它取必填集合）。"""
+    schema = next(s for s in ml.tools.schemas() if s["name"] == name)
+    input_schema, _defaulted = tool_input_schema(
+        name, schema, ml.tools.get(name).execute,
+        declared_required=command_declared_required(ml, name))
+    return input_schema
 
-    ``None`` 有两种含义，判据里分开处理：① 真实默认就是 ``None``（该保留显式
-    null）；② 被 ``**kwargs`` 包装遮住、两处都看不见（见
-    ``test_null_shim_gap_of_wrapped_write_tools_is_pinned`` 钉住的已知缺口）。
+
+def _real_default(ml, tool: str, param: str):
+    """该参数**声明**的真实默认（R8-2a 之后声明是唯一权威来源）。
+
+    ``None`` 有两种含义，判据里分开处理：① 真实默认就是 ``None``（该保留显式 null）；
+    ② 声明里没有 ``default`` 键（视同真默认 ``None``，同样保留显式 null）。两者在
+    null 垫片规则里落在同一格，但语义不同，所以这里如实区分（闭包签名只作为兜底读取，
+    仅用于诊断——本项目 11 个工具的 defaulted 已全部由声明承载，见
+    ``test_null_shim_authority_is_declaration_only``）。
     """
     _defaulted, schema = _defaulted_of(ml, tool)
     decl = schema["parameters"].get(param) or {}
@@ -343,64 +357,62 @@ def _real_default(ml, tool: str, param: str):
 
 #: ``defaulted`` 全表快照（实测；迁移不得静默增删——多了会吞掉"清空语义"的显式 null，
 #: 少了会让某类工具的默认值失效）。键是工具名，值是**排序后**的参数名列表。
+#: 16 项 = 全部「声明了非 None default」的参数（R8-2a：声明是唯一权威来源）。
 EXPECTED_DEFAULTED = {
     "cancel_run": [],
-    "compare_methods": [],
+    "compare_methods": ["dataset_id"],
     "describe_dataset": ["dataset_id"],
     "describe_method": [],
     "describe_methods": ["dataset_id", "family"],
     "describe_run": ["run_id"],
-    "prepare_dataset": ["diag"],
+    "prepare_dataset": ["diag", "name", "target", "time_col"],
     "read_job": ["wait_s"],
-    "run_method": ["persist"],
-    "run_method_batch": [],
+    "run_method": ["dataset_id", "device", "persist"],
+    "run_method_batch": ["dataset_id"],
     "submit_run": ["dataset_id", "device"],
 }
 
-#: ``defaulted`` 的三个来源都要被覆盖（契约 §8.1 R8-2 的并集语义）。
-#: (工具, 最小必填参数, 参数名, 真值) —— 真值必须是该参数类型的合法取值。
+#: 逐参数行为判据：(工具, 最小必填参数, 参数名, 真值)。
+#: **覆盖全部 16 个 defaulted 参数**，真值必须是该参数类型的合法取值。
+#: 备注一栏说明该参数的默认值原本来自哪一侧（R8-2a 之后一律由**声明**承载）：
+#: - 写工具的 `**kwargs` 包装会遮住内层闭包 ⇒ 只能靠声明（`diag`/`persist`/`name`/
+#:   `target`/`time_col`/`dataset_id`/`device`）；
+#: - 只读与 job 调度面未被包装，闭包默认本来可见（`family`/`run_id`/`wait_s`），
+#:   现同样显式声明，让"声明 = 唯一权威"成为事实。
 _DEFAULTED_PROBES = (
-    # 来源 ①：闭包签名（只读工具未被包装；声明里**没有** default）
     ("describe_methods", {}, "family", "linear"),
     ("describe_methods", {}, "dataset_id", "ds-null-shim"),
     ("describe_dataset", {}, "dataset_id", "ds-null-shim"),
     ("describe_run", {}, "run_id", "run-null-shim"),
-    # 来源 ②：声明 default（写工具被 ``**kwargs`` 包装 ⇒ 签名侧是空集）
+    ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "name", "my-ds"),
+    ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "target", "target"),
+    ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "time_col", "t"),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "diag", True),
+    ("run_method", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
+    ("run_method", {"method": "logistic"}, "device", "cpu"),
     ("run_method", {"method": "logistic"}, "persist", True),
-    # 来源 ③：两侧都有且一致（唯一一个真正"两边都能看见"的参数）
+    ("run_method_batch", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
+    ("compare_methods", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
-    # 未被包装的 job 调度面（签名来源；且它不是命令，没有声明侧）
     ("submit_run", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
     ("submit_run", {"method": "logistic"}, "device", "cpu"),
 )
 
-#: 真实默认**本就是 None** 的参数：显式 null 必须**原样保留**（这是"清空/不指定"
-#: 的唯一表达方式，也是 EL P0-1 注释里点名不许误伤的一类）。垫片必须是"按
+#: 真实默认**本就是 None** 的参数（10 项）：显式 null 必须**原样保留**（这是"清空/
+#: 不指定"的唯一表达方式，也是 EL P0-1 注释里点名不许误伤的一类）。垫片必须是"按
 #: ``defaulted`` 精确剥"，**不是**"见 null 就剥"。
 _NONE_DEFAULTED_PROBES = (
     ("run_method", {"method": "logistic"}, "overrides", {"k": 1}),
     ("run_method", {"method": "logistic"}, "seed", 7),
     ("run_method", {"method": "logistic"}, "resource_guard", {"max_kernel_mb": 64}),
     ("run_method_batch", {"methods": ["logistic"]}, "overrides", {"k": 1}),
+    ("run_method_batch", {"methods": ["logistic"]}, "seed", 7),
+    ("run_method_batch", {"methods": ["logistic"]}, "resource_guard", {"max_kernel_mb": 64}),
     ("compare_methods", {"methods": ["logistic"]}, "overrides", {"k": 1}),
+    ("compare_methods", {"methods": ["logistic"]}, "seed", 7),
     ("submit_run", {"method": "logistic"}, "overrides", {"k": 1}),
     ("submit_run", {"method": "logistic"}, "seed", 7),
 )
-
-#: **已知缺口**（当前实现）：被 ``**kwargs`` 包装的 4 个写工具里，真实默认非 None
-#: 的参数既没写进声明 ``default``、又因包装看不见内层签名 ⇒ 不在 ``defaulted`` 里。
-#: 值是该参数**内层闭包的真实默认**（出处：`ml_mecha/tools.py:262-264,311-314,
-#: 363-366,412-414` 的 ``execute`` 签名），此处按字面钉住以便迁移对账。
-_HIDDEN_DEFAULT_OF_WRAPPED_TOOLS = {
-    ("prepare_dataset", "name"): "",
-    ("prepare_dataset", "target"): "",
-    ("prepare_dataset", "time_col"): "",
-    ("run_method", "dataset_id"): "",
-    ("run_method", "device"): "",
-    ("run_method_batch", "dataset_id"): "",
-    ("compare_methods", "dataset_id"): "",
-}
 
 
 def test_null_shim_drops_explicit_null_for_every_defaulted_param():
@@ -457,69 +469,119 @@ def test_null_shim_keeps_explicit_null_when_real_default_is_none():
                 assert value.get(param) == real, (tool, param, value)
 
 
-#: 缺口判据每个参数的最小必填入参（工具不同，必填项也不同）。
-_GAP_BASE = {
-    ("prepare_dataset", "name"): {"source": dict(_SYNTHETIC)},
-    ("prepare_dataset", "target"): {"source": dict(_SYNTHETIC)},
-    ("prepare_dataset", "time_col"): {"source": dict(_SYNTHETIC)},
-    ("run_method", "dataset_id"): {"method": "logistic"},
-    ("run_method", "device"): {"method": "logistic"},
-    ("run_method_batch", "dataset_id"): {"methods": ["logistic"]},
-    ("compare_methods", "dataset_id"): {"methods": ["logistic"]},
+#: 穷举判据每个工具的最小必填入参（工具不同，必填项也不同）。
+_MIN_ARGS = {
+    "cancel_run": {"job_id": "job-null-shim"},
+    "compare_methods": {"methods": ["logistic"]},
+    "describe_dataset": {},
+    "describe_method": {"name": "logistic"},
+    "describe_methods": {},
+    "describe_run": {},
+    "prepare_dataset": {"source": dict(_SYNTHETIC)},
+    "read_job": {"job_id": "job-null-shim"},
+    "run_method": {"method": "logistic"},
+    "run_method_batch": {"methods": ["logistic"]},
+    "submit_run": {"method": "logistic"},
 }
 
+#: 可选参数总数（26 = 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
+#: "每个可选参数都被判据看过一遍"（新增参数会在这里红，提醒补探针）。
+_EXPECTED_OPTIONAL_PARAMS = 26
 
-def test_null_shim_gap_of_wrapped_write_tools_is_pinned():
-    """**已知缺口**（不是期望行为）：包装遮住的非 None 默认拿不到 null 垫片。
 
-    这 7 个参数的真实默认（内层闭包，多为 ``""``）今天**到不了** ``defaulted``：
-    声明里没写 ``default``，而 ``**kwargs`` 包装让签名侧也是空集 ⇒ 显式 null 会以
-    ``None`` 到达被调函数，而不是落到真实默认。
+def test_null_shim_rule_partitions_every_optional_param():
+    """把规则当**全函数**穷举：每个可选参数落进唯一一格，不存在第三态。
 
-    为什么今天没有用户可见 bug：各工具体内用的是真值判断（``if name:`` /
-    ``if dataset_id:`` / ``spec.get("target") or …``），``None`` 与 ``""`` 同路。
-    但这是"静默漂移"的温床——任何改成 ``is not None`` 判断的参数会立刻出错。
+    三格（契约 R8-2a）：
+      声明 ``default`` 非 None  → 进 ``defaulted`` → **丢**显式 null（让真默认生效）
+      声明 ``default`` 为 None  → **保留**显式 null
+      声明没有 ``default`` 键    → 视同真默认 None → **保留**显式 null
 
-    ⚠ **迁移修好这个缺口后本判据会红**（这是有意的）：届时请删掉本函数，把这 7 项
-    并入 ``EXPECTED_DEFAULTED`` 与 ``_DEFAULTED_PROBES``，让它们受正常判据保护。
+    动机：旧实现用「声明 ∪ 闭包签名」双来源，而 ``**kwargs`` 包装会让内层闭包默认
+    **不可见** ⇒ 有一类参数同时落空（静默缺口）。本条判据逐参数走过全部可选参数，
+    任何"第三态"（既不在 defaulted、真默认又不是 None）都会当场红——**这条取代了
+    早期那条"把 7 项缺口钉成数据"的迁移期判据**（缺口已在声明层修掉）。
     """
-    probes = [((tool, param), {**_GAP_BASE[(tool, param)], param: None})
-              for (tool, param) in _HIDDEN_DEFAULT_OF_WRAPPED_TOOLS]
-    with tempfile.TemporaryDirectory(prefix="ml-null-gap-") as td:
+    with tempfile.TemporaryDirectory(prefix="ml-null-partition-") as td:
         stub = _StubToolHost()
         with _authority(td, toolhost=stub) as (ml, host):
-            results = _call_tools(host.url, [(tool, args) for (tool, _p), args in probes])
-            assert all(not err for err, _ in results), [r for r in results if r[0]]
+            optional = []          # [(tool, param, decl)]
+            defaulted_all = {}     # {tool: set}
+            for name in TOOL_NAMES:
+                defaulted, schema = _defaulted_of(ml, name)
+                defaulted_all[name] = defaulted
+                required = set(_tool_input_schema(ml, name)["required"])
+                for param, decl in schema["parameters"].items():
+                    if param in required:
+                        continue
+                    optional.append((name, param, decl))
 
-            measured = {}
-            for i, ((tool, param), _args) in enumerate(probes):
-                defaulted, _schema = _defaulted_of(ml, tool)
+            assert len(optional) == _EXPECTED_OPTIONAL_PARAMS, \
+                f"可选参数 {len(optional)} != {_EXPECTED_OPTIONAL_PARAMS}（新增/删除参数请补探针）"
+
+            results = _call_tools(host.url, [(tool, {**_MIN_ARGS[tool], param: None})
+                                             for tool, param, _d in optional])
+            # 显式 null 对**每个**可选参数都必须能过 pydantic（注解为 ``T | None``）
+            assert all(not err for err, _ in results), [r for r in results if r[0]]
+            assert len(stub.calls) == len(optional), (len(stub.calls), len(optional))
+
+            for i, (tool, param, decl) in enumerate(optional):
                 null = stub.calls[i][1]
-                assert param not in defaulted, (tool, param, sorted(defaulted))
-                # 两处都看不见 ⇒ "声明 default 优先、否则闭包签名"取到 None
-                assert _real_default(ml, tool, param) is None, (tool, param)
-                assert param in null and null[param] is None, (tool, param, null)
-                measured[(tool, param)] = _HIDDEN_DEFAULT_OF_WRAPPED_TOOLS[(tool, param)]
-            assert measured == _HIDDEN_DEFAULT_OF_WRAPPED_TOOLS, measured
+                declared_non_none = decl.get("default") is not None
+                # 格归属必须由**声明**唯一决定（R8-2a：签名侧不得再承重）
+                assert (param in defaulted_all[tool]) is declared_non_none, \
+                    (tool, param, decl, sorted(defaulted_all[tool]))
+                if declared_non_none:
+                    assert param not in null, (tool, param, null)
+                else:
+                    assert param in null and null[param] is None, (tool, param, null)
+
+
+def test_null_shim_authority_is_declaration_only():
+    """R8-2a 的核心不变量：``defaulted`` **等于**「声明了非 None default 的参数」。
+
+    两条都要成立，缺一条就说明有参数在依赖看不见的东西：
+    ① **完备**：声明了非 None default ⇒ 必在 ``defaulted``（否则"默认值生效"是空话）；
+    ② **唯一**：``defaulted`` 里的每一项都必须有声明来源（否则它靠的是运行期闭包——
+       包装一变就失效，正是 R8-2a 要消灭的隐式依赖）。
+
+    纯集合比较、不打端口：行为面已由上面两条判据与 ``_DEFAULTED_PROBES`` 覆盖。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-null-authority-") as td:
+        ml = assemble_ml_mecha(root=td, seed=13)
+        try:
+            declared_only = {}
+            for name in TOOL_NAMES:
+                _defaulted, schema = _defaulted_of(ml, name)
+                declared_only[name] = sorted(
+                    p for p, d in schema["parameters"].items()
+                    if d.get("default") is not None)
+            measured = {name: sorted(_defaulted_of(ml, name)[0]) for name in TOOL_NAMES}
+            assert measured == declared_only, measured
+            assert measured == EXPECTED_DEFAULTED, measured
+        finally:
+            ml.close()
 
 
 def test_null_shim_single_source_mutant_is_detected():
-    """**致死性证据**：把 ``defaulted`` 退化成"只取一边"，正常判据必然变红。
+    """**致死性证据**：把 ``defaulted`` 算错，正常判据必然变红。
 
-    这不是测实现细节，而是测**判据的灵敏度**：契约 R8-2 要求并集，若哪个实现只取
-    一侧（EL 现状就是"只取签名侧"），本判据用同一个 seam 观测点证明那一侧的参数会
-    丢掉垫片——即 ``test_null_shim_drops_explicit_null_for_every_defaulted_param``
-    的断言在假实现上必然失败。三个方向都测：
+    这不是测实现细节，而是测**判据的灵敏度**——用同一个 seam 观测点证明两种典型
+    假实现会被抓到：
 
-    - 杀掉声明侧（``_declaration_defaulted`` → 空）⇒ 包装工具的 ``persist`` 失守；
-    - 杀掉签名侧（``_signature_defaulted`` → 空）⇒ 只读/调度面的 ``family`` 失守；
+    - **杀掉声明侧**（``_declaration_defaulted`` → 空）⇒ 全部 16 项失去垫片，
+      ``persist`` 的显式 null 会以 ``None`` 到达被调函数；
     - **滥收**（把真默认为 ``None`` 的 ``overrides`` 也算进 defaulted）⇒
       ``test_null_shim_keeps_explicit_null_when_real_default_is_none`` 失守
       （"按 defaulted 精确剥"退化成"一刀切剥"，清空语义被吞）。
 
-    ⚠ 本判据直接点名 ``ml_mecha.mcp_host`` 的两个私有函数：它针对的是**迁移前的
-    实现**。extras 落地后若这两个名字消失，请把本判据改写成"框架侧对应的来源函数"
-    或删除（迁移时必须显式决定，不许静默丢）。
+    "只取签名侧"这一方向**不再是突变体**：R8-2a 之后签名侧对本项目的 11 个工具不再
+    贡献任何一项，这一点由 ``test_null_shim_authority_is_declaration_only`` 永久断言
+    （那种假实现只会让 ``defaulted`` 变小，已被第一条突变体覆盖）。
+
+    ⚠ 本判据直接点名 ``ml_mecha.mcp_host`` 的私有函数：它针对的是**迁移前的实现**。
+    extras 落地后若该名字消失，请把本判据改写成"框架侧对应的来源函数"或删除
+    （迁移时必须显式决定，不许静默丢）。
     """
     from unittest import mock
 
@@ -544,13 +606,9 @@ def test_null_shim_single_source_mutant_is_detected():
                 if kept:
                     assert null[param] is None, (tool, param, null)
 
-    # 只取签名侧（杀掉声明侧）：包装工具的声明 default 失守（剥 null 的判据会红）
+    # 杀掉声明侧：所有 defaulted 失守（剥 null 的判据会红）
     probe(mock.patch.object(_mcp_host, "_declaration_defaulted", lambda _d: set()),
           "run_method", {"method": "logistic"}, "persist",
-          normally_defaulted=True, mutant_keeps_null=True)
-    # 只取声明侧（杀掉签名侧）：未包装工具的签名 default 失守（剥 null 的判据会红）
-    probe(mock.patch.object(_mcp_host, "_signature_defaulted", lambda _e: set()),
-          "describe_methods", {}, "family",
           normally_defaulted=True, mutant_keeps_null=True)
     # 滥收（真默认为 None 的也进 defaulted）：清空语义失守（保 null 的判据会红）
     probe(mock.patch.object(_mcp_host, "_declaration_defaulted",
@@ -1494,7 +1552,8 @@ _TESTS = [
     test_required_from_signature_and_declaration_survives,
     test_null_shim_drops_explicit_null_for_every_defaulted_param,
     test_null_shim_keeps_explicit_null_when_real_default_is_none,
-    test_null_shim_gap_of_wrapped_write_tools_is_pinned,
+    test_null_shim_rule_partitions_every_optional_param,
+    test_null_shim_authority_is_declaration_only,
     test_null_shim_single_source_mutant_is_detected,
     test_mcp_host_exposes_every_declared_tool_over_http,
     test_readonly_tool_returns_real_value_over_http,
