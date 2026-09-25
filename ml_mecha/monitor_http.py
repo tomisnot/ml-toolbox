@@ -42,8 +42,6 @@ from mecha.cockpit import config_tree as _fw_config
 from mecha.cockpit import history_records as _fw_history
 from mecha.cockpit import monitor_summary_payload
 
-from .runtime import MONITOR_PORT_FILE  # noqa: F401 - 历史公开名（消费方在 runtime）
-
 
 def _source(ml: Any):
     """数据源：``ml.software``（有 history/gate/authority 三成员，框架自动适配）。"""
@@ -177,9 +175,9 @@ def start_monitor_endpoint(ml: Any, *, host: str = "127.0.0.1", port: int = 0,
     return endpoint
 
 
-#: 公开面：端点壳 + ML 的取数函数 + 历史公开名 ``MONITOR_PORT_FILE``。
-#: 框架的 ``CORE_ROUTES`` / ``MonitorSource`` / ``start_monitor_endpoint`` **不再**
-#: 从这里转发——本仓没有它们的消费者（判据要用就直接 ``from mecha.cockpit import …``）。
+#: 公开面：端点壳 + ML 的取数函数。框架的 ``CORE_ROUTES`` / ``MonitorSource`` /
+#: ``start_monitor_endpoint`` **不在这里转发**，``MONITOR_PORT_FILE`` 也**不**转发
+#: ——它们的权威归属分别是 ``mecha.cockpit`` 与 ``ml_mecha.runtime``，本仓零消费者
+#: （判据要用就直接去那两个地方取；R1：没有具名消费者的转发面不留）。
 __all__ = ["MonitorEndpoint", "start_monitor_endpoint", "history_records",
-           "activity_records", "config_tree", "summary_view", "archived_runs",
-           "MONITOR_PORT_FILE"]
+           "activity_records", "config_tree", "summary_view", "archived_runs"]

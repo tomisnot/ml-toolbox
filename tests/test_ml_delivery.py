@@ -271,6 +271,114 @@ def test_required_from_signature_and_declaration_survives():
             ml.close()
 
 
+# ------------------------------------------------- 1a2. 「假契约不得回归」判据
+def test_mcp_wire_declares_no_output_schema():
+    """线上 ``tools/list`` 的 ``outputSchema`` **必须为空**（假契约不得回归）。
+
+    为什么要有这条：MCP SDK 会**从 handler 的返回注解派生** ``outputSchema``，并把它
+    放进 ``tools/list``。历史上合成签名带 ``return_annotation=str`` ⇒ 线上真的出现了
+    ``{"properties":{"result":…},"required":["result"]}`` —— 那是**谎称**"返回
+    ``{result: string}``"，而工具实际返回各自领域回执的 JSON。它没有任何消费者，
+    纯属把实现痕迹写进模型可见面（契约 §1.2 的 F 更正）。
+
+    这条判据**不看源码**（源码里 grep `outputSchema` 是零命中，正是漏检点），只看
+    **线上协议输出**；不需要模型、不依赖 dsh 实现，因此适合当回归门。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-outschema-") as td:
+        with _authority(td) as (_ml, host):
+            tools = _list_tools(host.url)
+            assert sorted(t.name for t in tools) == list(TOOL_NAMES)
+            offenders = [(t.name, t.output_schema) for t in tools
+                         if getattr(t, "output_schema", None) is not None]
+            assert not offenders, f"线上出现了 outputSchema（假契约）：{offenders}"
+
+
+def test_mcp_output_schema_judge_can_go_red():
+    """上一条的**灵敏度证据**：让派生注解回来，它就必然红。
+
+    复刻历史的成因（``return_annotation=str``）即可让 ``tools/list`` 带上
+    ``outputSchema``；本判据断言"确实带上了"——即上面那条在这具突变体上会失败。
+    不起端口（纯构造），因此这条证据几乎零成本。
+    """
+    from unittest import mock
+
+    import mecha.providers.mcp as _mcp_provider
+
+    original = _mcp_provider.synthesize_signature
+
+    def _legacy(schema, required, **kwargs):
+        sig = original(schema, required, **kwargs)
+        return sig.replace(return_annotation=str)      # 历史成因
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-outschema-mut-") as td:
+        ml = assemble_ml_mecha(root=td, seed=13)
+        try:
+            with mock.patch.object(_mcp_provider, "synthesize_signature",
+                                   _legacy):
+                server = build_mcp_server(ml)
+                mutated = asyncio.run(server.list_tools())
+            derived = {t.name: t.output_schema for t in mutated
+                       if t.output_schema is not None}
+            assert derived, "突变体没有让 outputSchema 回来 ⇒ 上一条判据抓不到这类回归"
+            # 形状必须是**历史上真实出现过**的那一个（不是随便什么非空值）：
+            # 派生自 ``return_annotation=str`` ⇒ required: ["result"]
+            sample = derived[sorted(derived)[0]]
+            assert sample.get("required") == ["result"], sample
+            assert "result" in (sample.get("properties") or {}), sample
+            # 去掉突变体后必须干净（否则上一条会误绿）
+            server2 = build_mcp_server(ml)
+            clean = asyncio.run(server2.list_tools())
+            assert all(t.output_schema is None for t in clean)
+        finally:
+            ml.close()
+
+
+# ------------------------------------------------- 1a3. 「公开名单不得撒谎」判据
+#: 至少要覆盖这两个模块（d561e13 踩的坑就在这里）。加别的模块欢迎，但不做大扫除。
+_PUBLIC_SURFACE_MODULES = ("ml_mecha.mcp_host", "ml_mecha.monitor_http")
+
+
+def _public_surface_violations(names, attributes) -> list[str]:
+    """``__all__`` 里"实际不存在"的名字（含重复项）。纯函数，便于自测灵敏度。"""
+    existing = set(attributes)
+    missing = sorted(n for n in names if n not in existing)
+    seen: set = set()
+    dupes: list = []
+    for n in names:
+        if n in seen and n not in dupes:
+            dupes.append(n)
+        seen.add(n)
+    return missing + [f"{n}（重复）" for n in dupes]
+
+
+def test_public_surface_all_names_exist():
+    """``__all__`` ⊆ 实际属性：**对外声明的名单不许撒谎**。
+
+    踩过的坑（commit d561e13）：``monitor_http.__all__`` 里留着已不再 import 的
+    ``CORE_ROUTES`` ⇒ **模块导入不报错、全部判据全绿**，但 ``import *`` 会
+    ``AttributeError``、按 ``__all__`` 枚举公开面的工具会列出不存在的名字。
+    静默失败 ⇒ 只能靠判据拦。
+    """
+    import importlib
+
+    problems = {}
+    for mod_name in _PUBLIC_SURFACE_MODULES:
+        mod = importlib.import_module(mod_name)
+        violations = _public_surface_violations(getattr(mod, "__all__", []),
+                                                dir(mod))
+        if violations:
+            problems[mod_name] = violations
+    assert not problems, f"__all__ 里有不存在的名字：{problems}"
+
+
+def test_public_surface_judge_can_go_red():
+    """上一条的**灵敏度证据**：名单里塞一个假名字必须被算出来。"""
+    assert _public_surface_violations(["ok", "不存在的东西"], ["ok"]) == \
+        ["不存在的东西"]
+    assert _public_surface_violations(["ok", "ok"], ["ok"]) == ["ok（重复）"]
+    assert _public_surface_violations(["ok"], ["ok"]) == []
+
+
 # ------------------------------------------- 1b. null 垫片（迁移前置判据）
 #
 # 契约（`_mecha-extraction/mcp-contract.md` §8.1 R8-1/R8-2/R8-2a）：
@@ -1653,6 +1761,10 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
 
 _TESTS = [
     test_required_from_signature_and_declaration_survives,
+    test_mcp_wire_declares_no_output_schema,
+    test_mcp_output_schema_judge_can_go_red,
+    test_public_surface_all_names_exist,
+    test_public_surface_judge_can_go_red,
     test_null_shim_drops_explicit_null_for_every_defaulted_param,
     test_null_shim_keeps_explicit_null_when_real_default_is_none,
     test_null_shim_rule_partitions_every_optional_param,
