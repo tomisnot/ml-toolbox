@@ -1,0 +1,6 @@
+# dsh 插件 overlay：加载本插件的**构建产物**（先 `npm run bundle` 生成 lib/）。
+#   dsh --profile web --patch ./dsh/cordis.patch.yml --port 3081
+# 注意：patch 条目必须用 `- insert:` 包住；裸 id 会被判「目标不存在」并跳过。
+- insert:
+    - id: ml-toolbox-monitor
+      name: './lib/index.mjs'

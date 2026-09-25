@@ -1,0 +1,48 @@
+{
+  "name": "ml-toolbox-dsh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ML Toolbox 的 dsh (Cordis) 插件：把只读监控端点地址交给驾驶舱面板，并在 dsh 右栏呈现 ML 的写事件 / 配置态 / 运行记录。工具接入**不**经本插件——走 dsh 内置 @deepseek-ai/dsh-mcp-client。",
+  "main": "lib/index.mjs",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./lib/index.mjs"
+    },
+    "./client": {
+      "types": "./src/client/index.ts",
+      "default": "./lib/client.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "bundle": "tsdown"
+  },
+  "devDependencies": {
+    "tsdown": "^0.23.0",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0",
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-client-ui-slots": "*",
+    "@deepseek-ai/dsh-session": "*"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true },
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-client-ui-slots": { "optional": true },
+    "@deepseek-ai/dsh-session": { "optional": true }
+  }
+}

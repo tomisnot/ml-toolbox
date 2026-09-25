@@ -1,36 +1,45 @@
 # -*- coding: utf-8 -*-
 """ML Toolbox 看门人（launcher）：两模式启动与交接的**唯一编排者**。
 
-心智模型（与 EL 的两模式收拢同构，见 ``docs/mecha/07-交付形态-双模式与dsh桥.md``）：
+心智模型（见 ``docs/mecha/07-交付形态-双模式与dsh桥.md``）：
 
 - **本地 GUI 模式**：纯本地软件（``app_entry.py --gui``），写权在人，不起任何端点。
 - **AI 模式**：headless 权威（``app_entry.py --authority``，写权自动落 AI）
-  + dsh 前台（AI 界面）。dsh 的启动在 P2 填（``_spawn_dsh`` 已留口子），
-  所以本阶段 AI 模式只有权威在跑。
+  + dsh 前台（AI 界面 + 驾驶舱监控面板）。
 
-看门人常驻（无窗口，日志进本控制台），职责三条：
+看门人常驻（无窗口，日志进本控制台），职责：
 
 1. 启动弹窗选一次模式 → spawn 对应进程组。
-2. 轮询 ``.mode-request``（任一子进程写它 = 切换意图）→ 交接：terminate 当前组、
-   **等进程真退出**（journal 写租约随进程释放，否则新权威被 ``writer_lease_held`` 拒）、
+2. AI 模式：等权威就绪（**D13 双条件**）→ 生成 dsh overlay → 起 dsh。
+3. 轮询 ``.mode-request``（任一子进程写它 = 切换意图）→ 交接：terminate 当前组、
+   **等进程真退出**（写租约随进程释放，否则新权威被 ``writer_lease_held`` 拒）、
    按新模式 spawn、清请求文件。
-3. 主进程自然退出且无切换请求 → 收尾退出。
+4. 主进程自然退出且无切换请求 → 收尾退出。
 
 ## 就绪判据（D13：**不照抄** EL 的"只判端口文件存在"）
 
 Windows 上 ``terminate()`` / ``taskkill /F`` **不跑** Python 的 ``finally``，强杀后
-``.mcp-port`` 会残留；只判"文件存在"会让看门人立刻去起 dsh（P2）并连**已死的端口**
+``.mcp-port`` 会残留；只判"文件存在"会让看门人立刻去起 dsh 并连**已死的端口**
 ——"起得来但看不见"。三条一起用：
 
 1. spawn 前**快照**端口文件（内容 + mtime）；
 2. 轮询到**新鲜**（文件先消失过 / mtime 变新 / 内容变化）**且** ``/mcp`` 上有 HTTP
    响应（TCP 连得上还不够——同端口上可能是别的东西在听）；
 3. 超时（``READY_TIMEOUT``）→ **明确报错且不 spawn dsh**（不静默退回默认端口）。
+
+探活用 stdlib（``urllib``）而非 MCP SDK：看门人不耦合 SDK；完整 MCP ``initialize``
+握手由交付判据的真客户端负责（``tests/test_ml_delivery.py``）。
+
+## 运行期文件
+
+文件名与清理规则收在 :mod:`ml_mecha.runtime`（**单一真源**），本模块不重抄字面量。
+dsh 的 overlay 是**生成物**（``runtime/dsh-ml-mcp.patch.yml``，每次启动按实际端口
+重写，不入库）。
 """
 from __future__ import annotations
 
-import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -39,18 +48,24 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from ml_mecha.runtime import (MCP_PORT_FILE, MODE_REQUEST, MODE_STATE, RUNTIME_JSON,
+                              clear_port_file, clear_runtime, read_port)
+from ml_mecha.runtime import write_runtime as _write_runtime
+
 HERE = Path(__file__).resolve().parent
 PY = sys.executable
 APP = str(HERE / "app_entry.py")
 
-#: 子进程写：切换意图（gui / ai）
-MODE_REQUEST = HERE / ".mode-request"
-#: 看门人写：当前模式（供人 / 判据看）
-MODE_STATE = HERE / ".mode-state"
-#: 权威写：实际 MCP 端口（发现用）
-MCP_PORT_FILE = HERE / ".mcp-port"
-#: 看门人写：运行期描述符（模式 / pid / 端口，单一真源）
-RUNTIME_JSON = HERE / ".ml-mecha-runtime.json"
+MODE_REQUEST_FILE = HERE / MODE_REQUEST
+MODE_STATE_FILE = HERE / MODE_STATE
+RUNTIME_FILE = HERE / RUNTIME_JSON
+MCP_PORT_PATH = HERE / MCP_PORT_FILE
+#: 生成的 dsh overlay（不入库；每次启动重写）。
+DSH_PATCH_FILE = HERE / "runtime" / "dsh-ml-mcp.patch.yml"
+#: 入库的插件 overlay（加载驾驶舱面板插件；相对本文件解析 `./lib/index.mjs`）。
+DSH_PLUGIN_PATCH = HERE / "dsh" / "cordis.patch.yml"
+#: 插件的构建产物：**没有它就不能挂插件 overlay**（否则 dsh 加载失败）。
+DSH_PLUGIN_BUNDLE = HERE / "dsh" / "lib" / "index.mjs"
 
 GUI, AI = "gui", "ai"
 
@@ -58,6 +73,9 @@ GUI, AI = "gui", "ai"
 READY_TIMEOUT = 90.0
 #: 交接时等旧进程真退出的上限（秒）；超时才 kill（防租约没放干净）。
 EXIT_TIMEOUT = 15.0
+#: MCP 单次工具调用的超时（dsh 客户端侧）。10 分钟：长训练不假失败，
+#: 又不至于让"卡住"看起来像在跑（07 §5 R2 / D4）。
+TOOL_CALL_TIMEOUT_MS = 600000
 
 _FLAGS = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
 
@@ -76,52 +94,111 @@ def start_group(mode: str):
     """按模式 spawn 进程组，返回 ``(procs, primary, ready)``。
 
     ``primary`` = 主进程索引：它自然退出且无切换请求 ⇒ 看门人收尾。
-    ``ready`` = 就绪信息 dict（AI 模式下含权威端口）。
+    ``ready`` = 就绪信息 dict（AI 模式下含权威 MCP 端口）。
     """
     if mode == GUI:
         return [_spawn([PY, APP, "--gui"])], 0, {}
-    auth = _spawn([PY, APP, "--authority"])
-    ok, port, reason = await_authority(auth, MCP_PORT_FILE)
+    authority = _spawn([PY, APP, "--authority"])
+    ok, port, reason = await_authority(authority, MCP_PORT_PATH)
     if not ok:
         # 不静默降级：权威没就绪就不起 dsh，并把原因说清楚（D13 第 3 条）。
         _log("⚠ 权威未就绪：%s" % reason)
-        return [auth], 0, {"ready": False, "reason": reason}
-    dsh = _spawn_dsh(port, MCP_PORT_FILE)
-    procs = [auth] if dsh is None else [auth, dsh]
-    # primary：有 dsh 时是 dsh（关掉 AI 界面即结束）；本阶段无 dsh 时是权威。
+        return [authority], 0, {"ready": False, "reason": reason}
+    dsh = _spawn_dsh(port)
+    procs = [authority] if dsh is None else [authority, dsh]
+    # primary：有 dsh 时是 dsh（关掉 AI 界面即结束整组）；缺 dsh 时退回权威。
     return procs, (1 if dsh is not None else 0), {"ready": True, "mcp_port": port}
 
 
-def _spawn_dsh(mcp_port: int, port_file: Path):
-    """起 dsh（AI 界面）——**P2 填**：生成带端口的 overlay 再起。
+def dsh_patch_text(mcp_port: int) -> str:
+    """生成的 dsh overlay 文本。
 
-    形状（P2 落地时照 ``07`` §4 P2 判据与 Lead 实测的 patch 形态）：
-    ``dsh --profile web --patch runtime/dsh-ml-mcp.patch.yml --port <3081+>``，
-    patch 里 ``- insert:`` 包住 ``@deepseek-ai/dsh-mcp-client`` 条目。
+    **必须是 ``- insert:`` 形态**：Lead 实测过裸 ``- id: mcp-mltoolbox`` 会被 dsh
+    判 ``patch: entry "mcp-mltoolbox" not found`` 并**静默跳过**（组合树里没有它）。
+    ``toolCallTimeoutMs`` 显式给 10 分钟：默认 60 s 会让长训练"假失败"。
+    ``failOnStartupError: true`` 让"连不上权威"变响，而不是留一个空工具表。
     """
-    _log("（P2 未接入）dsh 启动口子在此：MCP http://127.0.0.1:%d/mcp，"
-         "端口文件 %s" % (mcp_port, port_file))
-    return None
+    return (
+        "# 由 launcher.py 生成（每次启动按实际端口重写）——**不入库**。\n"
+        "# 用法：dsh --profile web --patch <本文件> --port <dsh 端口>\n"
+        "# 注意：patch 条目必须用 `- insert:` 包住；裸 id 会被判「目标不存在」并跳过。\n"
+        "- insert:\n"
+        "    - id: mcp-mltoolbox\n"
+        "      name: '@deepseek-ai/dsh-mcp-client'\n"
+        "      config:\n"
+        "        serverName: mltoolbox\n"
+        "        transport: streamable-http\n"
+        "        url: http://127.0.0.1:%d/mcp\n"
+        "        failOnStartupError: true\n"
+        "        toolCallTimeoutMs: %d\n" % (int(mcp_port), TOOL_CALL_TIMEOUT_MS)
+    )
+
+
+def write_dsh_patch(path: str | Path, mcp_port: int) -> Path:
+    """写生成的 overlay（父目录按需创建）；返回写入路径。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(dsh_patch_text(mcp_port), encoding="utf-8")
+    return target
+
+
+def dsh_overlays(mcp_port: int) -> list[str]:
+    """起 dsh 要带的两份 overlay（顺序：插件 → 工具接入）。
+
+    插件 overlay 只在**构建产物存在**时带上：`dsh/cordis.patch.yml` 指向
+    ``./lib/index.mjs``，没构建过就不能把它塞给 dsh（否则插件加载失败）。
+    降级要说清楚，不静默少挂东西。
+    """
+    patches: list[str] = []
+    if DSH_PLUGIN_PATCH.exists() and DSH_PLUGIN_BUNDLE.exists():
+        patches.append(str(DSH_PLUGIN_PATCH))
+    else:
+        _log("（面板插件未构建：先 `cd dsh && npm install && npm run bundle`；"
+             "本次不带面板 overlay，AI 模式照常可用，只是没有右栏监控面板）")
+    try:
+        patches.append(str(write_dsh_patch(DSH_PATCH_FILE, mcp_port)))
+    except OSError as exc:
+        _log("⚠ 生成 dsh overlay 失败（%s）；只用已有 overlay。" % exc)
+    return patches
+
+
+def _spawn_dsh(mcp_port: int):
+    """起 dsh（AI 界面 + 面板）：生成 overlay → 挑端口 → ``dsh --profile web ...``。
+
+    ``dsh`` 不在 PATH 时**清晰降级**：只打日志并返回 ``None``（AI 模式仍可用，
+    只是没有 AI 界面——比静默起不来强）。
+    """
+    dsh_exe = shutil.which("dsh")
+    if not dsh_exe:
+        _log("⚠ PATH 里没找到 dsh —— AI 模式只有权威在跑，没有 AI 界面/监控面板。")
+        _log("  手动运行：dsh --profile web --patch %s --port <端口>" % DSH_PATCH_FILE)
+        return None
+    patches = dsh_overlays(mcp_port)
+    port = pick_dsh_port()
+    cmd = [dsh_exe, "--profile", "web"]
+    for patch in patches:
+        cmd += ["--patch", patch]
+    cmd += ["--port", str(port)]
+    _log("起 dsh（本实例 :%d，避开官方 3080）；overlay=%s"
+         % (port, " + ".join(patches) or "(无)"))
+    return _spawn(cmd)
 
 
 # ---------------------------------------------------------------- 就绪判据
-def _read_port(port_file: Path):
-    """读端口文件：返回 ``(content, mtime)``；不存在返回 ``(None, None)``。"""
+def _port_snapshot(port_file: Path):
+    """``(port|None, mtime|None)``——供 D13 的"新鲜度"判定（读端口用 runtime）。"""
     try:
-        if not port_file.exists():
-            return None, None
-        content = port_file.read_text(encoding="utf-8").strip()
-        return (content or None), port_file.stat().st_mtime
+        mtime = Path(port_file).stat().st_mtime
     except OSError:
         return None, None
+    return read_port(port_file), mtime
 
 
 def _probe_http(host: str, port: int, timeout: float = 1.0) -> bool:
     """``/mcp`` 上有 HTTP 响应即算在听（4xx 也是响应；连不上/超时不算）。
 
     TCP 连得上还不够——同一端口上可能是别的东西在听。这里用 stdlib 做一次
-    真实 HTTP 请求；MCP 层握手（initialize）由交付判据用真正的 MCP 客户端验
-    （``tests/test_ml_delivery.py``），看门人不耦合 MCP SDK。
+    真实 HTTP 请求；MCP 层握手（``initialize``）由交付判据的真客户端验。
     """
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -143,31 +220,25 @@ def await_authority(proc, port_file: Path, *, timeout: float = READY_TIMEOUT,
 
     返回 ``(ok, port, reason)``；``ok=False`` 时 ``reason`` 是给人看的短句。
     """
-    before_content, before_mtime = _read_port(port_file)
-    saw_missing = before_content is None
+    before_port, before_mtime = _port_snapshot(port_file)
+    saw_missing = before_port is None
     deadline = time.time() + max(1.0, float(timeout))
     last = "尚未写入端口文件"
     while time.time() < deadline:
         if proc is not None and proc.poll() is not None:
             return False, None, "权威进程已退出（exit=%s）" % proc.returncode
-        content, mtime = _read_port(port_file)
-        if content is None:
+        port, mtime = _port_snapshot(port_file)
+        if port is None:
             saw_missing = True
             last = "尚未写入端口文件"
         else:
-            fresh = (saw_missing or mtime != before_mtime
-                     or content != before_content)
+            fresh = (saw_missing or mtime != before_mtime or port != before_port)
             if not fresh:
-                last = "端口文件还是上一次的旧值（%s）" % content
+                last = "端口文件还是上一次的旧值（%s）" % port
+            elif _probe_http(host, port):
+                return True, port, ""
             else:
-                try:
-                    port = int(content)
-                except ValueError:
-                    last = "端口文件内容不是端口：%r" % content
-                else:
-                    if _probe_http(host, port):
-                        return True, port, ""
-                    last = "端口 %d 上还没有 HTTP 响应" % port
+                last = "端口 %d 上还没有 HTTP 响应" % port
         time.sleep(0.25)
     return False, None, "等权威就绪超时（%.0fs）：%s" % (timeout, last)
 
@@ -220,8 +291,8 @@ def await_exit(procs, timeout: float = EXIT_TIMEOUT) -> None:
 def read_request():
     """读切换意图；非法内容返回 ``None``（不猜）。"""
     try:
-        if MODE_REQUEST.exists():
-            value = MODE_REQUEST.read_text(encoding="utf-8").strip().lower()
+        if MODE_REQUEST_FILE.exists():
+            value = MODE_REQUEST_FILE.read_text(encoding="utf-8").strip().lower()
             return value if value in (GUI, AI) else None
     except OSError:
         pass
@@ -230,30 +301,22 @@ def read_request():
 
 def clear_request() -> None:
     try:
-        if MODE_REQUEST.exists():
-            MODE_REQUEST.unlink()
+        if MODE_REQUEST_FILE.exists():
+            MODE_REQUEST_FILE.unlink()
     except OSError:
         pass
 
 
 def write_state(mode: str) -> None:
     try:
-        MODE_STATE.write_text(mode, encoding="utf-8")
+        MODE_STATE_FILE.write_text(mode, encoding="utf-8")
     except OSError:
         pass
 
 
-def write_runtime(**fields) -> None:
-    """写运行期描述符（模式 / pid / 端口）——端口发现的单一真源。"""
-    payload = {"mode": "", "pid": os.getpid(), "authority_pid": None,
-               "mcp_port": None, "dsh_port": None}
-    payload.update({k: v for k, v in fields.items() if k in payload})
-    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    try:
-        RUNTIME_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                                encoding="utf-8")
-    except OSError:
-        pass
+def write_runtime(**fields) -> dict:
+    """写运行期描述符（合并语义：权威写的端口不会被看门人抹掉）。"""
+    return _write_runtime(HERE, **fields)
 
 
 # ---------------------------------------------------------------- 模式选择
@@ -294,6 +357,9 @@ def main() -> int:
         except (AttributeError, OSError):
             pass
     clear_request()
+    # 前一次被强杀留下的端口文件：权威自己也会清，这里先清一次让 D13 的
+    # "文件消失过"信号从一开始就是干净的。
+    clear_port_file(MCP_PORT_PATH)
     mode = choose_mode()
     if mode is None:
         _log("未选模式，退出。")
@@ -339,12 +405,12 @@ def main() -> int:
         _terminate_group(procs)
         await_exit(procs, timeout=8)
         clear_request()
-        for path in (MODE_STATE, RUNTIME_JSON):
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
+        try:
+            if MODE_STATE_FILE.exists():
+                MODE_STATE_FILE.unlink()
+        except OSError:
+            pass
+        clear_runtime(HERE)
     return 0
 
 

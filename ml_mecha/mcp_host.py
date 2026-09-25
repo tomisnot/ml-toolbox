@@ -60,6 +60,8 @@ from mcp.types import CallToolResult, TextContent
 from mecha.errors import MechaError
 from mecha.tools import CURRENT_CALL_ID
 
+from .runtime import clear_port_file, write_port_file
+
 #: MCP 服务名 → dsh 侧工具名形如 ``mcp__mltoolbox__describe_methods``。
 MCP_SERVER_NAME = "mltoolbox"
 
@@ -364,7 +366,9 @@ class McpHost:
                              hint="一个 McpHost 只 start 一次；要重起先 stop()")
         import uvicorn
 
-        self._unlink_stale_port_file()
+        # 端口文件语义的唯一实现在 ml_mecha.runtime（单一真源）：启动前无条件清
+        # 陈旧文件（Windows 强杀不跑 finally，见 runtime 模块 docstring 的论证）。
+        clear_port_file(self._port_file)
         self._server = build_mcp_server(self._ml)
         # 直接用 streamable_http_app + uvicorn.Server（而不是 server.run(...)）：
         # 后者内部自己 asyncio.run，拿不到句柄 ⇒ 无法干净 stop。
@@ -377,8 +381,7 @@ class McpHost:
                                         name="ml-mecha-mcp")
         self._thread.start()
         self._port = self._await_ready(timeout)
-        if self._port_file is not None:
-            self._port_file.write_text(str(self._port), encoding="utf-8")
+        write_port_file(self._port_file, self._port)
         self._log(f"[ml-mecha-mcp] {self.url}（工具 {len(self._ml.tools.schemas())} 个）")
         return self._port
 
@@ -418,43 +421,16 @@ class McpHost:
         if self._thread is not None:
             self._thread.join(max(0.1, float(timeout)))
         self._thread = None
-        self._clear_port_file()
+        # 只在内容仍是**我们自己**的端口时删（别误删下一台权威刚写的）。
+        clear_port_file(self._port_file, self._port)
         self._port = None
 
-    def _unlink_stale_port_file(self) -> None:
-        """起服务前清掉上一次留下的端口文件（陈旧文件是"假绿"的温床）。
+    # 端口文件的清理规则已收在 :mod:`ml_mecha.runtime`（单一真源）：
+    # ``clear_port_file(path)``（启动前无条件清陈旧文件）与
+    # ``clear_port_file(path, port)``（收尾只删自己的）。安全性论证见该模块
+    # docstring——结论是"装配成功 ⇒ 已持写租约 ⇒ 同根无别的活宿主 ⇒ 陈旧文件
+    # 必属死进程"。这里不再留同名私有方法，免得出现第二份实现。
 
-        **为什么必须有这一步**（实测得出）：Windows 上 ``terminate()`` /
-        ``taskkill /F`` **不会**跑 Python 的 ``finally``，所以"起写止删"不能只靠
-        :meth:`stop`。留下一个陈旧 ``.mcp-port`` 的危害很具体：看门人若只判
-        "文件存在"就认为权威就绪（EL ``launcher._wait_mcp_port`` 正是这么写的），
-        它会立刻去起 dsh，而 dsh 连的是**已经死掉的端口**——"起得来但看不见"。
-
-        **安全性论证**：本方法只在 :meth:`start` 里、**装配成功之后**被调用；
-        装配成功意味着本进程已持有该数据根的写租约（``.ml-mecha/.writer.lock``，
-        跨进程独占），即同一根上不可能还有别的活写宿主 ⇒ 这个端口文件必然属于
-        一个已经退出的进程，删它不会误伤活实例。
-        """
-        if self._port_file is None:
-            return
-        try:
-            if self._port_file.exists():
-                self._port_file.unlink()
-        except OSError:
-            pass                          # 删不掉不致命：真端口随后会被覆写
-
-    def _clear_port_file(self) -> None:
-        """收尾时删端口文件——只在内容仍是**我们自己**的端口时删。"""
-        if self._port_file is None:
-            return
-        try:
-            if not self._port_file.exists():
-                return
-            if self._port is None or self._port_file.read_text(
-                    encoding="utf-8").strip() in ("", str(self._port)):
-                self._port_file.unlink()
-        except OSError:
-            pass
 
     def __enter__(self) -> "McpHost":
         self.start()

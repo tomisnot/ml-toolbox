@@ -49,6 +49,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -160,6 +162,30 @@ def _spawned_authority(root, *, open_gate: bool = True, extra_args=()):
     finally:
         launcher._terminate_group([proc])
         launcher.await_exit([proc], timeout=20)
+
+
+def _http_get(url: str, method: str = "GET"):
+    """裸 HTTP 请求（监控端点判据用 stdlib，不引第三方）。返回 (code, headers, body)。"""
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, dict(resp.headers), resp.read().decode("utf-8")
+    except urllib.error.HTTPError as err:
+        return err.code, dict(err.headers or {}), err.read().decode("utf-8")
+
+
+def _strip_js_comments(text: str) -> str:
+    """剥掉 JS/TS 的块注释与整行注释（判据用；不做完整词法分析）。
+
+    只删 ``/* ... */`` 块与**整行** ``//`` 注释——刻意不删行尾 ``//``：那会把
+    ``http://127.0.0.1:8767`` 这类字面量从中间截断，正好让"硬编码端口"漏网
+    （对"必须不存在"的判据来说，假阴性最危险）。
+    """
+    import re
+
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return "\n".join(line for line in text.splitlines()
+                     if not line.lstrip().startswith(("//", "*")))
 
 
 def _list_tools(url: str):
@@ -550,6 +576,205 @@ def test_launcher_await_authority_rejects_stale_port_file():
         assert "退出" in reason3, reason3
 
 
+# ------------------------------------------------------- P2：只读监控端点
+def test_monitor_shapes_match_el_cockpit_contract():
+    """监控端点**逐字段**对齐 EL `_MonitorHandler`——面板才能不改渲染逻辑。
+
+    只读端点是"面板能不能直接用"的契约面，所以断言的是**字段名与取值语义**，
+    不是"有响应就算过"：`/history` 必须含 `seq/kind/actor/target/value/before/
+    after/reason/call_id`，且 `kind == "set"`、`before` 由全史 fold 重建；
+    `/config` 必须 `has_schema=False` + 快照键全进 `orphans`（**不许造树**）。
+    """
+    from ml_mecha.monitor_http import MonitorEndpoint
+    from ml_mecha.runtime import MONITOR_PORT_FILE, read_port
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-mon-") as td:
+        root = Path(td)
+        pf = root / MONITOR_PORT_FILE
+        with _authority(root, open_gate=True) as (ml, host):
+            monitor = MonitorEndpoint(ml, mcp_port=host.port, port_file=pf)
+            try:
+                mon_port = monitor.start()
+                assert mon_port > 0
+                assert read_port(pf) == mon_port, "必须写 .ml-monitor-port 供发现"
+                base = f"http://127.0.0.1:{mon_port}"
+
+                # 先经 MCP 真跑一次，让 /history /config /summary 有内容
+                _call_tools(host.url, [
+                    ("prepare_dataset", {"source": dict(_SYNTHETIC)}),
+                    ("run_method", {"method": "logistic"})])
+
+                code, headers, body = _http_get(base + "/status")
+                assert code == 200, body
+                assert headers.get("Access-Control-Allow-Origin") == "*"
+                status = json.loads(body)
+                assert status["ok"] is True and status["mode"] == "ai", status
+                assert status["mcp_port"] == host.port, status
+                assert status["monitor_port"] == mon_port, status
+
+                code, _, body = _http_get(base + "/activity?since_seq=0")
+                activity = json.loads(body)
+                assert code == 200 and activity["mode"] == "ai", body[:200]
+                assert activity["events"], "跑过运行就该有事件"
+                # EL 的 activity 形状：**无** before/after/reason
+                assert set(activity["events"][0]) == {
+                    "kind", "actor", "target", "value", "seq", "call_id"}, \
+                    activity["events"][0]
+
+                code, _, body = _http_get(base + "/history?since_seq=0")
+                hist = json.loads(body)
+                assert code == 200 and hist["mode"] == "ai"
+                assert hist["events"], "跑过运行就该有事件"
+                for ev in hist["events"]:
+                    assert set(ev) == {"seq", "kind", "actor", "target", "value",
+                                       "before", "after", "reason", "call_id"}, ev
+                    assert ev["kind"] == "set", ev
+                    assert ev["after"] == ev["value"], ev
+                assert hist["events"][0]["before"] is None, \
+                    f"首写 before 必须是 None：{hist['events'][0]}"
+                assert [e for e in hist["events"] if e["before"] is not None], \
+                    "同键第二次写必须有重建出来的 before"
+
+                code, _, body = _http_get(base + "/config")
+                cfg = json.loads(body)
+                assert code == 200, body[:200]
+                assert cfg["has_schema"] is False, cfg
+                assert cfg["groups"] == {}, cfg
+                assert cfg["n_keys"] == 0, cfg
+                names = {r["name"] for r in cfg["orphans"]}
+                assert "current.dataset_id" in names, names
+                assert cfg["n_snapshot_keys"] == len(cfg["orphans"]), cfg
+                row = next(r for r in cfg["orphans"]
+                           if r["name"] == "current.dataset_id")
+                assert set(row) == {"name", "value", "set"}, row
+                assert row["set"]["actor"] == "ml-ai" and row["set"]["seq"] > 0, row
+
+                # ML 附加面：/summary（可对账概括）与 /runs（磁盘存档）
+                code, _, body = _http_get(base + "/summary")
+                summary = json.loads(body)
+                assert code == 200 and summary["ok"] is True, body[:200]
+                assert "disputed" in summary and "summary" in summary, summary
+                assert summary["summary"]["run_count"] >= 1, summary["summary"]
+
+                code, _, body = _http_get(base + "/runs?limit=5")
+                runs = json.loads(body)
+                assert code == 200 and runs["source"] == "runs/", runs
+                assert isinstance(runs["runs"], list), runs
+
+                # 只读：未知路径 404、POST 一律 404
+                code, _, body = _http_get(base + "/nope")
+                assert code == 404 and json.loads(body) == {
+                    "ok": False, "error": "unknown endpoint"}, body
+                code, _, body = _http_get(base + "/status", method="POST")
+                assert code == 404 and json.loads(body) == {
+                    "ok": False, "error": "read-only monitor endpoint"}, body
+
+                # 跨源预检：204 + CORS
+                code, headers, _ = _http_get(base + "/history", method="OPTIONS")
+                assert code == 204, code
+                assert headers.get("Access-Control-Allow-Origin") == "*"
+                assert headers.get("Access-Control-Allow-Methods") == "GET, OPTIONS"
+            finally:
+                monitor.stop()
+                ml.close()
+            assert not pf.exists(), "stop 后监控端口文件必须删掉"
+
+
+def test_monitor_endpoint_rejects_stale_port_file():
+    """监控端点的端口文件走同一清理规则（陈旧文件必须被替换）。"""
+    from ml_mecha.monitor_http import MonitorEndpoint
+    from ml_mecha.runtime import read_port
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-mon-stale-") as td:
+        root = Path(td)
+        pf = root / ".ml-monitor-port"
+        pf.write_text("1", encoding="utf-8")
+        ml = assemble_ml_mecha(root=root, seed=13)
+        monitor = MonitorEndpoint(ml, port_file=pf)
+        try:
+            port = monitor.start()
+            assert port > 1 and read_port(pf) == port, (port, pf.read_text())
+        finally:
+            monitor.stop()
+            ml.close()
+
+
+# ------------------------------------------------------- P2：dsh overlay 生成
+def test_generated_dsh_patch_composes_with_real_dsh():
+    """生成的 overlay 必须真能被 dsh 组合（`- insert:` + 端口 + 超时）。
+
+    这条跑**真的 dsh CLI**（`--dump-config` 只组合配置、不 mount 服务），因为
+    patch 形态错误恰恰是"静默跳过"（裸 id 被判目标不存在）——只看我们自己生成的
+    文本会漏掉这类假绿。dsh 不在 PATH 时如实说明并跳过。
+    """
+    import shutil as _shutil
+
+    import launcher
+
+    dsh_exe = _shutil.which("dsh")
+    if not dsh_exe:
+        print("    （跳过：PATH 里没有 dsh——patch 组合未验证）")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-patch-") as td:
+        patch = launcher.write_dsh_patch(Path(td) / "dsh-ml-mcp.patch.yml", 59999)
+        text = patch.read_text(encoding="utf-8")
+        assert "- insert:" in text, "patch 条目必须用 `- insert:` 包住"
+        for token in ("mcp-mltoolbox", "serverName: mltoolbox",
+                      "transport: streamable-http",
+                      "url: http://127.0.0.1:59999/mcp",
+                      "failOnStartupError: true",
+                      f"toolCallTimeoutMs: {launcher.TOOL_CALL_TIMEOUT_MS}"):
+            assert token in text, token
+
+        proc = subprocess.run(
+            [dsh_exe, "--profile", "web", "--patch", str(patch), "--dump-config"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=180)
+        assert proc.returncode == 0, (proc.returncode, (proc.stdout or "")[-800:],
+                                      (proc.stderr or "")[-800:])
+        dumped = proc.stdout or ""
+        assert "mcp-mltoolbox" in dumped, "组合树里没有我们的条目（被跳过了？）"
+        assert "serverName: mltoolbox" in dumped, dumped[-500:]
+        assert "url: http://127.0.0.1:59999/mcp" in dumped, dumped[-500:]
+        assert f"toolCallTimeoutMs: {launcher.TOOL_CALL_TIMEOUT_MS}" in dumped
+
+
+def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
+    """静态：ML 的 `dsh/` 不得残留 EL 专属字样，也不得有硬编码监控端口。
+
+    `MONITOR_URL` 是 EL 的硬编码常量（写死在两端 ⇒ 漂移即"面板空白但没人报错"）。
+    ML 的地址必须走 `resolveMonitorBase()`（host 半读运行期描述符）。
+
+    判据只看**代码**（先剥掉注释/文档串）：那些"EL 当时怎么写的、为什么不能照抄"
+    的说明是有价值的文档，不该因为出现 `8767` 三个字就被判红。
+    """
+    import re
+
+    dsh_dir = REPO / "dsh"
+    src_files = [p for p in (dsh_dir / "src").rglob("*")
+                 if p.suffix in (".ts", ".tsx")]
+    assert src_files, "dsh/src 不存在或为空——面板源码丢了？"
+
+    code = "\n".join(_strip_js_comments(p.read_text(encoding="utf-8"))
+                     for p in src_files)
+    for token in ("re0", "机甲", "Rb-87", "8767", "mecha_v2", "energy-level",
+                  "Energy Level", "MONITOR_URL"):
+        assert token not in code, f"dsh 源码（去注释后）仍含 EL 专属字样 {token!r}"
+
+    client_code = _strip_js_comments(
+        (dsh_dir / "src" / "client" / "index.ts").read_text(encoding="utf-8"))
+    assert not re.search(r"127\.0\.0\.1:\d+", client_code), \
+        "客户端里出现了硬编码的 loopback 端口"
+    assert "resolveMonitorBase" in client_code, "监控地址必须经注入的解析器取"
+    assert "/ml-monitor-url" in client_code, "必须经 host 半命令取地址"
+
+    body = (dsh_dir / "src" / "client" / "MonitorTabBody.tsx").read_text(
+        encoding="utf-8")
+    for label in ("飞行记录仪", "配置态", "运行记录"):
+        assert label in body, f"面板缺少页签 {label!r}"
+
+
 _TESTS = [
     test_required_from_signature_and_declaration_survives,
     test_mcp_host_exposes_every_declared_tool_over_http,
@@ -564,6 +789,10 @@ _TESTS = [
     test_dataset_roots_authorization_is_fail_closed,
     test_launcher_pick_dsh_port_skips_official_3080,
     test_launcher_await_authority_rejects_stale_port_file,
+    test_monitor_shapes_match_el_cockpit_contract,
+    test_monitor_endpoint_rejects_stale_port_file,
+    test_generated_dsh_patch_composes_with_real_dsh,
+    test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port,
 ]
 
 

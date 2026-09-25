@@ -83,7 +83,6 @@ def run_authority(args: argparse.Namespace) -> int:
     """AI 模式后台权威：装配 → 起 MCP → 开闸 → 阻塞。"""
     root = Path(args.root).resolve() if args.root else PROJ_ROOT
     root.mkdir(parents=True, exist_ok=True)
-    port_file = Path(args.port_file) if args.port_file else root / ".mcp-port"
 
     # 训练核心（lightgbm/torch 等）先于一切 GUI 栈导入——headless 路径本就不
     # import Qt，这里显式先 load_builtin 是把 app.py 的顺序铁律在同一进程里也钉住。
@@ -92,25 +91,43 @@ def run_authority(args: argparse.Namespace) -> int:
 
     from ml_mecha.assembly import assemble_ml_mecha
     from ml_mecha.mcp_host import McpHost
+    from ml_mecha.monitor_http import MonitorEndpoint
+    from ml_mecha.runtime import (MCP_PORT_FILE, MONITOR_PORT_FILE, resolve,
+                                  write_runtime)
 
+    mcp_port_file = (Path(args.port_file) if args.port_file
+                     else resolve(root, MCP_PORT_FILE))
     ml = assemble_ml_mecha(root=root, dataset_roots=args.dataset_roots or None)
-    host = McpHost(ml, host=args.host, port=args.port, port_file=port_file,
+    host = McpHost(ml, host=args.host, port=args.port, port_file=mcp_port_file,
                    log=lambda m: print(m, flush=True))
+    monitor = None
     try:
         port = host.start()
+        # 监控端点在同一权威进程内（与 MCP 共一份 History/Gate）——这正是
+        # "AI 模式不开 GUI 也能看见谁改了什么"的数据来源（07 §7.3）。
+        monitor = MonitorEndpoint(ml, host=args.host, mcp_port=port,
+                                  port_file=resolve(root, MONITOR_PORT_FILE),
+                                  log=lambda m: print(m, flush=True))
+        monitor.start()
         if args.no_open_gate:
             print("[authority] 写权保持 LOCKED（--no-open-gate）。", flush=True)
         else:
             # 看门人代理人的启动意图开闸：人选了 AI 模式即授权 AI 写。
             # 这不是 AI 自解锁——AI 侧拿不到 side='human' 的通道。
             ml.switch_ai()
+        # 运行期描述符 = 端口/模式的单一真源（看门人、监控页、故障排查都读它）。
+        write_runtime(root, mode=ml.mode.value, authority_pid=os.getpid(),
+                      mcp_port=port, monitor_port=monitor.port)
         print(f"[authority] headless 权威就绪：写权 {'LOCKED' if args.no_open_gate else 'AI'}，"
-              f"MCP {host.url}，端口文件 {port_file}"
+              f"MCP {host.url}，只读监控 {monitor.url}（端口文件 "
+              f"{mcp_port_file.name} / {MONITOR_PORT_FILE}）"
               f"（Ctrl+C 或看门人交接时退出，写租约随进程释放）。", flush=True)
         threading.Event().wait()
     except KeyboardInterrupt:
         print("\n[authority] 收到 Ctrl+C，收尾（释放写租约）。", flush=True)
     finally:
+        if monitor is not None:
+            monitor.stop()
         host.stop()
         ml.close()
     return 0
