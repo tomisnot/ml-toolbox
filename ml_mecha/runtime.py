@@ -41,6 +41,8 @@ RUNTIME_JSON = ".ml-mecha-runtime.json"
 #: 看门人两模式的状态文件。
 MODE_REQUEST = ".mode-request"
 MODE_STATE = ".mode-state"
+#: 看门人单实例锁（同 root 只允许一个看门人；含 pid ⇒ 陈旧锁可自动接管）。
+LAUNCHER_LOCK = ".launcher.lock"
 
 _RUNTIME_FIELDS = ("mode", "pid", "authority_pid", "mcp_port", "monitor_port",
                    "dsh_port", "root", "started_at", "updated_at")
@@ -135,6 +137,40 @@ def clear_runtime(root: str | Path) -> None:
         pass
 
 
+# ---------------------------------------------------------------- 单实例锁
+def read_lock_pid(root: str | Path) -> int | None:
+    """读看门人锁里的 pid；缺失/损坏返回 ``None``（调用方按"无锁"处理）。"""
+    try:
+        raw = resolve(root, LAUNCHER_LOCK).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdigit() else None
+
+
+def write_lock(root: str | Path, pid: int | None = None) -> None:
+    try:
+        resolve(root, LAUNCHER_LOCK).write_text(str(int(pid or os.getpid())),
+                                                encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_lock(root: str | Path, pid: int | None = None) -> None:
+    """删锁；``pid`` 给了就只在锁里仍是它时删（别误删接管者的新锁）。"""
+    target = resolve(root, LAUNCHER_LOCK)
+    try:
+        if not target.exists():
+            return
+        if pid is not None:
+            raw = target.read_text(encoding="utf-8").strip()
+            if raw and raw != str(int(pid)):
+                return
+        target.unlink()
+    except OSError:
+        pass
+
+
 __all__ = ["MCP_PORT_FILE", "MONITOR_PORT_FILE", "RUNTIME_JSON", "MODE_REQUEST",
-           "MODE_STATE", "resolve", "read_port", "write_port_file",
-           "clear_port_file", "read_runtime", "write_runtime", "clear_runtime"]
+           "MODE_STATE", "LAUNCHER_LOCK", "resolve", "read_port",
+           "write_port_file", "clear_port_file", "read_runtime", "write_runtime",
+           "clear_runtime", "read_lock_pid", "write_lock", "clear_lock"]

@@ -30,6 +30,7 @@ logs/
 .ml-mecha-runtime.json
 .mode-state
 .mode-request
+.launcher.lock
 
 # AI 模式运行期生成的 dsh overlay（每次启动按实际端口重写）
 runtime/

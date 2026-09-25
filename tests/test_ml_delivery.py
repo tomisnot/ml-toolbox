@@ -775,6 +775,289 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
         assert label in body, f"面板缺少页签 {label!r}"
 
 
+# ------------------------------------------------------- P3：面板的自动化代理验收
+def _node_available():
+    import shutil as _shutil
+    return _shutil.which("node")
+
+
+def _run_node(script: str, *args, timeout: float = 120.0):
+    """把一段 JS 写到临时文件跑掉，返回 ``(rc, stdout, stderr)``。
+
+    用文件而不是 ``node -e``：脚本里有多行模板与顶层 await，命令行转义太脆。
+    """
+    node = _node_available()
+    assert node, "PATH 里没有 node"
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-node-") as td:
+        path = Path(td) / "probe.mjs"
+        path.write_text(script, encoding="utf-8")
+        proc = subprocess.run([node, str(path), *[str(a) for a in args]],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout,
+                              env={**os.environ,
+                                   "MLTB_BUNDLE": str(REPO / "dsh" / "lib")})
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _payload(stdout: str, marker: str = "RESULT "):
+    for line in reversed((stdout or "").splitlines()):
+        if line.startswith(marker):
+            return json.loads(line[len(marker):])
+    raise AssertionError(f"JS 没有输出 {marker!r} 行；stdout=\n{stdout}")
+
+
+_HOST_HALF_JS = r"""
+import { pathToFileURL } from 'node:url'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const bundle = join(process.env.MLTB_BUNDLE, 'index.mjs')
+const mod = await import(pathToFileURL(bundle).href)
+const root = process.argv[2]
+const out = { name: mod.name, inject: mod.inject, hasApply: typeof mod.apply === 'function' }
+try {
+  out.url = mod.resolveMonitorBase(root)
+  out.errored = false
+} catch (err) {
+  out.errored = true
+  out.error = String((err && err.message) || err)
+}
+// 空目录必须**抛错**（不许回落硬编码端口）
+const empty = mkdtempSync(join(tmpdir(), 'mltb-empty-'))
+try {
+  out.emptyDirUrl = mod.resolveMonitorBase(empty)
+} catch (err) {
+  out.emptyDirThrew = true
+}
+console.log('RESULT ' + JSON.stringify(out))
+"""
+
+_CLIENT_HALF_JS = r"""
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+const registry = {}
+globalThis.window = { __ModuleLoader__: { load: (m) => { registry.mod = m } } }
+const code = readFileSync(join(process.env.MLTB_BUNDLE, 'client.js'), 'utf8')
+new Function('window', code)(globalThis.window)      // classic-script 形态
+const mod = registry.mod
+if (!mod) { console.log('RESULT ' + JSON.stringify({ loaded: false })); process.exit(0) }
+
+const react = {
+  createElement: (t, p, ...c) => ({ t, p, c }),
+  useState: (v) => [v, () => {}],
+  useEffect: () => {},
+  useRef: (v) => ({ current: v }),
+  useCallback: (f) => f,
+  Fragment: 'fragment',
+}
+const jsx = { jsx: (t, p) => ({ t, p }), jsxs: (t, p) => ({ t, p }) }
+const fakeRequire = (id) =>
+  id === 'react' ? react : (id === 'react/jsx-runtime' ? jsx : {})
+
+const exported = mod.factory(fakeRequire)
+const regs = []
+const calls = []
+let tabDesc = null
+const ctx = {
+  effect: async (fn) => fn(),
+  slots: {
+    inject: (_slot, cb) => cb(),
+    register: (desc, comp) => {
+      regs.push({ slot: desc.name, id: desc.id ?? null, key: desc.key ?? null,
+                  comp: comp && comp.name,
+                  hasInject: typeof desc.inject === 'function' })
+      if (desc.name === 'sidebar.right.pane.tab') tabDesc = desc
+      return () => {}
+    },
+  },
+  layout: { openRightbar: () => {} },
+  sidebarRight: { openTab: (id) => calls.push(['openTab', id]) },
+  sidebarRightTabs: { register: (d) => { regs.push({ tab: d.id, kind: d.kind }); return () => {} } },
+  remote: { commands: { execute: async (...a) => {
+    calls.push(['execute', ...a]);
+    return { ok: true, value: 'http://127.0.0.1:4242' } } } },
+  logger: { info() {}, warn() {}, error() {} },
+}
+await exported.apply(ctx)
+
+const out = { loaded: true, name: exported.name, inject: exported.inject, regs, calls }
+if (tabDesc && typeof tabDesc.inject === 'function') {
+  const injected = tabDesc.inject('sess-1')
+  out.injectedKeys = Object.keys(injected || {})
+  try {
+    out.resolvedUrl = await injected.resolveMonitorBase()
+  } catch (err) {
+    out.resolveError = String((err && err.message) || err)
+  }
+}
+console.log('RESULT ' + JSON.stringify(out))
+"""
+
+
+def test_panel_host_half_resolves_monitor_url_from_runtime_descriptor():
+    """HOST 半（真产物）能从运行期描述符解析地址；空目录必须**抛错**、不猜端口。"""
+    if not _node_available():
+        print("    （跳过：PATH 里没有 node）")
+        return
+    if not (REPO / "dsh" / "lib" / "index.mjs").exists():
+        print("    （跳过：dsh/lib 未构建——cd dsh && npm install && npm run bundle）")
+        return
+    from ml_mecha.monitor_http import MonitorEndpoint
+    from ml_mecha.runtime import MONITOR_PORT_FILE, write_runtime
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-host-") as td:
+        root = Path(td)
+        with _authority(root, open_gate=True) as (ml, host):
+            monitor = MonitorEndpoint(ml, mcp_port=host.port,
+                                      port_file=root / MONITOR_PORT_FILE)
+            try:
+                mon_port = monitor.start()
+                write_runtime(root, mode="ai", mcp_port=host.port,
+                              monitor_port=mon_port)
+                rc, out, err = _run_node(_HOST_HALF_JS, root)
+                assert rc == 0, (rc, out[-800:], err[-800:])
+                got = _payload(out)
+                assert got["name"] == "ml-toolbox-monitor", got
+                assert got["inject"] == ["commands"], got
+                assert got["hasApply"] is True, got
+                assert got["errored"] is False, got
+                # 地址必须等于**权威真写的那个端口**（不是猜的/默认的）
+                assert got["url"] == f"http://127.0.0.1:{mon_port}", got
+                assert got.get("emptyDirThrew") is True, \
+                    "空目录读不到端口时必须抛错——回落硬编码端口就是 EL 的假绿"
+            finally:
+                monitor.stop()
+                ml.close()
+
+
+def test_panel_client_half_loads_registers_and_injects_resolver():
+    """CLIENT 半（真产物）能在无浏览器环境下装载、apply、并经命令解析地址。
+
+    这是 R19 的**自动化代理**：浏览器里发生的事拆成可断言的三步——
+    ① bundle 是合法的 ``__ModuleLoader__.load`` 包并能被 factory 求值；
+    ② ``apply(ctx)`` 注册了会话头按钮 + tab 类型 + tab body；
+    ③ tab body 的 ``inject(sessionId)`` 给出 ``resolveMonitorBase()``，
+       它真的发出 ``/ml-monitor-url`` 命令并取回地址（**不是硬编码**）。
+    """
+    if not _node_available():
+        print("    （跳过：PATH 里没有 node）")
+        return
+    if not (REPO / "dsh" / "lib" / "client.js").exists():
+        print("    （跳过：dsh/lib 未构建）")
+        return
+    rc, out, err = _run_node(_CLIENT_HALF_JS)
+    assert rc == 0, (rc, out[-1500:], err[-1500:])
+    got = _payload(out)
+    assert got.get("loaded") is True, got
+    assert got["name"] == "ml-toolbox-monitor", got
+    assert "slots" in got["inject"] and "remote.commands" in got["inject"], got
+
+    regs = got["regs"]
+    header = [r for r in regs if r.get("slot") == "conversation.session.header.actions"]
+    assert header and header[0]["comp"] == "CockpitButton", regs
+    assert header[0]["id"] == "ml-toolbox-monitor", header
+    assert [r for r in regs if r.get("tab")], regs
+    assert regs[[i for i, r in enumerate(regs) if r.get("tab")][0]]["tab"] \
+        == "ml-toolbox-monitor", regs
+    body = [r for r in regs if r.get("slot") == "sidebar.right.pane.tab"]
+    assert body and body[0]["comp"] == "MonitorTabBody", regs
+    assert body[0]["key"] == "ml-toolbox-monitor", body
+    assert body[0]["hasInject"] is True, body
+
+    # ③ 地址解析：真的发了命令，且拿到命令返回的地址
+    assert got.get("injectedKeys") == ["resolveMonitorBase"], got
+    assert got.get("resolvedUrl") == "http://127.0.0.1:4242", got
+    executes = [c for c in got["calls"] if c[0] == "execute"]
+    assert executes and executes[0][1] == "sess-1", got["calls"]
+    assert executes[0][2] == "/ml-monitor-url", got["calls"]
+
+
+def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
+    """真实两进程 mount：权威 + dsh（三份 overlay）——R19 的最强代理。
+
+    断言：dsh 起来后**进程仍活着**、在挑到的端口上**真的在听 HTTP**、输出里
+    **没有插件加载失败 / 语法错 / 未处理拒绝**；且**不碰官方 :3080**。
+    收尾用进程树杀（``launcher._kill_tree``）——只 terminate 会留下持有端口的
+    node 孤儿（P3 实测踩过，见 launcher 里 ``_kill_tree`` 的注释）。
+    """
+    import shutil as _shutil
+    import socket
+
+    import launcher
+
+    dsh_exe = _shutil.which("dsh")
+    if not dsh_exe:
+        print("    （跳过：PATH 里没有 dsh——本项未能自动化，见 dsh/README.md 手动清单）")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-mount-") as td:
+        root = Path(td)
+        authority = _spawn_authority_proc(root)
+        dsh_proc = None
+        try:
+            ok, mcp_port, reason = launcher.await_authority(
+                authority, root / ".mcp-port", timeout=90.0)
+            assert ok is True, reason
+
+            patches = launcher.dsh_overlays(mcp_port)
+            names = [Path(p).name for p in patches]
+            # 三份都要在：插件（面板）+ 项目隔离（让 --port 生效）+ 工具接入
+            assert "cordis.patch.yml" in names, names
+            assert "cordis.project.patch.yml" in names, names
+            assert "dsh-ml-mcp.patch.yml" in names, names
+
+            dsh_port = launcher.pick_dsh_port()
+            assert dsh_port != 3080, "绝不能占官方 dsh 的端口"
+            cmd = [dsh_exe, "--profile", "web"]
+            for patch in patches:
+                cmd += ["--patch", patch]
+            cmd += ["--port", str(dsh_port), "--no-open"]
+            dsh_proc = subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        encoding="utf-8", errors="replace")
+
+            deadline = time.time() + 120
+            serving = False
+            while time.time() < deadline:
+                if dsh_proc.poll() is not None:
+                    break
+                try:
+                    with socket.create_connection(("127.0.0.1", dsh_port),
+                                                  timeout=1.0):
+                        serving = True
+                        break
+                except OSError:
+                    time.sleep(0.5)
+            assert dsh_proc.poll() is None, f"dsh 提前退出 rc={dsh_proc.returncode}"
+            assert serving, f"dsh 起来了但 :{dsh_port} 没有在听"
+
+            time.sleep(3)                      # 给插件加载/工具同步留出时间
+            assert dsh_proc.poll() is None, "dsh 在启动后几秒内退出了"
+
+            launcher._kill_tree(dsh_proc)
+            try:
+                out, _ = dsh_proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:                  # pragma: no cover
+                launcher._kill_tree(dsh_proc)
+                out, _ = dsh_proc.communicate(timeout=15)
+            output = out or ""
+            lowered = output.lower()
+            for bad in ("failed to load", "cannot find module", "unhandled rejection",
+                        "syntaxerror", "plugin load error"):
+                assert bad not in lowered, f"dsh 输出里有 {bad!r}：\n{output[-1500:]}"
+        finally:
+            if dsh_proc is not None:
+                launcher._kill_tree(dsh_proc)
+                try:
+                    dsh_proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:              # pragma: no cover
+                    pass
+            launcher._terminate_group([authority])
+            launcher.await_exit([authority], timeout=20)
+
+
 _TESTS = [
     test_required_from_signature_and_declaration_survives,
     test_mcp_host_exposes_every_declared_tool_over_http,
@@ -793,6 +1076,9 @@ _TESTS = [
     test_monitor_endpoint_rejects_stale_port_file,
     test_generated_dsh_patch_composes_with_real_dsh,
     test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port,
+    test_panel_host_half_resolves_monitor_url_from_runtime_descriptor,
+    test_panel_client_half_loads_registers_and_injects_resolver,
+    test_dsh_mounts_profile_with_all_overlays_and_stays_alive,
 ]
 
 

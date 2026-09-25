@@ -1,0 +1,23 @@
+# 项目实例隔离 overlay（launcher 每次以 --patch 传入）——**为什么要这一层**：
+#
+# 共享 profile（`~/.dsh/profiles/web/cordis.patch.yml`）把 webserver 的 `port` 钉成
+# **字面量 3080**；而 CLI 的 `--port` 是 web-app 的参数，经 `webStartup` 服务传递。
+# 同 id 的 patch 是 **整块替换 config**（不是深合并）——所以光传 `--port` 不生效，
+# 实测 `dsh --profile web --dump-config` 里就是 `port: 3080`。
+#
+# 本层把 webserver 的 config **照抄回来**、只把 host/port 换成 `!!js` 表达式，
+# 于是 `ctx.webStartup.port` 重新被读到 ⇒ `--port` 生效，项目实例能绑到 3081+，
+# 把 `:3080` 让给官方 dsh（两个实例并存）。
+#
+# ⚠ 若 dsh 版本升级后 webserver 多出/改名字段，这里必须跟着补——否则整块替换会
+# 把那几个字段**静默抹掉**。判据：`dsh --profile web --patch <本文件> --dump-config`
+# 里 host/port 是表达式，其余字段（compression 三件）与 profile 原样一致。
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  inject: [webStartup]
+  config:
+    host: !!js ctx.webStartup.host ?? '127.0.0.1'
+    port: !!js ctx.webStartup.port ?? 3080
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
