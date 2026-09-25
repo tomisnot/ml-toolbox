@@ -116,10 +116,13 @@ def _authority(root, *, open_gate: bool = False, toolhost=None, **kw):
 
     ``open_gate=False`` 保持出厂 ``LOCKED``（判据 4 靠它）；``True`` 模拟看门人
     代理启动意图开闸（判据 5 靠它）。``toolhost`` 给了就**在起服务之前**换掉传输
-    seam（null 垫片判据用它做"只记录、不执行"的观测宿主，见 :class:`_StubToolHost`）。
+    seam（null 垫片判据用它做"只记录、不执行"的观测宿主，见 :class:`_StubToolHost`）；
+    替换前先把真宿主交给它 ``attach``——声明面必须照抄真宿主，否则框架的 reach 守卫
+    （"端点列得出、toolhost 声明 0 个"＝绑错注册表）会如实报错。
     """
     ml = assemble_ml_mecha(root=root, seed=13)
     if toolhost is not None:
+        toolhost.attach(ml.software.toolhost)
         ml.software.toolhost = toolhost
     host = McpHost(ml, port_file=Path(root) / ".mcp-port", **kw)
     try:
@@ -399,17 +402,29 @@ _STUB_VALUE = {"ok": True, "stub": True}
 
 
 class _StubToolHost:
-    """传输 seam 的观测宿主：**只记录、不执行**。
+    """传输 seam 的观测宿主：``call`` **只记录、不执行**；声明面照抄真宿主。
 
     为什么必须 stub 而不是用真的 ``LocalToolHost``：真执行会带来副作用（起后台
     job、写 Gate、落 runs/、跑真训练），让"参数去留"的断言被无关噪声拖累。本类在
     ``call`` 处截断，于是判据测的正是**投影层**（pydantic 入参 → 合成签名 → 垫片 →
     seam）的契约，且零副作用：11 个工具（含 ``submit_run``）都不会真跑。
+
+    ⚠ **声明面必须照抄真宿主**（``attach``）：框架有一条 reach 守卫
+    （``mecha.providers.mcp._check_toolhost_reach``）——"端点列得出 N 个工具、而
+    toolhost 声明 0 个"＝绑错了注册表，当场 fail loud。本类只改 ``call`` 的行为，
+    **不改** ``schemas()/declare()/teardown()`` 的语义（照抄才是忠实的观测点）；
+    早先这里让 ``schemas()`` 返回 ``[]``，被那条守正如实抓到（是 stub 在撒谎，
+    不是守卫误报）。
     """
 
     def __init__(self, inner=None):
         self.inner = inner
         self.calls: list[tuple[str, dict]] = []
+
+    def attach(self, inner):
+        """接上真宿主（``_authority`` 在替换 seam 之前调用）。"""
+        self.inner = inner
+        return self
 
     def declare(self, schemas):
         if self.inner is not None:
