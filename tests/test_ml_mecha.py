@@ -604,17 +604,18 @@ def test_static_ml_mecha_does_not_load_gui_or_opt_layers():
 def test_static_ml_domain_keys_absent_from_mecha_core():
     """静态：ML 领域键/方法名没有写进 mecha 核心（宪章 §5.2 硬约束）。
 
-    命令名单独放宽一档：``mecha/commands.py`` 的**教学提示**里会把
-    ``run_method`` / ``prepare_dataset`` 当"合法命名长什么样"的例子（框架教
-    宿主怎么起名，不是框架拥有这两个命令）。因此命令名只在**代码字面量**里
-    查，文档串里出现不算违规——这也让"真写进核心"仍会被抓住。
+    命令名扫的是"非 docstring 的字符串字面量**整句**"：第三轮审查 P2-1 抓到
+    ``mecha/commands.py`` / ``mecha/tools.py`` 的**用户可见 hint** 里塞了宿主
+    命令名当例子（旧断言只判整串相等 ⇒ 整句 hint 漏抓 = 假绿）。核心可以写
+    中性示例（``do_thing`` / ``compute_summary``），但不许出现真宿主命令名——
+    所以这里改成**子串**扫描：核心若真把命令名写进可见文本，判据必红。
     """
     if not MECHA_ROOT.is_dir():
         pytest.skip(f"mecha 仓不在位：{MECHA_ROOT}")
     core = sorted((MECHA_ROOT / "mecha").rglob("*.py"))
     assert core, "mecha 核心源码为空？"
 
-    # 领域状态键与领域方法名：源码里一个都不许有
+    # 领域状态键与领域方法名：源码里一个都不许有（含 docstring/注释）
     forbidden = set(STATE_KEYS) | {"resource_guard", "dataset_id", "pipeline_id",
                                    "random_forest", "logistic"}
     offenders: list[str] = []
@@ -625,7 +626,8 @@ def test_static_ml_domain_keys_absent_from_mecha_core():
                 offenders.append(f"{path.relative_to(MECHA_ROOT)}: 含 {token!r}")
     assert offenders == [], offenders
 
-    # 命令名：只查 AST 里的字符串字面量（排除 docstring），命中即"核心注册了 ML 命令"
+    # 命令名：AST 字符串字面量（排除 docstring）按**子串**查——整句 hint、
+    # 报错文本、suggest 都是用户可见面，塞进宿主命令名一律算违规。
     command_names = {"prepare_dataset", "run_method", "run_method_batch",
                      "compare_methods"}
     hits: list[str] = []
@@ -642,8 +644,10 @@ def test_static_ml_domain_keys_absent_from_mecha_core():
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 if node.value in docstrings:
                     continue
-                if node.value in command_names:
-                    hits.append(f"{path.relative_to(MECHA_ROOT)}: {node.value!r}")
+                for name in sorted(command_names):
+                    if name in node.value:
+                        hits.append(f"{path.relative_to(MECHA_ROOT)}: "
+                                    f"{node.value[:70]!r} 含 {name!r}")
     assert hits == [], hits
 
 
@@ -707,6 +711,11 @@ def test_prepare_dataset_csv_allowed_inside_dataset_roots():
 
 def main() -> int:
     """不装 pytest 时的直跑入口（与仓内其他 test_*.py 同形）。"""
+    # 默认控制台可能是 GBK（本机 cp936）：✓/✗ 会让直跑入口在**第一个测试
+    # 之前**就崩掉（exit 1），真实失败被编码崩溃掩盖。与 tests/run_all.py
+    # 同款加固（第三轮审查 P2-8）。pytest 路径本来就走 UTF-8，不受影响。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     import tempfile
 
     tests = [test_tool_projection_is_read_only_capable,

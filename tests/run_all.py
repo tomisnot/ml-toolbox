@@ -7,7 +7,8 @@
 
 四个核心脚本彼此独立（各自进程、各自 runs/ 子目录），并行执行把墙钟时间
 从"求和"降到"取最大值"；输出按脚本缓冲、顺序打印，保持可读。
-mecha 存在时额外纳入 `test_ml_mecha.py`（缺 mecha 则明确跳过，不假绿）。
+mecha 存在时额外纳入 `test_ml_mecha.py` 与 `test_ml_capabilities.py`
+（缺 mecha 则明确跳过，不假绿）。
 """
 import os
 import subprocess
@@ -21,6 +22,7 @@ SCRIPTS = ["smoke_test.py", "test_regressions.py", "test_ui.py", "test_opt.py"]
 MECHA_ROOT = os.environ.get("MECHA_ROOT", r"D:\code-nosync\mecha")
 if os.path.isdir(MECHA_ROOT):
     SCRIPTS.append("test_ml_mecha.py")
+    SCRIPTS.append("test_ml_capabilities.py")
 
 
 def main():
@@ -61,7 +63,7 @@ def main():
     if failed:
         print("❌ 失败:", ", ".join(failed))
         return 1
-    print("✅ 全部通过（smoke + regressions + ui + opt + ml_mecha）")
+    print("✅ 全部通过（smoke + regressions + ui + opt + ml_mecha + ml_capabilities）")
     return 0
 
 
