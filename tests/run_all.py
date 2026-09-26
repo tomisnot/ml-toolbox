@@ -16,7 +16,10 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = ["smoke_test.py", "test_regressions.py", "test_ui.py", "test_opt.py"]
+#: `test_dsh_panel.py` **无条件**在列：它跑的是**仓内**的共享面板判据（`node --test`），
+#: 不依赖 mecha 仓；**硬依赖 `node`**（缺 node 即红——不把"存在但从不执行"当绿）。
+SCRIPTS = ["smoke_test.py", "test_regressions.py", "test_ui.py", "test_opt.py",
+           "test_dsh_panel.py"]
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。
 MECHA_ROOT = os.environ.get("MECHA_ROOT", r"D:\code-nosync\mecha")
