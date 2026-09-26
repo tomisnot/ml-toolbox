@@ -1,6 +1,24 @@
 # ML Toolbox 的 dsh 插件（驾驶舱监控面板）
 
-这个目录是 **P2c** 的产物：把 EL 的 dsh 驾驶舱面板移植到 ML，并做**参数化 + 改名**。
+> ## ⚠ 迁移后（2026-09-26）：面板与地址管线都换成**共享资产**
+>
+> 三家项目（EL / Get Paper / ML）共用一个面板实现，来源是
+> `mecha/dsh-panel/`，**逐字复制**到本仓 **`src/dsh-panel/`**（提交态 `ab28452`，12 文件）。
+> * **本仓不再自绘面板**：`src/client/MonitorTabBody.tsx` 已删除；client 半只做「按钮 + tab
+>   注册 + **两条附加页声明**」（`src/client/extraPages.ts`），面板本体、取数、错误档位、
+>   R8 自证、布局与 CSS 全在资产里（`mecha-` 前缀，`mltb-` 那套已丢）。
+> * **只能改 `src/dsh-panel/panel-config.ts`**（参数块）；其余 11 个文件与上游**逐字一致**，
+>   由 `dsh/test/panel-assets.test.ts` 的**常量指纹守卫**钉住（判据**不读 mecha**、不经 git）。
+> * **行为变更（已申报）**：① **地址来源两级 → 单级**（不再读 `.ml-mecha-runtime.json`，
+>   只读 `PANEL_CONFIG.PORT_FILE = '.ml-monitor-port'`；读不到 ⇒ 路由 `503` + 可读错误，
+>   **绝不回落**）；② 旧面板把「操作史运行记录」与「磁盘存档」画在同一页 ⇒ 资产机制是
+>   **一页一条路由** ⇒ 现在**两页**。
+> * **验收命令**：`npm test`（共享 4 份单测 + 本仓 3 份守卫）、`npm run typecheck`
+>   （`strict` + `noUncheckedIndexedAccess`，与 EL 同档）、`npm run bundle`（改 client 源码后必须重建）。
+>
+> 下面几节里"移植自 EL / 三页 / 读运行期描述符"等表述是**迁移前**的形态，保留作历史；
+> 当前真值以本节与 `src/dsh-panel/README.md`（资产自带文档）为准。
+
 工具接入**不**经过本插件——走 dsh 内置 `@deepseek-ai/dsh-mcp-client`（方案 A，
 见 `docs/mecha/07-交付形态-双模式与dsh桥.md` §4）。
 
@@ -8,8 +26,8 @@
 
 | 半 | 文件 | 职责 |
 |---|---|---|
-| HOST | `src/index.ts` → `lib/index.mjs` | 在 dsh **同源** webserver 上注册只读路由 `/ml-toolbox/monitor-url`，返回 `{base: 'http://127.0.0.1:<监控端口>'}`（端口读自权威写的运行期描述符，**没有硬编码默认值**） |
-| CLIENT | `src/client/*` → `lib/client.js` | 会话头「◈ 监控」按钮 + 右栏 tab（三页：飞行记录仪 / 配置态 / 运行记录），轮询权威的只读端点 |
+| HOST | `src/index.ts` → `lib/index.mjs` | 在 dsh **同源** webserver 上注册只读路由 `/ml-toolbox/monitor-url`，返回 `{base}`。**迁移后**：路由实现是资产的 `makeMonitorUrlHandler`，端口**只读裸端口文件**（`PANEL_CONFIG.PORT_FILE`），**不读运行期描述符、无硬编码默认值** |
+| CLIENT | `src/client/*` → `lib/client.js` | 会话头「◈ 监控」按钮 + 右栏 tab。**迁移后**：tab body = 资产的 `MonitorTabBody`；本仓声明**两条附加页**（运行记录 `/summary`、磁盘存档 `/runs?limit=50`），故共**四页**：飞行记录仪 / 配置态（资产标准页）+ 上述两条 |
 
 **不移植** EL 的 `dsh/src/host/mcp-bridge.ts`（自愈 MCP 桥）。那条桥是为治
 dsh 内置客户端的 streamable-http "HTTP 世代"死区而写的；ML 先靠"权威与 dsh
@@ -91,16 +109,18 @@ dsh --profile web --patch ./dsh/cordis.patch.yml `
 ## 参数化：监控地址从哪来
 
 `MONITOR_URL` **不是**硬编码常量（EL 把 `http://127.0.0.1:8767` 写死在两端，两处一漂移
-就是"面板空白但没人报错"的假绿）。ML 的链路只有一条：
+就是"面板空白但没人报错"的假绿）。**迁移后**的链路只有一条：
 
 ```
-权威启动 → 写 .ml-monitor-port + .ml-mecha-runtime.json（单一真源）
-   → client 半的 tab body（session 作用域 slot）
-   → inject 的 resolveMonitorBase() → 同源 fetch('/ml-toolbox/monitor-url')
-   → host 半读描述符（根 = MLTB_ML_ROOT 或 cwd）→ 返回 {base: "http://127.0.0.1:<实际端口>"}
+权威启动 → 写 .ml-monitor-port（裸端口；描述符另外写，但取址不再读它）
+   → 资产的 panel-data.loadPanel(fetch, extraRoutes)
+   → 资产 monitor-client.fetchMonitorBase(fetch, PANEL_CONFIG.ROUTE_PATH)
+   → 同源 fetch('/ml-toolbox/monitor-url')
+   → host 半 = 资产的 makeMonitorUrlHandler（根 = MLTB_ML_ROOT 或 cwd）
+       → 返回 {base: "http://127.0.0.1:<实际端口>"}，读不到则 503 + 可读错误
 ```
 
-读不到就**如实显示"监控端点未知"+ 重试**，绝不回落某个默认端口。
+读不到就**如实显示可读错误 + 重试**，绝不回落某个默认端口（这也正是"单级"那条行为变更）。
 
 ## R1 观测程序：dsh 内置客户端是否命中"HTTP 世代死区"
 

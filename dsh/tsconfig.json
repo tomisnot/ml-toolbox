@@ -3,12 +3,19 @@
     "target": "es2022",
     "module": "esnext",
     "moduleResolution": "bundler",
-    "lib": ["es2022", "dom"],
+    "lib": ["es2023", "dom"],
     "jsx": "react-jsx",
-    "strict": false,
+    // 资产（`dsh/src/dsh-panel/*`）的 import 带 `.ts`/`.tsx` 扩展名、且 tsdown 也照此解析
+    // ⇒ 必须开这一条（否则报 TS5097）。这不是"放松"，是模块解析口径。
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    // 资产 README 把「能在**最严**的消费者 tsconfig 下编译」写成硬约束（EL 用的是
+    // `--strict --noUncheckedIndexedAccess`）⇒ 本仓按同一档验收，不为资产放松任何旗标。
+    "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": []
+    // `node:*` / `process` / `Buffer`：资产单测与 host 半都要（`@types/node` 已进 devDeps）
+    "types": ["node"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "types/**/*.d.ts"]
 }

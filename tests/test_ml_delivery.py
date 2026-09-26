@@ -1150,7 +1150,8 @@ def test_monitor_shapes_match_el_cockpit_contract():
                 code, _, body = _http_get(base + "/runs?limit=5")
                 runs = json.loads(body)
                 assert code == 200 and runs["source"] == "runs/", runs
-                assert isinstance(runs["runs"], list), runs
+                # 行取 `rows`（共享面板的附加页数据契约；迁移前叫 `runs`）
+                assert isinstance(runs["rows"], list), runs
 
                 # 只读：未知路径 404、POST 一律 404
                 code, _, body = _http_get(base + "/nope")
@@ -1222,7 +1223,7 @@ def test_monitor_runs_route_fails_loud_instead_of_faking_empty():
                                        str(root / "no-such-runs")):
                     code, _, body = _http_get(base + "/runs?limit=5")
                     runs = json.loads(body)
-                    assert code == 200 and runs["runs"] == [], body[:200]
+                    assert code == 200 and runs["rows"] == [], body[:200]
                     assert runs["source"] == "runs/", runs
 
                 # ② 取数失败：响亮失败（500 + 结构化 kind），绝不降级成空表
@@ -1320,8 +1321,12 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
     import re
 
     dsh_dir = REPO / "dsh"
+    # ⚠ **扫描范围排除 `src/dsh-panel/`**：那是**逐字复制的共享资产**（判据
+    # `dsh/test/panel-assets.test.ts` 用常量指纹守着它），里面的命名/历史说明是上游的，
+    # 本仓**不许就地改**（改了指纹判据就红）。本条判据的对象是**本仓自己的代码**。
     src_files = [p for p in (dsh_dir / "src").rglob("*")
-                 if p.suffix in (".ts", ".tsx")]
+                 if p.suffix in (".ts", ".tsx")
+                 and "dsh-panel" not in p.parts]
     assert src_files, "dsh/src 不存在或为空——面板源码丢了？"
 
     code = "\n".join(_strip_js_comments(p.read_text(encoding="utf-8"))
@@ -1332,39 +1337,66 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
 
     client_code = _strip_js_comments(
         (dsh_dir / "src" / "client" / "index.ts").read_text(encoding="utf-8"))
-    assert not re.search(r"127\.0\.0\.1:\d+", client_code), \
-        "客户端里出现了硬编码的 loopback 端口"
-    assert "resolveMonitorBase" in client_code, "监控地址必须经注入的解析器取"
-    # 地址走**同源路由**（不是 command：命令返回值形状脆弱且会写会话记录）
-    assert "/ml-toolbox/monitor-url" in client_code, "客户端必须 fetch 同源地址路由"
+    host_code = _strip_js_comments(
+        (dsh_dir / "src" / "index.ts").read_text(encoding="utf-8"))
+    # 地址**单级、绝不回落**（迁移后由共享资产的 monitor-url.ts 实现）：本仓自己的代码里
+    # 不许再出现 loopback 端口字面量，也不许自己拼地址。
+    for name, src in (("client", client_code), ("host", host_code)):
+        assert not re.search(r"127\.0\.0\.1:\d+", src), \
+            f"{name} 半里出现了硬编码的 loopback 端口"
+    assert "resolveMonitorBase" not in client_code, \
+        "客户端不该自己解析地址（取址归共享资产的 fetchMonitorBase）"
     assert "commands.execute" not in client_code, \
-        "客户端不得再经 commands.execute 取地址（会污染会话 + 形状脆弱）"
+        "客户端不得经 commands.execute 取地址（会污染会话 + 形状脆弱）"
     assert "remote.commands" not in client_code, "客户端不该再依赖 remote.commands"
+    # host 半必须用**共享的**地址实现（参数块给路由与端口文件名）
+    assert "makeMonitorUrlHandler" in host_code, "host 半没有用共享的地址路由实现"
+    assert "monitor_url" not in host_code and ".ml-monitor-port" not in host_code, \
+        "host 半不该自己写端口文件名（单一来源是参数块 PANEL_CONFIG.PORT_FILE）"
 
-    body = (dsh_dir / "src" / "client" / "MonitorTabBody.tsx").read_text(
+    # 页签：标准两页的文案默认在资产里；ML 的两条附加页文案在本仓 client 数据层里
+    panel_data = (dsh_dir / "src" / "dsh-panel" / "panel-data.ts").read_text(
         encoding="utf-8")
-    for label in ("飞行记录仪", "配置态", "运行记录"):
-        assert label in body, f"面板缺少页签 {label!r}"
+    for label in ("飞行记录仪", "配置态"):
+        assert label in panel_data, f"共享面板缺少标准页签 {label!r}"
+    # ⚠ 附加页声明住在 `client/extraPages.ts`（无 react 的数据层，可 node 直测）
+    extra = (dsh_dir / "src" / "client" / "extraPages.ts").read_text(
+        encoding="utf-8")
+    for label in ("运行记录", "磁盘存档"):
+        assert label in extra, f"本仓 client 未声明附加页签 {label!r}"
 
 
 def test_panel_runs_page_shows_readable_error_instead_of_blank():
     """D6 的面板侧：``/runs`` 取数失败要显示**可读错误**，不能渲染成空表。
 
-    只看源码文本（面板是注入浏览器的合并包，值级判据在 host 半的 Node 代理里更
-    合适），但断言的是**行为分支存在**：附加路由的 HTTP 状态被判过、错误有独立状态位、
-    运行记录页把错误摆成人话，并且不再把"某一条附加路由失败"当成"权威离线"。
+    ⚠ **迁移后本条判据的对象变了**（强度不变）：这条性质现在由**共享资产**实现——
+    `panel-view.ts::extraPageHtml` 的失败分支画 `unreadableText` + 真因，而"每条分支都
+    返回非空可读 HTML"由资产自己的 `panel-view.test.ts` 逐档断言（随 `npm test` 执行）。
+    本仓侧要钉的是**声明对不对**：两条附加页各自声明了 `emptyText` 与 `unreadableText`，
+    且**两者必须不同**（"确实没有数据"与"读不到"是两件事）。
     """
-    body = (REPO / "dsh" / "src" / "client" / "MonitorTabBody.tsx").read_text(
+    client = (REPO / "dsh" / "src" / "client" / "extraPages.ts").read_text(
         encoding="utf-8")
-    assert "archiveError" in body, "缺少附加路由失败的状态位"
-    assert "res.ok" in body, "附加路由没有判 HTTP 状态（500 会被当成空表）"
-    assert "磁盘存档读取失败" in body, "运行记录页没有可读的错误文案"
-    assert "不是空的" in body, "错误态没有与「确实没有数据」区分开"
-    # 失败必须与"权威离线"分开：核心路由失败才置 offline
-    head, _, tail = body.partition("附加路由：各自失败各自显示")
-    assert tail, "轮询里没有把核心路由与附加路由分开处理"
-    assert "setOffline(true)" not in tail or "readJson('/runs" in tail, \
-        "附加路由失败仍然会把整块面板打成「权威离线」"
+    view = (REPO / "dsh" / "src" / "dsh-panel" / "panel-view.ts").read_text(
+        encoding="utf-8")
+    # 资产把"读不到"渲染成 `unreadableText` + 真因（不是空表）
+    assert "spec.unreadableText" in view and "result.failure.detail" in view, \
+        "资产的附加页失败分支没有画可读错误（读不到 ≠ 空表）"
+    # 我的两条声明都必须给"空"与"读不到"两套文案
+    for key in ("emptyText", "unreadableText"):
+        assert client.count(key + ":") >= 2, f"两条附加页都该声明 {key}"
+    assert "不是空的" in client, "错误文案没有与「确实没有数据」区分开"
+    assert "磁盘存档读取失败" in client, "附加页缺少可读的失败文案"
+    # 资产自测覆盖"每条分支都非空"（这条性质在 npm test 里跑；此处确认判据存在，不是被删了）
+    view_test = (REPO / "dsh" / "src" / "dsh-panel" / "panel-view.test.ts").read_text(
+        encoding="utf-8")
+    assert "每条分支都返回**非空**可读 HTML" in view_test, \
+        "资产自测里少了「每条分支都非空」那条（性质没被守）"
+    # 附加页失败**不牵连**标准两页：取数把它们单独返回（不塞进 panelState 的 extra）
+    data = (REPO / "dsh" / "src" / "dsh-panel" / "panel-data.ts").read_text(
+        encoding="utf-8")
+    assert "extraRoutes: ExtraRoute[] = []" in data and "extras[r.id] =" in data, \
+        "loadPanel 没有把附加页取数单独返回（失败会牵连标准两页）"
 
 
 # ------------------------------------------------------- P3：面板的自动化代理验收
@@ -1518,44 +1550,10 @@ const ctx = {
 await exported.apply(ctx)
 
 const out = { loaded: true, name: exported.name, inject: exported.inject, regs,
-              hasFetchMonitorBase: typeof exported.fetchMonitorBase === 'function' }
+              hasApply: typeof exported.apply === 'function' }
 out.injectedKeys = Object.keys(bodyDesc.inject() || {})
-
-// ① 真形状：200 + {base}
-const calls = []
-const goodFetch = async (url, init) => {
-  calls.push([url, init])
-  return { ok: true, status: 200, json: async () => ({ base: 'http://127.0.0.1:50062' }) }
-}
-out.goodBase = await exported.fetchMonitorBase(goodFetch)
-out.goodCalls = calls
-
-// ② 失败形状：404
-try {
-  await exported.fetchMonitorBase(async () => ({ ok: false, status: 404,
-                                                 json: async () => ({}) }))
-  out.notOkThrew = false
-} catch (err) { out.notOkThrew = true; out.notOkError = String(err.message) }
-
-// ③ 负例：喂**旧的 command 返回形状**必须失败（证明不再依赖命令返回值）
-const oldShape = { ok: true, value: { commandId: 'c1',
-                                      result: { kind: 'success',
-                                                text: 'http://127.0.0.1:9999' } } }
-try {
-  out.oldShapeUrl = await exported.fetchMonitorBase(
-    async () => ({ ok: true, status: 200, json: async () => oldShape }))
-  out.oldShapeThrew = false
-} catch (err) { out.oldShapeThrew = true; out.oldShapeError = String(err.message) }
-
-// ④ 空 base 也必须失败
-try {
-  await exported.fetchMonitorBase(async () => ({ ok: true, status: 200,
-                                                 json: async () => ({ base: '' }) }))
-  out.emptyBaseThrew = false
-} catch { out.emptyBaseThrew = true }
-
-// ⑤ 经注入面调用（面板真的会用这条路）
-out.viaInject = await bodyDesc.inject().resolveMonitorBase(goodFetch)
+// 附加页声明必须真的进到组件 props 里（R17：声明了就得被读——不是"看起来能注入"）
+out.injectedExtraIds = (bodyDesc.inject().extraPages || []).map((p) => p.id)
 console.log('RESULT ' + JSON.stringify(out))
 """
 
@@ -1619,11 +1617,14 @@ def test_panel_host_half_serves_monitor_url_route():
 
 
 def test_panel_client_half_uses_same_origin_fetch_not_command():
-    """CLIENT 半（真产物）：地址走同源 `fetch` → `{base}`；旧 command 形状必须失败。
+    """CLIENT 半（真产物）：地址走**共享资产**的同源 `fetch`；旧 command 形状必须失败。
 
-    真机 bug 的第二个回归点：喂**真形状**（`{ok, status, json}`）+ 一条**负例**
-    （旧的 `RemoteResult` `{ok, value:{result:{text}}}` 必须失败），这样"又把地址
-    读成命令返回值"会被判据当场抓住。
+    ⚠ **迁移后本条判据的对象变了**（强度不变）：
+    * 注册面仍断言**本仓 client**（按钮 / tab / 注入面 / 附加页声明真的进到 props）；
+    * 取址行为改断言**共享资产**的管线源码 + **真产物 bundle**——`fetchMonitorBase`
+      不再是本仓 client 的导出（它是资产内部实现），而"喂真形状得 base / 喂旧 command
+      形状必须失败 / 空 base 必须失败"这三条负例由资产的 `monitor-client.test.ts`
+      逐条覆盖（随 `npm test` 执行）。
     """
     if not _node_available():
         print("    （跳过：PATH 里没有 node）")
@@ -1649,28 +1650,27 @@ def test_panel_client_half_uses_same_origin_fetch_not_command():
     tab = next(r for r in regs if r.get("tab"))
     assert tab["tab"] == "ml-toolbox-monitor", regs
     body = [r for r in regs if r.get("slot") == "sidebar.right.pane.tab"]
+    # tab body 现在**就是共享面板本体**（本仓不再自绘）
     assert body and body[0]["comp"] == "MonitorTabBody", regs
     assert body[0]["key"] == "ml-toolbox-monitor", body
-    assert got["injectedKeys"] == ["resolveMonitorBase"], got
 
-    # ① 真形状：200 + {base}
-    assert got["hasFetchMonitorBase"] is True, got
-    assert got["goodBase"] == "http://127.0.0.1:50062", got
-    assert got["goodCalls"][0][0] == "/ml-toolbox/monitor-url", got["goodCalls"]
-    assert got["goodCalls"][0][1] == {"cache": "no-store"}, got["goodCalls"]
-    assert got["viaInject"] == "http://127.0.0.1:50062", got
+    # R17：声明了就必须被读——注入面只有 extraPages，且它**真的**是那两条声明
+    assert got["injectedKeys"] == ["extraPages"], got
+    assert got["injectedExtraIds"] == ["summary", "runs"], got
 
-    # ② 失败形状
-    assert got["notOkThrew"] is True, got
-    assert "404" in got["notOkError"], got
-
-    # ③ 负例：旧的 command 返回形状必须**失败**（喂进去也不该被当成地址）
-    assert got["oldShapeThrew"] is True, \
-        f"旧的 command 返回形状被当成地址了：{got.get('oldShapeUrl')!r}"
-    assert got["oldShapeError"], got
-
-    # ④ 空 base 也必须失败
-    assert got["emptyBaseThrew"] is True, got
+    # 取址走共享资产的管线：同源 fetch + `cache: no-store` + 失败落 `address` 档
+    pipeline = (REPO / "dsh" / "src" / "dsh-panel" / "monitor-client.ts").read_text(
+        encoding="utf-8")
+    assert "doFetch(routePath, { cache: 'no-store' })" in pipeline, \
+        "共享管线没有同源 fetch 地址路由"
+    assert "tier: 'address'" in pipeline, "取址失败没有落 address 档（会被误报成离线）"
+    assert "isOriginLike" in pipeline, "缺少地址形状自检（垃圾地址会被当成 base）"
+    # 真产物 bundle：路由字面量来自参数块（单一来源），且**不含**任何命令调用
+    bundle = (REPO / "dsh" / "lib" / "client.js").read_text(encoding="utf-8")
+    assert "ml-toolbox/monitor-url" in bundle, \
+        "bundle 里没有地址路由字面量 ⇒ 参数块没被打进产物（bundle 陈旧？）"
+    assert "commands.execute" not in bundle and "remote.commands" not in bundle, \
+        "bundle 里出现了命令调用（地址必须走同源 fetch）"
 
 
 def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():

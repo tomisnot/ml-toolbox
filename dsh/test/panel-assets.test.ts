@@ -92,3 +92,77 @@ test('R7 红证：指纹函数对**单字符**扰动敏感（不是哑守卫）'
   assert.equal(contentDigest(src.replace(/\n/g, '\r\n')), base,
     '行尾归一失效：CRLF 与 LF 得出了不同指纹')
 })
+
+// ---------------------------------------------------------------- 入口级闭包守卫
+
+/** 本仓 client 半的**入口**（不是资产目录内部）：闭包从这里开始走。 */
+const CLIENT_ENTRY = 'src/client/index.ts'
+
+/** 唯一允许的裸包名：dsh 宿主经模块表注入的 react（项目的 bundler 把它外置）。 */
+const ALLOWED_BARE = new Set(['react', 'react/jsx-runtime'])
+
+const DSH_DIR = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+/** 把相对 specifier 解析成仓内相对路径（`./x`、`../y`、带或不带扩展名）。 */
+function resolveSpec(fromRel: string, spec: string): string | undefined {
+  const base = join(dirname(fromRel), spec).replace(/\\/g, '/')
+  for (const cand of [base, base + '.ts', base + '.tsx', base + '/index.ts',
+                      base + '/index.tsx']) {
+    try {
+      readFileSync(join(DSH_DIR, cand))
+      return cand
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  return undefined
+}
+
+/** 剥注释（否则文档里"举例说明"的 `from 'node:fs'` 会被误判成真 import）。 */
+const stripComments = (src: string): string => src
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+test('⭐ 从**本仓入口**出发：client 半闭包零 `node:`，裸包只许 react（照 GP 那条）', () => {
+  const seen = new Set<string>()
+  const nodeHits: string[] = []
+  const bareHits: string[] = []
+  const queue = [CLIENT_ENTRY]
+  while (queue.length) {
+    const rel = queue.shift() as string
+    if (seen.has(rel)) continue
+    seen.add(rel)
+    const src = stripComments(readFileSync(join(DSH_DIR, rel), 'utf8'))
+    for (const line of src.split('\n')) {
+      if (/^\s*import\s+type\b/.test(line)) continue   // 类型导入被剥掉，不是运行时依赖
+      const m = line.match(/from\s+'([^']+)'/)
+      if (!m) continue
+      const spec = m[1] ?? ''
+      if (spec.startsWith('node:')) { nodeHits.push(`${rel} → ${spec}`); continue }
+      if (spec.startsWith('.')) {
+        const next = resolveSpec(rel, spec)
+        if (next) queue.push(next)
+        continue
+      }
+      if (!ALLOWED_BARE.has(spec)) bareHits.push(`${rel} → ${spec}`)
+    }
+  }
+  assert.deepEqual(nodeHits, [],
+    `client 半闭包里出现了 node 内建：${nodeHits.join('、')} ⇒ 浏览器 bundle 会失败`
+    + '（node-only 的实现必须留在 monitor-url.ts）')
+  assert.deepEqual(bareHits, [],
+    `client 半闭包里出现了未允许的裸包：${bareHits.join('、')}`
+    + `（只许 ${[...ALLOWED_BARE].join(' / ')}——它们是 dsh 模块表注入的）`)
+  // R8 自证：闭包必须**真的走过了几个文件**，且**真的走到了共享面板**——
+  // 否则"没命中"只是因为入口压根没接线（那正是 R17 禁止的假锚点）。
+  assert.ok(seen.size >= 4, `闭包只走了 ${seen.size} 个文件 ⇒ 检查可能没生效：${[...seen]}`)
+  assert.ok(seen.has('src/dsh-panel/monitor-client.ts'),
+    `闭包里应当有共享取数管线：${[...seen]}`)
+  assert.ok(seen.has('src/dsh-panel/MonitorTabBody.tsx'),
+    `闭包里应当有共享面板本体（否则面板没接上，这条检查是空转）：${[...seen]}`)
+  // 对偶（不许误报）：host 半**必须**仍依赖 node —— 同一条边界的两侧都要钉住
+  const hostHalf = readFileSync(join(DSH_DIR, 'src/index.ts'), 'utf8')
+  assert.match(hostHalf, /from '\.\/dsh-panel\/monitor-url\.ts'/,
+    'host 半应当用共享的地址实现（monitor-url.ts 是 node-only 的那一半）')
+})
+

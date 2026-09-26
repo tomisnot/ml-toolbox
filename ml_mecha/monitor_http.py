@@ -71,8 +71,16 @@ def summary_view(ml: Any) -> dict:
     ``{"value", "target"}`` 再上线——否则 JSON 编码会把 dataclass 变成
     ``"Claim(value=...)"`` 字符串，人就再也读不出"它复述的是哪个原始键"。
     投影与 ``disputed`` 原样透出的规则在框架 ``monitor_summary_payload`` 里（单一实现）。
+
+    ⚠ 共享面板的**通用**读面**不渲染** ``/summary`` 的信封（``disputed`` 那句没有标准
+    渲染位）⇒ 本函数额外把 ``recent_runs`` 摆成 ``rows``（面板附加页的表格行契约），
+    对账结论则由项目附加页的 ``summaryLine`` 承担。信封本身**形状不变**（只多一个键）。
     """
-    return monitor_summary_payload(ml.monitor.read())
+    payload = monitor_summary_payload(ml.monitor.read())
+    summary = payload.get("summary") or {}
+    runs = summary.get("recent_runs") if isinstance(summary, Mapping) else None
+    payload["rows"] = list(runs) if isinstance(runs, list) else []
+    return payload
 
 
 def archived_runs(limit: int = 50) -> list[dict]:
@@ -117,10 +125,13 @@ class MonitorEndpoint:
         self._endpoint = _MonitorEndpoint(
             _source(ml), host=host, port=port, port_file=port_file,
             status_extra=self._status_extra, log=log)
-        # 两条 ML 附加路由（框架统一包 {ok: true, **payload} 并归一化失败为 500）
+        # 两条 ML 附加路由（框架统一包 {ok: true, **payload} 并归一化失败为 500）。
+        # ⚠ 两条都按**共享面板的附加页数据契约**回 `rows`（表格行取 `payload.rows`）：
+        #   * `/summary` 的 `rows` = 操作史里的 `recent_runs`（信封形状不变，只多这个键）；
+        #   * `/runs` 的 `rows` = 磁盘存档记录（**行为变更**：旧键名是 `runs`）。
         self._endpoint.add_route("/summary", lambda _query: summary_view(self._ml))
         self._endpoint.add_route(
-            "/runs", lambda query: {"runs": archived_runs(_limit_of(query)),
+            "/runs", lambda query: {"rows": archived_runs(_limit_of(query)),
                                     "source": "runs/"})
 
     def _status_extra(self) -> dict:
