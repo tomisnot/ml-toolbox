@@ -49,6 +49,11 @@
   （工具层 ``_with_channel`` / ``MLMecha.submit`` 的 worker 各自 ``use_channel``），
   引擎从 contextvar 读；声明 ``wants_channel=True`` 会把同一个事实搬成 handler 形参，
   属于另一处重构（要配自己的判据），本批不做——不是遗漏。
+  ⚠ **框架已有声明式替代品**：``CommandSpec.wants_channel``（声明后 handler 直接收
+  ``channel=``，不声明则调用形状一字不变）⇒ 本仓用的是"自有的调用路径绑定"。
+  **若将来要统一到框架那套**，改动面 = **handler 签名**（`_cmd_*` 与命令 handler 工厂）
+  **+ 判据**（通道归因那几条，`test_ml_mecha.py` 的 actor/call_id 组）——换过去的收益是
+  "归因来源收进声明面"，代价是上面两处；下一个人不必重新论证这一遍。
 """
 from __future__ import annotations
 
