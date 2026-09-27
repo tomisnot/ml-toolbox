@@ -35,8 +35,20 @@
   闸门只负责"拒收做不到的取消"，不代表可取消的命令真能被中途打断。
 - 跨进程写租约由 mecha local Log Provider 提供（``.ml-mecha`` 目录）；多进程
   同时写同一数据目录会被拒，这是有意的 fail closed。
-- Approval 未接命令：``approval_required`` 只是核心声明，导出/删除类命令尚未
-  出现，本装配点不接审批闸（诚实推迟）。
+- **Approval 已接线，但今天没有命令用到它**：框架 ADR
+  （``docs/v2/notes/implemented/2026-09-26-命令面治理闸前置与声明式opt-in.md``）之后，
+  ``approval_required=True`` 的命令会**真的被拦**（在任何副作用之前要一次 one-shot 授权，
+  没接审批通道即拒绝，fail closed）。本装配点把 ``Software.approval`` 注入到
+  :meth:`MLEngine.bind_command_registry`（``invoke(..., approval=…)``），
+  但**ML 目前四条命令都是 ``approval_required=False``**（``core_commands.py``，
+  且没有导出/删除类命令）⇒ 这道闸**今天不挡任何东西**。
+  ⇒ 将来给导出/删除类命令声明 ``approval_required=True`` 时，闸**立刻生效**：
+  默认的 ``LocalApproval(decider=None)`` 会**拒绝**（fail closed），要放行必须显式给决策器
+  （装配参数 ``approval_decider=``）。
+- ``wants_channel``（ADR §Decision 3）**本适配层不采用**：ML 的通道是**显式**绑在调用路径上的
+  （工具层 ``_with_channel`` / ``MLMecha.submit`` 的 worker 各自 ``use_channel``），
+  引擎从 contextvar 读；声明 ``wants_channel=True`` 会把同一个事实搬成 handler 形参，
+  属于另一处重构（要配自己的判据），本批不做——不是遗漏。
 """
 from __future__ import annotations
 
@@ -322,7 +334,12 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
     for core_spec in core_command_specs():
         software.commands.register(
             core_spec, _core_command_handler(engine, core_spec.name))
-    engine.bind_command_registry(software.commands, software.gate)
+    # 审批通道一并注入（``invoke(..., approval=…)``）：框架**刻意不做自动接线**
+    # （ADR：自动接线会让没声明审批的命令也走一遍审批通道 ⇒ 扩大行为面），
+    # 由本装配点显式给。今天四条命令都没声明 ``approval_required`` ⇒ 这道闸不挡任何东西；
+    # 将来声明了它立刻生效（默认 decider=None ⇒ fail closed 拒绝）。
+    engine.bind_command_registry(software.commands, software.gate,
+                                approval=software.approval)
 
     # 作用域写权：命令 scope 用 ML 自己的命令名（不透明字符串）。人类侧全给；
     # AI 侧只给当前开放的四条命令——未来 export/predict 等新命令必须显式加授，

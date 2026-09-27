@@ -233,6 +233,9 @@ class MLEngine(Engine):
         self._surface_query: Callable[..., Any] | None = None
         self._commands: Any | None = None
         self._command_gate: Any | None = None
+        #: 审批通道（``Software.approval``）：只有声明 ``approval_required=True`` 的命令会用到；
+        #: 未注入时框架 fail closed（拒绝），不会静默放行。
+        self._command_approval: Any | None = None
         self._validator = MLValidator(
             self, allowed_export_roots=self._allowed_export_roots,
             max_batch_methods=max_batch_methods,
@@ -523,7 +526,7 @@ class MLEngine(Engine):
         args["call_id"] = _call_id()
         result = self._commands.invoke(
             command, args, context=context, gate=self._command_gate,
-            channel=active_channel())
+            channel=active_channel(), approval=self._command_approval)
         if result.get("is_error"):
             failure = result.get("error") or {}
             info = failure.get("info") or {}
@@ -1045,10 +1048,23 @@ class MLEngine(Engine):
         """注入 ``Surface.query``：只读查询统一走 mecha 注册项分派。"""
         self._surface_query = query_fn
 
-    def bind_command_registry(self, commands: Any, gate: Any) -> None:
-        """注入核心 ``CommandRegistry`` + ``Gate``：受控命令经核心命令面调用。"""
+    def bind_command_registry(self, commands: Any, gate: Any,
+                              approval: Any = None) -> None:
+        """注入核心 ``CommandRegistry`` + ``Gate`` + ``approval``：受控命令经核心命令面调用。
+
+        ``approval`` 是**审批通道**（框架 ADR「命令面治理闸前置与声明式 opt-in」§Decision 2）：
+        ``approval_required=True`` 的命令在**任何副作用之前**要一次 one-shot 授权，
+        **没接通道即拒绝**（fail closed）。⇒ 本适配层把装配点的 ``Software.approval``
+        一路传下去；今天 ML **没有任何命令声明** ``approval_required=True``，
+        所以这是"把闸接上电"（将来声明导出/删除类命令时它立刻生效），
+        不是"多走一遍审批通道"。
+
+        ⚠ 框架**刻意不做自动接线**（ADR §Consequences：「自动接线会让没声明审批的命令也走一遍
+        审批通道，属于扩大行为面」）⇒ 注入由本装配点显式完成。
+        """
         self._commands = commands
         self._command_gate = gate
+        self._command_approval = approval
 
     def _failure(self, command: str, exc: MechaError,
                  warnings: list[str]) -> Mapping[str, Any]:

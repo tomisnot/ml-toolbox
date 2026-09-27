@@ -560,18 +560,36 @@ def test_run_event_carries_artifact_locator(app):
 
 
 def test_write_tool_failures_are_tool_failure(app):
-    """写工具失败必须是 ``is_error=True`` + ToolFailure kind，不是假成功。"""
+    """写工具失败必须是 ``is_error=True`` + ToolFailure kind，不是假成功。
+
+    ⚠ **行为变更（框架 ADR「命令面治理闸前置」）**：工具面注册的是 **ai 侧**
+    （``assembly.py`` 的 ``register_ml_tools(..., side="ai")``）⇒ 在 ``human`` 模式下调它，
+    现在会被框架的**前置** authority 检查当场拒（``authority_mode_mismatch``），
+    **不再跑到 handler**。旧行为是"handler 先跑、报它自己的错"（本用例原先把
+    ``dataset_roots_required`` 当成这条路径的期望——那是在"检查滞后于副作用"的旧次序下
+    才成立）。本判据因此**两段都钉**：① 新次序（前置拒，fail closed）；
+    ② 开闸后 handler 级失败仍被归一化成 ToolFailure（原意保留）。
+    """
     csv_path = Path(app.layout.root) / "outside.csv"
     _frame().to_csv(csv_path, index=False)
+    bad = {"source": {"kind": "csv", "path": str(csv_path), "target": "target"}}
+
+    # ① 新次序：human 模式下调 **ai 侧**工具 ⇒ 前置闸当场拒（不是 handler 的错）
     app.switch_human()
-    result = app.tools.execute("prepare_dataset", {
-        "source": {"kind": "csv", "path": str(csv_path), "target": "target"}})
+    early = app.tools.execute("prepare_dataset", bad)
+    assert early["is_error"] is True, early
+    assert early["error"]["info"]["kind"] == "authority_mode_mismatch", early
+
+    # 人类侧准备一份数据（**必须在 human 模式**：它是 human 侧通道的活）
+    dataset_id = _prepare(app, app.human_channel)["dataset_id"]
+
+    # ② 开闸后走到 handler：csv 未授权 ⇒ 归一化成 ToolFailure（原意）
+    app.switch_ai()
+    result = app.tools.execute("prepare_dataset", bad)
     assert result["is_error"] is True
     assert result["error"]["info"]["kind"] == "dataset_roots_required"
 
     # 未知方法同样归一化（不是 value.ok=False 的假成功）
-    dataset_id = _prepare(app, app.human_channel)["dataset_id"]
-    app.switch_ai()
     missing = app.tools.execute("run_method", {"method": "no_such_method",
                                                 "dataset_id": dataset_id})
     assert missing["is_error"] is True
@@ -984,6 +1002,107 @@ def test_prepare_dataset_csv_allowed_inside_dataset_roots():
             instance.close()
 
 
+# ------------------------------------- 命令面：required 语义翻转 + 审批闸接线
+# 依据：mecha ADR `docs/v2/notes/implemented/2026-09-26-命令面治理闸前置与声明式opt-in.md`
+# ① `parameters.required` **缺失或空 = 无必填**（对齐 JSON Schema）——老写法从"全必填"
+#    翻转成"都不必填" ⇒ 可能**静默接受**原本会被拒的调用。② `approval_required` 真的拦；
+#    审批通道由**调用方注入**（框架刻意不自动接线）。本组判据把这两条钉在**本适配层**。
+
+def test_core_command_specs_declare_explicit_required(app):
+    """⭐ 四条命令的**核心投影**都必须带**显式非空** `required`（否则语义翻转会开口子）。
+
+    这是 ADR「迁移须知 1」对 ML 的直接检查项：ML 的命令声明走
+    ``commands.py → core_commands.core_command_specs()`` 机械投影，投影**无条件**写出
+    ``"required": [...]``。本判据逐条核对"核心 spec 里的 required == 宿主声明里的必填"，
+    并**显式要求非空**——万一哪天有人把投影改成"空就不写"，这里立刻红。
+    """
+    from ml_mecha.commands import COMMANDS
+    commands = app.software.commands
+    checked = []
+    for host in COMMANDS:
+        spec = commands.spec(host.name)
+        assert spec is not None, f"核心注册表里没有 {host.name}"
+        params = dict(spec.parameters)
+        assert "required" in params, (
+            f"{host.name} 的核心参数 schema **没有写 required** ⇒ 按新语义它变成"
+            "「都不必填」，会静默接受原本该被拒的调用（ADR 迁移须知 1）")
+        core_required = list(params["required"])
+        host_required = list(host.required_params)
+        assert core_required == host_required, (host.name, core_required, host_required)
+        assert core_required, (
+            f"{host.name} 的 required 是空的 ⇒ 它现在「什么都不必填」；"
+            "若这是有意的，请删掉这条断言并说明；否则补齐声明")
+        # 必填项必须都在 properties 里（否则模型永远填不出来）
+        assert set(core_required) <= set(dict(params["properties"])), host.name
+        checked.append(host.name)
+    # R8 非退化：真的逐条比过 4 条（不是空转）
+    assert sorted(checked) == ["compare_methods", "prepare_dataset", "run_method",
+                               "run_method_batch"], checked
+
+
+def test_missing_required_param_is_rejected_not_silently_accepted(app):
+    """⭐ 缺必填参数必须被**拒**（不是静默接受）——语义翻转的杀伤面就在这里。
+
+    ``run_method`` 的必填是 ``method``：不给它，核心命令面必须在**干活之前**拒
+    （``missing_arguments`` 一类结构化失败），而不是拿 ``None`` 一路跑下去。
+    """
+    app.switch_human()
+    receipt = _as(app, app.human_channel, {"command": "run_method"})
+    assert receipt["ok"] is False, receipt
+    assert receipt.get("error_kind"), receipt          # 机读分类必须在
+    # 只读命令（describe_*）不受影响：它们没有命令声明，走 Surface
+    assert app.engine.query("method_catalog", family="", dataset_id="")["methods"]
+
+
+def test_approval_channel_is_injected_into_invoke(app):
+    """⭐ 审批通道**真的接到了 invoke 上**（R17：不是"看起来能注入"）。
+
+    做法：包一层 ``software.commands.invoke`` 记录实参，跑一条真命令，断言
+    ``approval is app.software.approval`` —— 即装配点把 ``Software.approval`` 一路传到了
+    命令面（ADR §Consequences：框架**刻意不自动接线**，所以这一层必须由本仓显式做）。
+    """
+    seen: dict = {}
+    real_invoke = app.software.commands.invoke
+
+    def spy(name, args, **kwargs):
+        seen["name"] = name
+        seen["approval"] = kwargs.get("approval")
+        seen["channel"] = kwargs.get("channel")
+        seen["gate"] = kwargs.get("gate")
+        return real_invoke(name, args, **kwargs)
+
+    app.software.commands.invoke = spy
+    try:
+        app.switch_human()
+        receipt = _prepare(app, app.human_channel)
+    finally:
+        app.software.commands.invoke = real_invoke
+    assert receipt["ok"], receipt
+    assert seen.get("name") == "prepare_dataset", seen
+    assert seen.get("approval") is app.software.approval, (
+        "审批通道没接到 invoke ⇒ 将来声明 approval_required=True 的命令会因"
+        "「没接通道」被 fail closed 拒（那是设计，但会让声明者以为闸坏了）")
+    assert seen.get("gate") is app.software.gate, seen
+
+
+def test_no_ml_command_declares_approval_required(app):
+    """今天的**事实**：四条命令都没有声明审批（这道闸不挡任何东西）。
+
+    钉住它是为了让"加声明"成为**有意的**动作：一旦有人声明 ``approval_required=True``，
+    本条会红——那时请确认审批人已接线（上一条判据），并更新
+    ``assembly.py`` 的 Known Limitations（那里写着今天没有命令用到它）。
+    """
+    from ml_mecha.commands import COMMANDS
+    declared = [c.name for c in COMMANDS]
+    assert declared, "命令声明为空？"
+    approvals = {name: bool(app.software.commands.spec(name).approval_required)
+                 for name in declared}
+    assert not any(approvals.values()), (
+        f"有命令声明了 approval_required=True：{approvals} ⇒ 请确认审批通道已接线"
+        "（bind_command_registry 的 approval=）并同步更新 assembly.py 的说明；"
+        "否则这条闸会把该命令**全部拒绝**（fail closed）")
+
+
 def main() -> int:
     """不装 pytest 时的直跑入口（与仓内其他 test_*.py 同形）。"""
     # 默认控制台可能是 GBK（本机 cp936）：✓/✗ 会让直跑入口在**第一个测试
@@ -1024,7 +1143,11 @@ def main() -> int:
              test_static_ml_mecha_does_not_copy_el_command_or_state_names,
              test_static_ml_mecha_does_not_load_gui_or_opt_layers,
              test_static_ml_domain_keys_absent_from_mecha_core,
-             test_static_command_surface_is_ml_owned]
+             test_static_command_surface_is_ml_owned,
+             test_core_command_specs_declare_explicit_required,
+             test_missing_required_param_is_rejected_not_silently_accepted,
+             test_approval_channel_is_injected_into_invoke,
+             test_no_ml_command_declares_approval_required]
     failures = []
     for fn in tests:
         if "app" in fn.__code__.co_varnames:
