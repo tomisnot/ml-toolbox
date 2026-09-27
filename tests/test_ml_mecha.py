@@ -1233,6 +1233,8 @@ def main() -> int:
                 fn()
             except (KeyboardInterrupt, SystemExit):
                 raise
+            # ⚠ 同上面的理由，**别改回 `Exception`**：`pytest.raises` 失败抛的 `Failed`
+            # 继承 `BaseException` ⇒ 改窄了会让这个入口被掀翻成 traceback（红看不见）。
             except BaseException as exc:  # noqa: BLE001
                 failures.append((fn.__name__, exc))
         print(("  ✓ " if not failures or failures[-1][0] != fn.__name__ else "  ✗ ")
