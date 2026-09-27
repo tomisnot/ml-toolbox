@@ -1002,6 +1002,66 @@ def test_prepare_dataset_csv_allowed_inside_dataset_roots():
             instance.close()
 
 
+# --------------------------- 框架 ADR「域快照纯净与失败说真话」（2026-09-26）的落地钉
+def test_audit_keys_are_rejected_as_domain_state(app):
+    """⭐ `command.*` **审计键**不许当域状态写（响亮拒绝 + 可教学），域键照常放行。
+
+    依据：框架 ADR「域快照纯净与失败说真话」。审计从前**借 `gate.set` 落史** ⇒ 审计键会
+    走到宿主 validator 上，本仓那时是"**只校验形状就放行**"。框架改后审计走 `Gate.record`、
+    **不再经过宿主 validator**（迁移须知 2）⇒ 那个放行分支成了**写时死码**，而"审计键不是
+    域状态"这件事**没人守**。⇒ 改成**显式拒绝**，本判据钉住它（**行为变更，已在 commit 申报**）。
+
+    对偶（防把闸关死）：真的域键 `current.dataset_id` 必须照常通过。
+    """
+    from mecha.commands import AUDIT_KEY_PREFIX
+
+    # 用**装配好的** validator（`assembly` 把它接到 Gate 上，见 `validate=`）——
+    # 不是自己造一个，判据才落在真链路上。
+    v = app.engine.validator
+    # 域键：放行（对偶——否则"全拒"也能让下面那些过）。⚠ 值也要合法：
+    # ML 的 validator 会**对着事实**校验（未知 dataset_id 会被拒），所以先真建一个。
+    dataset_id = _prepared(app)
+    v.validate_state("current.dataset_id", dataset_id)
+    v.validate_state("current.pipeline_id", None)
+
+    # 审计键：拒绝，且文案可教学（说清它是什么 + 你大概想写什么）
+    with pytest.raises(GateDenied) as exc:
+        v.validate_state(AUDIT_KEY_PREFIX + "prepare_dataset", {"actor": "ml-ai"})
+    assert exc.value.kind == "audit_key_not_state", exc.value
+    assert "审计" in str(exc.value) and "域状态" in str(exc.value), exc.value
+    assert exc.value.hint.strip(), exc.value
+    # 形状合法也不放行（旧行为正是"形状合法即接受"）
+    with pytest.raises(GateDenied):
+        v.validate_state(AUDIT_KEY_PREFIX + "run_method", {})
+    # 而且**键名里的命令是否真存在**与判定无关（这是"类别"问题，不是"这条命令"问题）
+    with pytest.raises(GateDenied):
+        v.validate_state(AUDIT_KEY_PREFIX + "totally_made_up", {"x": 1})
+
+
+def test_cancel_job_returns_core_truth_instead_of_dropping_it(app):
+    """⭐ 人类侧的 ``cancel_job`` 必须**透出**核心说的真话（不再返回 `None` 把它扔掉）。
+
+    对偶两向：① 运行中的可取消 job ⇒ `cancel_requested=True` 且 `terminal=False`；
+    ② **已经跑完**的 job ⇒ `terminal=True` 且 `cancel_requested=False`
+    （后者是 ADR 的要害：对终态 job 说"已请求取消"就是谎）。
+    """
+    dataset_id = _prepared(app)
+    job = app.submit({"command": "run_method", "method": "logistic",
+                      "dataset_id": dataset_id})
+    got = app.cancel_job(job)
+    assert isinstance(got, dict), got
+    assert got.get("job_id") == job.id, got
+    assert got.get("terminal") is False, got
+    assert got.get("cancel_requested") is True, got
+    assert got.get("state_before"), got
+    app.wait_job(job, 120)                       # 等它落终态（取消是协作式的）
+
+    late = app.cancel_job(job)
+    assert late.get("terminal") is True, late
+    assert late.get("cancel_requested") is False, (
+        f"对已终态的 job 仍说「请求了取消」⇒ 人类侧会以为它停了：{late}")
+
+
 # ------------------------------------- 命令面：required 语义翻转 + 审批闸接线
 # 依据：mecha ADR `docs/v2/notes/implemented/2026-09-26-命令面治理闸前置与声明式opt-in.md`
 # ① `parameters.required` **缺失或空 = 无必填**（对齐 JSON Schema）——老写法从"全必填"
@@ -1147,7 +1207,9 @@ def main() -> int:
              test_core_command_specs_declare_explicit_required,
              test_missing_required_param_is_rejected_not_silently_accepted,
              test_approval_channel_is_injected_into_invoke,
-             test_no_ml_command_declares_approval_required]
+             test_no_ml_command_declares_approval_required,
+             test_audit_keys_are_rejected_as_domain_state,
+             test_cancel_job_returns_core_truth_instead_of_dropping_it]
     failures = []
     for fn in tests:
         if "app" in fn.__code__.co_varnames:
@@ -1155,14 +1217,23 @@ def main() -> int:
                 instance = assemble_ml_mecha(root=td, seed=13)
                 try:
                     fn(instance)
-                except Exception as exc:  # noqa: BLE001
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                # ⚠ 必须捕 **BaseException**，不能只捕 Exception：`pytest.raises` 失败时抛的
+                # `Failed` **继承 BaseException** ⇒ 只捕 Exception 会让**整个直跑入口被掀翻**
+                # （实测：`DID NOT RAISE` 直接把 main 打成 traceback，**没有 `✗` 行、没有汇总**）。
+                # 后果不是"假绿"（exit code 仍是 1 ⇒ 门禁照样红），而是**红看不清**
+                # ——"哪条判据红"这件事被 traceback 吃掉。
+                except BaseException as exc:  # noqa: BLE001
                     failures.append((fn.__name__, exc))
                 finally:
                     instance.close()
         else:
             try:
                 fn()
-            except Exception as exc:  # noqa: BLE001
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:  # noqa: BLE001
                 failures.append((fn.__name__, exc))
         print(("  ✓ " if not failures or failures[-1][0] != fn.__name__ else "  ✗ ")
               + fn.__name__)

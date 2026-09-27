@@ -335,16 +335,20 @@ class MLValidator:
                                   message="状态键必须是非空字符串",
                                   hint="可写键见 MLValidator.STATE_KEYS")
         if key.startswith(AUDIT_KEY_PREFIX):
-            # 核心命令面的审计事件（command.<name>）不是域状态：只校验形状，
-            # 不在 ML 域键白名单里额外定义一份命令表（那是核心的事）。
-            if not isinstance(value, Mapping):
-                raise GateDenied(
-                    f"命令审计键 {key!r} 的值必须是映射，收到 "
-                    f"{type(value).__name__}",
-                    kind="bad_audit_value",
-                    hint="CommandRegistry 审计值是操作语义映射",
-                )
-            return
+            # ⚠ **行为变更（2026-09-27，随框架 ADR「域快照纯净与失败说真话」）**：
+            # 从前这里是"**只校验形状就放行**"——那是在审计**借 `gate.set` 落史**的年代，
+            # 审计键真的会走到本 validator 上。框架改后审计走 `Gate.record`、
+            # **不再经过宿主 validator**（ADR 迁移须知 2：别再依赖"审计被 validator 拦下"这条路）
+            # ⇒ 走到这里说明**有人拿 `command.*` 当域状态写**，那是把两类东西混了：
+            # 审计属事件史、不属域状态（正是那条 ADR 的问题 1）。
+            # ⇒ 改为**响亮拒绝**，并给可教学的文案（说清它是什么、你大概想写什么）。
+            raise GateDenied(
+                f"键 {key!r} 是**命令审计键**，不属于域状态 ⇒ 拒绝写入",
+                kind="audit_key_not_state",
+                hint="审计由核心经 Gate.record 记入事件史（不进域快照）；"
+                     "要写域状态请用 MLValidator.STATE_KEYS 里的键（current.*）",
+                suggest="current.dataset_id",
+            )
         if key.startswith("ml."):
             raise GateDenied(
                 f"键 {key!r} 是域事件词汇，不是域状态键",

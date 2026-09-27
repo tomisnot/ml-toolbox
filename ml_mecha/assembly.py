@@ -244,8 +244,15 @@ class MLMecha:
         """等待 job 结束并返回状态（``result_ref`` 在其中）。"""
         return self.software.jobs.wait(job.id, timeout)
 
-    def cancel_job(self, job) -> None:
-        self.software.jobs.cancel(job.id)
+    def cancel_job(self, job) -> dict:
+        """请求取消并**返回核心说的真话**（``state_before`` / ``terminal`` / ``cancel_requested``）。
+
+        ⚠ **行为变更（2026-09-27）**：从前返回 ``None`` —— 框架后来把取消的真实结果写进了
+        返回值（终态 ⇒ ``cancel_requested=False``），丢掉它等于**把已经拿到的真话扔掉**，
+        人类侧（控制台/GUI）于是只能自己编"已取消"。现在原样透出。
+        返回值从 ``None`` 变成 ``dict`` 是**加法**：忽略返回值的调用方不受影响。
+        """
+        return self.software.jobs.cancel(job.id)
 
     def list_jobs(self) -> list[dict]:
         return self.software.jobs.list()

@@ -957,14 +957,33 @@ def test_cancel_run_rejects_uncancellable_job():
             body = json.loads(txt)
             assert body["error"]["info"]["kind"] == "job_not_cancellable", body
 
-            # 可取消的 job：cancel_run 受理并给出请求前后状态（不谎报"已取消"）
+            # 可取消的 job：cancel_run 受理并**如实**回报（不谎报"已取消"）
             ok_job = ml.submit({"command": "run_method", "method": "logistic",
                                 "dataset_id": ml.engine.dataset_ids()[-1]}, side="ai")
             err, txt = _call_tools(host.url, [("cancel_run", {"job_id": ok_job.id})])[0]
             assert err is False, txt
             body = json.loads(txt)
-            assert body["cancel_requested"] is True, body
-            assert "state_before" in body and "state" in body, body
+            # ⚠ **不要断言"运行中 ⇒ cancel_requested=True"**：那是**竞态**——小数据集上的
+            # `run_method` 可能在这次调用前就跑完（实测在门禁负载下真的发生了）。
+            # 断**契约本身**（两个方向都成立、且与速度无关）：
+            #   终态 ⇒ 什么都没取消（cancel_requested=False）；非终态 ⇒ 确实请求了取消。
+            assert body["state_before"], body           # 请求前的状态（不是编的）
+            assert body["terminal"] in (True, False), body
+            assert body["cancel_requested"] is (not body["terminal"]), body
+
+            # ⭐ **对偶（这条才是"说真话"的要害，且确定性）**：先**等它跑完**，再调 cancel_run，
+            #    必须如实答"我什么都没取消"——`cancel_requested=False` + `terminal=True`。
+            #    ⚠ 从前这里**硬编** `cancel_requested: True`，于是对终态 job 也说"已请求取消"
+            #      （框架 ADR 点名的那个谎，在我们自己的工具面上活着）⇒ 本对偶就是它的守卫。
+            done_job = ml.submit({"command": "run_method", "method": "logistic",
+                                  "dataset_id": ml.engine.dataset_ids()[-1]}, side="ai")
+            ml.wait_job(done_job, 300)
+            err, txt = _call_tools(host.url, [("cancel_run", {"job_id": done_job.id})])[0]
+            assert err is False, txt
+            after = json.loads(txt)
+            assert after["terminal"] is True, after
+            assert after["cancel_requested"] is False, (
+                f"对**已结束**的 job 仍报 cancel_requested=True ⇒ 这正是要防的谎：{after}")
 
 
 # ------------------------------------------------------- P1：数据根授权面

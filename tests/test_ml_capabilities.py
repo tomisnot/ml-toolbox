@@ -391,7 +391,12 @@ def main() -> int:
                         instance.close()
             else:
                 fn()
-        except Exception as exc:  # noqa: BLE001
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        # ⚠ 必须捕 **BaseException**：`pytest.raises` 失败抛的 `Failed` 继承 BaseException
+        # ⇒ 只捕 Exception 会让整个直跑入口崩成 traceback（没有 `✗` 行、没有汇总）。
+        # exit code 仍为 1（门禁照样红），但那属于"红看不清"——本套件有 5 处 `pytest.raises`。
+        except BaseException as exc:  # noqa: BLE001
             failures.append((fn.__name__, exc))
             print(f"  ✗ {fn.__name__}: {type(exc).__name__}: {exc}")
         else:

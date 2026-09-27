@@ -570,24 +570,33 @@ def _cancel_run(host: Any,
                 banned_words: tuple[str, ...] = ()) -> ToolDefinition:
     def execute(*, job_id: str) -> Mapping[str, Any]:
         ml = _require_job_host(host)
-        # 先读一次状态：回执里同时给"请求前"与"请求后"的状态，不谎报"已取消"
-        # （取消是协作式的——设置取消标志不等于训练当场停下）。
-        before = str(ml.jobs.wait(job_id, 0.0).get("state") or "")
-        ml.jobs.cancel(job_id)
-        after = str(ml.jobs.wait(job_id, 0.0).get("state") or "")
-        return {"ok": True, "job_id": job_id, "cancel_requested": True,
-                "state_before": before, "state": after, "error": ""}
+        # ⚠ **行为变更（2026-09-27）**：从前这里自己探两次状态，
+        # 并**硬编** `cancel_requested: True`——于是对**已经跑完**的 job 也说"已请求取消"
+        # （那正是框架 ADR 点名的谎：下游会以为它停了）。
+        # 框架现在把真话**写在返回值里**（`state_before` / `terminal` / `cancel_requested`；
+        # 终态 ⇒ `cancel_requested=False`）⇒ 直接采用，不再自探、不再硬编。
+        #
+        # 关于字段：`state_before`（请求**前**的状态）与框架同名字段**是同一个事实** ⇒ 保留原名；
+        # 旧的 `state`（请求**后** 0ms 再探一次）**删掉**——它不是独立事实（协作式取消下几乎
+        # 恒等于 `state_before`），且与 `cancel_requested` 并列会诱导"还在跑 ⇒ 会停"的误读；
+        # 换成 `terminal`（它是否**已经结束**）——这才是模型真正需要知道的那件事。
+        got = ml.jobs.cancel(job_id)
+        return {"ok": True, "job_id": str(got.get("job_id") or job_id),
+                "cancel_requested": bool(got.get("cancel_requested")),
+                "terminal": bool(got.get("terminal")),
+                "state_before": str(got.get("state_before") or ""), "error": ""}
 
     return define_tool(
         name="cancel_run",
         description="请求取消一个后台任务。取消是协作式的：任务的取消标志被置位，"
-                    "它会在下一个检查点停止；不可取消的任务会被明确拒绝。",
+                    "它会在下一个检查点停止；不可取消的任务会被明确拒绝。"
+                    "回执里 `terminal=true` 表示**它本来就已经结束**（此时什么都没取消）。",
         parameters={
             "job_id": {"type": "string", "description": "submit_run 返回的任务编号"},
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "cancel_requested",
-                                    "state_before", "state", "error"]},
+                                    "terminal", "state_before", "error"]},
         execute=execute,
         banned_words=banned_words,
     )

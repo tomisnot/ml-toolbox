@@ -61,8 +61,12 @@ source               该行由哪一处声明生成（冲突/漂移时用于定�
   ``command:<name>`` 在 mecha 侧登记为 CONSUMER/consumer=Surface，
   ``query:<name>`` 登记为 CONSUMER/provider=<查询名>；本模块声明的是"谁提供、
   谁消费"（provider=ml_toolbox），二者是同一能力的两面，见 §6 of 04 文档。
-- ``consumer`` 里的 ``adapter.gui`` 是**声明**（assembly 把命令/查询 scope 同授
-  给 human 通道，测试以 human 通道真实跑过命令），但 Qt GUI 面板尚未接线；
+- ``consumer`` 里的 ``adapter.gui`` 是**声明**：按框架口径（ADR
+  「工具命名放宽与接入口径三条」§Decision 3）它是"**面向人的适配面**"，
+  **不要求是一个独立 GUI**。本仓的"人面"就是**人类通道**（assembly 把命令/查询
+  scope 同授给 human 通道，判据以 human 通道**真实跑过**命令与查询）⇒ 声明成立。
+  ⚠ 早先这里的措辞是"Qt GUI 面板尚未接线"——那句容易被读成"还不合规"，
+  按上述口径改成现在这句（Qt 面板是否走这条通道，是**我们**的接线选择，与角色定义无关）；
   工具面只注册给 ai 通道，故工具行只标 ``adapter.ai``。
 - 不校验"命令声明的 risk 分得对不对"（那是宿主分类内容，机械不可判）。
 """
@@ -87,7 +91,7 @@ PROVIDER = "ml_toolbox"
 
 #: 消费方（mecha 出厂 map 的 ``adapter.*`` 词汇）。
 CONSUMER_AI = "adapter.ai"      # AI 操作通道（工具面 + 命令/查询面）
-CONSUMER_GUI = "adapter.gui"    # 人类操作通道（命令/查询面；GUI 面板待接线）
+CONSUMER_GUI = "adapter.gui"    # 面向人的适配面（本仓 = 人类通道的命令/查询面）
 
 #: 能力分类。``seam`` 专指 mecha 出厂 map 的角色声明行（不是命令/查询/工具）。
 KIND_COMMAND = "command"
