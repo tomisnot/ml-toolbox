@@ -16,7 +16,7 @@ matplotlib>=3.7
 # optuna>=3.0
 
 # mecha 是本机**兄弟仓**的可编辑安装（不是 PyPI 包），本仓根必须与它同级：
-#   "Mechine learning" 与 "mecha" 同在 D:\code-nosync\ 下 ⇒ 下面这条相对路径才成立。
+#   "Mechine learning" 与 "mecha" 是同级目录 ⇒ 下面这条相对路径才成立。
 # ⚠ 相对路径的解析基准是**执行命令时的 CWD**，不是本文件所在目录
 #   ⇒ **必须在仓根执行**（本仓文档里的用法都是先 cd 到仓根）。
 # AI 模式所需的 mcp / uvicorn **不在本文件**——它们声明在 pyproject.toml 的 `ai` extra

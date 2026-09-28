@@ -33,7 +33,7 @@ P1 追加（工具面补齐 + 看门人机械件）：
     来源是声明**（R8-2a，包装 `**kwargs` 会遮住内层闭包默认）——显式 ``null`` 被剥
     （真实默认生效）、真值原样过线、真默认本就是 ``None`` 的参数**必须保留**显式
     null；并把规则当全函数穷举（每个可选参数落进唯一一格）+ 单来源/滥收突变体的
-    灵敏度（致死性）判据。契约见 ``D:\\code-nosync\\_mecha-extraction\\mcp-contract.md``
+    灵敏度（致死性）判据。契约见框架仓的 mcp-contract 文档
     §8.1。
 
 运行：``python -m pytest tests/test_ml_delivery.py -q``
@@ -42,7 +42,7 @@ P1 追加（工具面补齐 + 看门人机械件）：
 
 ## 环境要求
 
-- mecha 在 ``sys.path`` 上（``MECHA_ROOT`` 或默认 ``D:\\code-nosync\\mecha``）；
+- mecha 在 ``sys.path`` 上（``MECHA_ROOT`` 或与之同级的框架仓）；
 - ``mcp`` 已安装（服务端 ``mcp.server.mcpserver`` + 客户端
   ``mcp.client.streamable_http``）；
 - 只在**回环**上起临时端口（``port=0``，OS 分配）：不占固定端口、不碰仓内
@@ -69,7 +69,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 # ---- mecha 上 sys.path（不 vendor；环境变量优先，默认走同级仓） ----
-MECHA_ROOT = Path(os.environ.get("MECHA_ROOT", r"D:\code-nosync\mecha"))
+MECHA_ROOT = Path(os.environ.get("MECHA_ROOT") or os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "mecha")))
 if MECHA_ROOT.is_dir() and str(MECHA_ROOT) not in sys.path:
     sys.path.insert(0, str(MECHA_ROOT))
 

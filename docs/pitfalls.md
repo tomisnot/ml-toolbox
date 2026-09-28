@@ -1,6 +1,6 @@
 # 踩坑清单（症状 → 原因 → 修法）
 
-> 沿用 `D:\desktop\UI design\pitfalls.md` 的格式与纪律：新坑按此追加，
+> 沿用外部 UI 设计资产的 `pitfalls.md` 的格式与纪律：新坑按此追加，
 > 同类坑会复发。上游 17 条（Qt 离屏/matplotlib/pyqtgraph）依然适用，
 > 本文件只记本项目新增的坑。
 

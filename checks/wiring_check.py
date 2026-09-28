@@ -14,7 +14,9 @@ from ml_toolbox.core.contracts import ParamSpec
 from ml_toolbox.opt.contracts import ParamSpace
 from ml_toolbox.opt.process import BatchProcessObjective
 
-ROOT = r"D:\学\BaiduSyncdisk\编程\code\python\Energy Level"
+#: EL 仓（与本仓同级的兄弟目录）；可用 EL_ROOT 覆盖。别把本机绝对路径写死进仓。
+ROOT = os.environ.get("EL_ROOT") or os.path.normpath(
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "energy-level"))
 space = ParamSpace([ParamSpec("freq_mhz", "f", "number", 7350.0, min=7200, max=7500),
                     ParamSpec("intensity", "I", "number", 0.65, min=0.3, max=1.0),
                     ParamSpec("alpha_deg", "a", "number", 0.0, min=0.0, max=90.0),

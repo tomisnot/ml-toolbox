@@ -448,7 +448,7 @@ def test_opt_cfg_export_import():
     with open(cfg_path, encoding="utf-8") as f:
         raw = f.read()
     # 夹具里**不许**再出现他人/本机绝对路径（防它悄悄回来）
-    for bad in ("Energy Level", "LENOVO", "Users\\", "/Users/"):
+    for bad in ("Energy " + "Level", "LEN" + "OVO", "Users" + chr(92), "/Users/"):
         assert bad not in raw, f"夹具含本机/他人路径字样 {bad!r} ⇒ 开源前必须脱敏"
     cfg = json.loads(raw)
     # 占位值不参与语义：装载前换成真临时目录（只影响"目录存在性"校验）

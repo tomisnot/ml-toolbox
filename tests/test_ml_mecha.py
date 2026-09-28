@@ -17,7 +17,7 @@
 ## 环境要求
 
 mecha 必须在 ``sys.path`` 上：优先用环境变量 ``MECHA_ROOT``，否则回退到
-``D:\\code-nosync\\mecha``。**不 vendor mecha**（两个仓各自独立演进）。
+框架仓（与本仓同级）。**不 vendor mecha**（两个仓各自独立演进）。
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 # ---- mecha 上 sys.path（不 vendor；环境变量优先，默认走同级仓） ----
-MECHA_ROOT = Path(os.environ.get("MECHA_ROOT", r"D:\code-nosync\mecha"))
+MECHA_ROOT = Path(os.environ.get("MECHA_ROOT") or os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "mecha")))
 if MECHA_ROOT.is_dir() and str(MECHA_ROOT) not in sys.path:
     sys.path.insert(0, str(MECHA_ROOT))
 

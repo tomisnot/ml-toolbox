@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""离屏 UI 截图工作流（外部资产 `D:\\desktop\\UI design\\SKILL.md` 五步闭环的第②步）。
+"""离屏 UI 截图工作流（外部 UI 设计资产的 `SKILL.md` 五步闭环的第②步）。
 
-⚠ 上面那个 skill 与它的 `checklist.md` 都是**本仓之外的资产**（`D:\\desktop\\UI design\\`，
+⚠ 上面那个 skill 与它的 `checklist.md` 都是**本仓之外的资产**（本机路径略，
 PyQt5 模式库），所以路径写绝对形式——写 `UI design/SKILL.md` 这种"看起来在仓内"的相对
 形式，按仓根解析必然是空的（曾经就这么写过，读的人/AI 会以为文件丢了）。本仓内的对应
 脚本是 `checks/ui_shot.py`，清单在外部 skill 里。
@@ -244,4 +244,4 @@ if __name__ == "__main__":
         print("截图 " + shot_path(name))
     win.close()
     print("完成 —— 用视觉模态读取 PNG，按 "
-          "D:\\desktop\\UI design\\checklist.md 逐项自查（外部资产）。")
+          "外部 UI 设计资产的 checklist.md 逐项自查。")

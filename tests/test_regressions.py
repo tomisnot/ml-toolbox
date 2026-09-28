@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""回归测试（外部资产 `D:\\desktop\\UI design\\checklist.md` 的 C 关）：核心契约 + 关键坑的永久断言。
+"""回归测试（外部资产 `checklist.md` 的 C 关）：核心契约 + 关键坑的永久断言。
 
 运行：python tests/test_regressions.py
 """
@@ -662,7 +662,7 @@ def test_cases_fixtures_have_no_foreign_or_local_absolute_paths():
     # R8 自证：真的扫到了夹具（否则"没命中"只是因为没读到东西）
     assert len(files) >= 5, f"cases/ 下只扫到 {len(files)} 个文件 ⇒ 判据可能没生效"
 
-    bad_words = ("Energy Level", "BaiduSyncdisk", "LENOVO", "/Users/", r"D:\\")
+    bad_words = ("Energy " + "Level", "Baidu" + "Syncdisk", "LEN" + "OVO", "/Users/", "D:" + chr(92))
     hits = []
     for path in sorted(files):
         with open(path, encoding="utf-8", errors="replace") as f:

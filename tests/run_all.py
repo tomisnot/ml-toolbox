@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""一键回归门（外部资产 `D:\\desktop\\UI design\\checklist.md` 的 C 关）：核心 + UI + 冒烟 + 优化。
+"""一键回归门（外部资产 `checklist.md` 的 C 关）：核心 + UI + 冒烟 + 优化。
 
 运行：python tests/run_all.py            （fast 层，目标 <1min）
 全量：set MLTB_SLOW=1 && python tests/run_all.py
@@ -44,7 +44,7 @@ PHASE_SENSITIVE = ["test_dsh_panel.py"]
 
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。
-MECHA_ROOT = os.environ.get("MECHA_ROOT", r"D:\code-nosync\mecha")
+MECHA_ROOT = os.environ.get("MECHA_ROOT") or os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "mecha"))
 MECHA_PRESENT = os.path.isdir(MECHA_ROOT)
 if MECHA_PRESENT:
     PHASE_SENSITIVE += ["test_ml_mecha.py", "test_ml_capabilities.py",

@@ -888,7 +888,7 @@ class MLEngine(Engine):
                 kind="dataset_roots_required",
                 hint="装配时传 dataset_roots=[...] 才允许 csv 数据源；"
                      "未声明即不允许 AI 读取任意路径（fail closed）",
-                suggest="assemble_ml_mecha(root=..., dataset_roots=[r'D:\\data'])",
+                suggest="assemble_ml_mecha(root=..., dataset_roots=[<数据根>])",
             )
         allowed = [Path(r).resolve() for r in self._dataset_roots]
         if not any(candidate == r or r in candidate.parents for r in allowed):
