@@ -2,7 +2,7 @@
 """ml_mecha —— ML Toolbox 的 mecha host adapter（薄接入层）。
 
 归属：本包住在 **ML 仓**，不属于 mecha 框架仓。设计依据见
-``docs/mecha/00-衔接基调与通用化宪章.md``：
+内部记录（未随仓发布，存档在仓外）：
 
 - ML 不做 EL 化适配：命令名、状态键、工具面全部是 ML 自己的词汇；
 - mecha 不做 ML 化特化：本包只使用 mecha 的通用机制（Gate / History /

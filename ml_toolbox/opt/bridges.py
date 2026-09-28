@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""三接缝桥（docs/优化定位.md §2）：ML 工具箱 <-> 优化框架 的互操作实体。
+"""三接缝桥（内部记录（未随仓发布，存档在仓外） §2）：ML 工具箱 <-> 优化框架 的互操作实体。
 
 接缝1（ML→调参）：GPR 当 GP-BO 代理 —— 已在 engines/bo.py 直接复用
     sklearn GaussianProcessRegressor（purpose=surrogate 的兑现），无需额外代码。

@@ -3,7 +3,7 @@
 
 只收编**机械重复**（解析 runs 根、按标记文件列举元数据），不合并存储语义：
 ML 存 record.json + artifacts.npz，优化存 opt_record.json + history.csv——
-这个差异是有理由的（docs/架构审视与改造建议.md §6）。
+这个差异是有理由的（内部记录（未随仓发布，存档在仓外） §6）。
 
 两个 runs 根各自独立（ML=ML_TOOLBOX_RUNS，opt=ML_TOOLBOX_OPT_RUNS），
 本模块用 marker 文件名区分归属，list_all_records() 汇总供历史面板消费。

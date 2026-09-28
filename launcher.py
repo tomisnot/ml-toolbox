@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ML Toolbox 看门人（launcher）：两模式启动与交接的**唯一编排者**。
 
-心智模型（见 ``docs/mecha/07-交付形态-双模式与dsh桥.md``）：
+心智模型（见 内部记录（未随仓发布，存档在仓外））：
 
 - **本地 GUI 模式**：纯本地软件（``app_entry.py --gui``），写权在人，不起任何端点。
 - **AI 模式**：headless 权威（``app_entry.py --authority``，写权自动落 AI）

@@ -29,7 +29,7 @@
   不一致，能力清单会当场 ``CapabilityDrift``（fail loud，方向正确）。
 - 代价是能力清单把它们记为 ``side_effect=False``（**调用当刻**不写域状态），
   而"提交即产生一次运行"这个事实写在各自的 description 与
-  ``docs/mecha/04`` 的专门小节里，不靠那个 bool 表达。
+  内部记录（未随仓发布，存档在仓外） 的专门小节里，不靠那个 bool 表达。
 - ``host`` 是 job 服务 seam（``MLMecha``）；省略时（如 ``capabilities.py``
   只为取名而构造工具、不执行）job 工具仍能构造，调用时才结构化报错。
 """

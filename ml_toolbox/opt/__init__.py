@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ml_toolbox.opt —— 序贯黑盒优化 / 自动调参子框架（方案：docs/优化定位.md）。
+"""ml_toolbox.opt —— 序贯黑盒优化 / 自动调参子框架（方案：内部记录（未随仓发布，存档在仓外））。
 
 与 ML 工具箱的关系 = 兄弟框架 + 共享内核 + 三接缝：
 - 共享：core.ParamSpec（参数空间）、registry 模式、PageSpec 检视契约、

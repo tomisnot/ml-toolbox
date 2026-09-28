@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """优化运行持久化：runs/<run_id>/{opt_record.json, history.csv}。
 
-与 ML 侧的差异（docs/优化定位.md §5）：ML 存数值工件 npz；优化存
+与 ML 侧的差异（内部记录（未随仓发布，存档在仓外） §5）：ML 存数值工件 npz；优化存
 **追加式评估历史 CSV**——历史本身就是表格资产（回流 ML 做响应面，接缝3），
 csv 比 npz 更通用（Excel/pandas 直读）。
 """

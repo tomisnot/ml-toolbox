@@ -4,7 +4,7 @@
  * 自包含内联样式（无外部 CSS 依赖，随 client bundle 打进合并包）。
  * 移植自 EL `dsh/src/client/buttons.tsx`：**只保留监控按钮**——EL 的「→ GUI」
  * 按钮要 `/re0-gui`（host 半写 `.mode-request`），ML 的切回在 P2 走看门人控制台，
- * 该按钮随 `/ml-gui` 命令一起属于 P3（见 `docs/mecha/07-...md` §4）。
+ * 该按钮随 `/ml-gui` 命令一起属于 P3（见 内部记录（未随仓发布，存档在仓外） §4）。
  */
 import type { CSSProperties } from 'react'
 

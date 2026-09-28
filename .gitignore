@@ -42,4 +42,5 @@ logs/
 runtime/
 
 .vscode/
-
+# Trae IDE 的文档目录（AI 编辑器的过程产物；曾入库现已不在树）
+.trae/

@@ -39,7 +39,7 @@ description = "机器学习方法试验台：可 import 的方法库 + PyQt5 桌
 readme = "README.md"
 requires-python = ">=3.10"
 #: 版本**单一来源**：ml_toolbox/__init__.py 的 __version__（不在这里再抄一份，
-#: 免得多出第三个会漂移的版本号——见 docs/team/01 的 R10）。
+#: 免得多出第三个会漂移的版本号——见 内部记录（未随仓发布，存档在仓外） 的 R10）。
 dynamic = ["version"]
 #: 直接依赖 = 代码里**实际 import** 的第三方（逐文件取证；不含仅传递依赖）。
 #: scipy 刻意不列：全仓零直接 import（sklearn/statsmodels 会传递带来它）——

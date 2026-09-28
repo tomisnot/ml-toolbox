@@ -20,7 +20,7 @@
 > 当前真值以本节与 `src/dsh-panel/README.md`（资产自带文档）为准。
 
 工具接入**不**经过本插件——走 dsh 内置 `@deepseek-ai/dsh-mcp-client`（方案 A，
-见 `docs/mecha/07-交付形态-双模式与dsh桥.md` §4）。
+见 内部记录（未随仓发布，存档在仓外） §4）。
 
 ## 它做什么
 

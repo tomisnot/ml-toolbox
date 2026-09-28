@@ -3,7 +3,7 @@
 
 依据：宪章 §10.8（capability map 升级为 command map）与 §12.2（"EL 与 ML 的
 能力声明能生成可合并 map"）。判据在 ``tests/test_ml_capabilities.py``；生成方式
-与"仍是部分并表"的边界记录在 ``docs/mecha/04-ML能力面与双宿主并表.md``。
+与"仍是部分并表"的边界记录在 内部记录（未随仓发布，存档在仓外）。
 
 ## 单一来源（本模块不手抄任何命令 / 查询 / 工具名）
 
@@ -443,7 +443,7 @@ def render_markdown(rows: Any = None, *, with_mecha_rows: bool = False) -> str:
     head = (
         "<!-- 本文件由 ml_mecha/capabilities.py 从 ML 声明生成，禁止手工编辑。\n"
         "     字段格式与 mecha 出厂 map 相同（gen_capability_map.render 同格式），\n"
-        "     两宿主并表见 docs/mecha/04-ML能力面与双宿主并表.md。 -->\n"
+        "     两宿主并表见 内部记录（未随仓发布，存档在仓外）。 -->\n"
         "# ML Capability Map（生成）\n\n"
     )
     return head + render_rows(rows, with_mecha_rows=with_mecha_rows)
