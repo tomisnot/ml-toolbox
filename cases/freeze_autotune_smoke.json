@@ -12,7 +12,7 @@
     "mode": 1,
     "params": "freq_mhz=7200..7500, intensity=0.3..1.0, alpha_deg=0..90, theta_deg=0..180, eps_deg=-45..45",
     "cmd": "python scripts\\freeze_blackbox.py --points {points_file} --out {out_file} --fast",
-    "cwd": "D:\\学\\BaiduSyncdisk\\编程\\code\\python\\Energy Level",
+    "cwd": "C:\\path\\to\\blackbox",
     "parse": "score[:=]\\s*(-?\\d+(?:\\.\\d+)?)",
     "score_field": "C_dual",
     "maximize": true,

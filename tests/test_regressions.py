@@ -642,6 +642,38 @@ def test_sqa_engine_registered_family_quantum():
     assert float(r.best["score"]) < 1.0, "SQA 未把球函数降到 1.0 以下"
 
 
+# ---------------------------------------------------------------- 开源前卫生（夹具脱敏）
+def test_cases_fixtures_have_no_foreign_or_local_absolute_paths():
+    """`cases/**` 里不许出现**本机/他人**的绝对路径（开源前脱敏的永久钉子）。
+
+    来历（2026-09-27/28）：5 个 `freeze_autotune*.json` 夹具原先都把 `proc.cwd` 写成
+    **另一个项目**的本机绝对路径 ⇒ 两个后果：① 随仓发布等于暴露他人本地路径；
+    ② 那条 UI 判据**依赖别人机器上的目录存在**（那个目录一被移走，判据就红——实测发生过）。
+    ⇒ 夹具只放中性占位 `C:\\path\\to\\blackbox`，判据在装载前换成真临时目录。
+
+    口径（如实）：查的是**已知的他人/本机字样**（项目名、机器名、数据盘盘符、用户目录），
+    不是"任何盘符路径"——`C:\\path\\to\\blackbox` 这种中性占位是允许的。
+    """
+    import glob as _glob
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    files = [p for p in _glob.glob(os.path.join(root, "cases", "**", "*"), recursive=True)
+             if os.path.isfile(p)]
+    # R8 自证：真的扫到了夹具（否则"没命中"只是因为没读到东西）
+    assert len(files) >= 5, f"cases/ 下只扫到 {len(files)} 个文件 ⇒ 判据可能没生效"
+
+    bad_words = ("Energy Level", "BaiduSyncdisk", "LENOVO", "/Users/", r"D:\\")
+    hits = []
+    for path in sorted(files):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        for w in bad_words:
+            if w in text:
+                hits.append(f"{os.path.relpath(path, root)}: {w!r}")
+    assert not hits, ("夹具里出现本机/他人绝对路径字样（开源前必须脱敏）：\n  "
+                      + "\n  ".join(hits))
+
+
 def main():
     # 默认控制台可能是 GBK（本机 cp936）：✓/✗ 会让直跑入口在**失败分支**打印时
     # 崩成 UnicodeEncodeError，把真实的失败详情一起吞掉（第三轮审查 P2-9）。

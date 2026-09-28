@@ -19,9 +19,10 @@ python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
 
 > 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
 > `pip install optuna`；二者均为可选依赖，未装时其余方法/自研优化器照常可用。
-> 依赖声明有两处、**分工明确**：`requirements.txt` 是「跑起来」的安装清单（GUI 全量，
-> 主路径），`pyproject.toml` 是包元数据 + 按用途分组的 extras（`ai` / `neural` / `optuna`）
-> ——AI 模式的三项依赖以前**一个都没声明**，现在至少有了声明处。
+> 依赖声明有两处、**分工明确**：`requirements.txt` 是「把整台软件跑起来」的安装清单（GUI 全量，
+> 本地开发主路径，mecha 走兄弟仓可编辑安装），`pyproject.toml` 是包元数据 + 按用途分组的 extras
+> （`ai` / `neural` / `optuna`）——**AI 模式的依赖（mecha / mcp / uvicorn）都在 `ai` extra 里声明**
+> ⇒ 非本机环境装 AI 模式：`pip install -e ".[ai]"`（其中 mecha 是 GitHub URL 依赖）。
 
 ### AI 模式（可选）：运行后在 dsh 界面指挥 AI 调用 ML
 
@@ -35,11 +36,10 @@ python launcher.py                    # 看门人：弹窗选「本地 GUI 模�
 选 **AI 模式** 后会起 headless 权威（写权出厂 LOCKED、由人类侧开闸）+ 本地 MCP 工具服务
 + dsh 界面（本实例绑 3081，3080 留给官方 dsh）；在 dsh 里用自然语言让 AI 调
 `describe_methods` / `prepare_dataset` / `run_method` / `submit_run` / `read_job`，
-点会话头「◈ 监控」看只读驾驶舱（飞行记录仪 / 配置态 / 运行记录）。
+点会话头「◈ 监控」看只读驾驶舱（飞行记录仪 / 配置态 / 运行记录 / 磁盘存档）。
 模式切换用看门人控制台敲 `gui` / `ai` / `quit`。
 
-- 使用者请看 [docs/交付说明.md](docs/交付说明.md)（安装、启动、示例、排错）；
-- 维护者请看 内部记录（未随仓发布，存档在仓外）（地图、改哪里、门禁、限制）。
+- 使用者请看 [docs/交付说明.md](docs/交付说明.md)（安装、启动、示例、排错）。
 
 ---
 
