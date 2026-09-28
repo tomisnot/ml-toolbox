@@ -11,19 +11,21 @@
 #   - 本文件 = 包元数据 + 可安装性 + **按用途分组的 extras**（AI / 神经网络 / 优化引擎）。
 #   两边列出的直接依赖**口径一致**，且都按"代码实际 import"取证（不写"将来可能需要"）。
 #
-# ## `mecha` 的声明（开源后改口径，2026-09-28）
+# ## `mecha` 的声明（开源后改口径；2026-09-28 钉 tag）
 # 它是**宿主框架**，AI 模式必需、GUI 模式完全不需要 ⇒ 声明在 **`ai` extra** 里，
-# 用 **URL 依赖**（PEP 508 direct reference）：`mecha @ git+https://github.com/tomisnot/mecha`
-#   - **为什么不钉 tag/SHA**：上游此刻**没有任何版本 tag**（只有个陈旧的 `v2-replaces-v1`），
-#     而且它的历史仍在重写中 ⇒ 钉 SHA 会在上游重写后失效、钉 tag 会指向不存在的 ref。
-#     ⇒ 先按默认分支装；**待上游打 tag 后改成 `@vX.Y.Z`**（那时也才真正可复现）。
+# 用 **URL 依赖**（PEP 508 direct reference）并**钉到 tag**：
+# `mecha @ git+https://github.com/tomisnot/mecha@v0.2.0`
+#   - **为什么可以钉了**：上游 `v0.2.0` 已发布（annotated tag → `4c6544d`，与它自己
+#     `pyproject.toml` 的 `version = "0.2.0"` 一致），且上游历史**已定稿、不会再重写**
+#     ⇒ tag 不会漂。（此前不钉的理由——"无 tag + 历史仍在重写"——已消失。）
+#   - 钉 tag 而不是 SHA：tag 是可读的发布点，SHA 只在"上游没有 tag"时才更稳。
 #   - **为什么不写本地路径**：`file://` 绝对/相对路径会把"环境漂移"从"未声明"换成"路径失效"
 #     （换机器/换盘符/换目录名就崩）。
-#   - ⚠ **`github.com/tomisnot/mecha` 目前返回 404**（账号存在、仓未建或未公开）⇒
-#     **公开发布前必须先建仓/开权限**，否则 `pip install -e ".[ai]"` 会因"仓库不存在"失败。
-#     本仓的 `tests/test_delivery_contract.py` 只做**声明一致性**检查，不联网验证可达性。
+#   - ⚠ **`github.com/tomisnot/mecha` 目前仍返回 404**（账号 `tomisnot` 存在=200，仓未建/未公开）
+#     ⇒ **上游仓建好之后这个 URL 才可解析**；否则 `pip install -e ".[ai]"` 会因"仓库不存在"失败。
+#     （与 tag 无关：tag 已在本地上游仓里打好了。）
 #   - **本地开发**仍走 `requirements.txt` 的 `-e ../mecha`（兄弟仓可编辑安装）；
-#     两条路**同一事实、不同场合**：公开安装用 URL，本机开发用可编辑安装。
+#     两条路**同一事实、不同场合**：公开安装用 URL+tag，本机开发用可编辑安装。
 #
 # ## 未声明的东西（不是遗漏）
 #   - `[project.scripts]`：入口仍是仓库根的 `python launcher.py`（看门人）/
@@ -63,11 +65,11 @@ dependencies = [
 
 [project.optional-dependencies]
 #: AI 模式：宿主框架 mecha + MCP 工具服务（streamable-http）+ 只读监控端点。
-#: mecha 是 URL 依赖（见上方说明：上游暂无 tag ⇒ 先按默认分支；发布前需先建仓）。
+#: mecha 是 URL 依赖并**钉到 tag `v0.2.0`**（见上方说明；上游仓建好后该 URL 才可解析）。
 #: `mcp>=2.2,<3`：`MCPServer` 与 `_tool_manager.get_tool` 是 2.2 的形状；
 #: `uvicorn` 是被**直接** import 的，不是仅传递依赖。
 ai = [
-    "mecha @ git+https://github.com/tomisnot/mecha",
+    "mecha @ git+https://github.com/tomisnot/mecha@v0.2.0",
     "mcp>=2.2,<3",
     "uvicorn>=0.30",
 ]
