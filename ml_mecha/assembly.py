@@ -394,7 +394,11 @@ def _history_event_writer(history: History, artifacts):
                 json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
                 kind="ml_run_summary", name=run_id)
             payload["artifact_locator"] = locator
-        history.append(key, payload, actor, "ml_mecha:command", call_id)
+        # ⚠ 新事件形状（mecha `926b90d`）：`History.append` 已被
+        # `append_state` / `append_history` 取代。域运行摘要**只记史**（`ml.run` 不进快照）
+        # ⇒ 用 `append_history(op=…, target="", after=…)`：`op` 承载事件名，`target` 留空。
+        history.append_history("ml.run", after=payload, actor=actor,
+                               reason="ml_mecha:command", call_id=call_id)
     return write
 
 

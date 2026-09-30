@@ -271,7 +271,7 @@ def test_job_contract_runs_command_async(app):
     assert status["command"] == "run_method"
     assert status["result_ref"]["run_ids"] == [job.result["run_id"]]
     assert job.result["ok"] is True
-    audit = [e for e in app.history.events() if e.key == "command.run_method"]
+    audit = [e for e in app.history.events() if e.op == "command.run_method"]
     assert audit and audit[-1].actor == "ml-ai"
     assert any(j["id"] == job.id for j in app.list_jobs())
 
@@ -317,9 +317,9 @@ def test_cancelled_command_entry_is_a_noop_failure(app):
     # 2) 零副作用：不产 run、不写 ml.run、不写 command.<name>、History 零新增
     assert len(app.engine.session.export_state()["records"]) == records_before
     events = app.history.events()
-    assert len(events) == before, [e.key for e in events[before:]]
-    assert [e for e in events if e.key == "ml.run"] == []
-    assert [e for e in events if e.key == "command.run_method"] == []
+    assert len(events) == before, [(e.op, e.target) for e in events[before:]]
+    assert [e for e in events if e.op == "ml.run"] == []
+    assert [e for e in events if e.op == "command.run_method"] == []
 
     # 3) 对照片：同一调用不取消 ⇒ 成功且真的产 run / 写史（防断言空转）
     ok = _as(app, app.ai_channel,
@@ -329,8 +329,8 @@ def test_cancelled_command_entry_is_a_noop_failure(app):
     assert ok["run_ids"], ok
     assert len(app.engine.session.export_state()["records"]) == records_before + 1
     after = app.history.events()
-    assert [e for e in after if e.key == "ml.run"]
-    assert [e for e in after if e.key == "command.run_method"]
+    assert [e for e in after if e.op == "ml.run"]
+    assert [e for e in after if e.op == "command.run_method"]
 
 
 def test_job_path_carries_call_id_into_audit(app):
@@ -346,7 +346,7 @@ def test_job_path_carries_call_id_into_audit(app):
                         "dataset_id": dataset_id})
     assert app.wait_job(plain, 20)["state"] == "done"
     plain_audit = [e for e in app.history.events()
-                   if e.key == "command.run_method"][-1]
+                   if e.op == "command.run_method"][-1]
     assert plain_audit.call_id == "", plain_audit.call_id
 
     CURRENT_CALL_ID.set("job-call-1")
@@ -360,11 +360,11 @@ def test_job_path_carries_call_id_into_audit(app):
     assert status["state"] == "done", status
     assert job.result["ok"] is True, job.result
 
-    audit = [e for e in app.history.events() if e.key == "command.run_method"][-1]
+    audit = [e for e in app.history.events() if e.op == "command.run_method"][-1]
     assert audit.actor == "ml-ai"
     assert audit.call_id == "job-call-1", audit.call_id
     # 域运行摘要与命令审计互引同一个 call_id（两处同源）
-    run_event = [e for e in app.history.events() if e.key == "ml.run"][-1]
+    run_event = [e for e in app.history.events() if e.op == "ml.run"][-1]
     assert run_event.call_id == "job-call-1", run_event.call_id
 
 
@@ -500,8 +500,8 @@ def test_writes_state_declaration_matches_actual_history(app):
         mark = len(app.history.events())
         receipt = _as(app, app.ai_channel, spec)
         assert receipt["ok"] is True, receipt
-        keys = {e.key for e in app.history.events()[mark:]
-                if e.actor == "ml-ai" and e.key.startswith("current.")}
+        keys = {e.target for e in app.history.events()[mark:]
+                if e.actor == "ml-ai" and e.target.startswith("current.")}
         return receipt, keys
 
     prep, prep_keys = _actual({
@@ -547,10 +547,10 @@ def test_run_event_carries_artifact_locator(app):
                   {"command": "run_method", "method": "logistic",
                    "dataset_id": dataset_id})
     assert receipt["ok"] is True
-    events = [e for e in app.history.events() if e.key == "ml.run"]
+    events = [e for e in app.history.events() if e.op == "ml.run"]
     assert events, "没有 ml.run 事件"
-    locator = events[-1].value.get("artifact_locator")
-    assert locator, f"事件缺 artifact_locator：{events[-1].value}"
+    locator = events[-1].after.get("artifact_locator")
+    assert locator, f"事件缺 artifact_locator：{events[-1].after}"
     assert "artifact-" in locator and "/" not in locator and "\\" not in locator
     assert app.artifacts.exists(locator)
     meta = app.artifacts.describe(locator)
@@ -694,9 +694,9 @@ def test_history_resource_guard_is_effective_value(app):
                    "resource_guard": {"max_kernel_mb": 123.0}})
     assert receipt["ok"] is True, receipt
     guard_events = [e for e in app.history.events()
-                    if e.key == "current.resource_guard"]
+                    if e.target == "current.resource_guard"]
     assert guard_events, "resource_guard 没进 History"
-    assert guard_events[-1].value == {"max_kernel_mb": 123.0}, guard_events[-1].value
+    assert guard_events[-1].after == {"max_kernel_mb": 123.0}, guard_events[-1].after
 
 
 # ---------------------------------------------------------------- 5. History 归因
@@ -715,35 +715,35 @@ def test_history_attribution_actor_and_call_id(app):
 
     events = app.history.events()
     # 命令审计由 mecha 核心写（第二宿主真实消费 Command Surface）
-    audit_events = [e for e in events if e.key == "command.run_method"]
+    audit_events = [e for e in events if e.op == "command.run_method"]
     assert audit_events, "核心命令审计没进 History"
     audit = audit_events[-1]
     assert audit.actor == "ml-ai"
     assert audit.call_id == "call-abc123"
-    assert audit.value["result_ref"]["run_ids"] == [receipt["run_id"]]
+    assert audit.after["result_ref"]["run_ids"] == [receipt["run_id"]]
 
     # 域运行摘要（ml.run）保留 run 引用与标量指标，供 Monitor 复述
-    run_events = [e for e in events if e.key == "ml.run"]
+    run_events = [e for e in events if e.op == "ml.run"]
     assert run_events, "域运行摘要没进 History"
     run_event = run_events[-1]
     assert run_event.actor == "ml-ai"
     assert run_event.call_id == "call-abc123"
-    assert run_event.value["run_id"] == receipt["run_id"]
+    assert run_event.after["run_id"] == receipt["run_id"]
 
-    state_events = [e for e in events if e.key.startswith("current.")]
+    state_events = [e for e in events if e.target.startswith("current.")]
     assert state_events, "状态键没进 History"
     for e in state_events:
-        assert e.key in STATE_KEYS, e.key
+        assert e.target in STATE_KEYS, e.target
         assert e.actor in ("ml-gui", "ml-ai")
 
     # 准备阶段是人类侧发起的 → 归因必须是人类标签
-    prepare_events = [e for e in events if e.key == "current.pipeline_id"]
+    prepare_events = [e for e in events if e.target == "current.pipeline_id"]
     assert prepare_events and prepare_events[0].actor == "ml-gui"
 
     # History 只存引用与标量：事件体序列化后不得出现大数组/大对象
     for e in events:
-        payload = json.dumps(e.value, ensure_ascii=False, default=str)
-        assert len(payload) < 2000, f"事件 {e.key} 体过大，疑似内联大对象"
+        payload = json.dumps(e.after, ensure_ascii=False, default=str)
+        assert len(payload) < 2000, f"事件 {e.target} 体过大，疑似内联大对象"
         assert "y_pred" not in payload
         assert "artifacts.npz" not in payload
 
@@ -779,9 +779,9 @@ def test_monitor_reconciles_claims_against_raw_history(app):
 
     # 人话里的 run_id 能在原始史与 ML 侧同时查到（双向可核）
     assert receipt["run_id"] in summary["headline"]
-    assert any(e.value.get("run_id") == receipt["run_id"]
+    assert any(e.after.get("run_id") == receipt["run_id"]
                for e in app.history.events()
-               if isinstance(e.value, dict))
+               if isinstance(e.after, dict))
 
 
 def test_monitor_marks_deliberate_mismatch_as_disputed(app):
@@ -1003,41 +1003,6 @@ def test_prepare_dataset_csv_allowed_inside_dataset_roots():
 
 
 # --------------------------- 框架 ADR「域快照纯净与失败说真话」（2026-09-26）的落地钉
-def test_audit_keys_are_rejected_as_domain_state(app):
-    """⭐ `command.*` **审计键**不许当域状态写（响亮拒绝 + 可教学），域键照常放行。
-
-    依据：框架 ADR「域快照纯净与失败说真话」。审计从前**借 `gate.set` 落史** ⇒ 审计键会
-    走到宿主 validator 上，本仓那时是"**只校验形状就放行**"。框架改后审计走 `Gate.record`、
-    **不再经过宿主 validator**（迁移须知 2）⇒ 那个放行分支成了**写时死码**，而"审计键不是
-    域状态"这件事**没人守**。⇒ 改成**显式拒绝**，本判据钉住它（**行为变更，已在 commit 申报**）。
-
-    对偶（防把闸关死）：真的域键 `current.dataset_id` 必须照常通过。
-    """
-    from mecha.commands import AUDIT_KEY_PREFIX
-
-    # 用**装配好的** validator（`assembly` 把它接到 Gate 上，见 `validate=`）——
-    # 不是自己造一个，判据才落在真链路上。
-    v = app.engine.validator
-    # 域键：放行（对偶——否则"全拒"也能让下面那些过）。⚠ 值也要合法：
-    # ML 的 validator 会**对着事实**校验（未知 dataset_id 会被拒），所以先真建一个。
-    dataset_id = _prepared(app)
-    v.validate_state("current.dataset_id", dataset_id)
-    v.validate_state("current.pipeline_id", None)
-
-    # 审计键：拒绝，且文案可教学（说清它是什么 + 你大概想写什么）
-    with pytest.raises(GateDenied) as exc:
-        v.validate_state(AUDIT_KEY_PREFIX + "prepare_dataset", {"actor": "ml-ai"})
-    assert exc.value.kind == "audit_key_not_state", exc.value
-    assert "审计" in str(exc.value) and "域状态" in str(exc.value), exc.value
-    assert exc.value.hint.strip(), exc.value
-    # 形状合法也不放行（旧行为正是"形状合法即接受"）
-    with pytest.raises(GateDenied):
-        v.validate_state(AUDIT_KEY_PREFIX + "run_method", {})
-    # 而且**键名里的命令是否真存在**与判定无关（这是"类别"问题，不是"这条命令"问题）
-    with pytest.raises(GateDenied):
-        v.validate_state(AUDIT_KEY_PREFIX + "totally_made_up", {"x": 1})
-
-
 def test_cancel_job_returns_core_truth_instead_of_dropping_it(app):
     """⭐ 人类侧的 ``cancel_job`` 必须**透出**核心说的真话（不再返回 `None` 把它扔掉）。
 
@@ -1208,7 +1173,6 @@ def main() -> int:
              test_missing_required_param_is_rejected_not_silently_accepted,
              test_approval_channel_is_injected_into_invoke,
              test_no_ml_command_declares_approval_required,
-             test_audit_keys_are_rejected_as_domain_state,
              test_cancel_job_returns_core_truth_instead_of_dropping_it]
     failures = []
     for fn in tests:

@@ -48,8 +48,9 @@ def ml_summarizer(events: list[Event]) -> Mapping[str, Any]:
     不一致即把整份读数标成 ``disputed``（原始赢）。
     """
     raw = fold(events)
-    commands = [e for e in events if str(e.key).startswith(COMMAND_EVENT_PREFIX)]
-    runs = [_compact_run(e) for e in commands if e.value]
+    # ⚠ 事件名在 `op`（新形状）：`ml.run` 是 history 事件，`target` 为空、不进快照。
+    commands = [e for e in events if str(e.op).startswith(COMMAND_EVENT_PREFIX)]
+    runs = [_compact_run(e) for e in commands if e.after]
     runs = [r for r in runs if r]
 
     methods = _unique(r["method"] for r in runs if r["method"])
@@ -94,8 +95,8 @@ def ml_summarizer(events: list[Event]) -> Mapping[str, Any]:
     if runs:
         last_key = None
         for e in reversed(commands):
-            if e.value:
-                last_key = e.key
+            if e.after:
+                last_key = e.op
                 break
         if last_key is not None and last_key in raw:
             summary["latest_run"] = Claim(raw[last_key], target=last_key)
@@ -134,7 +135,7 @@ def _fmt(value: Any) -> str:
 
 
 def _compact_run(event: Event) -> dict[str, Any]:
-    value = event.value
+    value = event.after
     if not isinstance(value, Mapping):
         return {}
     metrics = value.get("metrics")

@@ -788,7 +788,7 @@ def test_write_tool_is_fail_closed_while_locked():
             assert payload["ok"] is False, payload
             assert payload["error"]["info"]["kind"] == "authority_locked", payload
             # 被拒的写：快照/内存/史都不留半拉子状态
-            assert ml.history.events() == [], [e.key for e in ml.history.events()]
+            assert ml.history.events() == [], [(e.op, e.target) for e in ml.history.events()]
             assert ml.engine.dataset_ids() == []
 
 
@@ -818,8 +818,8 @@ def test_open_gate_write_tools_run_and_call_id_is_attributed():
 
             # call_id 互引：ctx 注入没生效的话这里会是空串
             events = ml.history.events()
-            ds_events = [e for e in events if e.key == "current.dataset_id"]
-            assert ds_events, [e.key for e in events]
+            ds_events = [e for e in events if e.target == "current.dataset_id"]
+            assert ds_events, [(e.op, e.target) for e in events]
             assert ds_events[-1].actor == "ml-ai", ds_events[-1]
             assert ds_events[-1].call_id != "", "MCP request_id 未进 call_id（ctx 没注入？）"
 
@@ -1091,9 +1091,13 @@ def test_monitor_shapes_match_el_cockpit_contract():
     """监控端点**逐字段**对齐 EL `_MonitorHandler`——面板才能不改渲染逻辑。
 
     只读端点是"面板能不能直接用"的契约面，所以断言的是**字段名与取值语义**，
-    不是"有响应就算过"：`/history` 必须含 `seq/kind/actor/target/value/before/
-    after/reason/call_id`，且 `kind == "set"`、`before` 由全史 fold 重建；
-    `/config` 必须 `has_schema=False` + 快照键全进 `orphans`（**不许造树**）。
+    不是"有响应就算过"。
+    ⚠ **2026-09-30 随 mecha `926b90d` 更新期望**（事件形状改名）：`/history` 现在是
+    `seq/kind/actor/op/target/after/before/reason/call_id/ts`（**`value` 已取消**、
+    新增 `op` 与 `ts`；`op` 对 state 事件恒为 `"set"`）；`/activity` 仍是 6 键
+    `kind/actor/target/value/seq/call_id`（**它的 `value` 没改名**，那是另一条 wire）。
+    `before` 由全史 fold 重建；`/config` 必须 `has_schema=False` + 快照键全进 `orphans`
+    （**不许造树**）。
     """
     from ml_mecha.monitor_http import MonitorEndpoint
     from ml_mecha.runtime import MONITOR_PORT_FILE, read_port
@@ -1136,10 +1140,18 @@ def test_monitor_shapes_match_el_cockpit_contract():
                 assert code == 200 and hist["mode"] == "ai"
                 assert hist["events"], "跑过运行就该有事件"
                 for ev in hist["events"]:
-                    assert set(ev) == {"seq", "kind", "actor", "target", "value",
-                                       "before", "after", "reason", "call_id"}, ev
+                    # ⚠ 新形状（mecha `926b90d`）：`value` 取消、改 `after`；新增 `op`/`ts`
+                    assert set(ev) == {"seq", "kind", "actor", "op", "target", "after",
+                                       "before", "reason", "call_id", "ts"}, ev
                     assert ev["kind"] == "set", ev
-                    assert ev["after"] == ev["value"], ev
+                    # `op` 与 `target` 的分工（新形状的要害）：
+                    #   **只有域状态事件带 `target`**（且 `op` 恒为 `"set"`）；
+                    #   其余（审计 `command.<name>`、本仓的域事件 `ml.run`）**`target` 为空**
+                    #   ——它们的"名字"在 `op` 里（这正是类 C：按名字筛要用 `op`）。
+                    assert ev["op"], ev            # op 恒非空（新形状的必填）
+                    assert (ev["op"] == "set") == bool(ev["target"]), ev
+                    if ev["op"] == "set":
+                        assert ev["target"].startswith("current."), ev
                 assert hist["events"][0]["before"] is None, \
                     f"首写 before 必须是 None：{hist['events'][0]}"
                 assert [e for e in hist["events"] if e["before"] is not None], \
