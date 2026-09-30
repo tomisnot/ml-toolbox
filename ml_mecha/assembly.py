@@ -353,9 +353,21 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
     engine.bind_command_registry(software.commands, software.gate,
                                 approval=software.approval)
 
-    # 作用域写权：命令 scope 用 ML 自己的命令名（不透明字符串）。人类侧全给；
-    # AI 侧只给当前开放的四条命令——未来 export/predict 等新命令必须显式加授，
-    # 否则 AI 在副作用之前被 scope_denied（fail closed）。
+    # 作用域写权：命令 scope 用 ML 自己的命令名（不透明字符串）。
+    # ⚠ **实情（2026-09-30 校正注释）**：两条 side 通道**同授全部已注册命令**——
+    # `all_scopes` 就是 `HOST_COMMANDS` 的**那四条**（prepare_dataset / run_method /
+    # run_method_batch / compare_methods）⇒ 今天这个闸**不区分两侧**。
+    # 这与能力图的声明**一致**（`capabilities.py` 的
+    # `CONSUMERS_BY_KIND[KIND_COMMAND] = (adapter.ai, adapter.gui)`，注明"两条 side 通道都有 scope"）；
+    # 工具面才是 AI 独有的（`register_ml_tools(..., side="ai")` + `KIND_TOOL: (adapter.ai,)`）。
+    # ⇒ 本闸的价值是**运行期可撤销**：`scopes.revoke("ai", "run_method")` 之后，AI 的下一次调用
+    #   会在副作用之前被 `scope_denied` 挡住（判据 `test_scope_policy_denies_unlisted_command_scope`
+    #   钉的就是这条：先拒、再 `grant` 回来即放行）。
+    # ⚠ **此前的注释在这里说了假话**：它写"未来 export/predict 等新命令必须显式加授，否则被
+    #   `scope_denied`"——但 `all_scopes` 是**装配时**从 `HOST_COMMANDS` 算出来的 ⇒ 新增命令会
+    #   **自动**进 AI 的授权集，不会出现"必须显式加授"。若要"新命令默认不给 AI"，那是**代码变更**
+    #   （把 AI 侧改成显式白名单，如 `scopes.grant("ai", "prepare_dataset", …)` 逐条列），
+    #   属行为变更，不是注释能表达的。
     scopes = ScopePolicy()
     all_scopes = tuple(c.name for c in HOST_COMMANDS)
     scopes.grant("human", *all_scopes)
