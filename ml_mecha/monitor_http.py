@@ -189,6 +189,6 @@ def start_monitor_endpoint(ml: Any, *, host: str = "127.0.0.1", port: int = 0,
 #: 公开面：端点壳 + ML 的取数函数。框架的 ``CORE_ROUTES`` / ``MonitorSource`` /
 #: ``start_monitor_endpoint`` **不在这里转发**，``MONITOR_PORT_FILE`` 也**不**转发
 #: ——它们的权威归属分别是 ``mecha.cockpit`` 与 ``ml_mecha.runtime``，本仓零消费者
-#: （判据要用就直接去那两个地方取；R1：没有具名消费者的转发面不留）。
+#: （判据要用就直接去那两个地方取；R1：没有消费的转发面不留）。
 __all__ = ["MonitorEndpoint", "start_monitor_endpoint", "history_records",
            "activity_records", "config_tree", "summary_view", "archived_runs"]

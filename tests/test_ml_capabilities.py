@@ -243,7 +243,7 @@ def test_merge_with_mecha_merges_and_sorts():
     assert names == sorted(names)
     assert len(merged) == len(ml_rows) + len(build_roles().entries())
     assert set(names) >= {row["name"] for row in ml_rows}
-    # mecha 出厂脊椎件在同表里（两宿主真的进了同一张表）
+    # mecha 出厂正职件在同表里（两宿主真的进了同一张表）
     assert {"gate", "history", "surface", "monitor", "authority"} <= set(names)
     for row in merged:
         assert set(row) == set(CAPABILITY_FIELDS), row["name"]

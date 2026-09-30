@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""唯一装配点：把 ML host adapter 接到 mecha 的稳定脊椎上（宪章 §11.1）。
+"""唯一装配点：把 ML host adapter 接到 mecha 的四件正职上（宪章 §11.1）。
 
 ``assemble`` 是 mecha 的唯一具名装配点（ADR 装配统一-assemble单点），本模块
 只是**调用它**并补齐 ML 侧的注入：项目名、数据目录名、校验器、概括器、
