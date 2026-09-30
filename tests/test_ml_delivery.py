@@ -496,7 +496,7 @@ EXPECTED_DEFAULTED = {
     "describe_run": ["run_id"],
     "prepare_dataset": ["diag", "name", "target", "time_col"],
     "read_job": ["wait_s"],
-    "run_method": ["dataset_id", "device", "persist"],
+    "run_method": ["dataset_id", "device", "diag", "persist"],
     "run_method_batch": ["dataset_id"],
     "submit_run": ["dataset_id", "device"],
 }
@@ -615,7 +615,7 @@ _MIN_ARGS = {
 
 #: 可选参数总数（26 = 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
 #: "每个可选参数都被判据看过一遍"（新增参数会在这里红，提醒补探针）。
-_EXPECTED_OPTIONAL_PARAMS = 27
+_EXPECTED_OPTIONAL_PARAMS = 28
 
 
 def test_null_shim_rule_partitions_every_optional_param():
