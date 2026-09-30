@@ -296,7 +296,7 @@ def _prepare_dataset(engine: MLEngine, wrap,
                                       "{'kind': 'frame', 'frame': <表格>}、"
                                       "{'kind': 'arrays', 'X': [...], 'y': [...]}、"
                                       "{'kind': 'synthetic', 'task': 'classification'}"},
-            "name": {"type": "string", "description": "数据集显示名", "default": ""},
+            "name": {"type": "string", "description": "数据集显示名", "default": "dataset"},
             "target": {"type": "string", "description": "目标列名（监督/时序任务需要）",
                        "default": ""},
             "time_col": {"type": "string", "description": "时序任务的时间列名",
@@ -345,7 +345,7 @@ def _run_method(engine: MLEngine, wrap,
         description="在已准备的数据视图上运行一个机器学习方法并返回运行编号与指标摘要；"
                     "预测数组等大产物留在结果侧，此处只给运行编号。",
         parameters={
-            "method": {"type": "string", "description": "方法名"},
+            "method": {"type": "string", "description": "已注册的方法名"},
             "dataset_id": {"type": "string",
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},
@@ -355,7 +355,7 @@ def _run_method(engine: MLEngine, wrap,
                                "description": "资源预算声明，例如 {'max_kernel_mb': 128}"},
             "device": {"type": "string", "description": "计算设备声明：auto / cpu / cuda:0",
                        "default": ""},
-            "persist": {"type": "boolean", "description": "是否把这次运行写入运行存档",
+            "persist": {"type": "boolean", "description": "是否把本次运行写入 ML 运行存档",
                         "default": False},
         },
         output_schema={"type": "object",
@@ -399,7 +399,7 @@ def _run_method_batch(engine: MLEngine, wrap,
         description="在同一份数据视图上顺序运行多个方法，逐方法隔离失败；"
                     "返回每个方法的运行编号与指标，失败项只给编号与原因。",
         parameters={
-            "methods": {"type": "array", "description": "按顺序运行的方法名列表"},
+            "methods": {"type": "array", "description": "按顺序运行的方法名列表（受数量上限约束）"},
             "dataset_id": {"type": "string",
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},
@@ -420,7 +420,8 @@ def _compare_methods(engine: MLEngine, wrap,
                      banned_words: tuple[str, ...] = ()) -> ToolDefinition:
     def execute(*, methods: list[str], dataset_id: str = "",
                 seed: int | None = None,
-                overrides: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+                overrides: Mapping[str, Any] | None = None,
+                resource_guard: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "compare_methods",
                                 "methods": list(methods)}
         if dataset_id:
@@ -429,6 +430,8 @@ def _compare_methods(engine: MLEngine, wrap,
             spec["seed"] = seed
         if overrides:
             spec["overrides"] = dict(overrides)
+        if resource_guard:
+            spec["resource_guard"] = dict(resource_guard)
         # 与 run_method_batch 同一规则：部分成功不是工具失败（否则成功项的
         # run_id / table 会被一起丢掉，与 description 承诺的"失败项只给编号与
         # 原因"自相矛盾）；全部失败才 fail loud。
@@ -453,6 +456,8 @@ def _compare_methods(engine: MLEngine, wrap,
                            "default": ""},
             "seed": {"type": "integer", "description": "随机种子（整数）"},
             "overrides": {"type": "object", "description": "所有方法共用的运行级参数覆写"},
+            "resource_guard": {"type": "object",
+                               "description": "资源预算声明，例如 {'max_kernel_mb': 128}"},
         },
         output_schema={"type": "object",
                        "required": ["ok", "run_ids", "primary_metric", "table",

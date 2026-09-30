@@ -90,14 +90,14 @@ class CommandSpec:
 COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="prepare_dataset",
-        summary="准备数据视图：登记数据集并在训练段上拟合预处理管道，返回 dataset_id 与管道指纹。",
+        summary="登记一份数据并在训练部分上拟合预处理链，返回数据集引用与管道指纹；数据来源可给文件路径、进程内表格、数组或合成规格。",
         parameters=(
             CommandParam("source", "object", True,
-                         "数据来源：{'kind': 'csv'|'frame'|'arrays'|'synthetic', ...}"),
+                         "数据来源声明，例如 {'kind': 'csv', 'path': 'x.csv'}、{'kind': 'frame', 'frame': <表格>}、{'kind': 'arrays', 'X': [...], 'y': [...]}、{'kind': 'synthetic', 'task': 'classification'}"),
             CommandParam("name", "string", False, "数据集显示名", "dataset"),
-            CommandParam("target", "string", False, "目标列名（监督/时序任务需要）"),
-            CommandParam("time_col", "string", False, "时序任务的时间列名"),
-            CommandParam("diag", "boolean", False, "是否在管道链里保留诊断中间产物", False),
+            CommandParam("target", "string", False, "目标列名（监督/时序任务需要）", ""),
+            CommandParam("time_col", "string", False, "时序任务的时间列名", ""),
+            CommandParam("diag", "boolean", False, "是否保留预处理链的诊断中间产物", False),
         ),
         writes_state=("current.dataset_id", "current.pipeline_id"),
         side_effect=SIDE_EFFECT_DOMAIN_STATE,
@@ -106,16 +106,16 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         name="run_method",
-        summary="在已准备的数据视图上运行一个方法，返回 run_id 与指标摘要（不内联预测数组）。",
+        summary="在已准备的数据视图上运行一个机器学习方法并返回运行编号与指标摘要；预测数组等大产物留在结果侧，此处只给运行编号。",
         parameters=(
             CommandParam("method", "string", True, "已注册的方法名"),
-            CommandParam("dataset_id", "string", False, "数据集引用；省略用当前数据集"),
+            CommandParam("dataset_id", "string", False, "数据集引用；留空用最近准备的一份", ""),
             CommandParam("overrides", "object", False, "运行级参数覆写（不改全局默认）"),
             CommandParam("seed", "integer", False, "随机种子（整数）"),
             CommandParam("diag", "boolean", False, "是否保留诊断信息", False),
             CommandParam("persist", "boolean", False, "是否把本次运行写入 ML 运行存档", False),
-            CommandParam("resource_guard", "object", False, "资源预算守卫声明"),
-            CommandParam("device", "string", False, "计算设备声明（auto/cpu/cuda[:n]）"),
+            CommandParam("resource_guard", "object", False, "资源预算声明，例如 {'max_kernel_mb': 128}"),
+            CommandParam("device", "string", False, "计算设备声明：auto / cpu / cuda:0", ""),
         ),
         # 声明必须**逐键等于**实际写入：run_method 的 `_write_state` 也写
         # `current.dataset_id`（隐含数据集解析），漏声明就是声明漂移
@@ -129,13 +129,13 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         name="run_method_batch",
-        summary="在同一数据视图上顺序运行多个方法，逐方法隔离失败，返回每个方法的 run_id 与指标。",
+        summary="在同一份数据视图上顺序运行多个方法，逐方法隔离失败；返回每个方法的运行编号与指标，失败项只给编号与原因。",
         parameters=(
-            CommandParam("methods", "array", True, "方法名列表（受数量上限约束）"),
-            CommandParam("dataset_id", "string", False, "数据集引用；省略用当前数据集"),
-            CommandParam("overrides", "object", False, "所有方法共用的运行级覆写"),
+            CommandParam("methods", "array", True, "按顺序运行的方法名列表（受数量上限约束）"),
+            CommandParam("dataset_id", "string", False, "数据集引用；留空用最近准备的一份", ""),
+            CommandParam("overrides", "object", False, "所有方法共用的运行级参数覆写"),
             CommandParam("seed", "integer", False, "随机种子（整数）"),
-            CommandParam("resource_guard", "object", False, "资源预算守卫声明"),
+            CommandParam("resource_guard", "object", False, "资源预算声明，例如 {'max_kernel_mb': 128}"),
         ),
         writes_state=("current.dataset_id", "current.seed", "current.overrides",
                       "current.resource_guard"),
@@ -145,13 +145,13 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         name="compare_methods",
-        summary="在一份数据视图上对比多个方法的同一主指标，返回可排序的对比摘要与最优方法。",
+        summary="在同一份数据视图上对比多个方法的主指标，返回可排序对比表与最优方法；逐方法隔离失败，失败项只给运行编号与失败原因。",
         parameters=(
             CommandParam("methods", "array", True, "参与对比的方法名列表"),
-            CommandParam("dataset_id", "string", False, "数据集引用；省略用当前数据集"),
+            CommandParam("dataset_id", "string", False, "数据集引用；留空用最近准备的一份", ""),
             CommandParam("seed", "integer", False, "随机种子（整数）"),
-            CommandParam("overrides", "object", False, "所有方法共用的运行级覆写"),
-            CommandParam("resource_guard", "object", False, "资源预算守卫声明"),
+            CommandParam("overrides", "object", False, "所有方法共用的运行级参数覆写"),
+            CommandParam("resource_guard", "object", False, "资源预算声明，例如 {'max_kernel_mb': 128}"),
         ),
         writes_state=("current.dataset_id", "current.seed",
                       "current.resource_guard"),

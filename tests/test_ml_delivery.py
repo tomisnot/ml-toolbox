@@ -261,7 +261,7 @@ def test_required_from_signature_and_declaration_survives():
             # 派生会加的 "title"（有 title 说明覆写没生效，声明被冲掉了）
             method = by_name["run_method"].input_schema["properties"]["method"]
             assert method["type"] == "string", method
-            assert method["description"] == "方法名", method
+            assert method["description"] == "已注册的方法名", method
             assert "title" not in method, method
 
             # 可选项带真实默认值（声明里的 default），不是派生出来的 null
@@ -615,7 +615,7 @@ _MIN_ARGS = {
 
 #: 可选参数总数（26 = 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
 #: "每个可选参数都被判据看过一遍"（新增参数会在这里红，提醒补探针）。
-_EXPECTED_OPTIONAL_PARAMS = 26
+_EXPECTED_OPTIONAL_PARAMS = 27
 
 
 def test_null_shim_rule_partitions_every_optional_param():
