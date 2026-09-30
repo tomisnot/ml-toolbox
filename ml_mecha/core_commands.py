@@ -31,6 +31,7 @@ def core_command_specs() -> list[CommandSpec]:
             description=host.summary,
             parameters={"type": "object", "properties": properties,
                         "required": required},
+            # ⚠ 这是【**命令面统一回执**】；工具面那份是【本工具返回哪些键】——两层不同，不是漂移。
             output_schema={"type": "object",
                            "required": list(RECEIPT_REQUIRED_KEYS)},
             side_effect=host.side_effect != SIDE_EFFECT_NONE,
