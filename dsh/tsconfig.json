@@ -8,6 +8,10 @@
     // 资产（`dsh/src/dsh-panel/*`）的 import 带 `.ts`/`.tsx` 扩展名、且 tsdown 也照此解析
     // ⇒ 必须开这一条（否则报 TS5097）。这不是"放松"，是模块解析口径。
     "allowImportingTsExtensions": true,
+    // ⭐ 必须开：`@mecha/dsh-panel` 经 **junction** 装进来（`file:` 依赖 ⇒ 磁盘上只有一份代码）。
+    // TypeScript 默认按资产的**真实路径**找它自己的依赖（MCP SDK / react），而那里没有我们
+    // 仓里的 node_modules ⇒ 不开这条会报 `TS2307`，且报错位置离病因很远。
+    "preserveSymlinks": true,
     "strict": true,
     // 资产 README 把「能在**最严**的消费者 tsconfig 下编译」写成硬约束（EL 用的是
     // `--strict --noUncheckedIndexedAccess`）⇒ 本仓按同一档验收，不为资产放松任何旗标。
@@ -17,5 +21,7 @@
     // `node:*` / `process` / `Buffer`：资产单测与 host 半都要（`@types/node` 已进 devDeps）
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "types/**/*.d.ts"]
+  // `test/**` 也要在列：依赖化之后闭包守卫要断言"@mecha/dsh-panel 真的被解析到"
+  // （`test/re0-panel.test.ts` 那条先例的口径），漏了 test 它就不参与类型检查。
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "types/**/*.d.ts"]
 }
