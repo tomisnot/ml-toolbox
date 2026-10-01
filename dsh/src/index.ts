@@ -3,18 +3,19 @@
  *
  * 职责**只有一件**：把 ML 只读监控端点的地址交给 client 半（面板要轮询它）。
  *
- * ## 现在这份实现来自共享资产
+ * ## 现在这份实现来自共享资产**包**
  *
- * 路由处理、端口文件解析、"绝不回落"的纪律都在逐字复制的
- * `../dsh-panel/monitor-url.ts`（`makeMonitorUrlHandler` + `resolveMonitorBase`）里；
- * 本文件只剩 ML 的两件事：**参数块**（`../dsh-panel/panel-config.ts`）与
- * **数据根从哪来**（`MLTB_ML_ROOT` 环境变量，看门人起 dsh 时显式设置）。
+ * 路由处理、端口文件解析、"绝不回落"的纪律都在 `@mecha/dsh-panel/host/monitor-url.ts`
+ * （`makeMonitorUrlHandler` + `resolveMonitorBase`）里——它是 **`file:` 依赖**
+ * （junction 指向 mecha 仓那一份，磁盘上只有一份代码），不再是本仓的逐字副本。
+ * 本文件只剩 ML 的三件事：**参数家**（`./ml-panel-params.ts`）、**注入**（见下）、
+ * 与**数据根从哪来**（`MLTB_ML_ROOT` 环境变量，看门人起 dsh 时显式设置）。
  *
  * ## ⚠ 行为变更（相对迁移前，已申报）
  *
  * **地址来源：两级 → 单级。** 迁移前本文件**先读 `.ml-mecha-runtime.json` 的
  * `monitor_port`，读不到再回落裸端口文件**；资产纪律是**单级、绝不回落**。
- * ⇒ 现在**只读 `.ml-monitor-port`**（`PANEL_CONFIG.PORT_FILE`），描述符**不再参与取址**。
+ * ⇒ 现在**只读 `.ml-monitor-port`**（`ML_PANEL.portFile`），描述符**不再参与取址**。
  * 后果（刻意）：裸端口文件缺失而描述符里有端口时，旧版能出面板、**新版回 `503` + 可读错误**
  * ——"权威没起来"不许伪装成"连上了但空面板"。
  *
@@ -30,17 +31,20 @@
  * 不写任何文件。不移植 EL 的自愈 MCP 桥（ML 的工具接入走 dsh 内置
  * `@deepseek-ai/dsh-mcp-client`；自愈桥只在命中 R1 时上，见 `dsh/README.md`）。
  */
-import { PANEL_CONFIG } from './dsh-panel/panel-config.ts'
-import { makeMonitorUrlHandler } from './dsh-panel/monitor-url.ts'
+import { configurePanel, panelConfig } from '@mecha/dsh-panel/panel/panel-config.ts'
+import { makeMonitorUrlHandler } from '@mecha/dsh-panel/host/monitor-url.ts'
+import { ML_PANEL } from './ml-panel-params.ts'
+
+// ⚠ **注入必须在模块顶层**（不是"更稳"，是**必需**）：资产的 `panelConfig()` **未注入即抛**，
+// 而这是个 **host 半**进程——client 半是另一份 bundle、另一个进程（浏览器），两半各注一次。
+// 放在 import 之后、任何读取之前，保证"本模块一加载就已注入"。
+configurePanel(ML_PANEL)
 
 /** Cordis 插件显示名（诊断用）。 */
 export const name = 'ml-toolbox-monitor'
 
 /** 只依赖 webserver 服务（注册那条只读路由）。 */
 export const inject = ['webServer']
-
-/** 挂载路径（**绝对、无尾斜杠**，dsh 路由契约要求）——与参数块同源，只有一处字面量。 */
-export const ROUTE_PATH = PANEL_CONFIG.ROUTE_PATH
 
 /**
  * 数据根的环境变量名：**看门人起 dsh 时显式设置**，指向 ML 仓根。
@@ -60,19 +64,26 @@ export function pluginRoot(): string | undefined {
 /**
  * 路由处理：能解析就 `200 {base}`；解析不了就 `503` + 可读错误（**不回落**）。
  *
+ * ⚠ **`portFile` 必须是 getter，不许"顺手简化"成普通属性**：
+ * 资产的惰性只针对**读取时机**（它在每次请求时才读 `opts.portFile`），而**值表达式在
+ * 调用处就被求值**。写成 `portFile: panelConfig().portFile` 的话，本模块**在 import 时**
+ * 就读 `panelConfig()`——于是"某条加载路径没先注入"会变成**每次插件加载都抛**，
+ * 而不是"面板请求时才 503"。且因为本文件此刻还没读面板参数，**类型检查不会报错**，
+ * 会一路绿到运行时。getter 把求值推迟到真正需要那一刻，与资产的惰性对齐。
+ *
  * ⚠ **每次请求现读端口文件**（资产实现，不缓存）：权威重启换端口后下一拍就落在新端口上。
  */
 export const monitorUrlHandler = makeMonitorUrlHandler({
   get root() { return pluginRoot() },
-  portFile: PANEL_CONFIG.PORT_FILE,
+  get portFile() { return panelConfig().portFile },
 })
 
-/** 挂载只读路由（路径来自参数块）。 */
+/** 挂载只读路由（路径来自 ML 的参数家，只有一处字面量）。 */
 export async function apply(ctx: any): Promise<void> {
   await ctx.effect(() => {
     const dispose = ctx.webServer.register({
       kind: 'exact',
-      path: ROUTE_PATH,
+      path: panelConfig().routePath,
       handler: monitorUrlHandler,
     })
     return () => {

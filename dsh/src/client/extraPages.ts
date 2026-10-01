@@ -16,7 +16,7 @@
  * 本仓让 `/summary` 也回 `rows`（= 操作史里的 `recent_runs`），于是"概括一行 + 表格"都在，
  * 既不丢信息也不会被误显示成"没有记录"。
  */
-import type { ExtraPageSpec } from '../dsh-panel/panel-view.ts'
+import type { ExtraPageSpec } from '@mecha/dsh-panel/panel/panel-view.ts'
 
 /** 取文本（`cell` 用；缺字段给空串，**不渲染 `undefined`**）。 */
 export const asText = (v: unknown): string =>

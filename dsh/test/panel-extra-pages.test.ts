@@ -13,7 +13,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EXTRA_PAGES, metricCell, savedAtCell, summaryLine } from '../src/client/extraPages.ts'
-import { extraPageHtml } from '../src/dsh-panel/panel-view.ts'
+import { extraPageHtml } from '@mecha/dsh-panel/panel/panel-view.ts'
 
 const byId = (id: string) => {
   const spec = EXTRA_PAGES.find((p) => p.id === id)

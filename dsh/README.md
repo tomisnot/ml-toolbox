@@ -1,23 +1,35 @@
 # ML Toolbox 的 dsh 插件（驾驶舱监控面板）
 
-> ## ⚠ 迁移后（2026-09-26）：面板与地址管线都换成**共享资产**
+> ## ⚠ 迁移后（2026-10-01）：面板资产改为**依赖包**（不再逐字复制）
 >
-> 三家项目（EL / Get Paper / ML）共用一个面板实现，来源是
-> `mecha/dsh-panel/`，**逐字复制**到本仓 **`src/dsh-panel/`**（提交态 `ab28452`，12 文件）。
-> * **本仓不再自绘面板**：`src/client/MonitorTabBody.tsx` 已删除；client 半只做「按钮 + tab
->   注册 + **两条附加页声明**」（`src/client/extraPages.ts`），面板本体、取数、错误档位、
->   R8 自证、布局与 CSS 全在资产里（`mecha-` 前缀，`mltb-` 那套已丢）。
-> * **只能改 `src/dsh-panel/panel-config.ts`**（参数块）；其余 11 个文件与上游**逐字一致**，
->   由 `dsh/test/panel-assets.test.ts` 的**常量指纹守卫**钉住（判据**不读 mecha**、不经 git）。
+> 三家项目（EL / Get Paper / ML）共用**同一份**面板实现，来源 `mecha/mecha/dsh-panel/`，
+> 以 **`file:` 依赖**接入（`node_modules/@mecha/dsh-panel` 是指向 mecha 仓的 **junction**
+> ⇒ 磁盘上只有一份代码，改它等于改 mecha）。**本仓的 12 文件副本已删除**。
+> * **本仓不再自绘面板**：client 半只做「按钮 + tab 注册 + **两条附加页声明**」
+>   （`src/client/extraPages.ts`），面板本体、取数、错误档位、布局与 CSS 全在资产里。
+> * **参数必须住进项目**（资产经 junction 只有一份 ⇒ 谁也不能改资产里的参数文件）：
+>   ML 的三个值在 **`src/ml-panel-params.ts`**（`ML_PANEL`），由**两半各注入一次**
+>   （`configurePanel(...)`；host 半 = `src/index.ts`，client 半 = `src/client/index.ts`。
+>   两份 bundle、两个进程 ⇒ 各注各的）。`panelConfig()` **未注入即抛**。
+> * **`tsconfig` 必须开 `preserveSymlinks: true`**（否则按资产真实路径找依赖 ⇒ `TS2307`）。
+>   ⚠ 但**不要**给 `npm test` 加 `--preserve-symlinks`：那样模块标识会停在
+>   `node_modules/…`，而 Node 24 的原生类型剥离**拒绝剥离 node_modules 下的 `.ts`**
+>   （`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`）⇒ 资产根本 import 不进来。
 > * **行为变更（已申报）**：① **地址来源两级 → 单级**（不再读 `.ml-mecha-runtime.json`，
->   只读 `PANEL_CONFIG.PORT_FILE = '.ml-monitor-port'`；读不到 ⇒ 路由 `503` + 可读错误，
+>   只读 `ML_PANEL.portFile = '.ml-monitor-port'`；读不到 ⇒ 路由 `503` + 可读错误，
 >   **绝不回落**）；② 旧面板把「操作史运行记录」与「磁盘存档」画在同一页 ⇒ 资产机制是
 >   **一页一条路由** ⇒ 现在**两页**。
-> * **验收命令**：`npm test`（共享 4 份单测 + 本仓 3 份守卫）、`npm run typecheck`
->   （`strict` + `noUncheckedIndexedAccess`，与 EL 同档）、`npm run bundle`（改 client 源码后必须重建）。
+> * **验收命令**：`npm test`（本仓 2 份判据：`test/ml-panel.test.ts` + `test/panel-extra-pages.test.ts`）、
+>   `npm run typecheck`（`strict` + `noUncheckedIndexedAccess`，与 EL 同档）、
+>   `npm run bundle`（改 client 源码后必须重建）。
+>   ⚠ 资产自带的 4 份共享单测**不由本仓跑**——它们随包发货，由**框架门禁**
+>   （`mecha/checks/dsh_panel_selfcheck.py`）跑（资产的单一副本 == 框架的资产）。
+> * **原「副本逐字一致」指纹判据已退场**（`test/panel-assets.test.ts` 删除）：承诺改由
+>   **结构**承担——不存在副本了。其中"参数块填了 ML 的值"改成 `test/ml-panel.test.ts` 的
+>   **注入往返**断言；"client 闭包零 `node:`"那条**保留并重写**为**跟着 junction 走进资产包**。
 >
-> 下面几节里"移植自 EL / 三页 / 读运行期描述符"等表述是**迁移前**的形态，保留作历史；
-> 当前真值以本节与 `src/dsh-panel/README.md`（资产自带文档）为准。
+> 下面几节里"移植自 EL / 读运行期描述符 / `src/dsh-panel/`"等表述是**更早形态**，
+> 保留作历史；当前真值以本节为准。
 
 工具接入**不**经过本插件——走 dsh 内置 `@deepseek-ai/dsh-mcp-client`（方案 A，
 见 内部记录（未随仓发布，存档在仓外） §4）。
@@ -26,7 +38,7 @@
 
 | 半 | 文件 | 职责 |
 |---|---|---|
-| HOST | `src/index.ts` → `lib/index.mjs` | 在 dsh **同源** webserver 上注册只读路由 `/ml-toolbox/monitor-url`，返回 `{base}`。**迁移后**：路由实现是资产的 `makeMonitorUrlHandler`，端口**只读裸端口文件**（`PANEL_CONFIG.PORT_FILE`），**不读运行期描述符、无硬编码默认值** |
+| HOST | `src/index.ts` → `lib/index.mjs` | 在 dsh **同源** webserver 上注册只读路由 `/ml-toolbox/monitor-url`，返回 `{base}`。**迁移后**：路由实现是资产的 `makeMonitorUrlHandler`，端口经 `panelConfig().portFile` 取（= `ML_PANEL.portFile`，`.ml-monitor-port`），**不读运行期描述符、无硬编码默认值** |
 | CLIENT | `src/client/*` → `lib/client.js` | 会话头「◈ 监控」按钮 + 右栏 tab。**迁移后**：tab body = 资产的 `MonitorTabBody`；本仓声明**两条附加页**（运行记录 `/summary`、磁盘存档 `/runs?limit=50`），故共**四页**：飞行记录仪 / 配置态（资产标准页）+ 上述两条 |
 
 **不移植** EL 的 `dsh/src/host/mcp-bridge.ts`（自愈 MCP 桥）。那条桥是为治
@@ -72,7 +84,7 @@ host 半会去读**另一个**数据根的文件，甚至读到上一次会话�
 
 ```powershell
 cd dsh
-npm install          # 只装 tsdown/typescript（react 等是 dsh 提供的 peer，外置）
+npm install          # tsdown/typescript + @mecha/dsh-panel（file: 依赖 ⇒ junction）
 npm run bundle       # → lib/index.mjs（host 半）+ lib/client.js（client 半）
 ```
 
@@ -114,7 +126,7 @@ dsh --profile web --patch ./dsh/cordis.patch.yml `
 ```
 权威启动 → 写 .ml-monitor-port（裸端口；描述符另外写，但取址不再读它）
    → 资产的 panel-data.loadPanel(fetch, extraRoutes)
-   → 资产 monitor-client.fetchMonitorBase(fetch, PANEL_CONFIG.ROUTE_PATH)
+   → 资产 monitor-client.fetchMonitorBase(fetch, panelConfig().routePath)
    → 同源 fetch('/ml-toolbox/monitor-url')
    → host 半 = 资产的 makeMonitorUrlHandler（根 = MLTB_ML_ROOT 或 cwd）
        → 返回 {base: "http://127.0.0.1:<实际端口>"}，读不到则 503 + 可读错误

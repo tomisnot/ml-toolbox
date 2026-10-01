@@ -3,16 +3,16 @@
  *
  * 三件事：
  *  1. 会话头部「◈ 监控」按钮 → 开右栏 + 打开 `ml-toolbox-monitor` tab。
- *  2. 右栏 tab body = **共享资产的面板**（`../dsh-panel/MonitorTabBody.tsx`，逐字复制自
- *     `mecha/dsh-panel`）；本仓**不再自己渲染**（旧的自绘面板已删——用户已裁"ML 也并入"，
- *     三家共用一份面板）。
+ *  2. 右栏 tab body = **共享资产的面板**（`@mecha/dsh-panel/panel/MonitorTabBody.tsx`，
+ *     `file:` 依赖 ⇒ junction 指向 mecha 仓那一份，磁盘上只有一份代码）；本仓**不再自己渲染**
+ *     （旧的自绘面板已删——用户已裁"ML 也并入"，三家共用一份面板）。
  *  3. **ML 的附加页用声明式列表挂上**（`ExtraPageSpec[]`）：领域词（列名/文案/取值）全留在
  *     本文件，资产里零 ML 字面量。
  *
  * ## 取数走资产的管线（本文件**不再**自己 fetch）
  *
  * 地址、四基础路由取数、三档错误态（`address`/`offline`/`route`）、`empty` 档、R8 自证全在
- * `../dsh-panel/` 里；本文件只声明"ML 多出来的那两页"。
+ * `@mecha/dsh-panel/panel/` 里；本文件只声明"ML 多出来的那两页"。
  *
  * ## ⚠ 两条已申报的行为变更（相对旧的自绘面板）
  *
@@ -25,11 +25,18 @@
  * `npm run bundle` 并**重启 dsh** 才生效（dsh 的 web client 只吃合并包）。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { MonitorTabBody } from '../dsh-panel/MonitorTabBody.tsx'
-import type { ExtraPageSpec } from '../dsh-panel/panel-view.ts'
-import { PANEL_CONFIG } from '../dsh-panel/panel-config.ts'
+import { configurePanel, panelConfig } from '@mecha/dsh-panel/panel/panel-config.ts'
+import { MonitorTabBody } from '@mecha/dsh-panel/panel/MonitorTabBody.tsx'
+import type { ExtraPageSpec } from '@mecha/dsh-panel/panel/panel-view.ts'
+import { ML_PANEL } from '../ml-panel-params.ts'
 import { CockpitButton, type CockpitInjected } from './buttons'
 import { EXTRA_PAGES } from './extraPages.ts'
+
+// ⚠ **注入必须在模块顶层**（不是"更稳"，是**必需**）：client 半是**另一份 bundle、另一个进程**
+// （浏览器），host 半那次注入到不了这里；而资产的 `panelConfig()` **未注入即抛**。
+// ⚠ 漏了这一次**类型检查不会报错**（下面只在 `title()` 里才读它）⇒ 会一路绿到浏览器里才炸。
+// 有判据专门验这条往返：`test/ml-panel.test.ts`。
+configurePanel(ML_PANEL)
 
 /** Cordis 插件名（与 host 半、package.json 一致）。 */
 export const name = 'ml-toolbox-monitor'
@@ -80,7 +87,7 @@ export async function apply(ctx: Context): Promise<void> {
     const releaseTab = ctx.sidebarRightTabs?.register?.({
       id: TAB_ID,
       kind: TAB_ID,
-      title: () => PANEL_CONFIG.TITLE,
+      title: () => panelConfig().title,
     }) || null
     const disposeBody = ctx.slots.inject('sidebar.right.pane.tab', () =>
       ctx.slots.register(
