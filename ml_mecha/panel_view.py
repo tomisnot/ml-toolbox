@@ -282,8 +282,9 @@ def page(*, title: str, view: str, header_right: str, body: str,
     ⚠ 三条按用户要求的定稿：
     - **不写"详情"二字**：页签已经说明在哪个页，标题行是白占高度；
     - **不给内容加框**：左栏与内容区都不套卡片边框（`section.detail` 只有分隔线）；
-    - **折叠开关放顶栏**（不是左栏里的第二个折叠钮）：左栏本身用 `<details>`；
-      顶栏那个钮只在**更宽屏**上出现（窄屏时左栏的 `<summary>` 本来就能点）。
+    - **折叠开关放顶栏**（不是左栏里的第二个折叠钮）；左栏用**显式结构**
+      `aside > .dh + .scroll`（**不是 `<details>`** —— 它的匿名 flex item 会让
+      整页被顶长，实测过程见 `runs_pane` 的 docstring 与 `STYLE` 里的注释）。
     """
     bar = (f'<header><span class="brand">ML 面板</span>'
            f"{views_bar(view, names=names)}"

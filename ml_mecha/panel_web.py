@@ -20,13 +20,18 @@
 |---|---|---|
 | `ml` | 机器学习方法的 run | `runs/<id>/{record.json, artifacts.npz}` |
 | `opt` | 自动调参的 run | `runs/<id>/{opt_record.json, history.csv}` |
-| `nn` | 神经网络：我们的表 + **TensorBoard iframe** | 同上 + `/dashboard` 起的 TB |
+| `nn` | 神经网络：我们的表 + **TensorBoard iframe** | 同上 + **本服务按需起的 TB 辅进程** |
+
+> ⚠ `nn` 那个 TensorBoard 是**本服务自己**按需起的（`/tensorboard?open=1` →
+> `TensorBoardSidecar`，端口文件 `runs/.tb-port`）。共享监控端点上也有一条
+> `GET /dashboard`，但那是**另一条路、今天没人用**——别把两者当成同一件事。
 
 ## 渲染策略（实测定下来的，不是设想）
 
 | `PageSpec.kind` | 怎么显示 | 依据 |
 |---|---|---|
-| `mpl` | **服务端 Agg 渲染成 PNG**，经 `/plot` 取 | 实测 9 种图种全部成功（存档→`load_run_record`→`plot(ax,res)`→PNG） |
+| `mpl`（已迁中立契约） | **内联 SVG**（`panel_svg`） | 方法只吐 `PlotSpec`，画法归渲染器；19 个页 key 已迁 |
+| `mpl`（未迁） | **服务端 Agg 渲染成 PNG**，经 `/plot` 取 | 实测 9 种图种全部成功（存档→`load_run_record`→`plot(ax,res)`→PNG） |
 | `table` | pandas → HTML 表 | `spec.data(...)` 或 `_table_source` 的老路 |
 | `text` | 诊断 JSON/文本 | `res.diag` |
 | `pg` | **占位 + 说明** | pyqtgraph 是 Qt 自绘控件；web 端重写是另一件事（**不假装能显示**） |
@@ -34,6 +39,7 @@
 
 ⚠ **PG 与自定义页画"占位而响亮"**：写清"这一页在 web 端没有渲染器，去 TensorBoard 看"，
 **不是空白**（空白的页 = 本仓反复在防的那种假绿）。
+⚠ `surrogate` 是**只能走 PNG** 的一类（图依赖运行时优化器实例）——见 `_PNG_ONLY_PAGES`。
 """
 
 from __future__ import annotations
@@ -370,6 +376,19 @@ def _dataspec_of(rec):
 #: 依赖 `target_kind` 的检视页（档内矛盾时它们**必然**画不出来——见 `target_kind_mismatch`）。
 _KIND_DEPENDENT_PAGES = frozenset({"cm", "roc", "pr"})
 
+#: **只能走 PNG 的页**：它们的图**依赖一个运行时对象**，不是"只吃存档"的自足页。
+#:
+#: `surrogate`（代理切片）是唯一一个：`PageSpec` 由优化器实例在
+#: `bo.py::inspect_pages` 里现造，图要 `self.surrogate_1d(...)` 的 **GP 后验**；
+#: 而 `opt/specs.spec_surrogate_1d(bundle)` 吃的是那个后验算出来的
+#: **六元组** ``(xs, mu, sd, obs_x, obs_y, label)``，不是 `OptRecord`
+#: ⇒ 按统一约定喂 record 会**每次抛 TypeError**，表现为"SVG 渲染失败 + 回退 PNG"。
+#:
+#: ⇒ 这里如实走 PNG（matplotlib 侧本来就画得出：它经 `PageSpec.plot` 那个闭包
+#: 拿到了 optimizer 实例），并在页面上**说明为什么**——不是静默降级，也不是
+#: 把一条注定失败的路留在表里当"已迁移"。
+_PNG_ONLY_PAGES = frozenset({"surrogate"})
+
 
 def _spec_fn_for(key: str, side: str = "ml"):
     """查"页 key → 中立绘图规格函数"；未迁移或取不到 ⇒ ``None``（调用方回退 PNG）。
@@ -401,6 +420,17 @@ def page_body(side: str, rec, key: str, kind: str, spec, run_id: str) -> str:
         return V.placeholder(f"「{getattr(spec, 'title', key)}」画不出来", conflict)
 
     if kind == "mpl":
+        # ⭐ 只能走 PNG 的页（图依赖运行时对象，见表说明）：**先把它说清楚**，再给图。
+        #   底座 PNG 仍是真图（matplotlib 侧经 `PageSpec.plot` 拿得到那个实例）
+        #   ⇒ 这里不是"回退"，而是"这一页本来就只有一条路"。
+        if key in _PNG_ONLY_PAGES:
+            plot_src = f"/plot?run={V.esc(run_id)}&page={V.esc(key)}"
+            return V.placeholder(
+                f"「{getattr(spec, 'title', key)}」用 PNG 渲染（本页没有 SVG 适配器）",
+                "这一页的图依赖运行时的优化器实例（GP 后验切片），不是"
+                "「只吃存档」的自足页 ⇒ 走服务端 matplotlib；不假装它已迁到中立契约。"
+                "解析器与判据见 panel_web._PNG_ONLY_PAGES 与 tests/test_plot_spec.py。"
+            ) + V.plot_html(plot_src, title="")
         # ⭐ 已迁移到中立契约的页：**在 web 端用 SVG 画**（矢量、贴合页面风格）。
         #   未迁移的页回退到 PNG（服务端 matplotlib）——迁移进度见两张 `SPEC_BY_KEY`。
         spec_fn = _spec_fn_for(key, side)
@@ -461,11 +491,53 @@ def _table_of(side: str, rec, spec):
 
 
 # ============================================================ 渲染图 → PNG
+def _plot_sources() -> tuple[Path, ...]:
+    """**画法来源**：这些文件一变，缓存里的 PNG 就算陈旧（见 `_is_stale`）。
+
+    为什么需要它（实测缺陷）：原先只判「文件在且非空」，于是
+    `runs/<id>/web/<key>.png` **永续复用**——可画法全在上面这几个文件里
+    （方法层只吐 `PlotSpec`，画法归渲染器）⇒ 绘图代码改了、旧 run 还显示旧画法，
+    而页面上没有任何东西会告诉你这件事。
+
+    ⚠ 取不到仓根时回**空元组**（= 无法判陈旧 ⇒ 缓存照常命中）。
+    这不是偷懒：本模块可能被装在 `site-packages` 里（那时"兄弟目录"根本不成立），
+    猜一个错路径只会让 `_is_stale` 静默永远返回 False —— 还不如**明说没有来源**。
+    """
+    here = Path(__file__).resolve()
+    for base in (here.parent.parent, *here.parents):
+        if (base / "ml_toolbox" / "methods" / "specs.py").is_file():
+            return (here, base / "ml_mecha" / "panel_svg.py",
+                    base / "ml_toolbox" / "core" / "plot_mpl.py",
+                    base / "ml_toolbox" / "methods" / "specs.py",
+                    base / "ml_toolbox" / "opt" / "specs.py")
+    return ()
+
+
+def _is_stale(png: Path) -> bool:
+    """缓存 PNG 比任何"画法来源"旧 ⇒ 该重画。**取不到 stat 一律不当陈旧。**
+
+    为什么把"取不到"判成**不陈旧**：那是不确定，不是证据。真把它当陈旧
+    ⇒ 只读挂载/权限异常下会**每请求重渲一次**（比留一张旧图糟得多）。
+    """
+    try:
+        mt = png.stat().st_mtime
+    except OSError:
+        return True                              # 文件没了 = 当然要重画
+    newest = 0.0
+    for p in _plot_sources():
+        try:
+            newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            continue
+    return newest > mt
+
+
 def render_plot(side: str, rec, spec, run_id: str, key: str) -> Path:
     """把某一页渲染成 PNG 并**缓存**（返回文件路径）。失败**抛**（由路由转成可读错误）。
 
-    ⚠ 缓存键含 run_id + 页 key：**绘图代码后来改了，旧 run 会重画**（数据是旧的、
-    画法新的）—— 这是有意的（通常更好），但界面上要说明（见 `page_body` 的注释）。
+    ⚠ 缓存键含 run_id + 页 key，**且随"画法来源"的 mtime 失效**（`_is_stale`）：
+    绘图代码改过之后，旧 run 会**重画**——数据是旧的、画法新的。这是有意的
+    （通常更好），但页面上要能看出这一点（见 `page_body` 与 `_PNG_ONLY_PAGES`）。
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -476,7 +548,7 @@ def render_plot(side: str, rec, spec, run_id: str, key: str) -> Path:
     d = _run_dir(run_id) / PLOT_CACHE_DIRNAME
     d.mkdir(parents=True, exist_ok=True)
     out = d / f"{key}.png"
-    if out.is_file() and out.stat().st_size > 0:
+    if out.is_file() and out.stat().st_size > 0 and not _is_stale(out):
         return out
 
     target = rec if side == "opt" else getattr(rec, "result", rec)

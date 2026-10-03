@@ -33,6 +33,7 @@ logs/
 # 交付形态运行期状态文件（看门人/发现用；每次启动重写）
 .mcp-port
 .ml-monitor-port
+.mlweb-port
 .ml-mecha-runtime.json
 .mode-state
 .mode-request
