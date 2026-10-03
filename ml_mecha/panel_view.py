@@ -52,9 +52,11 @@ def _num(v, digits: int = 4) -> str:
 
 STYLE = """
 *{box-sizing:border-box}
-body{margin:0;font:13px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;
+html,body{height:100%}
+body{margin:0;display:flex;flex-direction:column;height:100vh;
+     font:13px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;
      color:#1f2328;background:#f6f8fa}
-header{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid #d0d7de;
+header{flex:0 0 auto;background:#fff;border-bottom:1px solid #d0d7de;
        padding:8px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .brand{font-weight:600}
 .views a{padding:3px 10px;border:1px solid #d0d7de;border-radius:14px;
@@ -64,22 +66,36 @@ header{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid #
 .badge.ok{background:#dafbe1;color:#1a7f37}
 .badge.warn{background:#fff8c5;color:#7d4e00}
 .badge.err{background:#ffebe9;color:#cf222e}
-main{display:grid;grid-template-columns:300px 1fr;gap:12px;padding:12px;align-items:start}
-.pane{background:#fff;border:1px solid #d0d7de;border-radius:8px}
-.pane h2{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.08em;
-         text-transform:uppercase;color:#0969da;border-bottom:1px solid #d0d7de}
-.runs{max-height:78vh;overflow:auto}
+/* 主区：横向两栏、占满剩余高度（**不给固定高度**，否则下方留白） */
+main{flex:1 1 auto;min-height:0;display:flex;gap:0}
+/* 左栏：**原生可折叠**（`<details>`，不引脚本），只限宽度、高度随主区 */
+aside{flex:0 0 300px;max-width:46vw;display:flex;flex-direction:column;
+      min-height:0;border-right:1px solid #d0d7de;background:#fff}
+aside>details{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}
+aside summary{cursor:pointer;padding:6px 10px;color:#57606a;font-size:12px;
+              list-style:none;user-select:none;border-bottom:1px solid #eaeef2}
+aside summary::-webkit-details-marker{display:none}
+aside summary::before{content:"▾ "}
+aside details:not([open])>summary::before{content:"▸ "}
+aside details:not([open])>summary{border-bottom:0}
+/* 列表自己滚（**不加 max-height**：高度由父容器给，不用魔法数字） */
+aside .scroll{flex:1 1 auto;min-height:0;overflow:auto}
+.collapsed aside{flex-basis:0;max-width:0;border-right:0}
 .runs a{display:block;padding:7px 12px;border-bottom:1px solid #eaeef2;
         text-decoration:none;color:#1f2328}
 .runs a:hover{background:#f6f8fa}
 .runs a.on{background:#ddf4ff}
 .runs .m{font-weight:600}
 .runs .s{color:#57606a;font-size:12px}
-.tabs{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #d0d7de}
+/* 详情：**没有框、没有标题**（页签已经说明在哪个页），直接吃满剩余空间 */
+section.detail{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;
+               min-height:0;background:#fff}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;
+      border-bottom:1px solid #d0d7de;flex:0 0 auto}
 .tabs a{padding:3px 10px;border:1px solid #d0d7de;border-radius:6px;
         text-decoration:none;color:#1f2328}
 .tabs a.on{background:#0969da;color:#fff;border-color:#0969da}
-.body{padding:12px}
+.body{flex:1 1 auto;min-height:0;overflow:auto;padding:12px}
 table{border-collapse:collapse;width:100%}
 th,td{border:1px solid #d0d7de;padding:4px 8px;text-align:left;vertical-align:top}
 th{background:#f6f8fa}
@@ -88,11 +104,13 @@ pre{margin:0;padding:10px;background:#f6f8fa;border:1px solid #d0d7de;border-rad
     overflow:auto;white-space:pre-wrap}
 .muted{color:#57606a}
 .ph{padding:14px;border:1px dashed #d0d7de;border-radius:6px;color:#57606a}
-iframe{width:100%;height:78vh;border:1px solid #d0d7de;border-radius:6px;background:#fff}
-.note{padding:8px 12px;color:#57606a;border-top:1px solid #d0d7de}
+iframe{width:100%;height:100%;min-height:60vh;border:0;background:#fff}
+.note{padding:8px 12px;color:#57606a}
 a.btn{display:inline-block;padding:5px 12px;border:1px solid #0969da;border-radius:6px;
       background:#0969da;color:#fff;text-decoration:none}
 a.btn:hover{background:#0550ae}
+a.toggle{padding:3px 10px;border:1px solid #d0d7de;border-radius:6px;
+         text-decoration:none;color:#1f2328;background:#fff;cursor:pointer}
 """
 
 
@@ -118,9 +136,12 @@ def badge(text: str, kind: str = "ok") -> str:
 
 
 def runs_pane(rows, *, active: str = "", view: str = "ml") -> str:
-    """左栏：运行列表。``rows`` = ``[{run_id, method, primary, score, elapsed, saved_at}]``。
+    """左栏（`<aside>`）：**原生可折叠**的运行列表，只限宽度、高度由父容器给。
 
-    ⚠ **空表要说明为什么空**（"确实没跑过" ≠ "读不到"），这句在 `<div class="note">` 里。
+    - 折叠控件用 `<details open>`：**原生、零脚本**（面板是个链接页，不该为折叠加 JS），
+      且 `<summary>` 只占一行（"运行列表（N）"），折起来只剩它 ⇒ 省空间。
+    - ⚠ **没有 `max-height`**：早先用 `max-height:78vh` ⇒ 下面留白、没吃满。
+      现在高度来自 `main{flex:1;min-height:0}`，列表在 `.scroll` 里自己滚。
     """
     items = []
     for r in rows or ():
@@ -135,8 +156,10 @@ def runs_pane(rows, *, active: str = "", view: str = "ml") -> str:
             f'<div class="s">{esc(rid)}</div>'
             f'<div class="s">{extra} · {_num(r.get("elapsed"), 3)}s · '
             f'{esc(r.get("saved_at") or "")}</div></a>')
+    rows_n = len(list(rows or ()))
     inner = "".join(items) or f'<div class="note">{esc(EMPTY_TEXT)}</div>'
-    return f'<section class="pane runs"><h2>运行列表（{len(list(rows or ()))}）</h2>{inner}</section>'
+    return (f'<aside><details open><summary>运行列表（{rows_n}）</summary>'
+            f'<div class="scroll runs">{inner}</div></details></aside>')
 
 
 def tabstrip(pages, active_key: str, *, view: str, run_id: str) -> str:
@@ -223,9 +246,30 @@ def unreadable(what: str, reason: str) -> str:
 def page(*, title: str, view: str, header_right: str, body: str,
          pages=(), active: str = "", run_id: str = "", runs_html: str = "",
          names=None) -> str:
-    """整页装配（列表 + 详情）。"""
+    """整页装配（左栏列表 + 右侧内容）。
+
+    ⚠ 三条按用户要求的定稿：
+    - **不写"详情"二字**：页签已经说明在哪个页，标题行是白占高度；
+    - **不给内容加框**：左栏与内容区都不套卡片边框（`section.detail` 只有分隔线）；
+    - **折叠开关放顶栏**（不是左栏里的第二个折叠钮）：左栏本身用 `<details>`；
+      顶栏那个钮只在**更宽屏**上出现（窄屏时左栏的 `<summary>` 本来就能点）。
+    """
     bar = (f'<header><span class="brand">ML 面板</span>'
-           f"{views_bar(view, names=names)}{header_right}</header>")
+           f"{views_bar(view, names=names)}"
+           f'<a class="toggle" href="#" data-toggle="sidebar">折叠列表</a>'
+           f"{header_right}</header>")
     tabs = tabstrip(pages, active, view=view, run_id=run_id)
-    detail = f'<section class="pane"><h2>详情</h2>{tabs}<div class="body">{body}</div></section>'
-    return f"{head(title)}{bar}<main>{runs_html}{detail}</main></body></html>"
+    detail = f'<section class="detail">{tabs}<div class="body">{body}</div></section>'
+    # 折叠状态**跨导航保留**（点页签是整页重载，不存就只能每次重新折）。
+    # 用一小段内联脚本：设置 body.collapsed + 存 localStorage；零依赖、失败不影响页面。
+    script = (
+        "<script>(function(){var b=document.body;"
+        "try{if(localStorage.getItem('mlpanel.collapsed')==='1')"
+        "b.classList.add('collapsed');}catch(e){}"
+        "document.addEventListener('click',function(ev){"
+        "var t=ev.target.closest('[data-toggle=sidebar]');if(!t)return;"
+        "ev.preventDefault();b.classList.toggle('collapsed');"
+        "try{localStorage.setItem('mlpanel.collapsed',"
+        "b.classList.contains('collapsed')?'1':'0');}catch(e){}});})();</script>")
+    return (f"{head(title)}{bar}<main>{runs_html}{detail}</main>{script}"
+            "</body></html>")

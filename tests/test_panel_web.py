@@ -328,6 +328,47 @@ def test_runs_cache_is_fast_and_never_stale():
             pass
 
 
+def test_layout_follows_the_four_agreed_constraints():
+    """⭐ 布局四条硬要求（用户逐条提的）—— 钉住，免得以后又长回去。
+
+    1. 左栏可折叠（用 `<details>`：**原生、零脚本**）；
+    2. **不要固定高度**（早先的 `max-height:78vh` 会在下方留白），**只限宽度**；
+    3. 内容区**不套卡片框**；
+    4. **不要"详情"二字**（谁都知道那是详情，那一行是白占高度）。
+
+    ⚠ 判据必须**先剔掉 CSS 注释与 `<style>`**：实测踩过 ——
+    注释里写了"max-height"与"详情"，直接搜字符串会**误报**。
+    """
+    import re
+    html = V.page(title="t", view="ml", header_right="", body="<p>BODY</p>",
+                  pages=[("fit", "拟合")], active="fit", run_id="r1",
+                  runs_html=V.runs_pane([{"run_id": "r1", "method": "ridge"}],
+                                        active="r1"))
+    style = re.search(r"<style>(.*?)</style>", html, re.S)
+    assert style, "页面里应该有样式块"
+    # ⚠ **先剥 CSS 注释再断言**：实测踩过——注释里写了 "max-height" 与 "详情"，
+    #   直接搜字符串会误报（判据红了但不是代码的问题）。断言的是**真声明**。
+    css = re.sub(r"/\*.*?\*/", "", style.group(1), flags=re.S)
+    visible = re.sub(r"/\*.*?\*/", "", re.sub(r"<style>.*?</style>", "", html,
+                                             flags=re.S), flags=re.S)
+
+    # 1. 原生可折叠 + 折叠开关
+    assert "<details open>" in html and "<summary>" in html, "左栏不是原生可折叠的"
+    assert "data-toggle=sidebar" in html, "缺折叠开关"
+    # 2. 只限宽度、**没有**高度上限
+    assert "max-width" in css, "应该只限宽度"
+    assert "max-height" not in css, "不该再有高度上限（会在下方留白）"
+    assert re.search(r"flex\s*:\s*1\s+1\s+auto", css), "主区/列表应靠 flex 撑满"
+    assert "min-height:0" in css.replace(" ", ""), \
+        "min-height:0 是 flex 里让子项正确滚动的前提（少了它列表会撑破父容器）"
+    # 3. 内容区不套卡片框
+    assert 'class="detail"' in html and 'class="pane' not in html, "内容区不该套卡片框"
+    # 4. 不见"详情"二字
+    assert "详情" not in visible, "页面上不该出现“详情”这两个字"
+    # 折叠状态要跨导航保留（点页签是整页重载）
+    assert "localStorage" in html, "折叠状态没持久化（每次点页签都会弹回）"
+
+
 # ============================================================ 直跑入口
 _TESTS = [
     test_esc_and_numbers_never_guess,
@@ -344,6 +385,7 @@ _TESTS = [
     test_server_serves_views_and_port_file,
     test_resolve_panel_base_rejects_stale_port_file,
     test_runs_cache_is_fast_and_never_stale,
+    test_layout_follows_the_four_agreed_constraints,
 ]
 
 
