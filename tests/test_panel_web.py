@@ -181,6 +181,134 @@ def test_render_plot_caches_and_returns_file():
         pass
 
 
+def test_plot_cache_is_invalidated_when_the_drawing_code_changes():
+    """⭐ PNG 缓存**随画法来源的 mtime 失效**——不是"文件在就永远复用"。
+
+    为什么必须有：`runs/<id>/web/<key>.png` 原先只判「在且非空」⇒ **永续复用**。
+    而画法全在渲染器与两张页 key 表里（方法层只吐 `PlotSpec`）⇒ 绘图代码改了、
+    旧 run 还显示旧画法，**页面上没有任何东西会告诉你**。今天刚做完 19/19 迁移，
+    一旦有页回退到 PNG 路径，看到的就是陈旧画法。
+
+    ⚠ 判据**不许**真去改仓内源码的 mtime（那会污染工作区、还会让别的判据飘）
+    ⇒ 用一个 temp 探针文件冒充"来源"，并**明确自证扰动落上了**（两次取 mtime
+    必须不能都等于 t0）——否则就是哑守卫：假如 `_plot_sources` 被换成空表，
+    "陈旧那一路"根本不会触发，而断言照样绿。
+    """
+    import tempfile
+    import time as _t
+
+    rows = W.list_runs("ml", limit=80)
+    picked = None
+    for r in rows:
+        side, rec = W.load_any(r["run_id"])
+        if rec is None or W.target_kind_mismatch(rec):
+            continue
+        for k, _t2, kd, s in W.pages_for(side, rec):
+            if kd == "mpl":
+                picked = (r["run_id"], k, s, rec, side)
+                break
+        if picked:
+            break
+    assert picked, "找不到任何有 mpl 页且档内自洽的 run（前提变了，本判据要重写）"
+    rid, key, spec, rec2, side2 = picked
+
+    with tempfile.TemporaryDirectory() as td:
+        probe = Path(td) / "fake_drawing_source.py"
+        probe.write_text("# 冒充渲染器源码\n", encoding="utf-8")
+        saved = W._plot_sources
+        W._plot_sources = lambda: (probe,)
+        try:
+            p1 = W.render_plot(side2, rec2, spec, rid, key)
+            assert p1.is_file() and p1.stat().st_size > 0, "没渲染出 PNG"
+            assert not W._is_stale(p1), "刚画出来的图不该被当成陈旧"
+
+            # ① 来源比图**新** ⇒ 陈旧（要重画），且自证扰动真的落上了
+            t0 = _t.time()
+            p1.touch()
+            _t.sleep(0.02)
+            probe.touch()
+            assert probe.stat().st_mtime > t0 or p1.stat().st_mtime > t0, \
+                "扰动没落上（mtime 精度不够？）⇒ 这条判据此刻是哑的"
+            assert W._is_stale(p1), "画法来源更新后，旧 PNG 没有被判为陈旧"
+            # ② 真走一遍 render_plot：陈旧就重画（新 mtime），新鲜就复用（同 mtime）
+            m_old = p1.stat().st_mtime
+            p2 = W.render_plot(side2, rec2, spec, rid, key)
+            assert p2 == p1, "缓存路径应不变（只换内容）"
+            assert p2.stat().st_mtime > m_old, "陈旧缓存没有重画（画法改了还显示旧图）"
+            # ③ 再取一次 ⇒ 现在新鲜了，**不许**再重画
+            p3 = W.render_plot(side2, rec2, spec, rid, key)
+            assert p3.stat().st_mtime == p2.stat().st_mtime, "新鲜缓存被无谓重画了"
+        finally:
+            W._plot_sources = saved
+            try:
+                p1.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+
+
+def test_surrogate_page_is_honestly_png_only():
+    """⭐ 代理切片页**不再"假迁移"**：显式走 PNG，并在页面上说清为什么。
+
+    事实（2026-10-03 实测）：`opt/specs.SPEC_BY_KEY` 曾把 `surrogate` 收进表，
+    但 `spec_surrogate_1d(bundle)` 吃的是 **六元组** `(xs, mu, sd, obs_x, obs_y, label)`
+    ——那个 bundle 要**活的优化器实例**（`bo.py:239` 的 `self.surrogate_1d(...)`）
+    才算得出来，而面板按统一约定喂 `OptRecord` ⇒ 每次 `TypeError`
+    ⇒ 页面表现成"SVG 渲染失败 + 回退 PNG"，而表上看起来"已迁移"。
+
+    ⇒ 本条同时钉两件（结构 + 页面），并**不重复** `test_plot_spec.py` 的覆盖面：
+    那边只有**页 key（字符串）**、没有声明对象；本仓的教训是
+    "surrogate 在表里"≠"面板能喂对参"，所以必须拿**真的 `PageSpec`** 走一遍。
+    """
+    from ml_toolbox.opt.engines.bo import GPBO
+    from ml_toolbox.opt.specs import SPEC_BY_KEY, spec_for_key
+
+    class _Rec:
+        """给闭包用的最小壳：`inspect_pages` 只用到它把页面拼出来（不读数据）。"""
+
+    pages = GPBO().inspect_pages(_Rec())
+    sup = next((p for p in pages if getattr(p, "key", "") == "surrogate"), None)
+    assert sup is not None, "优化器不再声明代理切片页了（前提变了，本判据要重写）"
+    assert callable(getattr(sup, "plot", None)), \
+        "代理切片页没有 plot（闭包）⇒ PNG 那条路也断了"
+
+    # ① 表里那条映射**是**这个函数名（漂了就说明有人改了没同步本判据）
+    assert SPEC_BY_KEY.get("surrogate") == "spec_surrogate_1d", "表与函数名对不上了"
+    # ② 面板要显式知道它只能走 PNG
+    assert "surrogate" in W._PNG_ONLY_PAGES, \
+        "面板没把 surrogate 列为只能走 PNG ⇒ 又会去画那张注定失败的 SVG"
+    # ③ 结构侧：喂 record 确实不行（这就是"只能走 PNG"的根因）——异常类型别放宽
+    try:
+        spec_for_key("surrogate")(_Rec())
+        raise AssertionError("spec_surrogate_1d 居然吃得下 record？那本判据要重写")
+    except TypeError:
+        pass
+    # ④ 真声明走一遍：**只给 PNG**，并在页面上说得出"为什么没有 SVG 适配器"
+    html = W.page_body("opt", _Rec(), sup.key, sup.kind, sup, "r1")
+    assert "<svg" not in html, "这一页还是想画 SVG（那张图必然失败）"
+    assert "/plot?run=r1&amp;page=surrogate" in html, \
+        f"没给 PNG 兜底图：{html[:200]}"
+    assert "SVG 适配器" in html, "没有说明为什么这一页只能走 PNG（静默降级）"
+
+
+def test_plot_sources_cover_the_renderers_and_both_key_tables():
+    """`_plot_sources` 要**真的**覆盖到渲染器与两张页 key 表（不是空表/瞎指）。
+
+    为什么单列：上面那条判据会**替换** `_plot_sources`。若它替换的是空表，
+    "陈旧那一路"永远不触发而断言照样绿 ⇒ 必须另有一条钉住**真身**指向什么。
+    """
+    srcs = W._plot_sources()
+    assert srcs, "取不到画法来源（缓存将永不失效）"
+    assert all(p.is_file() for p in srcs), \
+        f"来源里有不存在的文件（那一路会静默失效）：{[str(p) for p in srcs if not p.is_file()]}"
+    # ⚠ 按**路径**断言，不按文件名：两张表都叫 specs.py，用名字集合会自相吞掉
+    #   （实测踩过——`{p.name}` 里两个 specs.py 只剩一个，"两张表都在"这条就形同虚设）。
+    tails = {"/".join(p.parts[-3:]) for p in srcs}
+    for want in ("ml_mecha/panel_web.py", "ml_mecha/panel_svg.py",
+                 "core/plot_mpl.py", "methods/specs.py", "opt/specs.py"):
+        assert any(t.endswith(want) for t in tails), \
+            f"少了画法来源 {want}（已有的：{sorted(tails)}）"
+
+
 def test_conflicting_archive_is_disclosed_not_hidden():
     """⭐ 档内自相矛盾（历史错标）⇒ **说出来**，而不是静默跳过或崩掉。
 
@@ -394,6 +522,9 @@ _TESTS = [
     test_missing_opt_slot_degrades_honestly,
     test_pages_for_does_not_swallow_errors,
     test_render_plot_caches_and_returns_file,
+    test_plot_cache_is_invalidated_when_the_drawing_code_changes,
+    test_plot_sources_cover_the_renderers_and_both_key_tables,
+    test_surrogate_page_is_honestly_png_only,
     test_conflicting_archive_is_disclosed_not_hidden,
     test_plot_failure_returns_explanatory_png,
     test_server_serves_views_and_port_file,

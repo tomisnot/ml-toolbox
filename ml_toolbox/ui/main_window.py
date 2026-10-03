@@ -551,6 +551,14 @@ class MainWindow(QMainWindow):
         if idx is None:
             self.records.append(rec)
             idx = len(self.records) - 1
+        else:
+            # ⚠ **就地重跑会沿用同一个 run_id**（run_id 在跑之前就定死，见
+            #   `runner._run_id` —— 为了让 TensorBoard 逐 epoch 直播的目录不变）
+            #   ⇒ 命中"同 id"不等于"同一次运行"：这里是**新结果**，必须顶掉旧的。
+            #   不换的后果（实测 2026-10-03）：`_show_record(idx)` 紧接着把
+            #   `_current_record` 覆盖回**旧对象** ⇒ 重跑后检视页/对比表/对新数据
+            #   预测用的都是上一轮的记录，而图上画的是新拟合 —— 两处不一致。
+            self.records[idx] = rec
         self._fill_compare_table()
         self._show_record(idx)
         self.tabs.setCurrentIndex(self.TAB_INSPECT)

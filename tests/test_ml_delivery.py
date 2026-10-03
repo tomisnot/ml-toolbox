@@ -84,9 +84,10 @@ from mecha.providers.mcp import tool_input_schema               # noqa: E402
 
 #: 工具面全量（``ToolRegistry.schemas()`` 按 name 排序）。
 TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
-              "describe_method", "describe_methods", "describe_run",
-              "prepare_dataset", "read_job", "run_method", "run_method_batch",
-              "submit_run")
+              "describe_method", "describe_methods", "describe_network",
+              "describe_networks", "describe_run", "describe_training",
+              "prepare_dataset", "read_job", "run_custom", "run_method",
+              "run_method_batch", "submit_run")
 
 #: 每个工具的必填项（写工具取**命令声明**，只读与 job 调度面取闭包签名）。
 EXPECTED_REQUIRED = {
@@ -95,15 +96,26 @@ EXPECTED_REQUIRED = {
     "describe_dataset": [],
     "describe_method": ["name"],
     "describe_methods": [],
+    "describe_network": ["name"],
+    "describe_networks": [],
     "describe_run": [],
+    "describe_training": [],
     "prepare_dataset": ["source"],
     "read_job": ["job_id"],
+    "run_custom": ["code"],
+    # ⚠ `method` **不是**必填：`submit_run` 允许 `method` / `code` 二选一
+    #   （给了 code 就走自定义网络）。必填项由工具自己判并给可读错误。
     "run_method": ["method"],
     "run_method_batch": ["methods"],
-    "submit_run": ["method"],
+    "submit_run": [],
 }
 
 _SYNTHETIC = {"kind": "synthetic", "task": "classification", "n_samples": 120}
+
+#: `run_custom` 探针用的最小网络代码（**真能跑**：单层线性就是合法的 Network）。
+_MIN_NET_CODE = ("class Network:\n"
+                 "    def build(self, n_in, n_out, *, nn):\n"
+                 "        return nn.Linear(n_in, n_out)\n")
 
 #: 单次端到端调用的墙钟上限（防"挂住"把判据变成超时噪音）。
 _TIMEOUT = 90.0
@@ -494,11 +506,21 @@ EXPECTED_DEFAULTED = {
     "describe_method": [],
     "describe_methods": ["dataset_id", "family"],
     "describe_run": ["run_id"],
+    "describe_training": ["include_series", "limit", "run_id"],
+    "describe_network": ["limit"],
+    "describe_networks": ["limit"],
+    # ⚠ `pipeline` 是**可选但无默认**（None = 用默认链）⇒ 不进这张表，
+    #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
     "prepare_dataset": ["diag", "name", "target", "time_col"],
     "read_job": ["wait_s"],
+    # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
+    #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
+    "run_custom": ["dataset_id", "diag", "name", "persist"],
     "run_method": ["dataset_id", "device", "diag", "persist"],
     "run_method_batch": ["dataset_id"],
-    "submit_run": ["dataset_id", "device"],
+    # `method`/`code`/`name` 都声明了 `""` 默认 ⇒ 进这张表（"未给"= 空串）。
+    "submit_run": ["code", "dataset_id", "device", "diag", "method", "name",
+                   "persist"],
 }
 
 #: 逐参数行为判据：(工具, 最小必填参数, 参数名, 真值)。
@@ -513,6 +535,11 @@ _DEFAULTED_PROBES = (
     ("describe_methods", {}, "dataset_id", "ds-null-shim"),
     ("describe_dataset", {}, "dataset_id", "ds-null-shim"),
     ("describe_run", {}, "run_id", "run-null-shim"),
+    ("describe_training", {}, "run_id", "run-null-shim"),
+    ("describe_training", {}, "include_series", True),
+    ("describe_training", {}, "limit", 50),
+    ("describe_networks", {}, "limit", 10),
+    ("describe_network", {"name": "n"}, "limit", 10),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "name", "my-ds"),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "target", "target"),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "time_col", "t"),
@@ -520,11 +547,26 @@ _DEFAULTED_PROBES = (
     ("run_method", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
     ("run_method", {"method": "logistic"}, "device", "cpu"),
     ("run_method", {"method": "logistic"}, "persist", True),
+    ("run_method", {"method": "logistic"}, "diag", True),
+    # ⚠ `run_custom` 只探**声明了默认值**的那几个：`overrides`/`seed`/`resource_guard`
+    #   没有默认值（是可选但无默认）⇒ 进这张表会被前提守卫挡下（实测）。
+    ("run_custom", {"code": _MIN_NET_CODE}, "dataset_id", "ds-null-shim"),
+    ("run_custom", {"code": _MIN_NET_CODE}, "name", "my-net"),
+    ("run_custom", {"code": _MIN_NET_CODE}, "diag", True),
+    ("run_custom", {"code": _MIN_NET_CODE}, "persist", True),
     ("run_method_batch", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("compare_methods", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
     ("submit_run", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
     ("submit_run", {"method": "logistic"}, "device", "cpu"),
+    ("submit_run", {"method": "logistic"}, "persist", True),
+    ("submit_run", {"method": "logistic"}, "diag", True),
+    # ⚠ 不探 `submit_run.method`：它现在声明成默认 `""`（与 `code` 二选一），
+    #   而本探针表的 `base` 里已经带了 `method="logistic"` ⇒ 两者会撞在一起
+    #   （实测：断言 "method 不该出现" 失败）。它的"二选一"语义由
+    #   `test_tool_params_stay_within_command_declaration` 与端到端判据覆盖。
+    ("submit_run", {"method": "logistic"}, "code", _MIN_NET_CODE),
+    ("submit_run", {"method": "logistic"}, "name", "my-net"),
 )
 
 #: 真实默认**本就是 None** 的参数（10 项）：显式 null 必须**原样保留**（这是"清空/
@@ -606,16 +648,25 @@ _MIN_ARGS = {
     "describe_method": {"name": "logistic"},
     "describe_methods": {},
     "describe_run": {},
+    "describe_training": {},
+    "describe_networks": {},
+    "describe_network": {"name": "n"},
     "prepare_dataset": {"source": dict(_SYNTHETIC)},
     "read_job": {"job_id": "job-null-shim"},
+    "run_custom": {"code": _MIN_NET_CODE},
     "run_method": {"method": "logistic"},
     "run_method_batch": {"methods": ["logistic"]},
     "submit_run": {"method": "logistic"},
 }
 
-#: 可选参数总数（26 = 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
+#: 可选参数总数（= 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
 #: "每个可选参数都被判据看过一遍"（新增参数会在这里红，提醒补探针）。
-_EXPECTED_OPTIONAL_PARAMS = 28
+#: 2026-10-03 `describe_training` 带来 3 个（run_id / include_series / limit）；
+#: 同日补齐 `diag`/`persist` 的**工具面缺口**（`run_method.diag` 曾声明却调不通，
+#: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
+#: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
+#: —— 这是"AI 写网络代码 + 按名字复用"那条路。
+_EXPECTED_OPTIONAL_PARAMS = 46
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -664,6 +715,97 @@ def test_null_shim_rule_partitions_every_optional_param():
                     assert param not in null, (tool, param, null)
                 else:
                     assert param in null and null[param] is None, (tool, param, null)
+
+
+def test_tool_params_stay_within_command_declaration():
+    """⭐ 工具面的参数必须落在**命令声明**里，且 `run_method.diag` 要真通。
+
+    钉的是一个实测到的真缺陷（2026-10-03）：`run_method` 的 `parameters` 里
+    **声明了** `diag`，但处理函数签名里**没有**它 ⇒ 调用方按声明传 `diag`
+    会撞 "unexpected keyword argument" ⇒ **该参数在工具面上从来调不通**。
+    这类"声明与实现漂移"用别的判据看不出来：`EXPECTED_DEFAULTED` 只看声明、
+    null 垫片探针只看"显式 null 被丢掉"，**没有一条真把 `diag=True` 发下去**。
+
+    两个方向一起钉：
+    ① 工具参数 ⊆ 命令声明参数（超集会被 `validate_spec` 以"未声明的参数"拒）；
+    ② 端到端真发一次 `run_method(diag=True, persist=True)`：必须成功，且
+       `diag` 真的到达方法层（`nn_attr` 归因工件存在——那是 `diag` 的唯一产物）。
+    """
+    from ml_mecha.commands import COMMANDS
+
+    with tempfile.TemporaryDirectory(prefix="ml-toolparam-") as td:
+        ml = assemble_ml_mecha(root=td, seed=13)
+        try:
+            declared = {c.name: {p.name for p in c.parameters} for c in COMMANDS}
+            #: 工具 → 它**可能**落到哪些命令（一套参数可以喂多条命令）。
+            #: ⚠ `submit_run` 是两条：给 `method` 走 `run_method`、给 `code` 走
+            #:   `run_custom`（2026-10-03 起，长训练的自定义网络才跑得起来）。
+            #:   ⇒ 它的参数只要被**其中任一条**命令接受即可。
+            routes = {"prepare_dataset": ("prepare_dataset",),
+                      "run_method": ("run_method",),
+                      "run_method_batch": ("run_method_batch",),
+                      "compare_methods": ("compare_methods",),
+                      "run_custom": ("run_custom",),
+                      "submit_run": ("run_method", "run_custom")}
+            for tool_name, commands in routes.items():
+                tool = ml.tools.get(tool_name)
+                assert tool is not None, tool_name
+                got = set((tool.parameters or {}).keys())
+                allowed = set().union(*(declared[c] for c in commands))
+                extra = got - allowed
+                assert not extra, (
+                    f"{tool_name} 声明了 {'/'.join(commands)} 都不认识的参数 "
+                    f"{sorted(extra)}（工具参数必须是命令声明参数的子集；"
+                    f"要加就先改 commands.py）")
+
+            # ---- ② 真发一次：`diag` 必须通，并且真的产出归因工件
+            if not _torch_ready():
+                print("    （torch 不可用：跳过 diag 端到端那一半）")
+                return
+            ml.switch_ai()          # 开闸：写命令需要它（出厂是 LOCKED）
+            got = _tool_ok(ml, "run_method",
+                           {"method": "torch_mlp", "dataset_id": _tool_ok(
+                               ml, "prepare_dataset",
+                               {"source": {"kind": "synthetic",
+                                           "task": "classification",
+                                           "n_samples": 90},
+                                "name": "params", "target": "target"})["dataset_id"],
+                            "diag": True, "persist": True,
+                            "overrides": {"hidden": "8", "epochs": 5}})
+            rid = got["run_id"]
+            try:
+                import shutil
+                from pathlib import Path
+
+                from ml_toolbox.core.persistence import RUNS_DIR, load_run_record
+                record = load_run_record(rid)
+                assert record is not None, "persist=True 却没落盘"
+                assert "nn_attr" in record.result.artifacts, \
+                    "diag=True 没有产出归因工件 ⇒ diag 没真的到达方法层"
+            finally:
+                import shutil
+                from pathlib import Path
+
+                from ml_toolbox.core.persistence import RUNS_DIR
+                shutil.rmtree(Path(RUNS_DIR) / rid, ignore_errors=True)
+        finally:
+            ml.close()
+
+
+def _torch_ready() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("torch") is not None
+
+
+def _tool_ok(ml, name: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
+    """经**工具面**调一次工具（走的就是 AI 的路径：自带通道绑定与参数默认值）。
+
+    ⚠ 名字带 `_tool_` 是刻意的：本文件另有一个 `_run`（跑协程的那个），
+    重名会把它所有调用方静默换成这个签名 —— 实测撞过一次，两条判据一起红。
+    """
+    result = ml.tools.execute(name, dict(args))
+    assert result.get("is_error") is False, result
+    return result["value"]
 
 
 def test_null_shim_authority_is_declaration_only():

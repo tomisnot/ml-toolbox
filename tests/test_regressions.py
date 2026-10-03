@@ -336,6 +336,262 @@ def test_neural_fit_and_artifacts():
     assert r.metrics["f1"] > 0.7
 
 
+def test_neural_structure_knobs_are_really_effective():
+    """⭐ 结构旋钮**真的生效**：每个激活/优化器/调度都跑一遍，且拒绝静默忽略。
+
+    为什么必须有（本仓的判据口径）：`param_schema` 里多一个 `select` 只说明
+    "界面/工具收得下这个值"，**不说明它被用上了**。而"参数形同生效"正是本仓
+    反复在防的假绿（多个坑都记在 `docs/pitfalls.md`）。
+    ⇒ 三件一起钉：
+    1. 每个激活、每个优化器都**真能跑出结果**（不是抛在构造里）；
+    2. 上了调度器之后 **TB 里的 lr 曲线必须真的在变**——若仍写参数里那个常量，
+       曲线是一条**平线**，图就在骗人；
+    3. **不适用就该拒绝**：给 adam 传 `momentum` 必须报错，未知取值必须响亮
+       （不是静默退回 relu）。
+    """
+    if not _neural_available():
+        print("    (torch 不可用，跳过)")
+        return
+    import numpy as np
+    from sklearn.datasets import make_classification
+
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    from ml_toolbox.methods.neural.mlp import ACTIVATIONS, OPTIMIZERS, SCHEDULES
+
+    registry.load_builtin()
+    X, y = make_classification(120, 6, n_informative=4, random_state=0)
+    spec = Pipeline.default().run(Dataset.from_arrays(X, y, "knobs"))
+    m = registry.get("torch_mlp")
+
+    def _run(**ov):
+        # ⚠ `diag` 是 RunConfig 的**顶层字段**（不是 overrides 里的一项）：
+        #   塞进 overrides 会被 `resolve()` 丢掉、`fit` 也就拿不到 ⇒ diag 恒空。
+        cfg = RunConfig(diag=True,
+                        overrides={"hidden": "8,4", "epochs": _EPOCHS, **ov})
+        return runner.run_one(m, spec, cfg)
+
+    # ① 每个激活都能跑（且 diag 报出的就是它——参数与事实对得上）
+    for act in ACTIVATIONS:
+        rec = _run(activation=act, diag=True)
+        assert rec.result.ok, f"activation={act} 跑失败：{rec.result.error}"
+        assert rec.result.diag["activation"] == act, rec.result.diag
+    # ② 每个优化器都能跑
+    for o in OPTIMIZERS:
+        rec = _run(optimizer=o, lr=0.05, diag=True)
+        assert rec.result.ok, f"optimizer={o} 跑失败：{rec.result.error}"
+        assert rec.result.diag["optimizer"] == o, rec.result.diag
+    # ③ ⭐ 调度器：必须能让 lr **真的衰减**（否则图是平线 = 骗人）
+    for sched in ("step", "cosine"):
+        rec = _run(lr=0.1, epochs=max(8, _EPOCHS), lr_schedule=sched,
+                   lr_step=4, lr_gamma=0.5)
+        assert rec.result.ok, rec.result.error
+        series = np.asarray(rec.result.artifacts["nn_history"]["lr"], float)
+        assert len(np.unique(np.round(series, 6))) > 1, \
+            f"lr_schedule={sched} 的 lr 曲线是平的 ⇒ 调度没生效（图在骗人）"
+        assert series[-1] < series[0], f"{sched} 应当让 lr 下降：{series}"
+    # ④ ⭐ 不适用就**拒绝**，不静默忽略。
+    #   ⚠ 这里**必须直测构造器**，不能靠"跑一次看有没有炸"：静默忽略时
+    #   `momentum` 根本不会被传给 torch（只有 sgd 分支用它）⇒ 整轮训练**照样成功**，
+    #   任何"看最终结果"的断言都发现不了它。实测踩过这条（判据当时是哑的）。
+    torch = __import__("torch")
+    probe = torch.nn.Linear(2, 2)
+    # 用**同一个契约**造参数（`RunConfig.resolve` 是"未覆写取默认"的单一真源），
+    # 不手抄默认值 —— 手抄的那份会悄悄漂。
+    def _params(**ov):
+        return RunConfig(overrides=ov).resolve(m.param_schema)
+
+    for name in ("adam", "adamw", "rmsprop"):
+        try:
+            m._optimizer(_params(optimizer=name, momentum=0.9),
+                         probe.parameters(), torch)
+            raise AssertionError(
+                f"optimizer={name} + momentum=0.9 被静默忽略了（参数在骗人）")
+        except ValueError as exc:
+            assert "momentum" in str(exc), exc
+    # 默认 momentum=0 时任何优化器都不该报错
+    for name in OPTIMIZERS:
+        m._optimizer(_params(optimizer=name, momentum=0.0),
+                     probe.parameters(), torch)
+    # sgd **真的**把 momentum 用上了（不是收下就扔）
+    opt = m._optimizer(_params(optimizer="sgd", momentum=0.9),
+                       probe.parameters(), torch)
+    assert float(opt.param_groups[0].get("momentum") or 0.0) == 0.9, \
+        "sgd 没拿到 momentum ⇒ '收下就扔'"
+    # ⑤ 未知取值响亮（不退回默认——那会让参数形同生效）
+    for bad in ({"activation": "no_such_act"}, {"optimizer": "no_such_opt"},
+                {"lr_schedule": "no_such_sched"}):
+        assert not _run(**bad).result.ok, f"{bad} 没有被拒（静默退回默认了？）"
+
+
+def test_neural_device_resolution_is_deterministic():
+    """⭐ `device` 的解析规则（**不依赖本机有没有 CUDA**）。
+
+    ⚠ 为什么单列这一条：把"设备透传"写成一整轮真训练 + 断言 `diag["device"]=="cpu"`
+    是**假绿**——本机 `torch.cuda.is_available()` 为 False 时，`auto` 本来就会
+    落到 cpu ⇒ 透传**断了也照样绿**（我在停掉守卫做红验证时发现的，两次都绿）。
+    ⇒ 这里直测解析函数，并把 `cuda` 伪装成可用，让判定与硬件**无关**：
+    1. 引擎透传的声明赢过"本机自动"；
+    2. 方法自己的 `device` 参数**不会**被引擎默认的 `auto` 吃掉（否则就是
+       "参数形同生效"）；
+    3. 两边都 `auto` ⇒ 才回落到"有卡用卡、没卡用 CPU"。
+    """
+    from ml_toolbox.methods.neural.mlp import TorchMLP
+
+    class _FakeDev:
+        def __init__(self, s):
+            self.s = str(s)
+
+        def __repr__(self):
+            return f"dev({self.s})"
+
+    class _FakeTorch:
+        """只提供 `_device` 用到的那点表面（**不导入 torch**，本判据无依赖）。"""
+        cuda = type("c", (), {"is_available": staticmethod(lambda: True)})
+        device = staticmethod(_FakeDev)
+
+    t = _FakeTorch
+    # ① 引擎声明赢
+    assert repr(TorchMLP._device({"device": "auto"}, t,
+                                 type("C", (), {"extras": {"device": "cpu"}})())) \
+        == "dev(cpu)"
+    assert repr(TorchMLP._device({"device": "auto"}, t,
+                                 type("C", (), {"extras": {"device": "cuda:1"}})())) \
+        == "dev(cuda:1)"
+    # ② 具体的方法参数不被默认 auto 吃掉（有卡也不许改道）
+    assert repr(TorchMLP._device({"device": "cpu"}, t,
+                                 type("C", (), {"extras": {"device": "auto"}})())) \
+        == "dev(cpu)"
+    # ③ 两边 auto ⇒ 有卡用卡
+    assert repr(TorchMLP._device({"device": "auto"}, t,
+                                 type("C", (), {"extras": {"device": "auto"}})())) \
+        == "dev(cuda)"
+    # 没有 cfg（裸调用）也要能工作
+    assert repr(TorchMLP._device({"device": "cpu"}, t)) == "dev(cpu)"
+
+
+def test_neural_loss_init_clip_early_stop_and_device():
+    """⭐ 第 1 批旋钮：损失 / 初始化 / 梯度裁剪 / 早停 / device 端到端。
+
+    为什么每条都要真跑而不是"设上了就算"：
+    1. `loss`——**与任务不匹配必须拒**（给回归配 celoss 会在反向传播时炸在形状上，
+       而"悄悄换回 mse"会让人以为交叉熵生效了）；
+    2. `init`——`xavier`/`kaiming` 要真的改到权重（不是收下就扔）；
+    3. `grad_clip`——有它时训练仍收敛、且 diag 报出真值；
+    4. `early_stop`——真停（不是跑满 epochs 却假装早停），**且没验证集时必须拒**
+       （val_split=0 时没有任何"改善"可判断，静默忽略＝旋钮形同生效）；
+    5. `device`——端到端走一遍 `RunConfig.extras["device"]`（解析规则本身由
+       `test_neural_device_resolution_is_deterministic` 钉，那条与硬件无关）。
+    """
+    if not _neural_available():
+        print("    (torch 不可用，跳过)")
+        return
+    import numpy as np
+    from sklearn.datasets import make_classification, make_regression
+
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+    from ml_toolbox.core.dataset import Dataset
+    from ml_toolbox.core.pipeline import Pipeline
+    from ml_toolbox.methods.neural.mlp import INITS, LOSSES
+
+    registry.load_builtin()
+    X, y = make_classification(120, 6, n_informative=4, random_state=0)
+    spec_c = Pipeline.default().run(Dataset.from_arrays(X, y, "nn-c"))
+    Xr, yr = make_regression(90, 5, noise=0.1, random_state=1)
+    spec_r = Pipeline.default().run(Dataset.from_arrays(Xr, yr, "nn-r"))
+    assert spec_r.target_kind == "regression", spec_r.target_kind
+    m = registry.get("torch_mlp")
+
+    def _run(spec, **ov):
+        return runner.run_one(m, spec, RunConfig(
+            diag=True, overrides={"hidden": "8,4", "epochs": _EPOCHS, **ov}))
+
+    # ① 损失：自动 / 分类交叉熵 / 回归 MSE 都能跑；不匹配的组合必须拒
+    assert _run(spec_c, loss="auto").result.ok
+    assert _run(spec_c, loss="celoss").result.ok
+    assert _run(spec_r, loss="mse").result.ok
+    for spec, loss in ((spec_c, "mse"), (spec_r, "celoss"), (spec_c, "no_such")):
+        assert not _run(spec, loss=loss).result.ok, \
+            f"{loss} 用在 kind={spec.target_kind} 上竟然没被拒"
+    assert _run(spec_c, loss="auto").result.diag["loss"] == "auto"
+
+    # ② 初始化：三种都能跑，且真的改到了权重（xavier 与默认必须不同）
+    import torch
+    p_default = dict(RunConfig(overrides={"hidden": "8,4", "init": "default"})
+                     .resolve(m.param_schema))
+    p_xavier = dict(RunConfig(overrides={"hidden": "8,4", "init": "xavier"})
+                    .resolve(m.param_schema))
+    torch.manual_seed(0)
+    w_def = [l.weight.detach().clone() for l in
+             m._build(p_default, 6, 3, torch.nn).modules()
+             if isinstance(l, torch.nn.Linear)]
+    torch.manual_seed(0)
+    mdl = m._build(p_xavier, 6, 3, torch.nn)
+    m._init_weights(mdl, p_xavier, torch.nn)
+    w_xav = [l.weight.detach().clone() for l in mdl.modules()
+             if isinstance(l, torch.nn.Linear)]
+    assert any(not torch.allclose(a, b) for a, b in zip(w_def, w_xav)), \
+        "xavier 与 default 的权重完全一样 ⇒ init 没生效"
+    for init in INITS:                       # 每个候选都真能跑（且 diag 对得上）
+        rec = _run(spec_c, init=init)
+        assert rec.result.ok, f"init={init}: {rec.result.error}"
+        assert rec.result.diag["init"] == init
+
+    # ③ 梯度裁剪：能跑，且 diag 报真值
+    rec = _run(spec_c, grad_clip=0.5)
+    assert rec.result.ok, rec.result.error
+    assert rec.result.diag["grad_clip"] == 0.5
+
+    # ④ 早停：真停（用一个必然很快过拟合的配置逼它停）
+    rec = _run(spec_c, early_stop="on", early_stop_patience=3,
+               epochs=200, lr=0.5, batch=8, hidden="64,64")
+    d = rec.result.diag
+    assert rec.result.ok, rec.result.error
+    assert d["epochs_run"] < 200, f"早停没生效：跑满了 {d['epochs_run']} 轮"
+    assert d["early_stopped_at"] is not None
+    # 没验证集 ⇒ 必须拒（不静默忽略）
+    assert not _run(spec_c, early_stop="on", val_split=0.0).result.ok, \
+        "early_stop=on 且 val_split=0 时没有拒绝（静默忽略了）"
+
+    # ⑤ device 透传：RunConfig.extras["device"] 必须决定实际设备
+    cfg = RunConfig(diag=True, overrides={"hidden": "8", "epochs": _EPOCHS},
+                    extras={"device": "cpu"})
+    assert runner.run_one(m, spec_c, cfg).result.diag["device"] == "cpu"
+    # 方法自己的 device 参数也不能被"引擎默认的 auto"吃掉
+    cfg2 = RunConfig(diag=True,
+                     overrides={"hidden": "8", "epochs": _EPOCHS, "device": "cpu"})
+    assert runner.run_one(m, spec_c, cfg2).result.diag["device"] == "cpu"
+
+
+def test_neural_param_choices_are_deterministic():
+    """`select` 的 `choices` 顺序必须**稳定**（两次取到同一顺序）。
+
+    为什么：`choices` 是接口的一部分——面板下拉框按它排、`describe_method`
+    把它原样回给 AI。用 `frozenset` 当来源时遍历顺序不稳定 ⇒ AI 两次问到的
+    候选顺序不一样（"同一事实两个说法"，且无法复现）。
+    """
+    from ml_toolbox.methods.neural.mlp import (ACTIVATIONS, OPTIMIZERS,
+                                               SCHEDULES, TorchMLP)
+
+    assert isinstance(OPTIMIZERS, tuple) and isinstance(SCHEDULES, tuple), \
+        "应当是有序元组，不是 set/frozenset"
+    for p in TorchMLP.param_schema:
+        if p.choices:
+            assert list(p.choices) == list(p.choices), p.key
+            assert len(set(p.choices)) == len(list(p.choices)), \
+                f"{p.key} 的候选有重复：{p.choices}"
+    for spec in (("activation", list(ACTIVATIONS)),
+                 ("optimizer", list(OPTIMIZERS)),
+                 ("lr_schedule", list(SCHEDULES))):
+        key, want = spec
+        got = next(p for p in TorchMLP.param_schema if p.key == key)
+        assert list(got.choices) == want, f"{key} 候选顺序漂了：{got.choices}"
+        assert got.default in want, f"{key} 的默认值不在候选里：{got.default}"
+
+
 def test_neural_fresh_predict_string_labels():
     """独立引用：新实例 + 字符串标签 predict 不丢编码（同 logistic 约定）。"""
     if not _neural_available():

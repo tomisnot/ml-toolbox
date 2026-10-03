@@ -175,22 +175,65 @@ def test_param_three_states():
 
 
 def test_param_rerun():
-    """改参 -> 应用并重跑：结果参数确实变化。"""
+    """改参 -> 应用并重跑：结果参数确实变化。
+
+    ⚠ **必须等第一次跑完再改参**（2026-10-03 修）：本判据以前在 `_inspect_method`
+    之后立刻 `setText` + `_rerun_current`，与第一次运行**抢同一个窗口**；第一次
+    跑完时回调会把 `_current_record` 写回**它自己那条**记录 ⇒ 断言的"参数变了"
+    随机落空。这是判据自身的竞态，不是业务逻辑错（业务侧另有真 bug，见下一条）。
+    """
     win = _win_get()
     win._inspect_method("ridge")
-    app.processEvents()
+    _wait_record(win, lambda r: r is not None)         # 先等第一次跑完
     w = win.params._widgets["alpha"][1]
     w.setText("100.0")
     win._rerun_current()
-    app.processEvents()
+    _wait_record(win, lambda r: r.result.params.get("alpha") == 100.0)
+    assert win._current_record.result.params["alpha"] == 100.0
+
+
+def test_rerun_swaps_in_the_new_record():
+    """⭐ 就地重跑（同一 run_id）后，`_current_record` 必须是**新对象**。
+
+    为什么单列一条：`run_id` 在跑之前就定死（`runner._run_id`，为了让 TensorBoard
+    逐 epoch 直播目录不变）⇒ **重跑沿用同一个 run_id**。而 `_show_single` 先
+    `_current_record = rec`，再按 `run_id` 去 `self.records` 里找——命中**旧**记录，
+    于是 `_show_record(idx)` 又把 `_current_record` 覆盖回旧的
+    （实测：收到的 rec 是 `alpha=100.0`，`_current_record` 却是 `alpha=1.0`）。
+    用户可见后果：重跑后检视页/对比表/后续预测用的还是上一轮记录。
+
+    ⚠ 断言用**对象同一性**，不是值相等：值相等在"新记录恰好等于旧记录"时会假绿。
+    """
+    win = _win_get()
+    win._inspect_method("ridge")
+    _wait_record(win, lambda r: r is not None)
+    before = win._current_record
+    w = win.params._widgets["alpha"][1]
+    w.setText("100.0")
+    win._rerun_current()
+    _wait_record(win, lambda r: r is not None and r is not before)
+    after = win._current_record
+    assert after is not before, "重跑后 _current_record 还是旧对象（被 records 里那条覆盖）"
+    assert after.result.params.get("alpha") == 100.0, \
+        f"重跑后记录里的参数不对：{after.result.params}"
+    assert after.config.get("overrides", {}).get("alpha") == 100.0, \
+        f"重跑后记录的 overrides 没跟上：{after.config}"
+
+
+def _wait_record(win, pred, timeout=8.0):
+    """等 `_current_record` 满足条件（超时就回 False，让断言给出可读失败）。"""
     import time
-    for _ in range(50):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
         app.processEvents()
         time.sleep(0.02)
-        if getattr(win, "_current_record", None) is not None \
-                and win._current_record.result.params.get("alpha") == 100.0:
-            break
-    assert win._current_record.result.params["alpha"] == 100.0
+        rec = getattr(win, "_current_record", None)
+        try:
+            if pred(rec):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def test_method_browser_filter():
@@ -552,6 +595,7 @@ if __name__ == "__main__":
         ("inspect_pages_built", test_inspect_pages_built),
         ("param_three_states", test_param_three_states),
         ("param_rerun", test_param_rerun),
+        ("rerun_swaps_in_new_record", test_rerun_swaps_in_the_new_record),
         ("method_browser_filter", test_method_browser_filter),
         ("pipeline_dialog_edit", test_pipeline_dialog_edit),
         ("history_load", test_history_load),
