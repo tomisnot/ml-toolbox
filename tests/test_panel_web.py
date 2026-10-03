@@ -256,6 +256,41 @@ def test_server_serves_views_and_port_file(tmp_dir=None):
     assert not pf.exists(), "收尾没清掉自己的端口文件"
 
 
+def test_resolve_panel_base_rejects_stale_port_file():
+    """⭐ 端口文件残留（指向**死进程**）时**认不出来** ⇒ 回 ``None``，不给坏地址。
+
+    为什么必须有：进程被强杀（`terminate()`／任务被会话收掉）**不跑 `finally`**
+    ⇒ 端口文件会留一个**没人听**的端口号。只读文件就会把浏览器开到那儿，
+    现象正是"面板打不开／端口好像不对"。⇒ 读出来之后必须**探一下** `/health`。
+    """
+    pf = Path(__file__).resolve().parent.parent / ".mlweb-resolve-probe"
+    try:
+        # ① 文件不存在 ⇒ None
+        pf.unlink(missing_ok=True)
+        assert W.resolve_panel_base(pf) is None
+        # ② 内容非法 ⇒ None（端口文件不校验合法性，非法一律按"不知道"）
+        pf.write_text("not-a-port", encoding="utf-8")
+        assert W.resolve_panel_base(pf) is None
+        # ③ 指向没人听的端口 ⇒ None（**关键那条**：陈旧残留）
+        import socket
+        with socket.socket() as s:                    # 抢一个端口再立刻放掉 ⇒ 必无人听
+            s.bind(("127.0.0.1", 0))
+            dead = s.getsockname()[1]
+        pf.write_text(str(dead), encoding="utf-8")
+        assert W.resolve_panel_base(pf) is None, "陈旧端口文件被当成有效地址了"
+        # ④ 真起服务 ⇒ 认得出，且地址与实际端口一致
+        svc = W.PanelWeb(port=0, port_file=pf)
+        port = svc.start()
+        try:
+            got = W.resolve_panel_base(pf)
+            assert got == f"http://127.0.0.1:{port}/", f"解析出的地址不对：{got}"
+        finally:
+            svc.stop()
+        assert W.resolve_panel_base(pf) is None, "收尾后不该还能解析出地址"
+    finally:
+        pf.unlink(missing_ok=True)
+
+
 # ============================================================ 直跑入口
 _TESTS = [
     test_esc_and_numbers_never_guess,
@@ -270,6 +305,7 @@ _TESTS = [
     test_conflicting_archive_is_disclosed_not_hidden,
     test_plot_failure_returns_explanatory_png,
     test_server_serves_views_and_port_file,
+    test_resolve_panel_base_rejects_stale_port_file,
 ]
 
 

@@ -711,6 +711,35 @@ def start_panel_web(*, port: int = 0, port_file=None, backend_url=None,
     return p
 
 
+def resolve_panel_base(port_file, *, host: str = "127.0.0.1",
+                       timeout: float = 1.5) -> str | None:
+    """从端口文件解析出**真的有人在听**的面板地址；否则 ``None``。
+
+    ## 为什么要"探一下"，而不是只读文件
+
+    端口文件是**发现辅助、不是真值**（`mecha.portfile` 的既定语义）。进程被强杀时
+    （`terminate()`／任务被会话收掉都**不跑 `finally`**）文件会残留一个**指向死进程**的
+    端口号。只读文件就会把浏览器开到**没人听**的地址上，现象正是
+    "面板打不开／端口好像不对"。⇒ 读出来之后连一下 `/health`，**只有真在听才认**。
+
+    ⚠ 端口文件里的数字本身**不校验合法性**（它回答"端口是多少"，不回答"文件合不合法"）：
+    非法/缺失一律按"不知道"处理，返回 ``None``。
+    """
+    from mecha.portfile import read_port
+    port = read_port(port_file)
+    if not port:
+        return None
+    base = f"http://{host}:{int(port)}/"
+    try:
+        import urllib.request
+        with urllib.request.urlopen(base + "health", timeout=timeout) as r:
+            if r.status == 200:
+                return base
+    except Exception:
+        return None
+    return None
+
+
 def main(argv=None) -> int:                            # pragma: no cover - CLI 入口
     """独立进程入口：``python -m ml_mecha.panel_web``（给 launcher 起窗口用）。"""
     import argparse

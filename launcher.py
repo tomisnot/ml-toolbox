@@ -321,6 +321,11 @@ def _spawn_panel(monitor_port: int | None, tb_url: str | None = None):
     #   启动路径（只为拿一个文件名，不值得）。文件名的单一真源仍在 `ml_mecha/panel_web.py`。
     from ml_mecha.panel_web import WEB_PORT_FILE as PANEL_PORT_FILE
     port_file = HERE / PANEL_PORT_FILE
+    # ⚠ 起之前**先清陈旧的端口文件**：上一次会话可能留下一个指向**死进程**的端口号
+    #   （`terminate()`／任务被收掉都**不跑** `finally` ⇒ 收尾那一次清不掉），不清就会
+    #   等/读到上一代的端口，或把浏览器开到**没人听**的地址上——现象是"面板打不开/端口不对"。
+    #   规则与 `mecha.portfile` 一致（启动前无条件清陈旧；收尾只删自己写的那个）。
+    clear_port_file(port_file)
     cmd = [PY, "-m", "ml_mecha.panel_web", "--port-file", str(port_file)]
     # ⭐ application 层指定"本服务要用到的层"：优化侧的读档能力是 opt 层 import 时
     #   注册进 core 的槽的，而 `ml_mecha` 不许直接 import opt（宪章纪律）⇒ 由这里给名字。
