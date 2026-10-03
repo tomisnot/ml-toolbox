@@ -29,8 +29,23 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
 #: 读回上限：每个 tag 最多回这么多点（事件文件可以很长，别整个倒出去）。
 MAX_POINTS = 500
 
-#: `run_id` → (`EventAccumulator`, 事件目录 mtime 快照)。模块级缓存（单进程只读端点）。
-_CACHE: dict[str, tuple[Any, float]] = {}
+#: `run_id` → (`EventAccumulator`, 建它时的「事件文件集」签名)。模块级缓存（单进程只读端点）。
+#: ⚠ 签名用来**发现目录里多/少了事件文件**：`EventAccumulator` 只盯**它创建时那个文件**，
+#: 目录里后来新增的文件它不会读（实测：模拟"重启后续写"的第二个文件时，复用缓存读不到）。
+#: ⇒ 文件集变了就**重建** accumulator。这是"跨进程续写同一个 run"能看见的前提。
+_CACHE: dict[str, tuple[Any, tuple]] = {}
+
+
+def _files_signature(d: Path) -> tuple:
+    """事件目录的「文件集」签名（名字 + mtime + 大小）。文件集不变则复用缓存。"""
+    out = []
+    for f in sorted(d.glob("events*")):
+        try:
+            st = f.stat()
+            out.append((f.name, int(st.st_mtime_ns), int(st.st_size)))
+        except OSError:
+            continue
+    return tuple(out)
 
 
 def runs_root() -> Path:
@@ -49,17 +64,24 @@ def tb_dir(run_id: str, root: Path | None = None) -> Path | None:
 
 
 def _accumulator(run_id: str, root: Path | None = None):
-    """取（或建）该 run 的 accumulator 并 ``Reload``（**读到最新**）。"""
+    """取（或建）该 run 的 accumulator 并 ``Reload``（**读到最新**）。
+
+    ⚠ 两步各自解决一件事：
+    1. **同文件内的增量**（训练逐 epoch 追加）⇒ 复用同一个 accumulator，``Reload()`` 就读得到；
+    2. **目录里新增文件**（SummaryWriter 重启新建文件）⇒ 靠 ``_files_signature`` 发现并**重建**
+       —— 因为 accumulator 不会自动去读它创建后新出现的文件（实测）。
+    """
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     d = tb_dir(run_id, root)
     if d is None:
         return None
     key = str(d)
-    acc, _ = _CACHE.get(key, (None, 0.0))
-    if acc is None:
-        acc = EventAccumulator(key)
-        _CACHE[key] = (acc, 0.0)
-    acc.Reload()                                    # ⭐ 增量：新写的事件这里读得到
+    sig = _files_signature(d)
+    acc, old_sig = _CACHE.get(key, (None, None))
+    if acc is None or old_sig != sig:
+        acc = EventAccumulator(key)                 # 文件集变了 ⇒ 重建（别复用旧的视野）
+        _CACHE[key] = (acc, sig)
+    acc.Reload()                                    # ⭐ 同文件增量：新写的事件这里读得到
     return acc
 
 
@@ -86,6 +108,7 @@ def read_run(run_id: str, *, root: Path | None = None,
                 "reason": f"读事件文件失败：{type(exc).__name__}: {exc}"}
 
     scalars: dict[str, Any] = {}
+    duplicated: list[str] = []
     for tag in tags.get("scalars", []) or []:
         try:
             ev = acc.Scalars(tag)
@@ -94,12 +117,26 @@ def read_run(run_id: str, *, root: Path | None = None,
         pts = _tail(ev, limit)
         if not pts:
             continue
+        # ⚠ **同一步出现多次**：同一个 `tb/` 目录里堆了**多个事件文件**时（训练重跑没清目录、
+        # 或 SummaryWriter 因重启新建文件），accumulator 会把两份都读出来 —— TensorBoard 自己
+        # 也会把它画成两条重叠曲线。
+        # ⇒ 按步去重（**后写的赢**，与 SummaryWriter 的语义一致），并**留痕**：
+        #    静默去重会把"目录脏了"这件事藏起来，而那正是要让人看见的。
+        by_step: dict[int, float] = {}
+        order: list[int] = []
+        for p in pts:
+            st = int(p.step)
+            if st not in by_step:
+                order.append(st)
+            by_step[st] = float(p.value)
+        if len(order) != len(pts):
+            duplicated.append(tag)
         scalars[tag] = {
-            "steps": [int(p.step) for p in pts],
-            "values": [float(p.value) for p in pts],
-            "latest": {"step": int(pts[-1].step), "value": float(pts[-1].value)},
+            "steps": order,
+            "values": [by_step[s] for s in order],
+            "latest": {"step": order[-1], "value": by_step[order[-1]]},
         }
-    return {
+    out = {
         "available": True,
         "run_id": str(run_id),
         "dir": d.name,
@@ -108,6 +145,10 @@ def read_run(run_id: str, *, root: Path | None = None,
         "images": list(tags.get("images", []) or []),
         "text": list(tags.get("tensors", []) or []),
     }
+    if duplicated:
+        # 留痕（不静默）：调用方/AI 能看出"这个 run 的目录里有重复写入"
+        out["duplicate_steps"] = sorted(duplicated)
+    return out
 
 
 #: 一屏能懂的几条（顺序即重要性）：与 LightlyTrain 的"梯度范数是最有用信号"一致。

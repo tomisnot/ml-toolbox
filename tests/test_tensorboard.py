@@ -149,11 +149,70 @@ def test_sidecar_stop_is_idempotent():
     assert sc.url is None
 
 
+def test_duplicate_steps_are_deduped_and_flagged():
+    """⚠ 同一 ``tb/`` 目录里堆了多个事件文件时：**按步去重**（后写的赢）且**留痕**。
+
+    为什么必须有这条：训练重跑没清目录、或 SummaryWriter 因重启新建文件 ⇒ accumulator 会把
+    两份都读出来，TensorBoard 自己也会画成**两条重叠曲线**。
+    静默去重会把"目录脏了"藏起来；静默不去重又会让读数看起来像"训练了两遍"。
+    ⇒ 去重 + 把 ``duplicate_steps`` 露出来。
+    """
+    rec = _run_once()
+    try:
+        d = Path(RUNS_DIR) / PROBE_ID / "tb"
+        first = sorted(d.glob("events*"))[0]
+        # 再开一个 writer 写**同样的步**（模拟"目录里多了一份事件文件"）
+        from torch.utils.tensorboard import SummaryWriter
+        w2 = SummaryWriter(log_dir=str(d))
+        for ep in range(len(rec.result.artifacts["nn_history"]["loss"])):
+            w2.add_scalar("loss", 0.5, ep)          # 与第一批同 step、不同值
+        w2.flush(); w2.close()
+        assert first.is_file()
+
+        payload = tb_series.read_run(PROBE_ID)
+        assert payload["available"], payload.get("reason")
+        steps = payload["scalars"]["loss"]["steps"]
+        assert steps == sorted(set(steps)), f"步号应去重后仍递增，实得 {steps}"
+        assert payload.get("duplicate_steps"), "重复步没有被留痕（静默去重）"
+        assert "loss" in payload["duplicate_steps"]
+        # 后写的赢：那些被重复的步应取 0.5
+        assert payload["scalars"]["loss"]["values"][-1] == 0.5
+    finally:
+        _clean()
+
+
+def test_new_event_file_is_picked_up():
+    """⭐ **目录里新增事件文件后能读到**（模拟"重启续写同一个 run"）。
+
+    为什么必须有：``EventAccumulator`` **只盯它创建时那个文件**，后来出现的文件它不会读
+    （实测）。训练若分两次进程写同一个 run，复用缓存就会**看不见后一半**——
+    面板/人会以为训练停在第一步。⇒ 缓存必须按「事件文件集」失效。
+    """
+    rec = _run_once(epochs=6)
+    try:
+        d = Path(RUNS_DIR) / PROBE_ID / "tb"
+        n0 = len(tb_series.read_run(PROBE_ID)["scalars"]["loss"]["values"])
+        # 第二个 writer：**新增一个文件**并往后多写几步（模拟续写）
+        from torch.utils.tensorboard import SummaryWriter
+        w2 = SummaryWriter(log_dir=str(d))
+        for ep in range(6, 9):
+            w2.add_scalar("loss", 0.9, ep)
+        w2.flush(); w2.close()
+
+        got = tb_series.read_run(PROBE_ID)["scalars"]["loss"]
+        assert got["steps"][-1] == 8, f"没读到新增文件里的步（实得到 {got['steps'][-1]}）"
+        assert len(got["values"]) > n0, "新增文件的点没进来（缓存没按文件集失效）"
+    finally:
+        _clean()
+
+
 # ---------------------------------------------------------------- 直跑入口
 _TESTS = [
     test_events_are_written_with_all_axes,
     test_series_matches_artifacts,
     test_latest_reads_the_newest_step,
+    test_duplicate_steps_are_deduped_and_flagged,
+    test_new_event_file_is_picked_up,
     test_missing_run_reports_reason_not_empty,
     test_run_id_path_traversal_is_rejected,
     test_sidecar_refuses_missing_logdir_with_reason,
