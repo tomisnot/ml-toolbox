@@ -40,6 +40,88 @@ TB_DIRNAME = "tb"
 CORE_SCALARS = ("loss", "val_loss", "lr", "grad_norm", "dead_relu")
 
 
+def layout_groups(layer_names) -> dict:
+    """标量分组的**纯函数**：``{类别: {图名: ["Multiline", [tag…]]}}``。
+
+    ⚠ 这个形状就是 **torch** 的 `SummaryWriter.add_custom_scalars` 的入参。
+    **不要走 protobuf 那条路**：`tensorboard.summary.v1.custom_scalar` 在新版里
+    `import tensorflow.compat.v1`（本机只有 tensorboard、没有 tensorflow ⇒ 实测直接
+    `ModuleNotFoundError`）；而 torch 这个封装**不需要 tensorflow**。
+
+    ⚠ 分组依据是"**读的人要判什么**"，不是"数据长什么样"：
+    - **训练动态** —— 一次训练是否健康（收敛 / 稳定 / 调度）；
+    - **逐层梯度** —— 梯度是**逐层衰减**还是**爆炸**（这必须一层层看）；
+    - **权重范数** —— 权重在**长**还是在**僵**（first/last/update 同图才看得出）。
+
+    ⚠ **不按 tag 字典序排**：那会把 `loss` 和 `grad/0.weight` 排在一起，读的人得自己找。
+    这是"帮人判"与"列清单"的区别。
+    """
+    names = [str(n) for n in (layer_names or ())]
+    layout: dict = {
+        "训练动态": {
+            "损失": ["Multiline", ["loss", "val_loss"]],
+            "稳定性": ["Multiline", ["grad_norm", "dead_relu"]],
+            "学习率": ["Multiline", ["lr"]],
+        },
+    }
+    if names:
+        layout["逐层梯度范数（逐层衰减 / 爆炸）"] = {
+            n: ["Multiline", [f"grad/{n}"]] for n in names}
+    layout["权重范数（在长还是在僵）"] = {
+        "首 / 末 / 更新": ["Multiline", ["weights_norm/first",
+                                        "weights_norm/last",
+                                        "weights_norm/update"]],
+    }
+    return layout
+
+
+CONFIG_SUMMARY_TAG = "custom_scalars__config__"
+PLUGIN_NAME = "custom_scalars"
+
+
+def _layout_summary(layout: dict):
+    """把 layout 打成 TB 能**真正读到**的那条 summary。
+
+    ## 为什么不直接用现成入口（两条路都实测不通）
+
+    | 路 | 为什么不行 |
+    |---|---|
+    | `torch` 的 `SummaryWriter.add_custom_scalars` | ⚠ 它把 layout 塞进 **`tensor.string_val`**，而 TB 2.19 读的是 **`plugin_data.content`** ⇒ **布局被静默丢掉**（实测：写进去了、读回 0 个类别） |
+    | `tensorboard.summary.v1.custom_scalar` | ⚠ 内部 `import tensorflow.compat.v1` ⇒ 本机只有 tensorboard、没有 tensorflow ⇒ `ModuleNotFoundError` |
+
+    ⇒ 所以按 TB 2.19 的**权威读法**自己造：`plugin_data.plugin_name="custom_scalars"`
+    + **`plugin_data.content = Layout.SerializeToString()`**（纯 proto，**不需要 tensorflow**）。
+    读法依据：`tensorboard/backend/event_processing/data_provider.py` 与
+    `event_accumulator.py` 都取 `summary_metadata.plugin_data.content`。
+    """
+    from tensorboard.compat.proto.summary_pb2 import Summary, SummaryMetadata
+    from tensorboard.plugins.custom_scalar import layout_pb2
+
+    categories = []
+    for cat_title, charts in layout.items():
+        pb_charts = []
+        for chart_title, meta in charts.items():
+            kind, tags = meta[0], list(meta[1])
+            if kind == "Margin":
+                content = layout_pb2.MarginChartContent(series=[
+                    layout_pb2.MarginChartContent.Series(
+                        value=tags[0], lower=tags[1], upper=tags[2])])
+                pb_charts.append(layout_pb2.Chart(title=chart_title,
+                                                  margin=content))
+            else:
+                content = layout_pb2.MultilineChartContent(tag=tags)
+                pb_charts.append(layout_pb2.Chart(title=chart_title,
+                                                  multiline=content))
+        categories.append(layout_pb2.Category(title=cat_title, chart=pb_charts))
+
+    blob = layout_pb2.Layout(category=categories).SerializeToString()
+    return Summary(value=[Summary.Value(
+        tag=CONFIG_SUMMARY_TAG,
+        metadata=SummaryMetadata(plugin_data=SummaryMetadata.PluginData(
+            plugin_name=PLUGIN_NAME, content=blob)),
+    )])
+
+
 class TensorBoardLog:
     """逐 epoch 写 TensorBoard 的单向桥。**永不抛**（写失败只记账）。"""
 
@@ -183,6 +265,28 @@ class TensorBoardLog:
             except Exception:
                 return
         self._safe("text/layers", w.add_text, "layers/health", md, int(step))
+
+    def write_layout(self, layer_names) -> None:
+        """把标量**排好组**写进事件文件（TensorBoard 的 custom scalars 布局 API）。
+
+        为什么值得写这一下：不排的话，TensorBoard 按 tag 字典序铺 20 张图，
+        `loss` 和 `grad/0.weight` 混在一起，读的人要自己找。
+        排完打开就是「训练动态 / 逐层梯度 / 权重范数」三组，**顺序即优先级**。
+
+        ⚠ 布局是**可选增强**：`custom_scalar` 不可用时静默跳过（不拖垮，也不假装）。
+        """
+        w = self._ensure()
+        if w is None:
+            return
+        try:
+            # ⚠ **不要用 `w.add_custom_scalars(...)`**：它把 layout 写进 tensor.string_val，
+            #   而 TB 读 plugin_data.content ⇒ 布局会被静默丢掉（实测）。
+            #   这里走自己造的那条 summary（见 `_layout_summary` 的取证）。
+            fw = w._get_file_writer()
+            fw.add_summary(_layout_summary(layout_groups(layer_names)), 0)
+            fw.flush()
+        except Exception as exc:
+            self.note_error("layout", exc)
 
     def close(self) -> None:
         """收尾：flush + close。**关闭日志本身可读**（TensorBoard 读文件，不读进程）。"""

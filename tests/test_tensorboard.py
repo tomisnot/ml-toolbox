@@ -206,11 +206,50 @@ def test_new_event_file_is_picked_up():
         _clean()
 
 
+def test_scalar_layout_is_written_and_readable():
+    """⭐ 标量**分组布局**真的写进去了、且 TB 读得到（不是"写了但被丢掉"）。
+
+    为什么必须有这条：`torch` 的 `add_custom_scalars` 把 layout 塞进
+    **`tensor.string_val`**，而 TB 2.19 读的是 **`plugin_data.content`**
+    ⇒ 用它写出来的布局**会被静默丢掉**（实测：写进去了、读回 0 个类别，
+    TensorBoard 里看到的仍是一堆按字典序铺的图）。
+    ⇒ 本条断言"读回的类别与图名齐全"，正是那个字段错位会打破的性质。
+    """
+    _run_once()
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import (
+            EventAccumulator)
+        from tensorboard.plugins.custom_scalar import layout_pb2
+        ea = EventAccumulator(str(Path(RUNS_DIR) / PROBE_ID / "tb"))
+        ea.Reload()
+        blobs = ea.PluginTagToContent("custom_scalars")
+        assert blobs, "没有 custom_scalars 布局（没写、或被写到读不到的地方）"
+        content = next(iter(blobs.values()))
+        assert content, "布局 content 为空（写错字段了：应在 plugin_data.content）"
+        lay = layout_pb2.Layout()
+        lay.ParseFromString(content)
+        titles = [c.title for c in lay.category]
+        assert len(lay.category) == 3, f"应有三个类别，实得 {titles}"
+        assert any("训练动态" in t for t in titles), titles
+        assert any("逐层梯度" in t for t in titles), titles
+        assert any("权重范数" in t for t in titles), titles
+        # 第一组必须把 loss 与 val_loss 画在**同一张图**上（否则"同图比较"这条性质没了）
+        dyn = next(c for c in lay.category if "训练动态" in c.title)
+        loss_chart = next(ch for ch in dyn.chart if ch.title == "损失")
+        assert set(loss_chart.multiline.tag) == {"loss", "val_loss"}
+        # 逐层梯度：每层一张图（层数 = 3）
+        grads = next(c for c in lay.category if "逐层梯度" in c.title)
+        assert len(grads.chart) == 3, [ch.title for ch in grads.chart]
+    finally:
+        _clean()
+
+
 # ---------------------------------------------------------------- 直跑入口
 _TESTS = [
     test_events_are_written_with_all_axes,
     test_series_matches_artifacts,
     test_latest_reads_the_newest_step,
+    test_scalar_layout_is_written_and_readable,
     test_duplicate_steps_are_deduped_and_flagged,
     test_new_event_file_is_picked_up,
     test_missing_run_reports_reason_not_empty,

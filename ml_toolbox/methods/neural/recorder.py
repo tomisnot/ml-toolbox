@@ -267,6 +267,9 @@ class TrainingRecorder:
                 self.tb.log_latent_frames(out["nn_latent"],
                                           out.get("nn_latent_epochs"))
             self.tb.log_layers_table(out.get("nn_layers"), last_ep)
+            # ⭐ 最后写布局：把 ~20 个标量排成「训练动态 / 逐层梯度 / 权重范数」三组。
+            #   不排的话 TensorBoard 按 tag 字典序铺，loss 与 grad/0.weight 混在一起。
+            self.tb.write_layout(list(self.grads))
             self.tb.close()
         return out
 
