@@ -103,6 +103,13 @@ def run_one(method: MLMethod, spec: DataSpec,
     # 经 `cfg.extras` 往下传；末态构造 RunRecord 时**复用同一个值** ⇒ 目录名与记录名一致。
     run_id = cfg.extras.get("run_id") or _run_id(method.name, cfg.seed)
     cfg.extras["run_id"] = run_id
+    #: **方法内部的进度钩子**（可选，逗号（epoch, total）之外不承诺任何形状）。
+    #: 为什么走 extras 而不是新增 `fit` 形参：`fit(X, y, cfg, diag)` 是方法层契约，
+    #: 为了一个可选观测能力去改**每个方法**的签名不划算；而 extras 本来就是
+    #: "任务级扩展"的通道（cv_folds 等已在用）。
+    #: ⚠ **它不落盘、不进指纹**：运行结束前必须摘掉，否则 RunConfig 会被
+    #: `record.json` 序列化时炸在"不是 JSON 的东西"上（见下面 finally）。
+    on_progress = cfg.extras.get("on_progress")
     try:
         with timer.stage("guard"):
             resource_estimate = _resource_guard(method, spec, cfg)
@@ -127,6 +134,13 @@ def run_one(method: MLMethod, spec: DataSpec,
     except Exception:
         res = MLResult(method_name=method.name, task=method.task,
                        error=traceback.format_exc(limit=10))
+    finally:
+        # ⚠ **摘掉进度钩子**（它是运行时对象，不是配置）：
+        #   留在这里会在 `record.json` 写盘时炸在"不可 JSON 序列化"上，
+        #   而且它会被带进 cfg 指纹/快照类的东西里（那都是错的）。
+        #   用 `pop(..., None)`：没传过就是 no-op（零开销，P3）。
+        if on_progress is not None:
+            cfg.extras.pop("on_progress", None)
 
     # 旧字段语义保持不变：评估/CV 之前结算 elapsed。
     res.target_kind = res.target_kind or spec.target_kind

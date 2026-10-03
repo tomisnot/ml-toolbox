@@ -138,10 +138,14 @@ def build_ml_tools(engine: MLEngine, *, actor: str = LOCAL_ACTOR,
         _describe_method(engine, banned_words),
         _describe_dataset(engine, banned_words),
         _describe_run(engine, banned_words),
+        _describe_training(engine, banned_words),
+        _describe_networks(engine, banned_words),
+        _describe_network(engine, banned_words),
         _prepare_dataset(engine, _with_channel, banned_words),
         _run_method(engine, _with_channel, banned_words),
         _run_method_batch(engine, _with_channel, banned_words),
         _compare_methods(engine, _with_channel, banned_words),
+        _run_custom(engine, _with_channel, banned_words),
         _submit_run(host, side, banned_words),
         _read_job(host, banned_words),
         _cancel_run(host, banned_words),
@@ -213,18 +217,24 @@ def _describe_dataset(engine: MLEngine,
                 "pipeline_id": detail["pipeline_id"],
                 "columns": list(detail["columns"]),
                 "pipeline_chain": detail["pipeline_chain"],
+                # ⭐ 实际的训练/测试划分口径（test_size/stratify/seed/time_split）。
+                #   与链上 `split` 步骤分开给：那个步骤的参数**不决定**划分
+                #   （真源是 Pipeline 本体），见 `engine._chain_summary` 的说明。
+                "split_policy": detail.get("split_policy") or {},
                 "schema_mismatch": detail["schema_mismatch"], "error": ""}
 
     return define_tool(
         name="describe_dataset",
-        description="说明一份已准备数据视图的行列规模、目标列、预处理链摘要与管道指纹；"
-                    "用于判断数据是否适合某个方法。",
+        description="说明一份已准备数据视图的行列规模、目标列、**预处理链逐步参数**"
+                    "（填充策略/编码模式/缩放方式…）、**实际划分口径**（split_policy）"
+                    "与管道指纹；用于判断数据是否适合某个方法。",
         parameters={"dataset_id": {"type": "string",
                                    "description": "数据集引用；留空用最近准备的一份",
                                    "default": ""}},
         output_schema={"type": "object",
                        "required": ["ok", "dataset_id", "n_rows", "n_features",
-                                    "pipeline_id", "pipeline_chain", "error"]},
+                                    "pipeline_id", "pipeline_chain",
+                                    "split_policy", "error"]},
         execute=execute,
         banned_words=banned_words,
     )
@@ -260,12 +270,195 @@ def _describe_run(engine: MLEngine,
     )
 
 
+def _describe_training(engine: MLEngine,
+                       banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """⭐ 训练过程观测：**逐 epoch 的数值**（只读投影，不经写权门）。
+
+    为什么必须单开一个工具（2026-10-03 实测的缺口）：训练观测数据一直是
+    **逐 epoch 落盘**的（`runs/<id>/tb/`），但那批数值只出现在**只读 HTTP 路由**
+    `/latest`、`/series` 上（`ml_mecha/monitor_http.py`）⇒ AI 经工具面**一条都拿不到**，
+    而 `describe_run` 只回"产物类别名"（`nn_history` 在列表里、数值不给）。
+    于是 AI 无法回答"梯度爆没爆 / 哪层死了 / 要不要早停"——那正是观测数据的用途。
+
+    ⚠ 与 `describe_run` 的**分工**（别合并）：
+    - `describe_run` = 这次运行的**元数据与最终指标**（会话内存态）；
+    - 本工具 = **过程数值**（磁盘事件文件），因此对"未落盘的运行"（`persist=false`，
+      AI 默认）与"跨重启的历史运行"同样有效——那两种情形 `describe_run` 都做不到。
+    """
+
+    def execute(*, run_id: str = "", include_series: bool = False,
+                limit: int = 200) -> Mapping[str, Any]:
+        detail = engine.query("training_detail", run_id=run_id,
+                              include_series=bool(include_series),
+                              limit=int(limit))
+        return {"ok": True, **detail, "error": ""}
+
+    return define_tool(
+        name="describe_training",
+        description="读一个 run 的**训练过程观测数值**（逐 epoch）：最新一轮的 "
+                    "loss / val_loss / grad_norm / lr / dead_relu / 逐层梯度范数，"
+                    "可选整条序列（include_series=true）用于判断趋势"
+                    "（如'梯度是否在多个数量级上快速增大'）。"
+                    "⚠ 数据来自 TensorBoard 事件文件：**没有事件文件就如实说读不到**"
+                    "（训练时未装 tensorboard 时如此）。",
+        parameters={
+            "run_id": {"type": "string",
+                       "description": "运行编号；留空则按最近落盘的 run 找", "default": ""},
+            "include_series": {"type": "boolean",
+                               "description": "是否连整条逐 epoch 序列一起回"
+                                              "（默认 false 只回最新一轮；序列较大）",
+                               "default": False},
+            "limit": {"type": "integer",
+                      "description": "每个 tag 最多回多少点（只对 include_series 生效）",
+                      "default": 200},
+        },
+        output_schema={"type": "object",
+                       "required": ["ok", "run_id", "available", "latest",
+                                    "tags", "error"]},
+        execute=execute,
+        banned_words=banned_words,
+    )
+
+
+def _describe_networks(engine: MLEngine,
+                       banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """⭐ 已保存的自定义网络清单（**让 AI 不必反复重贴同一段代码**）。
+
+    为什么必须有（用户点破的实际风险）：改个学习率就要重贴一遍网络代码的话，
+    token 全烧在复制粘贴上 ⇒ "自由度"换来的是低效。有了它，第一次写、之后按名字取。
+
+    ⚠ 名字是 `describe_networks`（不是 `list_networks`）：框架有命名律——
+    `list_` 前缀被禁（"视图/枚举不是工具，是 schema 的投影"），
+    与 `describe_methods` 同类。实测撞过这条守卫。
+    """
+
+    def execute(*, limit: int = 50) -> Mapping[str, Any]:
+        got = engine.query("network_catalog", limit=int(limit))
+        return {"ok": True, **got, "error": ""}
+
+    return define_tool(
+        name="describe_networks",
+        description="列出自定义网络（`run_custom` 存下来的）：名字、主指标、"
+                    "源码行数、用过几次、来自哪个 run。"
+                    "**先查这里再动手写**——已经跑过的网络可以直接取回源码改一版"
+                    "（用 describe_network），不必重贴。",
+        parameters={"limit": {"type": "integer",
+                              "description": "最多扫最近多少个 run 的存档",
+                              "default": 50}},
+        output_schema={"type": "object",
+                       "required": ["ok", "networks", "scanned", "error"]},
+        execute=execute,
+        banned_words=banned_words,
+    )
+
+
+def _describe_network(engine: MLEngine,
+                      banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """按名字取回已保存网络的**源码**（改一版再跑，不重贴）。"""
+
+    def execute(*, name: str, limit: int = 200) -> Mapping[str, Any]:
+        got = engine.query("network_source", name=str(name), limit=int(limit))
+        return {"ok": True, **got, "error": ""}
+
+    return define_tool(
+        name="describe_network",
+        description="按名字取回某个已保存自定义网络的**源码**（连同它来自哪个 run）。"
+                    "拿它改一版再 `run_custom` 是最省的迭代方式。"
+                    "⚠ 找不到就如实回 available=false + 原因，不回空源码。",
+        parameters={"name": {"type": "string", "description": "网络名字（见 list_networks）"},
+                    "limit": {"type": "integer",
+                              "description": "最多扫最近多少个 run 的存档",
+                              "default": 200}},
+        output_schema={"type": "object",
+                       "required": ["ok", "available", "name", "code", "error"]},
+        execute=execute,
+        banned_words=banned_words,
+    )
+
+
 # ---------------------------------------------------------------- 受控命令
+def _run_custom(engine: MLEngine, wrap,
+                banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """⭐ 跑**调用方给出的网络代码**（AI 写结构，系统管训练与观测）。
+
+    为什么要有它（用户裁决的设计）：`torch_mlp` 的旋钮再多也表达不了**拓扑**——
+    拓扑写死成 `nn.Sequential` ⇒ 残差/多分支/任意前向全都做不到。本工具把
+    "结构"这一段交给代码，而**其余一切照旧**（切分/指标/存档/五页检视/
+    `describe_training` 观测面全部白拿，因为它跑的就是一台 `MLMethod`）。
+    """
+
+    def execute(*, code: str, dataset_id: str = "",
+                overrides: Mapping[str, Any] | None = None, seed: int | None = None,
+                diag: bool = False, persist: bool = False, name: str = "",
+                resource_guard: Mapping[str, Any] | None = None
+                ) -> Mapping[str, Any]:
+        spec: dict[str, Any] = {"command": "run_custom", "code": str(code),
+                                "diag": bool(diag), "persist": bool(persist)}
+        if dataset_id:
+            spec["dataset_id"] = dataset_id
+        if overrides:
+            spec["overrides"] = dict(overrides)
+        if seed is not None:
+            spec["seed"] = seed
+        if name:
+            spec["name"] = str(name)
+        if resource_guard:
+            spec["resource_guard"] = dict(resource_guard)
+        receipt = _raise_on_failure(engine.run(spec, context=_local_context()))
+        return {"ok": bool(receipt["ok"]), "run_id": receipt.get("run_id", ""),
+                "network_name": receipt.get("network_name", ""),
+                "primary_metric": receipt.get("primary_metric", ""),
+                "metrics": dict(receipt.get("metrics", {})),
+                "elapsed_s": receipt.get("elapsed_s", 0.0),
+                "warnings": list(receipt.get("warnings", [])),
+                "error": receipt.get("error", "")}
+
+    return define_tool(
+        name="run_custom",
+        description="跑一段**自定义网络代码**：代码只需要定义 `class Network` 并实现 "
+                    "`build(self, n_in, n_out, *, nn)`（返回 nn.Module），"
+                    "可选 `loss` / `configure` / `forward_step`。"
+                    "训练循环、TensorBoard、逐 epoch 观测、指标、存档、检视页"
+                    "**全部由系统代管**（所以残差/多分支/任意前向都能跑，"
+                    "而 describe_training 照样读得到曲线）。"
+                    "⚠ 代码只写结构：**不许**自己写盘或碰 GUI（观测由系统统一负责）。",
+        parameters={
+            "code": {"type": "string",
+                     "description": "定义 `class Network` 的 Python 代码"},
+            "dataset_id": {"type": "string",
+                           "description": "数据集引用；留空用最近准备的一份",
+                           "default": ""},
+            "overrides": {"type": "object",
+                          "description": "训练超参覆写：epochs/batch/lr/"
+                                         "weight_decay/val_split/latent_every/"
+                                         "grad_clip/early_stop/early_stop_patience"},
+            "seed": {"type": "integer", "description": "随机种子（整数）"},
+            "diag": {"type": "boolean", "description": "是否保留诊断信息",
+                     "default": False},
+            "persist": {"type": "boolean",
+                        "description": "是否写入 ML 运行存档（**代码会跟着存档走**，"
+                                       "之后可按名字复用，不必重贴）",
+                        "default": False},
+            "name": {"type": "string",
+                     "description": "给这段网络起个名字（存进存档便于复用）",
+                     "default": ""},
+            "resource_guard": {"type": "object",
+                               "description": "资源预算声明，例如 {'max_kernel_mb': 128}"},
+        },
+        output_schema={"type": "object",
+                       "required": ["ok", "run_id", "primary_metric", "metrics",
+                                    "elapsed_s", "warnings", "error"]},
+        execute=wrap(execute),
+        banned_words=banned_words,
+    )
+
+
 def _prepare_dataset(engine: MLEngine, wrap,
                      banned_words: tuple[str, ...] = ()) -> ToolDefinition:
     def execute(*, source: Mapping[str, Any], name: str = "",
                 target: str = "", time_col: str = "",
-                diag: bool = False) -> Mapping[str, Any]:
+                diag: bool = False,
+                pipeline: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "prepare_dataset", "source": source,
                                 "diag": bool(diag)}
         if name:
@@ -274,6 +467,8 @@ def _prepare_dataset(engine: MLEngine, wrap,
             spec["target"] = target
         if time_col:
             spec["time_col"] = time_col
+        if pipeline:
+            spec["pipeline"] = dict(pipeline)
         receipt = _raise_on_failure(
             engine.run(spec, context=_local_context()))
         dataset = receipt.get("dataset") or {}
@@ -283,13 +478,20 @@ def _prepare_dataset(engine: MLEngine, wrap,
                 "n_rows": dataset.get("n_rows", 0),
                 "n_features": dataset.get("n_features", 0),
                 "target": dataset.get("target") or "",
+                # 回执里带上"这条链长什么样"与**真实划分口径**：调用方不用再查一次，
+                # 而且不用去猜"我配的切分到底生效了没有"。
+                "pipeline_chain": list(receipt.get("pipeline_chain") or []),
+                "split_policy": dict(receipt.get("split_policy") or {}),
                 "warnings": list(receipt.get("warnings", [])),
                 "error": receipt.get("error", "")}
 
     return define_tool(
         name="prepare_dataset",
-        description="登记一份数据并在训练部分上拟合预处理链，返回数据集引用与管道指纹；"
-                    "数据来源可给文件路径、进程内表格、数组或合成规格。",
+        description="登记一份数据并在**训练部分**上拟合预处理链，返回数据集引用、"
+                    "管道指纹、**链摘要**与**实际划分口径**。"
+                    "可给 `pipeline` 声明来**自己组装**这条链（选内置步骤+参数、"
+                    "换顺序、写自定义步骤、指定切分比例）；省略则用默认链"
+                    "（缺失值→编码→缩放→划分）。",
         parameters={
             "source": {"type": "object",
                        "description": "数据来源声明，例如 {'kind': 'csv', 'path': 'x.csv'}、"
@@ -303,10 +505,20 @@ def _prepare_dataset(engine: MLEngine, wrap,
                          "default": ""},
             "diag": {"type": "boolean", "description": "是否保留预处理链的诊断中间产物",
                      "default": False},
+            "pipeline": {"type": "object",
+                         "description": "预处理链声明（省略=默认链）："
+                                        "{'steps': [{'key': 'missing', 'params': "
+                                        "{'strategy': 'median'}}, {'key': 'scale', "
+                                        "'params': {'mode': 'robust'}}, {'key': "
+                                        "'my_step', 'code': 'class Step(StepBase): ...'}], "
+                                        "'split': {'test_size': 0.2, 'stratify': true, "
+                                        "'seed': 7}}。顺序即执行顺序；未知键/未知步骤/"
+                                        "坏取值都会**报错而不是静默忽略**。"},
         },
         output_schema={"type": "object",
                        "required": ["ok", "dataset_id", "pipeline_id", "n_rows",
-                                    "n_features", "warnings", "error"]},
+                                    "n_features", "pipeline_chain", "split_policy",
+                                    "warnings", "error"]},
         execute=wrap(execute),
         banned_words=banned_words,
     )
@@ -317,9 +529,14 @@ def _run_method(engine: MLEngine, wrap,
     def execute(*, method: str, dataset_id: str = "",
                 overrides: Mapping[str, Any] | None = None, seed: int | None = None,
                 resource_guard: Mapping[str, Any] | None = None,
-                device: str = "", persist: bool = False) -> Mapping[str, Any]:
+                device: str = "", persist: bool = False,
+                diag: bool = False) -> Mapping[str, Any]:
+        # ⚠ `diag` 曾在 `parameters` 里声明、却**没进这个签名**：调用方按声明传
+        #   `diag` 会撞上"unexpected keyword argument" ⇒ 该参数在工具面上**从来
+        #   调不通**（声明与实现漂移）。实测于 2026-10-03（我自己的探针撞到的）。
+        #   判据：`test_ml_delivery` 的逐参数探针表对 `run_method.diag` 有真值。
         spec: dict[str, Any] = {"command": "run_method", "method": method,
-                                "persist": bool(persist)}
+                                "persist": bool(persist), "diag": bool(diag)}
         if dataset_id:
             spec["dataset_id"] = dataset_id
         if overrides:
@@ -373,6 +590,10 @@ def _run_method_batch(engine: MLEngine, wrap,
                 overrides: Mapping[str, Any] | None = None,
                 seed: int | None = None,
                 resource_guard: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        # ⚠ 这里**不能**加 `diag`：`run_method_batch` 的**命令声明**里没有它
+        #   （`commands.py`），加了会被 `validate_spec` 以"未声明的参数"拒。
+        #   工具面的参数集必须是命令声明参数集的**子集**——这条由
+        #   `test_tool_params_stay_within_command_declaration` 守着。
         spec: dict[str, Any] = {"command": "run_method_batch",
                                 "methods": list(methods)}
         if dataset_id:
@@ -483,12 +704,39 @@ def _require_job_host(host: Any) -> Any:
 
 def _submit_run(host: Any, side: str,
                 banned_words: tuple[str, ...] = ()) -> ToolDefinition:
-    def execute(*, method: str, dataset_id: str = "",
+    def execute(*, method: str = "", dataset_id: str = "",
                 overrides: Mapping[str, Any] | None = None,
                 seed: int | None = None,
-                device: str = "") -> Mapping[str, Any]:
+                device: str = "",
+                persist: bool = False, diag: bool = False,
+                code: str = "", name: str = "") -> Mapping[str, Any]:
         ml = _require_job_host(host)
-        spec: dict[str, Any] = {"command": "run_method", "method": method}
+        # ⭐ **长训练的正确形态**（用户裁决）：只发一个"开始"信号就走，
+        #   之后靠 read_job 主动轮询。这是唯一可行的模式——LLM 的一次工具调用
+        #   本质是 HTTP 请求，客户端必须有超时（本实例 10 分钟），所以
+        #   "同步等训练跑完"对长训练天生不成立。
+        #
+        # `code` 给了就提交 `run_custom`（AI 写的网络），否则提交 `run_method`。
+        # ⚠ 这条以前**不存在**：`submit_run` 把命令**写死**成 run_method ⇒
+        #   自定义网络只能同步跑，也就等于长训练跑不了（10 分钟超时后 AI
+        #   连 run_id 都拿不到）。宿主层本来就支持任意命令，缺的只是这里透传。
+        if not code and not method:
+            raise MechaError(
+                "submit_run 需要 method（内置方法名）或 code（自定义网络代码）",
+                kind="missing_arguments",
+                hint="二选一：内置方法给 method=；AI 写的网络给 code=（可配 name=）",
+                suggest='submit_run(method="torch_mlp", ...) 或 '
+                        'submit_run(code="class Network: ...", name="resnet_v1")',
+            )
+        command = "run_custom" if code else "run_method"
+        spec: dict[str, Any] = {"command": command,
+                                "persist": bool(persist), "diag": bool(diag)}
+        if code:
+            spec["code"] = str(code)
+            if name:
+                spec["name"] = str(name)
+        else:
+            spec["method"] = str(method)
         if dataset_id:
             spec["dataset_id"] = dataset_id
         if overrides:
@@ -506,11 +754,19 @@ def _submit_run(host: Any, side: str,
 
     return define_tool(
         name="submit_run",
-        description="把一个方法运行提交为后台任务并立刻返回任务编号；"
-                    "提交即开始一次真实运行（写入域状态与运行存档），"
-                    "但本次调用不等它跑完——用 read_job 轮询进度与结果。",
+        description="把一个运行**提交为后台任务**并立刻返回任务编号（长训练就该用这条："
+                    "发一个开始信号就走，之后用 read_job 轮询）。"
+                    "给 `method` 跑内置方法；给 `code` 跑自定义网络（AI 写的结构）。"
+                    "⚠ 后台跑完会**自动落盘**（runs/<run_id>/record.json）——"
+                    "所以就算你后来丢了 job_id，结果也还在。",
         parameters={
-            "method": {"type": "string", "description": "方法名"},
+            "method": {"type": "string",
+                       "description": "内置方法名（与 code 二选一）", "default": ""},
+            "code": {"type": "string",
+                     "description": "自定义网络代码（定义 `class Network`；与 method 二选一）",
+                     "default": ""},
+            "name": {"type": "string",
+                     "description": "自定义网络的名字（存进存档便于复用）", "default": ""},
             "dataset_id": {"type": "string",
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},
@@ -518,6 +774,13 @@ def _submit_run(host: Any, side: str,
             "seed": {"type": "integer", "description": "随机种子（整数）"},
             "device": {"type": "string", "description": "计算设备声明：auto / cpu / cuda:0",
                        "default": ""},
+            "persist": {"type": "boolean",
+                        "description": "是否把本次运行写入 ML 运行存档（后台任务另有一条"
+                                       "**终态自动落盘**的兜底，见描述）",
+                        "default": False},
+            "diag": {"type": "boolean",
+                     "description": "是否保留诊断信息（如神经网络的特征归因页需要它）",
+                     "default": False},
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "command", "cancel_supported",
@@ -543,19 +806,40 @@ def _read_job(host: Any,
         raw = status.get("progress") or []
         progress = [{"frac": float(p[0]), "stage": str(p[1])}
                     for p in raw if isinstance(p, (list, tuple)) and len(p) == 2]
+        # ⭐ 富载荷（loss / val_loss / run_id）取自挂在执行上下文上的 sidecar。
+        #   为什么要有它（用户裁决）：
+        #   ① `result_ref`（含 run_id）**只在终态才有** ⇒ AI 训练中途拿不到句柄，
+        #      "边跑边查曲线"实际不可用；带上 run_id 后第一次轮询就能去查。
+        #   ② 只报 frac/stage 时，判断"该不该早停"还得再拉一次完整曲线；
+        #      带上 loss/val_loss 后**一次轮询就能决策**。
+        #   ⚠ 逐代列表**有界**（`PROGRESS_EPOCH_WINDOW`）：完整曲线按需从
+        #     `describe_training` 拉，不在这里线性膨胀。
+        extra: dict = {}
+        try:
+            from ml_mecha.engine import _PROGRESS_SIDECAR
+            extra = dict(getattr(ml.jobs.get(job_id).context,
+                                 _PROGRESS_SIDECAR, None) or {})
+        except Exception:                                   # noqa: BLE001
+            extra = {}
+        latest = dict(progress[-1]) if progress else {}
+        latest.update(extra.get("latest") or {})
         return {"ok": True, "job_id": str(status.get("id") or job_id),
                 "state": str(status.get("state") or ""),
                 "cancel_supported": bool(status.get("cancel_supported", False)),
                 "progress": progress,
-                "progress_latest": progress[-1] if progress else {},
+                "progress_latest": latest,
+                "run_id": str(extra.get("run_id") or ""),
+                "epochs": list(extra.get("epochs") or []),
                 "result_ref": dict(status.get("result_ref") or {}),
                 "error": str(status.get("error") or ""),
                 "ref_error": str(status.get("ref_error") or "")}
 
     return define_tool(
         name="read_job",
-        description="按任务编号查一次后台任务的进度与结果：状态、最近进度、"
-                    "结果引用（含运行编号）、失败原因；不阻塞（除非给 wait_s）。",
+        description="按任务编号查一次后台任务的进度与结果：状态、**逐代数值**"
+                    "（`epochs`/`progress_latest` 带 loss/val_loss，够判断该不该早停）、"
+                    "**训练中途就能拿到的 `run_id`**（拿去 describe_training 查曲线）、"
+                    "结果引用、失败原因；不阻塞（除非给 wait_s）。",
         parameters={
             "job_id": {"type": "string", "description": "submit_run 返回的任务编号"},
             "wait_s": {"type": "number",
@@ -565,8 +849,8 @@ def _read_job(host: Any,
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "state", "cancel_supported",
-                                    "progress", "progress_latest", "result_ref",
-                                    "error", "ref_error"]},
+                                    "progress", "progress_latest", "run_id",
+                                    "epochs", "result_ref", "error", "ref_error"]},
         execute=execute,
         banned_words=banned_words,
     )

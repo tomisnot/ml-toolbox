@@ -76,12 +76,14 @@ from ml_toolbox.api import Session
 
 from .commands import COMMANDS as HOST_COMMANDS
 from .core_commands import core_command_specs
-from .engine import MLEngine, clear_channel, make_state_writer, use_channel
+from .engine import (JOB_RUN_FLAG, RUN_COMMANDS, MLEngine, clear_channel,
+                     make_state_writer, use_channel)
 from .summarizer import ml_summarizer
 from .tools import register_ml_tools
 
 #: ML adapter 的只读查询面（注册进 ``Surface``，经 ``Surface.query`` 分派）。
-READ_QUERIES = ("method_catalog", "method_detail", "dataset_detail", "run_detail")
+READ_QUERIES = ("method_catalog", "method_detail", "dataset_detail", "run_detail",
+                "training_detail", "network_catalog", "network_source")
 
 #: ML adapter 自己的数据目录名（mecha 不提供默认值，必须由项目注入）。
 DATA_DIR_NAME = ".ml-mecha"
@@ -223,7 +225,17 @@ class MLMecha:
             channel_token = use_channel(channel)
             call_token = CURRENT_CALL_ID.set(call_id)
             try:
-                return self.engine.run(dict(spec), context=ctx)
+                # ⭐ **后台任务的终态自动落盘**（用户裁决：别让"意外"白训练）。
+                #   为什么在这里标：`submit` 是**后台 job 的唯一入口** ⇒ 打这个标
+                #   等价于"这次是在后台跑的"。而 job 状态只在**进程内存**里
+                #   （注册表无淘汰、也无持久化）⇒ 权威一重启，`job_id` 与
+                #   `result_ref` 全没了：训练其实跑完了、结果也在，但**没有路标**。
+                #   ⇒ 后台任务默认落盘，等于给结果留一个不依赖"进程活到取回"的锚。
+                #   ⚠ 只在**有 run 的命令**上打标（`prepare_dataset` 之类没有 run）。
+                job_spec = dict(spec)
+                if job_spec.get("command") in RUN_COMMANDS:
+                    job_spec[JOB_RUN_FLAG] = True
+                return self.engine.run(job_spec, context=ctx)
             finally:
                 CURRENT_CALL_ID.reset(call_token)
                 clear_channel(channel_token)
