@@ -52,8 +52,12 @@ def _num(v, digits: int = 4) -> str:
 
 STYLE = """
 *{box-sizing:border-box}
+/* ⚠ 高度必须"从顶到底每一层都夹住"，链条里漏一层，整页就会被内容顶长（实测过：
+   `docScrollH=2896 / aside 列表的 clientHeight=2820` ⇒ 列表根本没被限制，整页跟着变长）。
+   做法：`body` 定 100vh + `overflow:hidden`，`main` 与 `section.detail` 都 `min-height:0`
+   + `overflow:hidden`，**只有真正要滚的那格**给 `overflow:auto`。 */
 html,body{height:100%}
-body{margin:0;display:flex;flex-direction:column;height:100vh;
+body{margin:0;display:flex;flex-direction:column;height:100vh;overflow:hidden;
      font:13px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;
      color:#1f2328;background:#f6f8fa}
 header{flex:0 0 auto;background:#fff;border-bottom:1px solid #d0d7de;
@@ -67,20 +71,30 @@ header{flex:0 0 auto;background:#fff;border-bottom:1px solid #d0d7de;
 .badge.warn{background:#fff8c5;color:#7d4e00}
 .badge.err{background:#ffebe9;color:#cf222e}
 /* 主区：横向两栏、占满剩余高度（**不给固定高度**，否则下方留白） */
-main{flex:1 1 auto;min-height:0;display:flex;gap:0}
-/* 左栏：**原生可折叠**（`<details>`，不引脚本），只限宽度、高度随主区 */
+main{flex:1 1 auto;min-height:0;overflow:hidden;display:flex;gap:0}
+/* 左栏：可折叠的运行列表（只限宽度、高度随主区；折叠见 `.collapsed main>aside`） */
 aside{flex:0 0 300px;max-width:46vw;display:flex;flex-direction:column;
       min-height:0;border-right:1px solid #d0d7de;background:#fff}
-aside>details{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}
-aside summary{cursor:pointer;padding:6px 10px;color:#57606a;font-size:12px;
-              list-style:none;user-select:none;border-bottom:1px solid #eaeef2}
-aside summary::-webkit-details-marker{display:none}
-aside summary::before{content:"▾ "}
-aside details:not([open])>summary::before{content:"▸ "}
-aside details:not([open])>summary{border-bottom:0}
+/* ⚠ 为什么**不用 `<details>`**（我在这里绕了三圈，实测数据在下面）：
+   `<details>` 的可伸缩内容会被包进**匿名 flex item**，而那个 item 的 `min-height:auto`
+   会按内容长 ⇒ `min-height:0`、`overflow:hidden`、`height:100%`、显式包裹层**全都无效**：
+       detailsH=661  但  dbodyH=2820 / listClientH=2820（列表按内容长，整页跟着变长）
+   ⇒ 改用**显式结构**：`aside > .dh（表头）+ .scroll（列表）`，折叠靠 body 上的类。
+   这样每一层都是显式盒子、高度都能夹住。零脚本仍然成立（折叠只用 state class）。 */
+aside{flex:0 0 300px;max-width:46vw;display:flex;flex-direction:column;
+      min-height:0;overflow:hidden;border-right:1px solid #d0d7de;background:#fff}
+aside .dh{flex:0 0 auto;padding:6px 10px;color:#57606a;font-size:12px;
+          border-bottom:1px solid #eaeef2;background:#fff}
 /* 列表自己滚（**不加 max-height**：高度由父容器给，不用魔法数字） */
+/* 列表自己滚（**不加 max-height**：高度由父容器给，不用魔法数字）。
+   ⚠ 它必须自带宽高约束：`.dbody` 给了明确高度，这里 `flex:1` 就能吃到"壳 − summary"。 */
 aside .scroll{flex:1 1 auto;min-height:0;overflow:auto}
-.collapsed aside{flex-basis:0;max-width:0;border-right:0}
+/* ⚠ 折叠三处要点（早先三条都错了，用户实测"折叠了宽度没让出来"）：
+   1. `aside` 是 `main` 的**子元素**、`.collapsed` 加在 `body` 上
+      ⇒ 选择器必须是 `.collapsed main>aside`（写成 `.collapsed aside` 根本匹配不到）；
+   2. `flex-basis:0` **压不过** `flex:0 0 300px` 这个简写 ⇒ 要整条 `flex` 重写；
+   3. 再加 `width:0` 兜底：`flex-basis` 在某些浏览器/嵌套 flex 下不收缩到底。 */
+.collapsed main>aside{flex:0 0 0;width:0;max-width:0;overflow:hidden;border-right:0}
 .runs a{display:block;padding:7px 12px;border-bottom:1px solid #eaeef2;
         text-decoration:none;color:#1f2328}
 .runs a:hover{background:#f6f8fa}
@@ -89,7 +103,7 @@ aside .scroll{flex:1 1 auto;min-height:0;overflow:auto}
 .runs .s{color:#57606a;font-size:12px}
 /* 详情：**没有框、没有标题**（页签已经说明在哪个页），直接吃满剩余空间 */
 section.detail{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;
-               min-height:0;background:#fff}
+               min-height:0;overflow:hidden;background:#fff}
 .tabs{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;
       border-bottom:1px solid #d0d7de;flex:0 0 auto}
 .tabs a{padding:3px 10px;border:1px solid #d0d7de;border-radius:6px;
@@ -100,8 +114,10 @@ table{border-collapse:collapse;width:100%}
 th,td{border:1px solid #d0d7de;padding:4px 8px;text-align:left;vertical-align:top}
 th{background:#f6f8fa}
 img.plot{max-width:100%;border:1px solid #d0d7de;border-radius:6px;background:#fff}
-/* SVG 图：**不加边框**（矢量图直接坐在页面上，与页签/表格同层） */
-.chart{max-width:900px}
+/* SVG 图：**不加边框**（矢量图直接坐在页面上，与页签/表格同层）
+   宽度上限放宽到 1400：折叠左栏后内容区变宽，图要**跟着占满**（用户明确要求）。
+   ⚠ 图表本身有内在比例（viewBox 680×400），太宽会变扁 ⇒ 1400 是折中。 */
+.chart{max-width:1400px}
 .chart svg{display:block;width:100%;height:auto}
 pre{margin:0;padding:10px;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;
     overflow:auto;white-space:pre-wrap}
@@ -139,12 +155,22 @@ def badge(text: str, kind: str = "ok") -> str:
 
 
 def runs_pane(rows, *, active: str = "", view: str = "ml") -> str:
-    """左栏（`<aside>`）：**原生可折叠**的运行列表，只限宽度、高度由父容器给。
+    """左栏（`<aside>`）：可折叠的运行列表，只限宽度、高度由父容器给。
 
-    - 折叠控件用 `<details open>`：**原生、零脚本**（面板是个链接页，不该为折叠加 JS），
-      且 `<summary>` 只占一行（"运行列表（N）"），折起来只剩它 ⇒ 省空间。
-    - ⚠ **没有 `max-height`**：早先用 `max-height:78vh` ⇒ 下面留白、没吃满。
-      现在高度来自 `main{flex:1;min-height:0}`，列表在 `.scroll` 里自己滚。
+    ## ⚠ 为什么**没有**用 `<details>`（本文件最反直觉的一处）
+
+    最初用 `<details open>` 做"原生可折叠、零脚本"，但**实测它和 flex 高度约束互相打架**：
+    `<details>` 的可伸缩内容会被浏览器包进**匿名 flex item**，那个 item 的 `min-height:auto`
+    会按内容长 ⇒ 下面这些**全都无效**（逐个试过）：
+    `min-height:0` · `overflow:hidden` · 给内容层 `height:100%` · 再加一层显式包裹 `.dbody`。
+    量到的是：`detailsH=661` 而 `dbodyH=2820 / listClientH=2820`
+    —— 列表按内容长，**整页跟着被顶长**（用户反馈"网页顶得超级长"）。
+
+    ⇒ 改用**显式结构**：`aside > .dh（表头）+ .scroll（列表）`，折叠靠 `body.collapsed`。
+    每一层都是显式盒子，高度就夹得住；且**仍然零脚本**（没有交互逻辑，只是样式切换）。
+
+    ⚠ **折叠必须真的让出宽度**：光改 `flex-basis` 不够（压不过 `flex:0 0 300px` 简写），
+    选择器也得写 `.collapsed main>aside`（`aside` 是 `main` 的子元素、类加在 `body` 上）。
     """
     items = []
     for r in rows or ():
@@ -161,8 +187,10 @@ def runs_pane(rows, *, active: str = "", view: str = "ml") -> str:
             f'{esc(r.get("saved_at") or "")}</div></a>')
     rows_n = len(list(rows or ()))
     inner = "".join(items) or f'<div class="note">{esc(EMPTY_TEXT)}</div>'
-    return (f'<aside><details open><summary>运行列表（{rows_n}）</summary>'
-            f'<div class="scroll runs">{inner}</div></details></aside>')
+    # ⚠ 显式两层：`.dh`（表头，固定高）+ `.scroll`（列表，`flex:1` 吃掉余量并自己滚）。
+    #   **不是 `<details>`**——见函数 docstring 里那份实测数据（匿名 flex item 会按内容长）。
+    return (f'<aside><div class="dh">运行列表（{rows_n}）</div>'
+            f'<div class="scroll runs">{inner}</div></aside>')
 
 
 def tabstrip(pages, active_key: str, *, view: str, run_id: str) -> str:

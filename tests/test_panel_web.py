@@ -329,15 +329,20 @@ def test_runs_cache_is_fast_and_never_stale():
 
 
 def test_layout_follows_the_four_agreed_constraints():
-    """⭐ 布局四条硬要求（用户逐条提的）—— 钉住，免得以后又长回去。
+    """⭐ 布局硬要求（用户逐条提的）—— 钉住，免得以后又长回去。
 
-    1. 左栏可折叠（用 `<details>`：**原生、零脚本**）；
-    2. **不要固定高度**（早先的 `max-height:78vh` 会在下方留白），**只限宽度**；
+    1. 左栏可折叠，**且折叠后真的让出宽度**（右边必须占满腾出的空间）；
+    2. **不要固定高度**：列表在**自己那格里滚**，整页不被顶长；
     3. 内容区**不套卡片框**；
-    4. **不要"详情"二字**（谁都知道那是详情，那一行是白占高度）。
+    4. **不要"详情"二字**（谁都看得出来，那行是白占高度）。
 
-    ⚠ 判据必须**先剔掉 CSS 注释与 `<style>`**：实测踩过 ——
-    注释里写了"max-height"与"详情"，直接搜字符串会**误报**。
+    ⚠ 判据必须**先剥掉 CSS 注释与 `<style>`**：实测踩过——注释里写了 `max-height`
+    与"详情"，直接搜字符串会**误报**。断言的是真声明，不是注释文字。
+
+    ⚠ 折叠**不能用 `<details>`**（实测过：它的内容盒被浏览器包进**匿名 flex item**，
+    那个 item 的 `min-height:auto` 会按内容长 ⇒ `min-height:0` / `overflow:hidden` /
+    `height:100%` / 再加一层包裹 **全都无效**；量到 `detailsH=661` 而
+    `listClientH=2820`，于是**整页被顶长**）。⇒ 显式结构 `aside > .dh + .scroll`。
     """
     import re
     html = V.page(title="t", view="ml", header_right="", body="<p>BODY</p>",
@@ -346,27 +351,36 @@ def test_layout_follows_the_four_agreed_constraints():
                                         active="r1"))
     style = re.search(r"<style>(.*?)</style>", html, re.S)
     assert style, "页面里应该有样式块"
-    # ⚠ **先剥 CSS 注释再断言**：实测踩过——注释里写了 "max-height" 与 "详情"，
-    #   直接搜字符串会误报（判据红了但不是代码的问题）。断言的是**真声明**。
     css = re.sub(r"/\*.*?\*/", "", style.group(1), flags=re.S)
-    visible = re.sub(r"/\*.*?\*/", "", re.sub(r"<style>.*?</style>", "", html,
-                                             flags=re.S), flags=re.S)
+    flat = css.replace(" ", "").replace("\n", "")
+    # ⚠ 剥两层注释再看"结构"：CSS 注释与 HTML 注释里都解释了"为什么不用 details / max-height"
+    #   ⇒ 不剥就误报（**同一类坑踩了两次**，所以这里显式剥两层，且断言全部针对剥完的文本）。
+    htmlish = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    plain = re.sub(r"/\*.*?\*/", "", re.sub(r"<style>.*?</style>", "", htmlish,
+                                           flags=re.S), flags=re.S)
 
-    # 1. 原生可折叠 + 折叠开关
-    assert "<details open>" in html and "<summary>" in html, "左栏不是原生可折叠的"
-    assert "data-toggle=sidebar" in html, "缺折叠开关"
-    # 2. 只限宽度、**没有**高度上限
+    # 1. 可折叠 + 折叠**真的让出宽度**
+    assert "data-toggle=sidebar" in plain, "缺折叠开关"
+    assert re.search(r"\.collapsed\s+main>aside\{[^}]*width:0", css), \
+        "折叠没让出宽度：需要 `.collapsed main>aside{...width:0...}`"
+    assert "flex:000" in flat, "折叠要整条重写 flex（`flex-basis:0` 压不过 `flex:0 0 300px`）"
+    assert "<details" not in plain, \
+        "左栏又用回 <details> 了 ⇒ 高度夹不住、整页会被顶长（实测过）"
+    assert 'class="dh"' in plain and 'class="scroll runs"' in plain, \
+        "左栏应是显式两层：`.dh`（表头）+ `.scroll`（列表）"
+    # 2. 只限宽度、没有高度上限；列表自己滚
     assert "max-width" in css, "应该只限宽度"
     assert "max-height" not in css, "不该再有高度上限（会在下方留白）"
-    assert re.search(r"flex\s*:\s*1\s+1\s+auto", css), "主区/列表应靠 flex 撑满"
-    assert "min-height:0" in css.replace(" ", ""), \
-        "min-height:0 是 flex 里让子项正确滚动的前提（少了它列表会撑破父容器）"
+    assert re.search(r"flex\s*:\s*1\s+1\s+auto", css), "主区应靠 flex 撑满"
+    assert "min-height:0" in flat, "min-height:0 是 flex 里正确滚动的前提"
+    assert ".scroll{flex:11auto;min-height:0;overflow:auto}" in flat, \
+        "列表那格必须自己滚（overflow:auto）"
     # 3. 内容区不套卡片框
     assert 'class="detail"' in html and 'class="pane' not in html, "内容区不该套卡片框"
     # 4. 不见"详情"二字
-    assert "详情" not in visible, "页面上不该出现“详情”这两个字"
+    assert "详情" not in plain, "页面上不该出现“详情”这两个字"
     # 折叠状态要跨导航保留（点页签是整页重载）
-    assert "localStorage" in html, "折叠状态没持久化（每次点页签都会弹回）"
+    assert "localStorage" in plain, "折叠状态没持久化（每次点页签都会弹回）"
 
 
 # ============================================================ 直跑入口
