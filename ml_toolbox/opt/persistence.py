@@ -57,3 +57,23 @@ def load_record(run_id: str) -> OptRecord:
 def list_records() -> list[dict]:
     """只列优化运行（record.json 与 opt_record.json 互不混淆）。机械层见 core.runs。"""
     return _runs.list_meta(RUNS_DIR, "opt_record.json")
+
+
+#: **把自己注册给 core**（依赖方向仍是 opt → core，不反向）。
+#: 为什么需要：web 面板住在 `ml_mecha/` 里，而那一层**不许** import 本层（宪章纪律，
+#: 判据 `test_ml_mecha.py::...does_not_import_el_modules` 用 `ast.walk` 静态守着，
+#: 静默 import 也算违规）⇒ 面板只能经 `core.persistence.list_opt_records/load_opt_record` 取。
+#: 模块 import 即注册（幂等）。**改这里要同时看 `core/persistence.py` 的槽说明。**
+from ..core.persistence import register_opt_readers as _register  # noqa: E402
+
+_register(list_records, load_record)
+
+
+def _register_pages() -> None:
+    """把"未声明页时的兜底页"也注册给 core（同上：边界层要用但不能 import 本层）。"""
+    from ..core.persistence import register_opt_pages as _reg
+    from . import plots as _plots
+    _reg(_plots.default_pages)
+
+
+_register_pages()

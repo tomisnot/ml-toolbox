@@ -157,7 +157,16 @@ def run_one(method: MLMethod, spec: DataSpec,
     timer.values["total"] = max(0.0, time.perf_counter() - perf0)
     return RunRecord(run_id=run_id,
                      method=method.name, family=method.family,
-                     task=method.task, target_kind=spec.target_kind,
+                     task=method.task,
+                     # ⚠ 用 `res.target_kind`（= 方法**实际**用的 kind），**不是**
+                     # `spec.target_kind`（= 数据集的 kind）。两者会不一致：例如 `ridge`
+                     # 声明只能回归（`target_kind="regression"`）却可被喂分类数据，此时
+                     # 指标是 rmse/mae/r2，而 `spec.target_kind` 是 classification。
+                     # 早先落 spec 的那个值 ⇒ 存档自述"分类"但指标全是回归指标
+                     # （实测前 400 条里 47 条如此），下游按 target_kind 挑检视页就会挑错
+                     # （混淆矩阵画不出来）。上面那行 `res.target_kind = res.target_kind or
+                     # spec.target_kind` 已经把"方法没声明"的情形兜住了。
+                     target_kind=res.target_kind or spec.target_kind,
                      dataset=spec.meta.get("dataset", ""),
                      pipeline_id=spec.meta.get("pipeline_id", ""),
                      config={"overrides": dict(cfg.overrides),

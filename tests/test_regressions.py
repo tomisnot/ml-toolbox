@@ -674,6 +674,46 @@ def test_cases_fixtures_have_no_foreign_or_local_absolute_paths():
                       + "\n  ".join(hits))
 
 
+def test_archived_target_kind_is_the_methods_not_the_datasets():
+    """⭐ 归档的 ``target_kind`` 必须是**方法实际用的**那个，不是**数据集的**那个。
+
+    ## 为什么（这是一个真 bug 的永久断言）
+
+    `ridge` 声明 `target_kind="regression"`（只能回归），但**可以被喂分类数据**——
+    此时指标是 `rmse/mae/r2/mape`。早先 `run_one` 落盘用的是 `spec.target_kind`
+    （数据集的 kind）⇒ 存档自述"分类"而指标全是回归指标（实测前 400 条里 **47 条**如此）。
+    后果不是"数字难看"，而是**下游按 `target_kind` 挑检视页会挑错**：
+    面板/`auto_pages` 会给它配混淆矩阵与 ROC，而画混淆矩阵需要**离散**预测——
+    回归预测是连续值 ⇒ 直接 `ValueError: Classification metrics can't handle a mix of
+    multiclass and continuous targets`，那一页在面板里就炸给你看。
+
+    ⇒ 不变量：`RunRecord.target_kind == res.target_kind or spec.target_kind`。
+    """
+    from ml_toolbox.core.contracts import DataSpec, RunConfig
+    from ml_toolbox.core.runner import run_one
+    from ml_toolbox.core.registry import get as _get
+    from ml_toolbox.core import registry
+    registry.load_builtin()
+
+    rng = np.random.RandomState(0)
+    n = 80
+    frame = pd.DataFrame(rng.randn(n, 4), columns=[f"f{i}" for i in range(4)])
+    y = pd.Series((frame["f0"] > 0).astype(int))          # 分类数据的形态
+
+    ridge = _get("ridge")
+    assert getattr(ridge, "target_kind", None) == "regression", \
+        "前提变了：ridge 现在不是纯回归方法 ⇒ 本判据要跟着改"
+    spec = DataSpec(X=frame, y=y, target_kind="classification", meta={})
+    rec = run_one(ridge, spec, RunConfig(seed=42))
+
+    assert rec.target_kind == "regression", (
+        f"落盘用了数据集的 kind（{rec.target_kind!r}）而不是方法实际用的"
+        f"（{rec.result.target_kind!r}）⇒ 存档自述与指标会互相矛盾")
+    # 指标确实是回归的（这正是"自述分类"会显得荒谬的地方）
+    got = set(rec.result.metrics)
+    assert got & {"rmse", "mae", "r2"}, f"这批指标不像回归：{sorted(got)}"
+
+
 def main():
     # 默认控制台可能是 GBK（本机 cp936）：✓/✗ 会让直跑入口在**失败分支**打印时
     # 崩成 UnicodeEncodeError，把真实的失败详情一起吞掉（第三轮审查 P2-9）。

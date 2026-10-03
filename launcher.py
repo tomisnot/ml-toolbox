@@ -135,8 +135,28 @@ def start_group(mode: str):
         return [authority], 0, {"ready": False, "reason": reason}
     dsh = _spawn_dsh(port)
     procs = [authority] if dsh is None else [authority, dsh]
+    # ⭐ ML 面板：**dsh 之外的窗口**（用户裁决："选 AI 模式之后就开一个 dsh 之外的窗口"）。
+    #   它是**附加**的展示面，不改变主进程语义 ⇒ primary 仍是 dsh。
+    #   它起不来**不影响** AI 模式（只记日志）——监视器是附加，不是前置。
+    monitor_port = _monitor_port_of(procs)
+    panel = _spawn_panel(monitor_port)
+    if panel is not None:
+        procs.append(panel)
     # primary：有 dsh 时是 dsh（关掉 AI 界面即结束整组）；缺 dsh 时退回权威。
     return procs, (1 if dsh is not None else 0), {"ready": True, "mcp_port": port}
+
+
+def _monitor_port_of(procs) -> int | None:
+    """从运行期文件取监控端点端口（面板顶栏要读写权模式）；取不到回 ``None``。
+
+    ⚠ 不等它出现（权威刚起、文件可能还没写）：面板**允许**显示"权威离线"，
+    那是诚实状态，不是错误。想更准就刷新。
+    """
+    try:
+        from ml_mecha.runtime import MONITOR_PORT_FILE
+        return read_port(HERE / MONITOR_PORT_FILE)
+    except Exception:
+        return None
 
 
 def dsh_patch_text(mcp_port: int) -> str:
@@ -284,6 +304,67 @@ def _spawn_dsh(mcp_port: int):
     _log("起 dsh（本实例 :%d，避开官方 3080）；overlay=%s"
          % (port, " + ".join(patches) or "(无)"))
     return _spawn(cmd, env=env)
+
+
+def _spawn_panel(monitor_port: int | None, tb_url: str | None = None):
+    """起 **ML 面板**（web viewer，dsh 之外的窗口）并等它就绪。
+
+    用户裁决："选 AI 模式之后就开一个 dsh 之外的窗口展示信息"。
+    ⇒ 它是**独立进程**（与 TensorBoard 辅进程同族）：训练/权威不需要知道窗口在不在，
+    端口经 ``.mlweb-port`` 发现（框架 `mecha.portfile` 的规则）。
+
+    ⚠ 三处**清晰降级**（不静默）：
+    - 起不来 / 端口文件不出现 ⇒ 记日志说明"能做什么、不能做什么"，**AI 模式照常**；
+    - 打不开浏览器 ⇒ 把地址打出来让人自己点（服务已经在跑）。
+    """
+    # ⚠ 常量**就地取**：顶层 import `panel_web` 会把 matplotlib 等重依赖拉进 launcher 的
+    #   启动路径（只为拿一个文件名，不值得）。文件名的单一真源仍在 `ml_mecha/panel_web.py`。
+    from ml_mecha.panel_web import WEB_PORT_FILE as PANEL_PORT_FILE
+    port_file = HERE / PANEL_PORT_FILE
+    cmd = [PY, "-m", "ml_mecha.panel_web", "--port-file", str(port_file)]
+    # ⭐ application 层指定"本服务要用到的层"：优化侧的读档能力是 opt 层 import 时
+    #   注册进 core 的槽的，而 `ml_mecha` 不许直接 import opt（宪章纪律）⇒ 由这里给名字。
+    cmd += ["--preload", "ml_toolbox.opt.persistence"]
+    if monitor_port:
+        cmd += ["--backend-url", f"http://127.0.0.1:{int(monitor_port)}"]
+    if tb_url:
+        cmd += ["--tensorboard-url", tb_url]
+    _log("起 ML 面板（dsh 之外的窗口）…")
+    proc = _spawn(cmd, env={**os.environ, "MLTB_ML_ROOT": str(HERE)})
+    if proc is None:
+        _log("⚠ ML 面板没起来（能做什么：AI 模式与 MCP 工具照常）。")
+        return None
+    # 等端口文件（**探端口**，不靠 sleep 猜）
+    url = None
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            _log("⚠ ML 面板进程立刻退出了 ⇒ 本次没有这个窗口（AI 模式照常）。")
+            return None
+        port = read_port(port_file)
+        if port:
+            url = f"http://127.0.0.1:{int(port)}/"
+            break
+        time.sleep(0.2)
+    if not url:
+        _log("⚠ ML 面板端口文件没出现 ⇒ 本次没有这个窗口（AI 模式照常）。")
+        return proc
+    _log("ML 面板：%s" % url)
+    _open_browser(url)
+    return proc
+
+
+def _open_browser(url: str) -> None:
+    """打开默认浏览器（**失败只记日志**：地址已经打出来了，人自己点也行）。"""
+    try:
+        if os.name == "nt":
+            os.startfile(url)                          # noqa: S606 - 打自己的本地地址
+        else:
+            import webbrowser
+            webbrowser.open(url)
+    except Exception as exc:
+        _log("⚠ 没能自动打开浏览器（%s）⇒ 请手动打开上面那个地址。"
+             % type(exc).__name__)
 
 
 # ---------------------------------------------------------------- 就绪判据

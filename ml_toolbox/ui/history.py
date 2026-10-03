@@ -8,69 +8,26 @@ from __future__ import annotations
 
 import os
 
-import numpy as np
-import pandas as pd
-
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
                             QTableWidgetItem, QPushButton, QLabel,
                             QHeaderView, QDialogButtonBox)
 
 from ..core import persistence
-from ..core.contracts import MLResult, RunConfig
+from ..core.contracts import RunConfig
 from ..core.runner import RunRecord
 
 
 def load_run_record(run_id: str) -> RunRecord | None:
-    """record.json + artifacts.npz -> 可检视的 RunRecord（无 estimator）。"""
-    try:
-        meta = persistence.load_record(run_id)
-    except Exception:
-        return None
-    res = MLResult(method_name=meta.get("method", "?"),
-                   task=meta.get("task", "?"),
-                   target_kind=meta.get("target_kind"),
-                   metrics={k: v for k, v in meta.get("metrics", {}).items()
-                            if isinstance(v, (int, float))},
-                   primary_metric=meta.get("primary_metric", ""),
-                   params=meta.get("params", {}),
-                   elapsed=meta.get("elapsed", 0.0),
-                   error=meta.get("error"))
-    d = persistence.RUNS_DIR
-    ap = os.path.join(d, run_id, "artifacts.npz")
-    if os.path.exists(ap):
-        with np.load(ap, allow_pickle=False) as z:
-            flat = {k: z[k] for k in z.files}
-        # 嵌套 dict 工件（save_record 用 "__" 展平）：递归重组
-        res.artifacts = {}
-        for k, v in flat.items():
-            if "__" not in k:
-                res.artifacts[k] = v
-                continue
-            *path, leaf = k.split("__")
-            node = res.artifacts
-            for p in path:
-                node = node.setdefault(p, {})
-            node[leaf] = v
-    # 通用还原：<key>_values + <key>_names(+<key>_cols) -> DataFrame(<key>)
-    for k in list(res.artifacts):
-        if k.endswith("_values") and k[:-7] + "_names" in res.artifacts:
-            base = k[:-7]
-            vals = np.asarray(res.artifacts.pop(k), float)
-            names = res.artifacts.pop(base + "_names")
-            cols = res.artifacts.pop(base + "_cols", None)
-            if cols is None:
-                cols = np.array(["importance"])
-                vals = vals.ravel()
-            res.artifacts[base] = pd.DataFrame(
-                vals.reshape(len(names), len(cols)),
-                index=[str(s) for s in names], columns=[str(c) for c in cols])
-    return RunRecord(run_id=run_id, method=res.method_name,
-                     family=meta.get("family", "?"), task=res.task,
-                     target_kind=res.target_kind,
-                     dataset=meta.get("dataset", ""),
-                     pipeline_id=meta.get("pipeline_id", ""),
-                     config=meta.get("config", {}), result=res)
+    """record.json + artifacts.npz -> 可检视的 RunRecord（无 estimator）。
+
+    ⚠ **实现已下沉到 `core.persistence.load_run_record`**（2026-10-03）：那是纯数据访问、
+    零 Qt；而边界层 `ml_mecha/` 不许 import 本层（宪章纪律，判据守着），
+    面板又正需要它 ⇒ 只能下沉，否则要么违规、要么两处各抄一份（两处可以各自漂移）。
+    本函数**保留为转发**，GUI 既有调用点一行不改。
+    """
+    from ..core.persistence import load_run_record as _core_loader
+    return _core_loader(run_id)
 
 
 class HistoryDialog(QDialog):
