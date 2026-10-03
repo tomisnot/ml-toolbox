@@ -98,11 +98,17 @@ COMMANDS: tuple[CommandSpec, ...] = (
             CommandParam("target", "string", False, "目标列名（监督/时序任务需要）", ""),
             CommandParam("time_col", "string", False, "时序任务的时间列名", ""),
             CommandParam("diag", "boolean", False, "是否保留预处理链的诊断中间产物", False),
+            CommandParam("pipeline", "object", False,
+                         "预处理链声明：{'steps': [{'key': 'missing', 'params': {...}}, "
+                         "{'key': 'my_step', 'code': 'class Step(StepBase): ...'}], "
+                         "'split': {'test_size': 0.2, 'stratify': true, 'seed': 7}}；"
+                         "省略 = 用默认链（缺失值→编码→缩放→划分）"),
         ),
         writes_state=("current.dataset_id", "current.pipeline_id"),
         side_effect=SIDE_EFFECT_DOMAIN_STATE,
         risk=RISK_LOW,
-        extra_receipt_keys=("dataset_id", "pipeline_id", "dataset"),
+        extra_receipt_keys=("dataset_id", "pipeline_id", "dataset",
+                            "pipeline_chain", "split_policy"),
     ),
     CommandSpec(
         name="run_method",
@@ -158,6 +164,34 @@ COMMANDS: tuple[CommandSpec, ...] = (
         side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
         risk=RISK_MEDIUM,
         extra_receipt_keys=("table", "winner"),
+    ),
+    CommandSpec(
+        name="run_custom",
+        summary="跑一段**由调用方给出的网络定义代码**：代码只写结构（Network 契约），"
+                "训练循环/观测/存档由系统代管；返回运行编号与指标。",
+        parameters=(
+            CommandParam("code", "string", True,
+                         "定义 `class Network` 的 Python 代码；只需实现 "
+                         "build(n_in, n_out, *, nn)，可选 loss/configure/forward_step"),
+            CommandParam("dataset_id", "string", False,
+                         "数据集引用；留空用最近准备的一份", ""),
+            CommandParam("overrides", "object", False,
+                         "运行级参数覆写（epochs/batch/lr/val_split/latent_every…）"),
+            CommandParam("seed", "integer", False, "随机种子（整数）"),
+            CommandParam("diag", "boolean", False, "是否保留诊断信息", False),
+            CommandParam("persist", "boolean", False, "是否把本次运行写入 ML 运行存档", False),
+            CommandParam("name", "string", False,
+                         "给这段网络起个名字（存进存档，便于之后按名字复用）", ""),
+            CommandParam("resource_guard", "object", False,
+                         "资源预算声明，例如 {'max_kernel_mb': 128}"),
+        ),
+        # ⚠ 写状态的键与 run_method 一致（它本质就是"跑一个方法"），
+        #   额外把 `current.method` 记成自定义网络名——审计里要看得见"跑的是代码"。
+        writes_state=("current.dataset_id", "current.method", "current.overrides",
+                      "current.seed", "current.device"),
+        side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
+        risk=RISK_MEDIUM,
+        extra_receipt_keys=("run_id", "elapsed_s", "error", "network_name"),
     ),
 )
 

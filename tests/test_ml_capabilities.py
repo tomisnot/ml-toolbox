@@ -117,7 +117,14 @@ def _fake_tool(name: str, *, binds: bool):
 
 # ---------------------------------------------------------------- 1. 覆盖面
 def test_map_covers_commands_queries_tools_exactly(app):
-    """清单 = 4 命令 + 4 查询 + 11 工具；每条都与独立来源交叉核对，无缺无多。"""
+    """清单 = 5 命令 + 7 查询 + 15 工具；每条都与独立来源交叉核对，无缺无多。
+
+    ⚠ 计数会随能力增减而变（`run_custom` 命令 + `describe_networks`/
+    `describe_network` 工具 + `network_catalog`/`network_source` 查询，
+    2026-10-03：让 AI 能写网络代码、并按名字复用）。**改这里之前先问一句**：
+    新增的能力是不是真的需要？本仓的纪律是"能力图对不上账就硬失败"，
+    计数正是那道闸的读数——不是可以随手抬的数字。
+    """
     rows = ml_capability_map()
 
     for row in rows:
@@ -132,12 +139,12 @@ def test_map_covers_commands_queries_tools_exactly(app):
     command_rows = _rows(KIND_COMMAND)
     assert [row["declared_name"] for row in command_rows] == declared
     assert set(declared) == set(projected) == set(registered)
-    assert len(command_rows) == 4
+    assert len(command_rows) == 5
 
     # ---- 查询：与 READ_QUERIES / Surface 注册项两路交叉 ----
     query_rows = _rows(KIND_QUERY)
     assert [row["declared_name"] for row in query_rows] == list(READ_QUERIES)
-    assert len(query_rows) == 4
+    assert len(query_rows) == 7
     assert {e.name for e in app.software.surface.entries("query")} == set(READ_QUERIES)
     for row in query_rows:
         assert row["side_effect"] is False and row["scope"] == ()
@@ -148,9 +155,9 @@ def test_map_covers_commands_queries_tools_exactly(app):
     schema_names = [schema["name"] for schema in app.tools.schemas()]
     assert [row["declared_name"] for row in tool_rows] == tool_names
     assert sorted(tool_names) == schema_names
-    assert len(tool_rows) == 11
+    assert len(tool_rows) == 15
 
-    assert len(rows) == 19
+    assert len(rows) == 27
 
 
 # ---------------------------------------------------------------- 2. 命令字段
@@ -200,7 +207,7 @@ def test_tool_rows_match_registry_schemas(app):
             assert row["scope"] == ()
     write_rows = {row["declared_name"] for row in tool_rows if row["side_effect"]}
     assert write_rows == write_commands & set(_tool_names())
-    assert len(write_rows) == 4                       # 4 写工具 / 7 只读或调度面
+    assert len(write_rows) == 5                       # 5 写工具 / 10 只读或调度面
     # job 调度面（submit_run/read_job/cancel_run）**没有同名命令**，故不计入
     # write_rows；submit_run 的写路径在它提交的 run_method 命令里（见 04 文档
     # 「job 调度面」小节）。这里显式钉住这个事实，避免哪天被误当成只读。
@@ -325,7 +332,7 @@ def test_runtime_role_table_matches_declaration(app):
     assert diff["declared_not_registered"] == []
     assert diff["registered_not_declared"] == []
     assert set(diff["registered"]) == declared
-    assert len(diff["registered"]) == 8              # 4 命令 + 4 查询
+    assert len(diff["registered"]) == 12             # 5 命令 + 7 查询
 
     # L7 对偶：合成一条运行时没有的声明，必须被抓住（守卫不哑）
     ghost = dict(ml_capability_map()[0])

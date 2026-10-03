@@ -68,6 +68,23 @@ def families() -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in sorted(out.items())}
 
 
+def unregister(name: str) -> bool:
+    """撤掉一个注册项（回 ``True`` 表示真撤掉了）。
+
+    ## 为什么需要它（唯一的消费者是"自定义网络"）
+
+    自定义网络的代码是**逐请求变化**的，而 `Session.run` 只认注册表里的名字
+    （`registry.get(request.method)`）⇒ 只能"注册 → 跑 → 撤"。
+    没有撤除就会留下垃圾项：注册表里多一个**代码已经不对**的 `custom_network`，
+    之后任何人 `registry.get("custom_network")` 都会拿到上一次的代码——
+    那是最难查的一类"看起来对、其实是旧的"。
+
+    ⚠ 它**只删自己的临时项**：内置方法族在 `load_builtin` 里注册，调用方不该用它
+    去动内置方法（判据里也不这么做）。
+    """
+    return _REGISTRY.pop(str(name), None) is not None
+
+
 def load_builtin():
     """导入内置方法族（幂等）。"""
     from .. import methods  # noqa: F401

@@ -56,9 +56,10 @@ from ml_mecha.summarizer import ml_summarizer       # noqa: E402
 from ml_mecha.validator import STATE_KEYS           # noqa: E402
 
 TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
-              "describe_method", "describe_methods", "describe_run",
-              "prepare_dataset", "read_job", "run_method", "run_method_batch",
-              "submit_run")
+              "describe_method", "describe_methods", "describe_network",
+              "describe_networks", "describe_run", "describe_training",
+              "prepare_dataset", "read_job", "run_custom", "run_method",
+              "run_method_batch", "submit_run")
 
 
 # ---------------------------------------------------------------- 夹具
@@ -231,10 +232,10 @@ def test_read_queries_are_registered_in_surface(app):
 
 
 def test_commands_registered_in_core_registry(app):
-    """ML 4 条受控命令注册进核心 CommandRegistry（双宿主消费核心机制）。"""
+    """ML 5 条受控命令注册进核心 CommandRegistry（双宿主消费核心机制）。"""
     names = set(app.software.commands.names())
     assert names == {"prepare_dataset", "run_method", "run_method_batch",
-                     "compare_methods"}
+                     "compare_methods", "run_custom"}
     spec = app.software.commands.spec("run_method")
     assert spec is not None and spec.side_effect is True
     assert set(spec.output_schema["required"]) == set(RECEIPT_REQUIRED_KEYS)
@@ -515,7 +516,9 @@ def test_writes_state_declaration_matches_actual_history(app):
                  {"command": "run_method_batch", "methods": ["logistic", "svc"],
                   "dataset_id": dataset_id},
                  {"command": "compare_methods", "methods": ["logistic", "svc"],
-                  "dataset_id": dataset_id}):
+                  "dataset_id": dataset_id},
+                 {"command": "run_custom", "dataset_id": dataset_id,
+                  "code": _RESIDUAL_CODE, "overrides": {"epochs": 5}}):
         _receipt, keys = _actual(spec)
         observed[spec["command"]] = keys
 
@@ -648,6 +651,711 @@ def test_run_method_end_to_end_and_receipt_contract(app):
         {"command": "run_method", "method": "svc", "dataset_id": dataset_id})
     assert estimate["est_sec"] > 0
     assert estimate["command"] == "run_method"
+
+
+# ---------------------------------------------------------------- 3b. 神经网络观测面
+#: 训练观测判据用的固定 run_id（事件目录 = `runs/<PROBE_ID>/tb/`，用完即清）。
+_NN_PROBE_ID = "nncrit-0000001-42"
+
+
+def _has_torch() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("torch") is not None
+
+
+def _clean_nn_probe():
+    import shutil
+    from pathlib import Path
+
+    from ml_toolbox.core.persistence import RUNS_DIR
+    shutil.rmtree(Path(RUNS_DIR) / _NN_PROBE_ID, ignore_errors=True)
+
+
+def _train_nn(app, dataset_id, *, epochs=6):
+    """用**固定 run_id** 真训练一次（事件文件因此落在可预期的目录里）。"""
+    from ml_toolbox.core import registry, runner
+    from ml_toolbox.core.contracts import RunConfig
+
+    registry.load_builtin()
+    entry = app.engine.dataset_entry(dataset_id)
+    assert entry is not None
+    _clean_nn_probe()
+    cfg = RunConfig(overrides={"hidden": "16,8", "epochs": epochs,
+                               "latent_every": 3},
+                    extras={"run_id": _NN_PROBE_ID})
+    rec = runner.run_one(registry.get("torch_mlp"), entry.spec, cfg)
+    assert rec.result.ok, f"训练本身失败：{rec.result.error}"
+    return rec
+
+
+def test_device_declaration_reaches_the_method_layer(app):
+    """⭐ 引擎的 `device` 声明必须**进 RunRequest.extras**（它曾是死参数）。
+
+    实测的缺陷（2026-10-03）：`run_method(device=...)` 被 `clean_device` 清洗、
+    也写进了 `current.device` 域状态与审计，却**从不进 RunRequest** ⇒ 方法层
+    永远收不到它。后果是"审计说 cuda、实跑 CPU"——**比参数不存在更糟**，
+    因为它留下了一条假记录。
+
+    ⚠ 这条判据**只钉管道**（extras 里有没有那个键），不钉"实际用了哪块卡"：
+    后者依赖本机有没有 CUDA，写成 `diag["device"] == "cpu"` 会在无卡机器上
+    **永远绿**（`auto` 本来就落 cpu）⇒ 我第一版就是这么写错的，做红验证时
+    两次都绿才发现。解析规则另由
+    `test_regressions.py::test_neural_device_resolution_is_deterministic` 钉。
+    """
+    en = app.engine
+    req, options = en._build_request(
+        {"command": "run_method", "method": "logistic", "device": "cuda:1"},
+        method="logistic")
+    assert req.extras.get("device") == "cuda:1", req.extras
+    cfg = req.config()
+    assert cfg.extras.get("device") == "cuda:1", \
+        "device 没进 config.extras ⇒ 方法层收不到（`config()` 是拷贝语义）"
+    # 不传时是声明里的默认（auto），不是一个空串 —— 方法层要能分辨"没要求"
+    req2, _ = en._build_request({"command": "run_method", "method": "logistic"},
+                                method="logistic")
+    assert req2.extras.get("device") == "auto", req2.extras
+
+
+def test_training_observations_are_reachable_from_the_tool_face(app):
+    """⭐ AI **经工具面**能拿到逐 epoch 训练观测（原先只能走 HTTP 只读路由）。
+
+    为什么这条最要紧（2026-10-03 实测的缺口）：观测数值一直是**逐 epoch 落盘**的
+    （`runs/<id>/tb/`），但只出现在 `/latest`、`/series` 两条 HTTP 路由上 ⇒
+    AI 经 MCP **一条都拿不到**，"梯度爆没爆 / 哪层死了 / 要不要早停"全答不了；
+    而 `describe_run` 只回**产物类别名**（`nn_history` 在列表里、数值不给）。
+    ⇒ 本条钉的就是"这条链真的通了"：训练 → 事件文件 → 查询面 → 工具面。
+    """
+    if not _has_torch():                       # torch 是可选依赖，缺就**明确**跳过
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+    try:
+        _train_nn(app, dataset_id)
+
+        # ① 只读查询：最新一轮的数值真给出来了
+        detail = app.engine.query("training_detail", run_id=_NN_PROBE_ID)
+        assert detail["available"], detail.get("reason")
+        latest = detail["latest"]
+        assert latest["available"]
+        for tag in ("loss", "val_loss", "grad_norm", "dead_relu"):
+            assert tag in latest, f"缺 {tag}（实得 {sorted(latest)}）"
+        assert latest["grad_by_layer"], "缺逐层梯度（'哪层死了'要靠它）"
+        assert detail["tags"], "tags 为空 ⇒ 工具不知道该读什么"
+
+        # ② 工具面：AI 真的调得到（且默认不内联整条序列）
+        got = app.tools.execute("describe_training", {"run_id": _NN_PROBE_ID})
+        assert got["is_error"] is False, got
+        value = got["value"]
+        assert value["available"] is True
+        assert value["latest"]["loss"] is not None
+        assert "series" not in value, "默认不该内联整条序列（响应会很大）"
+
+        # ③ 要趋势时显式打开：每个 tag 都带自己的 steps（tag 可以晚开始）
+        with_series = app.tools.execute(
+            "describe_training",
+            {"run_id": _NN_PROBE_ID, "include_series": True, "limit": 50})["value"]
+        assert with_series["series"], "没回序列"
+        loss = with_series["series"]["loss"]
+        assert len(loss["steps"]) == len(loss["values"]) == 6, loss
+        assert loss["values"] == sorted(loss["values"], reverse=True), \
+            "这 6 个 epoch 的 loss 应当单调下降（方向反了？）"
+        assert with_series["max_points"] > 0, "没告诉调用方截断上限"
+
+        # ④ 数据来自**磁盘**（不依赖会话内存）——这正是本工具存在的独立理由
+        assert app.engine.query("training_detail", run_id=_NN_PROBE_ID,
+                                include_series=True)["available"]
+    finally:
+        _clean_nn_probe()
+
+
+def test_progress_hook_must_be_attached_before_session_run(app):
+    """⭐ 机制判据：钩子必须挂进 ``request.extras``，**且要早于 ``config()`` 那次拷贝**。
+
+    本条专门钉那个"太晚"的坑（见 `test_per_epoch_progress_reaches_read_job`）：
+    ``RunRequest.config()`` 是 `extras=dict(self.extras)` 的**一次性快照**
+    （`api.py:89-94`）⇒ 挂在 `session.run` 之后的钩子**永远传不到 cfg**，
+    而症状只在后台 job 上显形（同步路径会假绿）。
+    ⇒ 直接断言"挂上之后 `config()` 认得出它"，比只断言"心里想着要挂"强。
+    """
+    from mecha.surface import ExecutionContext
+    from ml_mecha import engine as E
+
+    class _Cfg:
+        def __init__(self, extras):
+            self.extras = extras
+
+    class _Req:
+        """照抄 `RunRequest.config()` 的**拷贝语义**（真实的那份在 `api.py:89-94`）。"""
+
+        def __init__(self):
+            self.extras = {}
+
+        def config(self):
+            return _Cfg(dict(self.extras))
+
+    ctx = ExecutionContext()
+    req = _Req()
+    E._attach_progress(req, ctx)
+    assert callable(req.extras.get("on_progress")), "钩子没挂上 request.extras"
+    assert callable(req.config().extras.get("on_progress")), \
+        "钩子挂晚了：`config()` 的拷贝看不见它 ⇒ 方法层收不到"
+
+    # 真调一下：分数落在 [0,1]、阶段名带 epoch 进度
+    req.extras["on_progress"](2, 4, "epoch")
+    frac, stage = ctx.progress()[-1]
+    assert frac == 0.75, frac
+    assert "3/4" in stage, stage
+
+    # context 缺失/不合用时是 no-op（不能因为"没有执行上下文"就炸）
+    bare = _Req()
+    E._attach_progress(bare, None)
+    assert bare.extras == {}, bare.extras
+
+
+def test_training_observation_degrades_honestly(app):
+    """读不到 ⇒ **说清为什么**，不是空数组假装"跑到第 0 个 epoch"。"""
+    got = app.tools.execute("describe_training", {"run_id": "definitely-no-such-run"})
+    assert got["is_error"] is False, "只读工具不该因为'没有数据'报错"
+    value = got["value"]
+    assert value["available"] is False
+    assert value["reason"], "读不到却没说原因"
+    assert value["tags"] == [] and value["latest"]["available"] is False
+
+
+#: 残差网络的源码（**这是旋钮路线永远表达不了的拓扑**：`x + f(x)` 需要跨层引用输入，
+#: 而 `nn.Sequential` 只能表达线性链 —— 见 `mlp.py::_build`）。
+_RESIDUAL_CODE = '''
+class Block(nn.Module):
+    def __init__(self, w):
+        super().__init__()
+        self.fc1, self.fc2, self.act = nn.Linear(w, w), nn.Linear(w, w), nn.ReLU()
+
+    def forward(self, x):
+        return self.act(x + self.fc2(self.act(self.fc1(x))))
+
+
+class Network:
+    """输入投影 → 若干个残差块 → 输出头。"""
+
+    def __init__(self, width=16, blocks=2):
+        self.width, self.blocks = width, blocks
+
+    def build(self, n_in, n_out, *, nn):
+        layers = [nn.Linear(n_in, self.width), nn.ReLU()]
+        layers += [Block(self.width) for _ in range(self.blocks)]
+        layers.append(nn.Linear(self.width, n_out))
+        return nn.Sequential(*layers)
+'''
+
+
+def test_custom_network_runs_and_keeps_the_observation_surface(app):
+    """⭐ AI 写网络代码能真跑，而且**观测面与检视面照旧**（不另开一条路）。
+
+    这是"自由度交给 AI、固定部分交给程序"那套理念的落地判据：
+    - **自由**：残差网络的跳跃连接是 `nn.Sequential` 表达不了的拓扑，
+      旋钮堆再多也生不出来（这一条就是"为什么需要 codeact"的实证）；
+    - **固定**：训练循环/TensorBoard/逐 epoch 观测/指标/存档/检视页
+      **一行都没重写**——因为跑的就是一台 `MLMethod`（适配器代写 `fit`）。
+
+    ⚠ 判据刻意**不**断言"残差网比 MLP 好"：那是数据与调参的事，不是契约的事。
+    它断言的是"能跑 + 观测面在 + 拓扑真的是残差"。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+    try:
+        got = app.tools.execute("run_custom", {
+            "code": _RESIDUAL_CODE, "dataset_id": dataset_id, "name": "resnet_crit",
+            "diag": True, "persist": True, "seed": 4242,
+            "overrides": {"epochs": 6, "lr": 0.01}})
+        assert got["is_error"] is False, got
+        value = got["value"]
+        assert value["ok"] is True, value
+        assert value["network_name"] == "resnet_crit"
+        rid = value["run_id"]
+
+        # ① 拓扑真的是残差 —— 并且**旋钮路线生不出它**（负对照）
+        #    ⚠ 不能用存档里的模型验：`load_run_record` **不带 estimator**（设计如此，
+        #      历史载入的运行没有已拟合模型）⇒ 这里拿沙箱编译产物验拓扑。
+        import torch as _t
+
+        from ml_mecha.sandbox import call_network_build, compile_network
+        net = compile_network(_RESIDUAL_CODE).instance
+        model = call_network_build(net, 6, 3, _t.nn)
+        names = [type(m).__name__ for m in model.modules()]
+        assert "Block" in names, f"自定义网络里没有残差块：{sorted(set(names))}"
+        # 负对照：内置 torch_mlp 的结构里**永远**不会有这种块
+        # （`_build` 返回 Sequential ⇒ 表达不了 `x + f(x)`）
+        from ml_toolbox.core import registry as _reg
+        from ml_toolbox.core.contracts import RunConfig as _RC
+        _mlp = _reg.get("torch_mlp")
+        p_mlp = _RC(overrides={"hidden": "8,4"}).resolve(_mlp.param_schema)
+        builtin = _mlp._build(p_mlp, 6, 3, _t.nn)
+        assert isinstance(builtin, _t.nn.Sequential), \
+            "内置 MLP 不再是 Sequential ⇒ '拓扑写死'这个论证前提变了"
+        assert not any(type(m).__name__ == "Block" for m in builtin.modules()), \
+            "内置 MLP 里出现了残差块？论证前提变了"
+
+        from pathlib import Path
+
+        from ml_toolbox.core.persistence import RUNS_DIR, load_run_record
+        try:
+            record = load_run_record(rid)
+            # ② 观测面白拿：TB/describe_training 必须有逐 epoch 数据
+            train = app.tools.execute("describe_training",
+                                      {"run_id": rid, "include_series": True})["value"]
+            assert train["available"] is True, train.get("reason")
+            assert len(train["series"]["loss"]["values"]) == 6, train["series"]["loss"]
+            for tag in ("loss", "val_loss", "grad_norm", "dead_relu"):
+                assert tag in train["tags"], f"缺 {tag}（{sorted(train['tags'])}）"
+            # ③ 五页检视沿用（artifacts 与 torch_mlp 同构）
+            for key in ("nn_history", "nn_weights", "nn_latent", "nn_layers"):
+                assert key in record.result.artifacts, f"缺工件 {key}"
+            # ④ 代码跟着运行走（跨会话取回、按名字复用的前提）
+            src = record.result.artifacts.get("custom_network_source")
+            assert src is not None and "class Network" in str(src[0])
+            assert record.config.get("extras", {}).get("network_name") == "resnet_crit"
+        finally:
+            import shutil
+            shutil.rmtree(Path(RUNS_DIR) / rid, ignore_errors=True)
+
+        # ⑤ 临时注册必须撤干净：注册表里不许留下"代码可能已经不对"的空壳
+        from ml_toolbox.core import registry
+        assert "custom_network" not in registry.names(), \
+            "run_custom 跑完没撤注册项 ⇒ 注册表里留了一个代码可能过期的壳"
+    finally:
+        _clean_nn_probe()
+
+
+def test_custom_network_reuse_by_name_avoids_repasting(app):
+    """⭐ 网络能**按名字取回**（改一版再跑，不必重贴整段代码）。
+
+    为什么单列（用户点破的实际风险）：改个学习率就要重贴一遍网络代码的话，
+    token 全烧在复制粘贴上 ⇒ "自由"换来的是低效。⇒ 本条钉"取回可得、可改、可再跑"。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    from pathlib import Path
+    import shutil
+
+    from ml_toolbox.core.persistence import RUNS_DIR
+
+    dataset_id = _prepared(app)
+    made: list[str] = []
+    try:
+        first = app.tools.execute("run_custom", {
+            "code": _RESIDUAL_CODE, "dataset_id": dataset_id, "name": "reuse_crit",
+            "persist": True, "overrides": {"epochs": 5}})["value"]
+        made.append(first["run_id"])
+
+        cat = app.tools.execute("describe_networks", {})["value"]
+        names = [r["name"] for r in cat["networks"]]
+        assert "reuse_crit" in names, names
+
+        got = app.tools.execute("describe_network", {"name": "reuse_crit"})["value"]
+        assert got["available"] is True, got.get("reason")
+        assert "class Network" in got["code"]
+        assert got["code"].strip() == _RESIDUAL_CODE.strip(), "取回的源码与原文不一致"
+
+        # 改一版（只动一行）再跑：这正是"不重贴"的价值
+        tweaked = got["code"].replace("blocks=2", "blocks=3")
+        assert tweaked != got["code"]
+        second = app.tools.execute("run_custom", {
+            "code": tweaked, "dataset_id": dataset_id, "name": "reuse_deep",
+            "persist": True, "overrides": {"epochs": 5}})["value"]
+        made.append(second["run_id"])
+        assert second["ok"] is True, second
+
+        # 取不存在的名字 ⇒ 如实说（不回空源码假装成功）
+        miss = app.tools.execute("describe_network", {"name": "no_such_net"})["value"]
+        assert miss["available"] is False and miss["reason"], miss
+    finally:
+        for rid in made:
+            shutil.rmtree(Path(RUNS_DIR) / rid, ignore_errors=True)
+
+
+def test_custom_network_errors_are_readable_not_raw_stacks(app):
+    """沙箱错误必须**可教学**：说清是哪一类 + 怎么改，而不是一句裸栈。
+
+    为什么（用户裁决的边界）：执行走 `exec`，代码由 AI 产出 ⇒ 报错质量直接决定它
+    能不能自己改对。⇒ 五种典型错法各有专门的 `kind` 与提示，且**都不许**逃逸成
+    `internal_error`（那等于把"你写错了"和"框架坏了"混成一样）。
+    """
+    dataset_id = _prepared(app)
+
+    cases = [
+        ("空代码", "", "empty_code"),
+        ("语法错", "class Network\n    pass", "code_syntax_error"),
+        ("没有 Network 类", "class Foo:\n    pass\n", "missing_network_class"),
+        ("缺 build", "class Network:\n    pass\n", "missing_build"),
+        ("build 返回错类型",
+         "class Network:\n    def build(self, n_in, n_out, *, nn):\n"
+         "        return 42\n", "build_wrong_type"),
+    ]
+    for label, code, want_kind in cases:
+        got = app.tools.execute("run_custom", {"code": code, "dataset_id": dataset_id})
+        assert got["is_error"] is True, f"{label} 竟然没报错"
+        blob = json.dumps(got, ensure_ascii=False)
+        assert want_kind in blob or "Network" in blob or "语法" in blob, \
+            f"{label} 的错误不可读：{blob[:300]}"
+        assert "internal_error" not in blob, f"{label} 被归成了内部错误：{blob[:300]}"
+
+
+#: 最小网络代码（判据里做"能跑就行"的提交用）。
+_MIN_NET_CODE = ("class Network:\n"
+                 "    def build(self, n_in, n_out, *, nn):\n"
+                 "        return nn.Sequential(nn.Linear(n_in, 8), nn.ReLU(),\n"
+                 "                             nn.Linear(8, n_out))\n")
+
+
+def test_background_custom_network_reports_progress_and_run_id(app):
+    """⭐ 后台跑自定义网络：**逐代数值 + 训练中途就拿到 run_id**（用户裁决的"发射后不管"）。
+
+    这是把"AI 控制训练"做成**人类操作 GUI 那样**的那条路：发一个开始信号就走，
+    之后自己轮询。三个必须成立的事实：
+
+    1. `submit_run(code=...)` 能提交 —— 它以前把命令**写死**成 `run_method`
+       ⇒ 自定义网络只能同步跑，而同步受客户端 10 分钟超时（`TOOL_TIMEOUT`）
+       ⇒ **长训练等于跑不了**（超时后连 `run_id` 都拿不到）；
+    2. 进度里带 **`loss`/`val_loss`**（有界窗口）—— 一次轮询就能判断该不该早停，
+       不必再拉一次完整曲线；
+    3. 进度里带 **`run_id`** —— `result_ref` 只在终态才有，不带它就没法"边跑边查曲线"。
+
+    ⚠ 判据不 sleep 等训练跑完（那会变成时序噪音）：提交一个**足够长**的训练，
+    在它还在 running 时就断言上面三件，然后取消收尾。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+    job_id = ""
+    try:
+        got = app.tools.execute("submit_run", {
+            "code": _RESIDUAL_CODE, "name": "bg_crit", "dataset_id": dataset_id,
+            "seed": 5150, "diag": True,
+            "overrides": {"epochs": 400, "batch": 2, "lr": 0.05}})
+        assert got["is_error"] is False, got
+        value = got["value"]
+        job_id = value["job_id"]
+        # ① 提交的是 run_custom（不是被写死的 run_method）
+        assert value["command"] == "run_custom", value
+
+        # ②③ 轮询：训练**还在跑**的时候，就应看到逐代数值与 run_id
+        import time
+        seen_run_id, seen_loss, seen_epochs = "", None, 0
+        for _ in range(60):
+            time.sleep(0.5)
+            j = app.tools.execute("read_job", {"job_id": job_id})["value"]
+            latest = j.get("progress_latest") or {}
+            if not seen_run_id and j.get("run_id"):
+                seen_run_id = j["run_id"]
+            if latest.get("loss") is not None:
+                seen_loss = latest
+            seen_epochs = max(seen_epochs, len(j.get("epochs") or []))
+            if seen_run_id and seen_loss is not None and seen_epochs >= 2:
+                break
+            if j["state"] != "running":
+                break
+        assert seen_run_id, "训练中途拿不到 run_id ⇒ '边跑边查曲线'不可用"
+        assert seen_loss is not None, "进度里没有 loss/val_loss ⇒ 轮询无法决策早停"
+        assert seen_epochs >= 2, f"逐代数值窗口没在长（{seen_epochs} 条）"
+        assert {"loss", "val_loss"} <= set(seen_loss), seen_loss
+        # 有界：窗口不会随训练轮数无限增长
+        from ml_mecha.engine import PROGRESS_EPOCH_WINDOW
+        assert seen_epochs <= PROGRESS_EPOCH_WINDOW, seen_epochs
+
+        # ④ 中途就能按 run_id 查曲线（不必等终态）
+        train = app.tools.execute("describe_training", {
+            "run_id": seen_run_id, "include_series": True})["value"]
+        assert train["available"] is True, train.get("reason")
+        assert len(train["series"]["loss"]["values"]) >= 1
+
+        # ⑤ 取消：**真的在 epoch 边界停下**（协作式），不是等它跑满 400 轮
+        c = app.tools.execute("cancel_run", {"job_id": job_id})["value"]
+        assert c["ok"] is True and c["cancel_requested"] is True, c
+        for _ in range(60):
+            time.sleep(0.5)
+            j = app.tools.execute("read_job", {"job_id": job_id})["value"]
+            if j["state"] != "running":
+                break
+        assert j["state"] == "cancelled", j["state"]
+        ran = j["progress_latest"]["epoch"]
+        assert ran < 399, f"取消后还跑到第 {ran} 轮 ⇒ 训练器没有协作式取消点"
+    finally:
+        if job_id:
+            app.tools.execute("cancel_run", {"job_id": job_id})
+        from pathlib import Path
+
+        from ml_toolbox.core.persistence import RUNS_DIR
+        import shutil
+        for d in Path(RUNS_DIR).glob("custom_network-*-5150"):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_internal_job_marker_never_leaks_into_command_params(app):
+    """⭐ 后台标记必须被**摘掉**后再校验（它不是命令参数）。
+
+    实测踩过：给后台请求打 `{"job_run": True}` 之后，`validate_spec` 立刻判
+    "接受了未声明的参数" ⇒ **job 以 ok=False 瞬间结束**，看起来像"训练秒完"，
+    而真相是它根本没跑。⇒ 引擎在 `run` 里**校验之前**把它摘成显式形参。
+
+    本条钉两个方向：① `JOB_RUN_FLAG` 不在任何命令的声明参数里；
+    ② 带标记跑一次 `run_method` 仍然成功（标记被摘掉、且真的生效为 persist）。
+    """
+    from ml_mecha.commands import COMMANDS
+    from ml_mecha.engine import JOB_RUN_FLAG
+
+    for command in COMMANDS:
+        names = {p.name for p in command.parameters}
+        assert JOB_RUN_FLAG not in names, \
+            f"{command.name} 把内部标记声明成了命令参数（它不该出现在参数面）"
+
+    dataset_id = _prepared(app)
+    # 带标记跑一次：必须成功（而不是像"未声明的参数"那样瞬间失败）
+    # ⚠ 走 `_as`（显式绑通道）——裸 `engine.run` 没有操作者通道，会以
+    #   `missing_channel` 被拒（那是另一条闸，不是本判据要测的东西）。
+    receipt = _as(app, app.ai_channel,
+                  {"command": "run_method", "method": "logistic",
+                   "dataset_id": dataset_id, JOB_RUN_FLAG: True})
+    assert receipt.get("ok") is True, receipt
+    rid = receipt["run_id"]
+    try:
+        # 标记的**唯一作用**是打开 persist ⇒ 应该有存档
+        from pathlib import Path
+
+        from ml_toolbox.core.persistence import RUNS_DIR
+        rec = Path(RUNS_DIR) / rid / "record.json"
+        assert rec.is_file(), "后台标记没有生效（persist 没被打开）"
+    finally:
+        from pathlib import Path
+
+        from ml_toolbox.core.persistence import RUNS_DIR
+        import shutil
+        shutil.rmtree(Path(RUNS_DIR) / rid, ignore_errors=True)
+
+
+def test_background_job_persists_without_asking(app):
+    """⭐ 后台任务**终态自动落盘**（用户裁决：别让"意外"白训练）。
+
+    为什么：job 状态只在**进程内存**里（注册表无淘汰、也无持久化）⇒ 权威一重启，
+    `job_id` 与 `result_ref` 全没了：训练其实跑完了、数据也在 `runs/`，但**没有路标**。
+    ⇒ 后台任务默认落盘，等于给结果留一个不依赖"进程活到取回那一刻"的锚。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    from pathlib import Path
+
+    from ml_toolbox.core.persistence import RUNS_DIR
+    import shutil
+
+    dataset_id = _prepared(app)
+    rid = ""
+    try:
+        got = app.tools.execute("submit_run", {
+            "code": _MIN_NET_CODE, "name": "persist_crit", "dataset_id": dataset_id,
+            "seed": 6160, "overrides": {"epochs": 5}})
+        assert got["is_error"] is False, got
+        job_id = got["value"]["job_id"]
+        # ⚠ **不传 persist**：这正是本判据的要点
+        for _ in range(120):
+            j = app.tools.execute("read_job", {"job_id": job_id})["value"]
+            rid = j.get("run_id") or rid
+            if j["state"] != "running":
+                break
+            import time
+            time.sleep(0.5)
+        assert j["state"] == "done", j
+        rid = rid or ((j.get("result_ref") or {}).get("run_ids") or [""])[0]
+        assert rid, "拿不到 run_id"
+        rec = Path(RUNS_DIR) / rid / "record.json"
+        assert rec.is_file(), "后台任务跑完没落盘 ⇒ 丢了 job 就再也找不回结果"
+    finally:
+        if rid:
+            shutil.rmtree(Path(RUNS_DIR) / rid, ignore_errors=True)
+
+
+#: 自定义**预处理步骤**源码：造一个内置步骤做不到的特征（逐行比值）。
+_CUSTOM_STEP_CODE = '''
+class Step(StepBase):
+    key, title = "ratio", "造个比值特征"
+
+    def apply(self, df, target, diag=False):
+        out = df.copy()
+        cols = [c for c in out.columns if c != target]
+        if len(cols) >= 2:
+            out["f0_over_f1"] = out[cols[0]] / (out[cols[1]].abs() + 1e-9)
+        return out, {"added": 1, "big_num": "+1 列"}
+'''
+
+
+def test_ai_can_assemble_the_preprocessing_chain(app):
+    """⭐ AI **自己组装预处理链**：配内置步骤 + 写自定义步骤 + 指定切分。
+
+    为什么这是"自由化的那半"（用户裁决）：默认链（中位数填 → one-hot → 标准化 →
+    8:2 切分）对多数题够用，但换策略/加特征工程/改切分比例就没办法了。
+    本判据钉住四件：
+
+    1. **顺序 = 声明顺序**（那是作者意图，不做任何重排）；
+    2. **自定义步骤真跑**（`class Step(StepBase)` 由沙箱编译后注入管道）；
+    3. **切分口径真的按声明生效**，且 `describe_dataset` 报的是**这份数据自己的**
+       口径（不是引擎默认值——AI 现在可以逐数据集指定切分）；
+    4. **坏声明一律响亮**（未知步骤/未知键/坏取值/坏切分都不静默忽略）。
+    """
+    ml = app
+    # ⚠ 工具面**绑在 ai 通道**上 ⇒ 模式必须是 ai。
+    #   `_prepared` 会"人类侧准备一份数据 + 开 AI 闸"（出厂是 LOCKED）。
+    _prepared(ml)
+    got = ml.tools.execute("prepare_dataset", {
+        "source": {"kind": "synthetic", "task": "classification", "n_samples": 150},
+        "name": "assembled", "target": "target",
+        "pipeline": {"steps": [
+            {"key": "missing", "params": {"strategy": "mean"}},
+            {"key": "ratio", "code": _CUSTOM_STEP_CODE},
+            {"key": "scale", "params": {"mode": "robust"}},
+        ], "split": {"test_size": 0.2, "seed": 7, "stratify": True}}})
+    assert got["is_error"] is False, got
+    v = got["value"]
+    assert [c["step"] for c in v["pipeline_chain"]] == ["missing", "ratio", "scale"], \
+        v["pipeline_chain"]
+    assert v["split_policy"] == {"test_size": 0.2, "stratify": True, "seed": 7,
+                                 "time_split": False}, v["split_policy"]
+    # 自定义步骤真的加了一列（n_features 比输入多 1）
+    assert v["n_features"] == 5, v["n_features"]        # synthetic 默认 4 列 + ratio
+
+    # ⭐ 查询面报的是**这份数据集自己的**划分口径（不是引擎默认的 0.25/42）
+    detail = app.engine.query("dataset_detail", dataset_id=v["dataset_id"])
+    assert detail["split_policy"]["test_size"] == 0.2, detail["split_policy"]
+    assert detail["split_policy"]["seed"] == 7, detail["split_policy"]
+    by = {c["step"]: c for c in detail["pipeline_chain"]}
+    assert by["missing"]["summary"].get("strategy") == "mean"
+    assert by["scale"]["summary"].get("mode") == "robust"
+    assert by["ratio"]["summary"].get("added") == 1, by["ratio"]
+
+    # 这条链产出的数据**能用**（跑个方法，不是只装配了好看）
+    run = ml.tools.execute("run_method", {"method": "logistic",
+                                          "dataset_id": v["dataset_id"]})
+    assert run["is_error"] is False, run
+    assert run["value"]["metrics"]["f1"] > 0.5, run["value"]["metrics"]
+
+    # ---- 顺序就是顺序 + enabled=false 会被跳过
+    order = ml.tools.execute("prepare_dataset", {
+        "source": {"kind": "synthetic", "task": "classification", "n_samples": 80},
+        "name": "order", "target": "target",
+        "pipeline": {"steps": [{"key": "scale"}, {"key": "encode"},
+                               {"enabled": False, "key": "missing"}]}})["value"]
+    chain = ml.tools.execute("describe_dataset",
+                             {"dataset_id": order["dataset_id"]})["value"]["pipeline_chain"]
+    assert [c["step"] for c in chain] == ["scale", "encode", "missing"], chain
+    assert chain[-1]["skipped"] is True, chain
+
+    # ---- 坏声明一律响亮（**不静默忽略**）
+    bad = [
+        {"steps": [{"key": "no_such_step"}]},                        # 未知步骤
+        {"steps": [{"key": "scale", "bogus": 1}]},                    # 未知键
+        # ⚠ 这条专门打"参数名不在该步骤的可调表里"——它与"坏取值"是**两条不同的
+        #   守卫**（`unknown_step_param` vs `bad_step_param_value`）。我第一版只写了
+        #   坏取值 ⇒ 那条参数名守卫**判据覆盖不到**（停掉它判据照样绿，实测发现）。
+        {"steps": [{"key": "scale", "params": {"no_such_param": 1}}]},
+        {"steps": [{"key": "scale", "params": {"mode": "bogus"}}]},   # 坏取值
+        {"steps": [{"key": "scale"}], "split": {"test_size": 1.5}},   # 坏切分
+        {"steps": [{"key": "scale"}], "split": {"ratio": 0.2}},       # 未知 split 键
+        {"steps": [{"key": "x", "code": "class Step\n  pass"}]},      # 语法错
+        {"steps": [{"key": "x", "code": "class Step:\n    pass\n"}]},  # 没继承基类
+    ]
+    for decl in bad:
+        out = ml.tools.execute("prepare_dataset", {
+            "source": {"kind": "synthetic", "task": "classification", "n_samples": 60},
+            "name": "bad", "target": "target", "pipeline": decl})
+        assert out["is_error"] is True, f"坏声明被接受了：{decl}"
+        blob = json.dumps(out, ensure_ascii=False)
+        assert "internal_error" not in blob, f"坏声明被归成内部错误：{blob[:200]}"
+
+
+def test_dataset_query_exposes_chain_params_and_real_split_policy(app):
+    """⭐ AI 能看见**预处理链每一步的参数**与**真实的划分口径**。
+
+    两个缺口一次钉住（2026-10-03 实测）：
+    1. `dataset_detail` 原先只给 `step` + `big_num` ⇒ AI 知道"有一步叫 scale"，
+       但**不知道它按什么参数跑**（standard 还是 robust、编码是 onehot 还是
+       ordinal），只能猜；指纹 `pipeline_id` 又不含这些可读信息。
+    2. ⚠ **`split` 步骤的 `test_size` 是误导的**：`SplitStep.apply` 写的是**步骤
+       参数**（默认 0.25），而真正决定划分的是 `Pipeline.test_size`
+       （`pipeline.py::_split`）⇒ 两者可以不一致。⇒ 链上那个数**剔除**，
+       真值由 `split_policy`（取自 Pipeline 本体）给。
+    """
+    dataset_id = _prepared(app)
+    detail = app.engine.query("dataset_detail", dataset_id=dataset_id)
+
+    chain = detail["pipeline_chain"]
+    keys = [c["step"] for c in chain]
+    for want in ("missing", "encode", "scale", "split"):
+        assert want in keys, f"链上少了 {want}（实得 {keys}）"
+    for c in chain:
+        assert "params" in c and isinstance(c["params"], dict), c
+        assert "title" in c and c["title"], f"{c['step']} 没有人类可读标题"
+        assert "summary" in c and isinstance(c["summary"], dict), c
+
+    # 参数与摘要要**说得出做法**（不是空壳）
+    by_step = {c["step"]: c for c in chain}
+    assert by_step["missing"]["summary"].get("strategy"), "缺失值策略没透出"
+    assert by_step["scale"]["summary"].get("mode"), "缩放方式没透出"
+
+    # ⚠ `split` 步骤那个误导性的 test_size 必须**不在**（它不决定划分）
+    assert "test_size" not in by_step["split"]["summary"], \
+        "步骤级 test_size 又漏出来了（它与 Pipeline.test_size 可以不一致）"
+
+    # 真值在 split_policy，且取自 Pipeline 本体（与工程默认一致）
+    policy = detail["split_policy"]
+    assert set(policy) == {"test_size", "stratify", "seed", "time_split"}, policy
+
+    # 工具面同样看得到（AI 用的是这一层）
+    got = app.tools.execute("describe_dataset", {"dataset_id": dataset_id})["value"]
+    assert got["split_policy"] == policy
+    assert got["pipeline_chain"][0]["summary"], "工具面把链摘要丢了"
+
+
+def test_per_epoch_progress_reaches_read_job(app):
+    """⭐ 后台长训练**逐 epoch 报进度** —— AI 靠它判断"跑到哪了 / 该不该早停"。
+
+    为什么必须钉（实测的假绿，值得记下来）：钩子最初挂在 `_execute_one` 里，
+    而那**太晚** —— `Session.run` 一进来就调 `request.config()`，而
+    ``RunRequest.config()`` 是 `extras=dict(self.extras)` 的**一次性拷贝**
+    （`api.py:89-94`）⇒ 之后往 `request.extras` 里塞东西**传不到 cfg**。
+    症状极具欺骗性：**同步** `run_method` 看着一切正常，只有**后台 job**
+    一条进度都没有 —— 正好是"人看得见、AI 看不见"的那个缺口。
+    ⇒ 判据必须走**真的 job**，不能只验 `_attach_progress` 有没有设上键。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+    try:
+        job = app.submit({"command": "run_method", "method": "torch_mlp",
+                          "dataset_id": dataset_id,
+                          "overrides": {"hidden": "16,8", "epochs": 8}},
+                         side="ai")
+        assert job.id
+        status = app.wait_job(job, timeout=180.0)
+        assert status["state"] == "done", status
+        raw = status.get("progress") or []
+        assert raw, ("job 一条进度都没有 ⇒ 钩子没挂上（见本判据 docstring 的"
+                     "那条'太晚'教训）")
+        # 进度是**逐 epoch** 的（不是只有一条批次级），且分数单调不减、以 1.0 收尾
+        assert len(raw) >= 8, f"进度点太少（{len(raw)}），像是批次级而非逐 epoch"
+        fracs = [float(p[0]) for p in raw]
+        assert fracs == sorted(fracs), f"进度分数不单调：{fracs}"
+        assert fracs[-1] == 1.0, f"最后一次进度不是 1.0：{fracs[-1]}"
+        assert all(isinstance(p[1], str) and p[1] for p in raw), "进度缺少阶段名"
+
+        # 工具面同样看得到（AI 用的是 read_job）
+        read = app.tools.execute("read_job", {"job_id": job.id})["value"]
+        assert len(read["progress"]) == len(raw)
+        assert read["progress_latest"]["frac"] == 1.0
+    finally:
+        _clean_nn_probe()
 
 
 # ---------------------------------------------------------------- 4. 资源守卫
@@ -949,7 +1657,8 @@ def test_static_command_surface_is_ml_owned():
     from ml_mecha.commands import COMMANDS, SIDE_EFFECT_NONE
 
     assert {c.name for c in COMMANDS} == {"prepare_dataset", "run_method",
-                                          "run_method_batch", "compare_methods"}
+                                          "run_method_batch", "compare_methods",
+                                          "run_custom"}
     for command in COMMANDS:
         assert command.side_effect, command.name
         assert command.risk, command.name
@@ -1034,7 +1743,7 @@ def test_cancel_job_returns_core_truth_instead_of_dropping_it(app):
 #    审批通道由**调用方注入**（框架刻意不自动接线）。本组判据把这两条钉在**本适配层**。
 
 def test_core_command_specs_declare_explicit_required(app):
-    """⭐ 四条命令的**核心投影**都必须带**显式非空** `required`（否则语义翻转会开口子）。
+    """⭐ 五条命令的**核心投影**都必须带**显式非空** `required`（否则语义翻转会开口子）。
 
     这是 ADR「迁移须知 1」对 ML 的直接检查项：ML 的命令声明走
     ``commands.py → core_commands.core_command_specs()`` 机械投影，投影**无条件**写出
@@ -1060,9 +1769,9 @@ def test_core_command_specs_declare_explicit_required(app):
         # 必填项必须都在 properties 里（否则模型永远填不出来）
         assert set(core_required) <= set(dict(params["properties"])), host.name
         checked.append(host.name)
-    # R8 非退化：真的逐条比过 4 条（不是空转）
-    assert sorted(checked) == ["compare_methods", "prepare_dataset", "run_method",
-                               "run_method_batch"], checked
+    # R8 非退化：真的逐条比过 5 条（不是空转）
+    assert sorted(checked) == ["compare_methods", "prepare_dataset", "run_custom",
+                               "run_method", "run_method_batch"], checked
 
 
 def test_missing_required_param_is_rejected_not_silently_accepted(app):
