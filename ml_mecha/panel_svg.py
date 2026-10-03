@@ -68,6 +68,15 @@ def _nice_ticks(lo: float, hi: float, n: int = 5) -> list:
     return [lo + step * i for i in range(n + 1)]
 
 
+def _slog(v: float, thr: float) -> float:
+    """symlog 变换（与 matplotlib 的 symlog 同形）：近零线性、远零对数。"""
+    import math
+    a = abs(v)
+    if a <= thr:
+        return v / thr
+    return math.copysign(1.0 + math.log10(a / thr), v)
+
+
 def _extent(values, *, frac: float = 0.06):
     vals = [float(v) for v in values if v is not None]
     if not vals:
@@ -108,8 +117,8 @@ def _collect_y(spec) -> list:
 def svg(spec) -> str:
     """``PlotSpec`` → SVG 字符串。**未知 kind 抛错**（空白页是那种假绿）。"""
     kind = getattr(spec, "kind", "")
-    fn = {"line": _line, "scatter": _scatter, "barh": _barh,
-          "heatmap": _heatmap}.get(kind)
+    fn = {"line": _line, "scatter": _scatter, "barh": _barh, "bar": _bar,
+          "hist": _hist, "heatmap": _heatmap, "parallel": _parallel}.get(kind)
     if fn is None:
         raise NotImplementedError(f"PlotSpec 渲染器不认识 kind={kind!r}")
     body, legend_items = fn(spec)
@@ -131,6 +140,12 @@ def svg(spec) -> str:
         parts.append(f'<text x="14" y="{T + PH / 2:.0f}" text-anchor="middle" '
                      f'fill="{_AXIS}" transform="rotate(-90 14 {T + PH / 2:.0f})">'
                      f'{_esc(spec.ylabel)}</text>')
+    # 色标（`scatter2d` 的分数色条）：用一小条离散色阶 + 两端数值说明
+    if getattr(spec, "cmap", "") and getattr(spec, "colorbar_label", ""):
+        vals = [v for s in (spec.series or ()) for v in (s.y or ()) if v is not None]
+        if vals:
+            parts.append(_colorbar(float(min(vals)), float(max(vals)),
+                                   str(spec.colorbar_label)))
     if legend_items and spec.legend:
         x = L + 8
         y = T + 10
@@ -180,6 +195,20 @@ def _frame(spec, xlo, xhi, ylo, yhi, xticks=None, xlabels=None):
                f'stroke="{_AXIS}" stroke-width="1"/>')
     out.append(f'<line x1="{L}" y1="{T}" x2="{L}" y2="{T + PH}" '
                f'stroke="{_AXIS}" stroke-width="1"/>')
+    # 横线标记（残差零线、归因零线、异常阈值线…）
+    for h in getattr(spec, "hlines", ()) or ():
+        try:
+            y = _py(float(h.get("y")), ylo, yhi)
+        except (TypeError, ValueError):
+            continue
+        out.append(f'<line x1="{L}" y1="{y:.1f}" x2="{L + PW}" y2="{y:.1f}" '
+                   f'stroke="{_esc(h.get("color") or _AXIS)}" stroke-width="1" '
+                   f'stroke-dasharray="4 3"/>')
+    # 副轴提示（SVG 只有一条 y 轴；副轴数据按自己的极值缩放，这里标注一下）
+    if getattr(spec, "ylabel2", ""):
+        out.append(f'<text x="{L + PW}" y="{T + 10}" text-anchor="end" '
+                   f'fill="{_AXIS}" font-size="10">{_esc(spec.ylabel2)}'
+                   f'（副轴，按自身范围缩放）</text>')
     # 竖线标记
     for v in spec.vlines or ():
         try:
@@ -200,6 +229,23 @@ def _py(v, lo, hi) -> float:
     return T + PH - PH * (float(v) - lo) / (hi - lo) if hi > lo else T + PH / 2
 
 
+def _series_xy(spec, s):
+    """取一条 series 的 (x, y)：``s.x`` 优先，回落到 ``spec.x``，再回落到序号。"""
+    x = s.x if s.x is not None else spec.x
+    y = list(s.y or ())
+    if not x:
+        x = list(range(len(y)))
+    return list(x), y
+
+
+def _color_at(s, i, idx):
+    """取第 idx 个点的颜色：``s.color`` 可以是**单色**或**逐点色数组**。"""
+    c = getattr(s, "color", "")
+    if isinstance(c, (list, tuple)):
+        return str(c[idx]) if idx < len(c) else PALETTE[i % len(PALETTE)]
+    return str(c) if c else PALETTE[i % len(PALETTE)]
+
+
 def _polyline(pts, color, *, dash=False, width=1.4, marker="", alpha=0.9) -> str:
     if len(pts) < 2 and not marker:
         return ""
@@ -215,46 +261,101 @@ def _polyline(pts, color, *, dash=False, width=1.4, marker="", alpha=0.9) -> str
     return "".join(out)
 
 
+def _legend_of(spec):
+    """图例项（跳过 ``no_legend`` 的 series）。"""
+    out = []
+    for i, s in enumerate(spec.series or ()):
+        if getattr(s, "no_legend", False) or not s.name:
+            continue
+        c = getattr(s, "color", "")
+        out.append((s.name, c if isinstance(c, str) and c else PALETTE[i % len(PALETTE)]))
+    for h in getattr(spec, "hlines", ()) or ():
+        if h.get("label"):
+            out.append((str(h["label"]), h.get("color") or _AXIS))
+    for v in getattr(spec, "vlines", ()) or ():
+        if v.get("label"):
+            out.append((str(v["label"]), v.get("color") or _AXIS))
+    return out
+
+
 def _line(spec):
-    xall, yall = _collect_x(spec), _collect_y(spec)
-    xe, ye = _extent(xall), _extent(yall)
+    """折线/散点（同一支：`connect=False` 就是散点）。
+
+    ⚠ 这里处理四件事，两个渲染器必须一致：
+    - `area=True` ⇒ 到 `fill_base` 之间填色（轮廓图、残差带）；
+    - `color` 可以是**逐点色数组**（按标签着色）；
+    - `axis2=True` 的 series 按**它自己那组数据**的极值缩放（SVG 里就一条 y 轴，
+      所以画在右半边并标注，见 `_frame` 的 `ylabel2`）；
+    - `yscale="symlog"` 时先做 symlog 变换再缩放。
+    """
+    sym = getattr(spec, "yscale", "") == "symlog"
+    thr = float(getattr(spec, "linthresh", 1e-3) or 1e-3)
+    tr = (lambda v: _slog(float(v), thr)) if sym else (lambda v: float(v))
+
+    prim = [s for s in (spec.series or ()) if not getattr(s, "axis2", False)]
+    sec = [s for s in (spec.series or ()) if getattr(s, "axis2", False)]
+    xs_all = _collect_x(spec)
+    ys_prim = [tr(v) for v in
+               [y for s in prim for y in (s.y or ()) if y is not None]]
     if spec.xlim:
         xe = (float(spec.xlim[0]), float(spec.xlim[1]))
+    else:
+        xe = _extent(xs_all)
     if spec.ylim:
-        ye = (float(spec.ylim[0]), float(spec.ylim[1]))
+        ye = (tr(spec.ylim[0]), tr(spec.ylim[1]))
+    else:
+        ye = _extent(ys_prim)
     if xe is None or ye is None:
         return _empty("没有可画的点"), []
     xlo, xhi = xe
     ylo, yhi = ye
+    ysec = [tr(v) for s in sec for v in (s.y or ()) if v is not None]
+    yl2 = getattr(spec, "ylim2", None)
+    se = ((tr(yl2[0]), tr(yl2[1])) if yl2 else (_extent(ysec) or (0.0, 1.0)))
     out = [_frame(spec, xlo, xhi, ylo, yhi)]
-    legend = []
+    legend = _legend_of(spec)
     for i, s in enumerate(spec.series or ()):
-        color = s.color or PALETTE[i % len(PALETTE)]
-        xs = list(s.x if s.x is not None else (spec.x or range(len(s.y or ()))))
-        ys = list(s.y or ())
-        n = min(len(xs), len(ys))
-        pts = [(_px(xs[j], xlo, xhi), _py(ys[j], ylo, yhi)) for j in range(n)]
+        second = getattr(s, "axis2", False)
+        axis = se if second else (ylo, yhi)
+        x, y = _series_xy(spec, s)
+        if not x:
+            x = list(range(len(y)))
+        n = min(len(x), len(y))
+        pts = [(_px(x[j], xlo, xhi), _py(tr(y[j]), axis[0], axis[1]))
+               for j in range(n) if y[j] is not None]
+        color = _color_at(s, i, 0)
+        # 面积：到基线之间填色
+        if getattr(s, "area", False) and pts:
+            base = _py(tr(float(getattr(s, "fill_base", 0.0))), axis[0], axis[1])
+            up = " ".join(f"{px:.1f},{py:.1f}" for px, py in pts)
+            out.append(f'<polygon points="{up} {pts[-1][0]:.1f},{base:.1f} '
+                       f'{pts[0][0]:.1f},{base:.1f}" fill="{color}" '
+                       f'fill-opacity="{float(s.alpha) * 0.35:.2f}"/>')
         if s.fill_lo is not None and s.fill_hi is not None:
-            lo = list(s.fill_lo)[:n]
-            hi = list(s.fill_hi)[:n]
-            up = " ".join(f"{_px(xs[j], xlo, xhi):.1f},{_py(hi[j], ylo, yhi):.1f}"
+            lo, hi = list(s.fill_lo)[:n], list(s.fill_hi)[:n]
+            up = " ".join(f"{_px(x[j], xlo, xhi):.1f},{_py(tr(hi[j]), axis[0], axis[1]):.1f}"
                           for j in range(n) if hi[j] is not None)
-            dn = " ".join(f"{_px(xs[j], xlo, xhi):.1f},{_py(lo[j], ylo, yhi):.1f}"
+            dn = " ".join(f"{_px(x[j], xlo, xhi):.1f},{_py(tr(lo[j]), axis[0], axis[1]):.1f}"
                           for j in range(n - 1, -1, -1) if lo[j] is not None)
             if up and dn:
                 out.append(f'<polygon points="{up} {dn}" fill="{color}" '
                            f'fill-opacity="0.12"/>')
-        connect = getattr(s, "connect", True)
-        if connect:
-            out.append(_polyline(pts, color, dash=s.dash, width=s.width,
-                                 marker=s.marker, alpha=s.alpha))
-        else:
-            # 纯散点：**不连线**，只画点（对应 GUI 的 `ax.scatter`）
-            for x, y in pts:
-                out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" '
-                           f'fill="{color}" fill-opacity="{float(s.alpha):.2f}"/>')
-        if s.name and not getattr(s, "no_legend", False):
-            legend.append((s.name, color))
+        if not getattr(s, "connect", True):
+            for j, (px, py) in enumerate(pts):
+                out.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="2.6" '
+                           f'fill="{_color_at(s, i, j)}" '
+                           f'fill-opacity="{float(s.alpha):.2f}"/>')
+            continue
+        dash = ' stroke-dasharray="5 3"' if s.dash else ""
+        d = " ".join(f"{px:.1f},{py:.1f}" for px, py in pts)
+        out.append(f'<polyline points="{d}" fill="none" stroke="{color}" '
+                   f'stroke-width="{float(s.width)}" '
+                   f'stroke-opacity="{float(s.alpha):.2f}"{dash} '
+                   f'stroke-linejoin="round"/>')
+        if s.marker:
+            for px, py in pts:
+                out.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="2.6" '
+                           f'fill="{color}"/>')
     return "".join(out), legend
 
 
@@ -314,8 +415,10 @@ def _barh(spec):
             continue
         y = _py(i, ylo, yhi)
         w = _px(float(v), xlo, xhi) - L
+        rc = list(getattr(spec, "rowcolors", ()) or ())
+        col = rc[i] if i < len(rc) and rc[i] else PALETTE[2]
         out.append(f'<rect x="{L}" y="{y - bar_h / 2:.1f}" width="{max(w, 0):.1f}" '
-                   f'height="{bar_h:.1f}" rx="2" fill="{PALETTE[2]}" '
+                   f'height="{bar_h:.1f}" rx="2" fill="{col}" '
                    f'fill-opacity="0.85"/>')
         lab = rows[i] if i < len(rows) else str(i)
         out.append(f'<text x="{L - 6}" y="{y + 3.5:.1f}" text-anchor="end" '
@@ -329,6 +432,122 @@ def _barh(spec):
     out.append(f'<line x1="{L}" y1="{T}" x2="{L}" y2="{T + PH}" '
                f'stroke="{_AXIS}" stroke-width="1"/>')
     return "".join(out), []
+
+
+def _bar(spec):
+    """竖条形（`as_bar` 的 series 画条，其余按线画：方差+累计线就是这种组合）。"""
+    xall = _collect_x(spec)
+    yall = [v for s in (spec.series or ()) for v in (s.y or ()) if v is not None]
+    xe = _extent(xall) or (0.0, 1.0)
+    ye = _extent(yall) or (0.0, 1.0)
+    ylo, yhi = min(0.0, ye[0]), ye[1]
+    xlo, xhi = xe
+    out = [_frame(spec, xlo, xhi, ylo, yhi)]
+    legend = _legend_of(spec)
+    if xhi > xlo:
+        bw = PW / (len(xall) or 1) * 0.72
+    else:
+        bw = 8.0
+    for i, s in enumerate(spec.series or ()):
+        x, y = _series_xy(spec, s)
+        if not x:
+            x = list(range(1, len(y) + 1))
+        n = min(len(x), len(y))
+        color = _color_at(s, i, 0)
+        if getattr(s, "as_bar", False):
+            for j in range(n):
+                if y[j] is None:
+                    continue
+                y0 = _py(max(0.0, 0.0), ylo, yhi)
+                y1 = _py(float(y[j]), ylo, yhi)
+                cx = _px(x[j], xlo, xhi)
+                out.append(f'<rect x="{cx - bw / 2:.1f}" y="{min(y0, y1):.1f}" '
+                           f'width="{bw:.1f}" height="{abs(y1 - y0):.1f}" rx="2" '
+                           f'fill="{color}" fill-opacity="{float(s.alpha):.2f}"/>')
+        else:
+            pts = " ".join(f"{_px(x[j], xlo, xhi):.1f},{_py(float(y[j]), ylo, yhi):.1f}"
+                           for j in range(n) if y[j] is not None)
+            out.append(f'<polyline points="{pts}" fill="none" stroke="{color}" '
+                       f'stroke-width="{float(s.width)}"/>')
+            for j in range(n):
+                if y[j] is None:
+                    continue
+                out.append(f'<circle cx="{_px(x[j], xlo, xhi):.1f}" '
+                           f'cy="{_py(float(y[j]), ylo, yhi):.1f}" r="2.6" '
+                           f'fill="{color}"/>')
+    return "".join(out), legend
+
+
+def _hist(spec):
+    """直方图：`spec.x` 是"全体"一组，各 series 各一组（异常分数图两组叠加）。"""
+    groups = []
+    if spec.x:
+        groups.append(("", [float(v) for v in spec.x if v is not None],
+                       PALETTE[0], 0.35, True))
+    for i, s in enumerate(spec.series or ()):
+        vals = [float(v) for v in (s.y or ()) if v is not None]
+        if vals:
+            groups.append((s.name, vals, _color_at(s, i, 0), float(s.alpha),
+                           bool(getattr(s, "no_legend", False))))
+    if not groups:
+        return _empty("没有可画的数据"), []
+    allv = [v for _n, vals, _c, _a, _q in groups for v in vals]
+    lo, hi = min(allv), max(allv)
+    if hi <= lo:
+        hi = lo + 1.0
+    nb = max(1, int(getattr(spec, "bins", 40) or 40))
+    step = (hi - lo) / nb
+    counts = []
+    for _n, vals, _c, _a, _q in groups:
+        c = [0] * nb
+        for v in vals:
+            k = min(nb - 1, max(0, int((v - lo) / step)))
+            c[k] += 1
+        counts.append(c)
+    ymax = max([1] + [max(c) for c in counts])
+    out = [_frame(spec, lo, hi, 0.0, ymax * 1.06)]
+    bw = PW / nb
+    for gi, (_n, _vals, color, alpha, _q) in enumerate(groups):
+        for k in range(nb):
+            hgt = PH * counts[gi][k] / (ymax * 1.06)
+            if hgt <= 0:
+                continue
+            out.append(f'<rect x="{L + k * bw:.1f}" y="{T + PH - hgt:.1f}" '
+                       f'width="{max(bw - 0.6, 0.6):.1f}" height="{hgt:.1f}" '
+                       f'fill="{color}" fill-opacity="{alpha:.2f}"/>')
+    legend = [(n, c) for n, _v, c, _a, q in groups if n and not q]
+    return "".join(out), legend
+
+
+def _parallel(spec):
+    """平行坐标：x 是**等距分类轴**（参数名），每条 series 一次评估的轨迹。"""
+    n_axes = max([len(s.y or ()) for s in (spec.series or ())] + [0])
+    if not n_axes:
+        return _empty("没有可画的参数"), []
+    xlo, xhi = -0.5, n_axes - 0.5
+    ylo, yhi = 0.0, 1.0
+    out = []
+    if spec.grid:
+        for j in range(n_axes):
+            x = _px(j, xlo, xhi)
+            out.append(f'<line x1="{x:.1f}" y1="{T}" x2="{x:.1f}" y2="{T + PH}" '
+                       f'stroke="{_GRID}" stroke-width="1"/>')
+    labels = [str(v) for v in (getattr(spec, "xticklabels", ()) or ())]
+    for j in range(n_axes):
+        lab = labels[j] if j < len(labels) else str(j)
+        out.append(f'<text x="{_px(j, xlo, xhi):.1f}" y="{T + PH + 14}" '
+                   f'text-anchor="middle" fill="{_AXIS}">{_esc(lab[:12])}</text>')
+    for name, y in (("min", 0.0), ("max", 1.0)):
+        out.append(f'<text x="{L - 6}" y="{_py(y, ylo, yhi) + 3.5:.1f}" '
+                   f'text-anchor="end" fill="{_AXIS}">{name}</text>')
+    for i, s in enumerate(spec.series or ()):
+        y = list(s.y or ())
+        pts = " ".join(f"{_px(j, xlo, xhi):.1f},{_py(float(y[j]), ylo, yhi):.1f}"
+                       for j in range(len(y)) if y[j] is not None)
+        out.append(f'<polyline points="{pts}" fill="none" '
+                   f'stroke="{_color_at(s, i, 0)}" stroke-width="{float(s.width)}" '
+                   f'stroke-opacity="{float(s.alpha):.2f}"/>')
+    return "".join(out), _legend_of(spec)
 
 
 def _heatmap(spec):
@@ -384,3 +603,32 @@ def _empty(why: str) -> str:
     """没有可画的东西 ⇒ **说出来**（不是空白页）。"""
     return (f'<text x="{L}" y="{T + 24}" fill="{_AXIS}">{_esc(why)}'
             f'（这一页没有可画的数据）</text>')
+
+
+def _colorbar(lo: float, hi: float, label: str, steps: int = 24) -> str:
+    """画一条竖直色标（SVG 里没有 matplotlib 的 colorbar 可借，自己画一条）。"""
+    x = L + PW + 6
+    y0, hgt = T, PH * 0.7
+    cell = hgt / steps
+    out = []
+    for i in range(steps):
+        t = i / max(1, steps - 1)
+        out.append(f'<rect x="{x:.1f}" y="{y0 + i * cell:.1f}" width="9" '
+                   f'height="{cell + 0.6:.1f}" fill="{_rdylgn_inv(t)}"/>')
+    out.append(f'<text x="{x + 13:.1f}" y="{y0 + 8:.1f}" fill="{_AXIS}" '
+               f'font-size="10">{_fmt_tick(lo)}</text>')
+    out.append(f'<text x="{x + 13:.1f}" y="{y0 + hgt:.1f}" fill="{_AXIS}" '
+               f'font-size="10">{_fmt_tick(hi)}</text>')
+    out.append(f'<text x="{x:.1f}" y="{y0 + hgt + 14:.1f}" fill="{_AXIS}" '
+               f'font-size="10">{_esc(label)}</text>')
+    return "".join(out)
+
+
+def _rdylgn_inv(t: float) -> str:
+    """viridis 近似的**反向**（色标上端=高分）。与 `opt/specs._viridis_r` 同一支。"""
+    stops = ((68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98),
+             (253, 231, 37))
+    t = max(0.0, min(1.0, float(t)))
+    k = t * (len(stops) - 1)
+    i = min(int(k), len(stops) - 2)
+    return _blend(stops[i], stops[i + 1], k - i)

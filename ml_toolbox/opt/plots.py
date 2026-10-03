@@ -11,9 +11,9 @@ UI 只装配不预设——G2 纪律推广到优化侧，终结"UI 硬编码五 
 """
 from __future__ import annotations
 
-import numpy as np
-
 from ..core.contracts import PageSpec
+from ..core import plot_mpl
+from . import specs as _specs
 
 _GREEN = "#2ca02c"
 _BLUE = "#1f77b4"
@@ -24,66 +24,25 @@ def _ok(record):
 
 
 def plot_convergence(ax, record, extra=None):
-    """收敛曲线：best-so-far 阶梯 + 评估散点。extra=[(label, history)] 叠加对比。
+    """收敛曲线：best-so-far 阶梯 + 单次评估散点（+可选叠加对比）。
 
-    extra 缺省时读 record._overlay（UI 直播时注入的已完成轨迹——呈现层
-    上下文放 record 上，绘图函数保持自足，声明式装配不传第二参数）。
+    ⚠ **已迁移**：数由 `opt/specs.spec_convergence` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 `default_pages` 与 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
     """
-    if extra is None:
-        extra = getattr(record, "_overlay", None)
-    h = record.history
-    if h.empty:
-        ax.text(0.5, 0.5, "尚无评估", ha="center", va="center", color="#888")
-        return
-    ok = _ok(record)
-    ax.plot(np.arange(1, len(h) + 1), h["best_so_far"], "-o", ms=3,
-            color=_GREEN, lw=1.6, label=f"best-so-far（{record.optimizer}）")
-    if len(ok):
-        ax.plot(np.arange(1, len(h) + 1), h["score"], ".", ms=4,
-                color=_BLUE, alpha=0.5, label="单次评估")
-    for label, hh in (extra or []):
-        if len(hh):
-            ax.plot(np.arange(1, len(hh) + 1), hh["best_so_far"], "--",
-                    lw=1.2, alpha=0.85, label=label)
-    ax.set_yscale("symlog", linthresh=1e-3)
-    ax.set_xlabel("评估次数")
-    ax.set_ylabel("分数（log 邻域）")
-    ax.set_title("收敛曲线（越小越好）")
-    ax.legend(fontsize=14)
-    ax.grid(alpha=0.25)
+    spec = _specs.spec_convergence(record, extra=extra)
+    plot_mpl.draw(spec, ax)
+    _finish_opt(spec, ax)
 
 
 def plot_parallel(ax, record):
-    """平行坐标：每维一根竖轴，每条线=一次评估，颜色=分数（绿=好）。"""
-    ok = _ok(record)
-    keys = [d["key"] for d in record.space_desc]
-    keys = [k for k in keys if k in ok.columns]
-    if ok.empty or not keys:
-        ax.text(0.5, 0.5, "无参数数据", ha="center", va="center", color="#888")
-        return
-    M = ok[keys].to_numpy(float)
-    lo, hi = M.min(0), M.max(0)
-    span = np.where(hi - lo < 1e-12, 1.0, hi - lo)
-    Z = (M - lo) / span
-    scol = "score" if "score" in ok.columns else "f0"   # 多目标用 f0 着色
-    s = ok[scol].to_numpy(float)
-    smin, smax = np.nanmin(s), np.nanmax(s)
-    sn = (s - smin) / max(smax - smin, 1e-12)
-    cmap = plt_cmap()
-    xs = np.arange(len(keys))
-    for i in range(len(Z)):
-        ax.plot(xs, Z[i], color=cmap(1 - sn[i]), alpha=0.35, lw=0.8)
-    best_i = int(np.argmin(s))
-    ax.plot(xs, Z[best_i], color=_GREEN, lw=2.0, label="当前最优")
-    for j, k in enumerate(keys):
-        ax.axvline(j, color="#ccc", lw=0.8)
-    ax.set_xticks(xs)
-    ax.set_xticklabels(keys, fontsize=16, rotation=20)
-    ax.set_yticks([0, 0.5, 1])
-    ax.set_yticklabels(["min", "", "max"], fontsize=16)
-    ax.set_xlim(-0.5, len(keys) - 0.5)
-    ax.set_title("参数×分数平行坐标（绿=好，红=差）")
-    ax.legend(fontsize=16)
+    """平行坐标：每维一根竖轴，每条线=一次评估。
+
+    ⚠ **已迁移**：数由 `opt/specs.spec_parallel` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 `default_pages` 与 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    spec = _specs.spec_parallel(record)
+    plot_mpl.draw(spec, ax)
+    _finish_opt(spec, ax)
 
 
 def plt_cmap():
@@ -92,76 +51,38 @@ def plt_cmap():
 
 
 def plot_scatter2d(ax, record):
-    """探索地图：前两个连续参数为轴，颜色=分数，×=失败点。"""
-    cont = [d["key"] for d in record.space_desc
-            if d["kind"] in ("uniform", "log-uniform", "randint")]
-    h = record.history
-    if len(cont) < 2 or h.empty:
-        ax.text(0.5, 0.5, "需要 ≥2 个连续参数（当前为 1D/类别空间，看平行坐标）",
-                ha="center", va="center", color="#888", fontsize=18)
-        return
-    a, b = cont[0], cont[1]
-    ok = _ok(record)
-    fail = h[h["status"] == "failed"]
-    sc = ax.scatter(ok[a], ok[b], c=ok["score"], cmap="viridis_r",
-                    s=28, edgecolors="k", linewidths=0.3)
-    if len(fail):
-        ax.scatter(fail[a], fail[b], marker="x", s=40, color="firebrick",
-                   label=f"失败 {len(fail)}")
-    if len(ok):
-        bx = ok.loc[ok["score"].idxmin()]
-        ax.scatter([bx[a]], [bx[b]], marker="*", s=220, color=_GREEN,
-                   edgecolors="k", zorder=5, label="最优")
-    ax.set_xlabel(a)
-    ax.set_ylabel(b)
-    ax.set_title("探索地图（前两个连续参数）")
-    ax.legend(fontsize=16)
-    try:
-        import matplotlib.pyplot as plt
-        plt.colorbar(sc, ax=ax, shrink=0.8).set_label("score", fontsize=16)
-    except Exception:
-        pass
+    """探索地图：前两个连续参数为轴，颜色=分数。
+
+    ⚠ **已迁移**：数由 `opt/specs.spec_scatter2d` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 `default_pages` 与 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    spec = _specs.spec_scatter2d(record)
+    plot_mpl.draw(spec, ax)
+    _finish_opt(spec, ax)
 
 
 def plot_pareto(ax, record):
-    """Pareto 前沿：全部可行点（灰）+ 非支配前沿（绿）+ 连线。"""
-    h = record.history
-    if h is None or h.empty or "f0" not in h.columns:
-        ax.text(0.5, 0.5, "多目标运行才有 Pareto 前沿（选 NSGA-II + ZDT）",
-                ha="center", va="center", color="#888", fontsize=18)
-        return
-    ok = h[h["status"] == "ok"]
-    ax.scatter(ok["f0"], ok["f1"], s=14, color="#bbb", alpha=0.7,
-               label="全部评估")
-    pf = record.pareto
-    if pf is not None and len(pf):
-        p = pf.sort_values("f0")
-        ax.scatter(p["f0"], p["f1"], s=42, color=_GREEN, edgecolors="k",
-                   linewidths=0.5, zorder=5, label=f"Pareto 前沿（{len(pf)}）")
-        ax.plot(p["f0"], p["f1"], "-", color=_GREEN, lw=1.2, alpha=0.8)
-    ax.set_xlabel("目标 f0")
-    ax.set_ylabel("目标 f1")
-    ax.set_title("Pareto 前沿（均最小化，绿=非支配）")
-    ax.legend(fontsize=16)
-    ax.grid(alpha=0.25)
+    """Pareto 前沿：全部评估（灰）+ 非支配前沿（绿）+ 连线。
+
+    ⚠ **已迁移**：数由 `opt/specs.spec_pareto` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 `default_pages` 与 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    spec = _specs.spec_pareto(record)
+    plot_mpl.draw(spec, ax)
+    _finish_opt(spec, ax)
 
 
 def plot_surrogate_1d(ax, bundle):
-    """GP 后验切片：bundle = (xs, mu, sd, obs_x, obs_y, label)。"""
-    xs, mu, sd, obs_x, obs_y, label = bundle
-    ax.plot(xs, mu, color=_BLUE, lw=1.6, label="GP 后验均值")
-    ax.fill_between(xs, mu - 2 * sd, mu + 2 * sd, color=_BLUE, alpha=0.18,
-                    label="±2σ")
-    if len(obs_x):
-        ax.plot(obs_x, obs_y, "k.", ms=7, label="已观测")
-    ax.set_xlabel(label)
-    ax.set_ylabel("score")
-    ax.set_title("代理模型切片（固定其余参数于当前最优）")
-    ax.legend(fontsize=16)
-    ax.grid(alpha=0.25)
+    """GP 后验切片：均值线 + ±2σ 带 + 已观测点（入参是 `bundle`，不是 record）。
+
+    ⚠ **已迁移**：数由 `opt/specs.spec_surrogate_1d` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 `default_pages` 与 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    spec = _specs.spec_surrogate_1d(bundle)
+    plot_mpl.draw(spec, ax)
+    _finish_opt(spec, ax)
 
 
-# ---------------------------------------------------------------- 默认页声明
 def default_pages(record) -> list:
     """所有优化运行的通用页（多目标自动切 Pareto 组合）。
 
@@ -180,3 +101,23 @@ def default_pages(record) -> list:
             common[0],
             PageSpec("scatter", "探索地图", "mpl", plot_scatter2d),
             common[1]]
+
+
+def _finish_opt(spec, ax):
+    """优化侧共同的收尾：**colorbar** 是 matplotlib 专属（SVG 侧用色阶自带）。
+
+    ⚠ 为什么放在这里而不是渲染器里：`scatter2d` 的色标是"这一页要的"，
+    不是所有散点图都要 ⇒ 归页的声明，不归渲染器的通用行为。
+    """
+    try:
+        if getattr(spec, "cmap", "") and spec.kind == "scatter":
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import Normalize
+            vals = [v for s in spec.series for v in (s.y or ()) if v is not None]
+            if vals:
+                sm = plt.cm.ScalarMappable(cmap="viridis_r",
+                                           norm=Normalize(min(vals), max(vals)))
+                ax.figure.colorbar(sm, ax=ax, shrink=0.8).set_label(
+                    getattr(spec, "colorbar_label", "score"), fontsize=9)
+    except Exception:
+        pass

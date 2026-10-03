@@ -70,10 +70,18 @@ _register(list_records, load_record)
 
 
 def _register_pages() -> None:
-    """把"未声明页时的兜底页"也注册给 core（同上：边界层要用但不能 import 本层）。"""
-    from ..core.persistence import register_opt_pages as _reg
+    """把"未声明页时的兜底页"与"页 key → 绘图规格"都注册给 core。
+
+    同上：边界层（`ml_mecha/panel_web.py`）要用它们，但**不许** import 本层
+    （宪章纪律，判据用 `ast.walk` 静态守着）⇒ 依赖方向保持 `opt → core`，
+    core 只存引用、不反向依赖。
+    """
+    from ..core.persistence import register_opt_pages as _reg_pages
+    from ..core.persistence import register_opt_spec_lookup as _reg_specs
     from . import plots as _plots
-    _reg(_plots.default_pages)
+    from . import specs as _specs
+    _reg_pages(_plots.default_pages)
+    _reg_specs(_specs.spec_for_key)
 
 
 _register_pages()

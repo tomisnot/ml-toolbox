@@ -42,7 +42,22 @@ def _sample(kind: str) -> PlotSpec:
                         series=[Series(name="s", y=[1, 2, 3])]).axes("x", "y")
     if kind == "barh":
         return PlotSpec(kind="barh", rows=["甲", "乙", "丙"],
-                        values=[0.2, 0.9, 0.5]).axes(xlabel="importance")
+                        values=[0.2, 0.9, 0.5],
+                        rowcolors=["#cf222e", "#1a7f37", "#0969da"]
+                        ).axes(xlabel="importance")
+    if kind == "bar":
+        return PlotSpec(kind="bar", series=[
+            Series(name="方差", y=[0.4, 0.3, 0.2], color="#8250df", as_bar=True),
+            Series(name="累计", y=[0.4, 0.7, 0.9], marker="o"),
+        ]).axes("component", "variance ratio")
+    if kind == "hist":
+        return PlotSpec(kind="hist", x=[0.1, 0.2, 0.3, 0.4, 0.5],
+                        series=[Series(name="异常", y=[0.6, 0.7, 0.8])],
+                        hlines=[{"y": 1.0, "color": "#57606a"}]).axes("score")
+    if kind == "parallel":
+        return PlotSpec(kind="parallel", xticklabels=["a", "b", "c"],
+                        series=[Series(name="最优", y=[0.2, 0.8, 0.5],
+                                       color="#1a7f37")])
     if kind == "heatmap":
         return PlotSpec(kind="heatmap", rows=["a", "b"],
                         values=[[3, 0], [1, 2]],
@@ -171,6 +186,35 @@ def test_migrated_pages_are_registered_and_produce_specs():
     assert checked >= 1, "一个已迁移的页都没真跑起来（前置条件不成立，不是通过）"
 
 
+def test_both_sides_are_registered_and_lookup_goes_through_core():
+    """⭐ 两侧的"页 key → 规格"都能查到，且**优化侧经 core 的槽**（边界纪律）。
+
+    为什么必须有：
+    1. 边界层 `ml_mecha/` **不许** import `ml_toolbox.opt`（判据静态守着，静默 import 也算）
+       ⇒ 优化侧的规格表只能由 **opt 自己注册进 core 的槽**、面板经 core 取；
+    2. 这条**踩过**：我只登记了 ML 侧，于是全量渲染时 opt 那 4 页**一个都没出**
+       （而且没有任何报错——静默空着）。
+    """
+    from ml_mecha import panel_web as W
+    from ml_toolbox.core import persistence
+    from ml_toolbox.methods import specs as mspecs
+
+    assert mspecs.SPEC_BY_KEY, "ML 侧的迁移表是空的"
+    for k in mspecs.SPEC_BY_KEY:
+        assert W._spec_fn_for(k, "ml") is not None, f"ML 侧查不到 {k}"
+    # 优化侧：先确保预载（等价 application 层的动作），再查
+    W.ensure_registry()
+    _, load = persistence.opt_readers()
+    assert callable(load), "优化侧读档没注册进 core 的槽"
+    for k in ("conv", "parallel", "scatter", "pareto"):
+        fn = W._spec_fn_for(k, "opt")
+        assert fn is not None, f"优化侧查不到 {k}（没走槽？）"
+        assert fn.__module__.startswith("ml_toolbox.opt"), fn.__module__
+    # 未迁移的页仍回 None（调用方回退 PNG）
+    assert W._spec_fn_for("没有这一页", "ml") is None
+    assert W._spec_fn_for("没有这一页", "opt") is None
+
+
 # ============================================================ 直跑入口
 _TESTS = [
     test_to_dict_is_serializable_and_never_guesses_numbers,
@@ -180,6 +224,7 @@ _TESTS = [
     test_svg_escapes_text,
     test_placeholder_when_no_data,
     test_migrated_pages_are_registered_and_produce_specs,
+    test_both_sides_are_registered_and_lookup_goes_through_core,
 ]
 
 

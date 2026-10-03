@@ -30,11 +30,12 @@ from ..core.plot_spec import PlotSpec, Series
 #: ⚠ 这张表就是"迁移进度"的单一真源：迁好一个 `spec_xxx` 就在这里加一行，
 #: 两个渲染器与面板**都不用改**（面板只查表）。
 SPEC_BY_KEY = {
-    "fit": "spec_fit_1d",
-    "imp": "spec_importance",
-    "cm": "spec_confusion",
-    "roc": "spec_roc",
-    "fc": "spec_forecast",
+    "fit": "spec_fit_1d", "resid": "spec_residual", "imp": "spec_importance",
+    "cm": "spec_confusion", "roc": "spec_roc", "pr": "spec_pr",
+    "emb": "spec_scatter_emb", "sil": "spec_silhouette",
+    "evr": "spec_explained_variance", "score": "spec_anomaly_score",
+    "fc": "spec_forecast", "res": "spec_ts_residual",
+    "nn_dyn": "spec_nn_dynamics", "nn_attr": "spec_feature_attribution",
 }
 
 
@@ -125,7 +126,7 @@ def spec_roc(result) -> PlotSpec:
     a = result.artifacts
     prob = a.get("y_prob")
     if prob is None:
-        return PlotSpec(kind="line")
+        return _note("这一页需要概率输出（`y_prob`）——该 run 没产生它。")
     prob = np.asarray(prob, float)
     yt = np.asarray(a["y_true"])
     classes = np.unique(yt)
@@ -141,7 +142,7 @@ def spec_roc(result) -> PlotSpec:
             series.append(Series(name=f"{str(c)[:10]} {auc(fpr, tpr):.2f}",
                                  x=_l(fpr), y=_l(tpr)))
     else:
-        return PlotSpec(kind="line")
+        return _note("ROC 需要二分类概率（这一档的概率矩阵与该页不匹配）。")
     series.append(Series(name="", x=[0.0, 1.0], y=[0.0, 1.0], color="#57606a",
                          dash=True, width=0.8, no_legend=True))
     return PlotSpec(kind="line", series=series).axes(xlabel="FPR", ylabel="TPR")
@@ -166,3 +167,208 @@ def spec_forecast(result) -> PlotSpec:
         s.fill_hi = _l(fn + c)
         s.name = "拟合/预测（±95%）"
     return PlotSpec(kind="line", series=series).axes(xlabel="t", ylabel="y")
+
+# ---------------------------------------------------------------- 调色板（与渲染器一致）
+RED, BLUE, GREEN = "#cf222e", "#0969da", "#1a7f37"
+PURPLE, ORANGE, GRAY = "#8250df", "#bc4c00", "#57606a"
+
+#: tab10 的精确色值（**不经过 matplotlib 的 colormap 调用**——那是 GUI 侧的事；
+#: 这里只需要"按标签分配离散色"这一件事，两个渲染器都能照用）。
+TAB10 = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+
+def _note(msg: str) -> PlotSpec:
+    """**没有可画的东西时，在图上写明原因**（而不是给一张空图）。
+
+    ⚠ 这条纪律与"面板不空白"同源：空图会让人以为"跑出来就是这样"，
+    而实际是"这一页不适用于这一档"。
+    """
+    return PlotSpec(kind="barh", rows=[msg], values=[0.0], rowcolors=["#8b949e"],
+                    legend=False, grid=False).axes(title="这一页没有可画的数据")
+
+
+def _discrete(n: int) -> list:
+    """给 n 个类别分色（超过 10 个就循环）。"""
+    return [TAB10[i % len(TAB10)] for i in range(max(0, int(n)))]
+
+
+def _labels_colors(labels):
+    """整数标签 → 逐点颜色数组（按出现顺序分配离散色）。"""
+    uniq = list(dict.fromkeys(np.asarray(labels).ravel().tolist()))
+    lut = {v: TAB10[i % len(TAB10)] for i, v in enumerate(uniq)}
+    return [lut[v] for v in np.asarray(labels).ravel().tolist()]
+
+
+# ---------------------------------------------------------------- 监督·残差 / 分类
+def spec_residual(result) -> PlotSpec:
+    """残差图：预测值 vs 残差 + 零线 + ±1σ 带。"""
+    a = result.artifacts
+    yt = np.asarray(a["y_true"], float)
+    yp = np.asarray(a["y_pred"], float)
+    resid = yt - yp
+    sd = float(np.nanstd(resid))
+    series = [Series(name="样本", x=_l(yp), y=_l(resid), color=BLUE,
+                     connect=False, marker="o")]
+    if sd > 0:
+        # 带用一条"空线 + fill_lo/hi"表达（渲染器把它画成区域，且不进图例时另给名字）
+        series.append(Series(name="±1σ", x=_l(yp), y=_l(resid),
+                             fill_lo=[-sd] * len(resid), fill_hi=[sd] * len(resid),
+                             color=ORANGE, connect=False, no_legend=True))
+    return PlotSpec(kind="line", x=_l(yp), series=series,
+                    hlines=[{"y": 0.0, "color": "#1f2328"}],
+                    ).axes(xlabel="预测值", ylabel="残差")
+
+
+def spec_pr(result) -> PlotSpec:
+    """PR 曲线（二分类）。"""
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    a = result.artifacts
+    prob = a.get("y_prob")
+    if prob is None:
+        return _note("这一页需要概率输出（`y_prob`）——该 run 没产生它。")
+    prob = np.asarray(prob, float)
+    yt = np.asarray(a["y_true"])
+    classes = np.unique(yt)
+    if len(classes) != 2:
+        # ⚠ 原实现是静默返回（空图）。**读不到要说原因**：多分类的 PR 曲线要每类一条，
+        #   这里没做 ⇒ 明写"这一页只对二分类"，而不是给一张空图。
+        return _note(f"PR 曲线这一页目前只对**二分类**（这一档有 {len(classes)} 类）。")
+    p = prob[:, 1] if prob.ndim == 2 else prob
+    prec, rec, _ = precision_recall_curve(yt, p, pos_label=classes[1])
+    ap = average_precision_score(yt, p)
+    return PlotSpec(kind="line", series=[
+        Series(name=f"AP={ap:.3f}", x=_l(rec), y=_l(prec), color=BLUE),
+    ]).axes(xlabel="Recall", ylabel="Precision")
+
+
+# ---------------------------------------------------------------- 聚类 / 降维
+def spec_scatter_emb(result) -> PlotSpec:
+    """2D 嵌入散点（聚类/降维共用），**按标签逐点着色**。"""
+    a = result.artifacts
+    src = a.get("embedding")
+    if src is None:
+        src = a.get("scores")
+    emb = np.asarray(src, float)
+    if emb.ndim != 2 or emb.shape[1] < 2:
+        return PlotSpec(kind="scatter")
+    labels = a.get("labels")
+    if labels is not None:
+        colors = _labels_colors(labels)
+    else:
+        colors = BLUE
+    return PlotSpec(kind="scatter", x=_l(emb[:, 0]), series=[
+        Series(y=_l(emb[:, 1]), color=colors, no_legend=True),
+    ]).axes(xlabel="dim 1", ylabel="dim 2").no_legend()
+
+
+def spec_silhouette(result) -> PlotSpec:
+    """轮廓系数：每个簇一条**面积**条带 + 均值竖线。"""
+    from sklearn.metrics import silhouette_samples, silhouette_score
+    a = result.artifacts
+    X = a.get("X_scaled")
+    labels = np.asarray(a.get("labels", []))
+    if X is None or len(labels) < 2 or len(np.unique(labels)) < 2:
+        return PlotSpec(kind="line")
+    X = np.asarray(X, float)
+    s_vals = silhouette_samples(X, labels)
+    series = []
+    y_lower = 10
+    colors = _discrete(len(np.unique(labels)))
+    for k, i in enumerate(np.unique(labels)):
+        vals = np.sort(s_vals[labels == i])
+        y_upper = y_lower + len(vals)
+        ys = np.arange(y_lower, y_upper)
+        series.append(Series(name=f"{i}", x=_l(vals), y=_l(ys), color=colors[k],
+                             area=True, fill_base=0.0, connect=True, width=0.8))
+        y_lower = y_upper + 10
+    mean = float(silhouette_score(X, labels))
+    return PlotSpec(kind="line", series=series,
+                    vlines=[{"x": mean, "color": RED, "label": "均值"}],
+                    ).axes(xlabel="silhouette value", ylabel="cluster")
+
+
+def spec_explained_variance(result) -> PlotSpec:
+    """方差解释：逐主成分条形 + 累计曲线。"""
+    evr = result.artifacts.get("explained_variance_ratio")
+    if evr is None:
+        return PlotSpec(kind="bar")
+    evr = np.asarray(evr, float)
+    xs = list(range(1, len(evr) + 1))
+    return PlotSpec(kind="bar", x=xs, series=[
+        Series(name="", y=_l(evr), color=PURPLE, as_bar=True, no_legend=True),
+        Series(name="累计", y=_l(np.cumsum(evr)), color="#1f2328", marker="o",
+               width=1.0),
+    ]).axes(xlabel="component", ylabel="variance ratio")
+
+
+# ---------------------------------------------------------------- 异常 / 时序
+def spec_anomaly_score(result) -> PlotSpec:
+    """异常分数直方图：全体 + 判为异常的一组 + 阈值竖线。"""
+    a = result.artifacts
+    s = np.asarray(a["scores"], float)
+    labels = np.asarray(a.get("labels", np.zeros_like(s)))
+    series = []
+    if (labels == 1).any():
+        series.append(Series(name="判为异常", y=_l(s[labels == 1]), color=RED,
+                             alpha=0.8))
+    thr = a.get("threshold")
+    vlines = [{"x": float(thr), "color": "#1f2328", "label": f"阈值={float(thr):.3f}"}]         if thr is not None else []
+    return PlotSpec(kind="hist", x=_l(s), series=series, vlines=vlines,
+                    ).axes(xlabel="anomaly score")
+
+
+def spec_ts_residual(result) -> PlotSpec:
+    """时序残差：实际 − 预测 随 t 的折线 + 零线。"""
+    a = result.artifacts
+    y = np.asarray(a["y_true"], float)
+    f = np.asarray(a["forecast"], float)
+    n = min(len(y), len(f))
+    resid = (y[:n] - f[:n])
+    return PlotSpec(kind="line", x=list(range(n)), series=[
+        Series(y=_l(resid), color=BLUE, width=1.0, no_legend=True),
+    ], hlines=[{"y": 0.0, "color": "#1f2328"}],
+    ).axes(xlabel="t", ylabel="residual").no_legend()
+
+
+# ---------------------------------------------------------------- 神经网络
+def spec_nn_dynamics(result) -> PlotSpec:
+    """训练动态：loss/val_loss 主轴，lr/grad_norm 走**副轴（log）**。
+
+    ⚠ 原 GUI 用 `ax.twinx()` + `set_yscale("log")`；契约里表达为
+    `Series.axis2=True` + `Spec.yscale2="log"`（副轴按自身数据缩放）。
+    """
+    h = result.artifacts.get("nn_history")
+    if h is None:
+        return PlotSpec(kind="line")
+    ep = _l(h["epoch"])
+    series = [Series(name="train loss", x=ep, y=_l(h["loss"]), color=BLUE)]
+    if np.isfinite(np.asarray(h["val_loss"], float)).any():
+        series.append(Series(name="val loss", x=ep, y=_l(h["val_loss"]),
+                             color=RED, dash=True))
+    series.append(Series(name="lr", x=ep, y=_l(h["lr"]), color=GREEN,
+                         dash=True, width=1.0, axis2=True))
+    series.append(Series(name="grad norm", x=ep, y=_l(h["grad_norm"]),
+                         color=PURPLE, dash=True, width=1.0, axis2=True))
+    return PlotSpec(kind="line", series=series, yscale2="log",
+                    ylabel2="lr / grad norm（副轴 · log）",
+                    ).axes(xlabel="epoch", ylabel="loss", title="训练动态")
+
+
+def spec_feature_attribution(result) -> PlotSpec:
+    """积分梯度归因：Top-20 横向条形，**正负逐条着色**。"""
+    attr = result.artifacts.get("nn_attr")
+    if attr is None:
+        return PlotSpec(kind="barh")
+    attr = np.atleast_2d(np.asarray(attr, float))
+    mean = attr.mean(axis=0)
+    names = result.artifacts.get("nn_feat_names")
+    idx = np.argsort(np.abs(mean))[-20:]
+    rows = [str(names[i])[:22] if names is not None else f"f{i}" for i in idx]
+    colors = [RED if mean[i] >= 0 else BLUE for i in idx]
+    return PlotSpec(kind="barh", rows=rows, values=_l(mean[idx]),
+                    rowcolors=colors,
+                    hlines=[], vlines=[{"x": 0.0, "color": "#1f2328"}],
+                    ).axes(xlabel="平均积分梯度归因（红=推高预测，蓝=压低）",
+                           title="特征归因（Top 20，%d 个探针样本平均）" % len(attr)
+                           ).no_legend()

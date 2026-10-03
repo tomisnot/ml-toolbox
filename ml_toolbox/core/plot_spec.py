@@ -38,17 +38,18 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 #: 已实现的图种（两个渲染器都必须支持；测试按这个表逐个验）。
-KINDS = ("line", "scatter", "barh", "heatmap")
+KINDS = ("line", "scatter", "barh", "bar", "hist", "heatmap", "parallel")
 
 
 @dataclass
 class Series:
-    """一条线/一组点。``name`` 是图例名（无图例可省）。"""
+    """一条线/一组点/一组条。``name`` 是图例名（无图例可省）。"""
 
     name: str = ""
     y: list = field(default_factory=list)
     x: Optional[list] = None          # 省略则用 PlotSpec.x
-    color: str = ""                   # 空 = 让渲染器按调色板分配
+    #: 颜色。**可以是单个色值，也可以是逐点色值数组**（散点按标签着色、条形按正负着色）。
+    color: Any = ""
     dash: bool = False                # 虚线
     marker: str = ""                  # "o" / "s" / ""（不画点）
     width: float = 1.4
@@ -60,6 +61,13 @@ class Series:
     no_legend: bool = False
     fill_lo: Optional[list] = None    # 有值 ⇒ 画带（置信区间）：y±ci 的两条边界
     fill_hi: Optional[list] = None
+    #: 用**条**而不是线来画这条 series（`bar`/`hist` 图种用；`bar` 里可再叠折线）
+    as_bar: bool = False
+    #: 面积填充：到 ``fill_base``（默认 0）之间的区域着色（轮廓图、残差带）
+    area: bool = False
+    fill_base: float = 0.0
+    #: 画在**副轴**上（`nn_dyn` 的 lr / grad_norm 要 log 副轴）
+    axis2: bool = False
 
 
 @dataclass
@@ -80,13 +88,32 @@ class PlotSpec:
     grid: bool = True
     xlim: Optional[list] = None
     ylim: Optional[list] = None
-    yscale: str = ""                                # "log" / ""
+    yscale: str = ""                                # "log" / "symlog" / ""
+    #: log 轴近零的线性邻域（`symlog` 用；收敛曲线的分数会跨很多量级）
+    linthresh: float = 1e-3
+    #: 分类 x 轴的刻度文字（平行坐标的参数名）；给了就按"等距分类"画，不做数值换算
+    xticklabels: list = field(default_factory=list)
+    #: 直方图分箱数（`hist` 图种）
+    bins: int = 40
+    #: 柱宽（`bar` 图种；`None` ⇒ 由渲染器按点数估）
+    bar_width: Optional[float] = None
+    #: 副轴的 y 范围（不给 ⇒ 按副轴数据自身极值）
+    ylim2: Optional[list] = None
+    #: 逐条颜色（barh / parallel 的每条）
+    rowcolors: list = field(default_factory=list)
+    #: 副轴标签（有 `Series.axis2` 时才用）
+    ylabel2: str = ""
+    yscale2: str = ""                               # 副轴的标度（`nn_dyn` 要 log）
+    #: 横线标记 ``[{y, color, label}]``（残差的零线、归因的零线）
+    hlines: list = field(default_factory=list)
     #: 竖线标记 ``[{x, color, label}]``（ROC 的对角线之外还用它画阈值线）
     vlines: list = field(default_factory=list)
     #: 文字标注 ``[{x, y, text}]``（热力图每格标数字、柱状图标值）
     texts: list = field(default_factory=list)
     #: 热力图色标名（渲染器各自映射；空 = 默认蓝）
     cmap: str = ""
+    #: CSV 色标标签（`scatter2d` 的分数色条）
+    colorbar_label: str = ""
 
     # ------------------------------------------------------------ 便捷构造
     def render_with(self, renderer):
@@ -103,23 +130,36 @@ class PlotSpec:
             "series": [{
                 "name": s.name, "y": _nums(s.y),
                 "x": _nums(s.x) if s.x is not None else None,
-                "color": s.color, "dash": bool(s.dash), "marker": s.marker,
+                # ⚠ 颜色**两种形态**：单色（str）或逐点色数组（list）——都要能序列化
+                "color": ([str(c) for c in s.color]
+                          if isinstance(s.color, (list, tuple)) else str(s.color or "")),
+                "dash": bool(s.dash), "marker": s.marker,
                 "width": float(s.width), "alpha": float(s.alpha),
                 "connect": bool(s.connect),
                 "no_legend": bool(s.no_legend),
+                "as_bar": bool(s.as_bar), "area": bool(s.area),
+                "fill_base": float(s.fill_base), "axis2": bool(s.axis2),
                 "fill_lo": _nums(s.fill_lo) if s.fill_lo is not None else None,
                 "fill_hi": _nums(s.fill_hi) if s.fill_hi is not None else None,
             } for s in self.series],
             "legend": bool(self.legend), "grid": bool(self.grid),
             "xlim": _nums(self.xlim) if self.xlim is not None else None,
             "ylim": _nums(self.ylim) if self.ylim is not None else None,
-            "yscale": self.yscale,
+            "yscale": self.yscale, "linthresh": float(self.linthresh),
+            "xticklabels": [str(v) for v in self.xticklabels],
+            "rowcolors": [str(c) for c in self.rowcolors],
+            "ylabel2": self.ylabel2, "yscale2": self.yscale2,
+            "hlines": [{"y": _num(v.get("y")), "color": str(v.get("color") or ""),
+                        "label": str(v.get("label") or "")} for v in self.hlines],
             "vlines": [{"x": _num(v.get("x")), "color": str(v.get("color") or ""),
                         "label": str(v.get("label") or "")} for v in self.vlines],
             "texts": [{"x": _num(t.get("x")), "y": _num(t.get("y")),
                        "text": str(t.get("text") or ""),
                        "color": str(t.get("color") or "")} for t in self.texts],
-            "cmap": self.cmap,
+            "cmap": self.cmap, "bins": int(self.bins),
+            "colorbar_label": str(self.colorbar_label),
+            "bar_width": (None if self.bar_width is None else float(self.bar_width)),
+            "ylim2": _nums(self.ylim2) if self.ylim2 is not None else None,
         }
 
     # ------------------------------------------------------------ 常用版式（链式，读起来顺）

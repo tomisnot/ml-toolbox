@@ -75,6 +75,22 @@ def ensure_registry() -> None:
         registry.load_builtin()
     except Exception:
         pass
+    # ⚠ **自足地预载优化侧**：opt 的读档/取页能力是它 import 时**注册进 core 的槽**的。
+    #   只靠 launcher 传 `--preload` 不够——手动起面板（或忘了传）时 `list_runs("opt")`
+    #   会**静默空着**（实测踩过：一次全量渲染里 opt 那 4 页一个都没出）。
+    #   ⇒ 这里按**名字**载（名字是数据，不是本层的依赖，边界判据仍过）。
+    if not _opt_ready():
+        preload_modules(["ml_toolbox.opt.persistence"])
+
+
+def _opt_ready() -> bool:
+    """优化侧的读取槽注册好没有。"""
+    try:
+        from ml_toolbox.core import persistence
+        lst, load = persistence.opt_readers()
+        return callable(lst) and callable(load)
+    except Exception:
+        return False
 
 
 def preload_modules(names) -> list[str]:
@@ -146,6 +162,7 @@ def _cached_records(root: Path, kind: str) -> list[dict]:
     切 view 的第一下仍要重读 1473 个 json（实测 293–336 ms）。缓存原始表 ⇒
     **一次重读、三个 view 共享**，过滤在内存里做（微秒级）。
     """
+    ensure_registry()          # ⚠ 它顺带预载优化侧（否则 opt view 会静默空着）
     sig = _runs_signature(root)
     slot = _RUNS_CACHE.setdefault(kind, {})
     if slot.get("sig") == sig and "rows" in slot:
@@ -354,9 +371,19 @@ def _dataspec_of(rec):
 _KIND_DEPENDENT_PAGES = frozenset({"cm", "roc", "pr"})
 
 
-def _spec_fn_for(key: str):
-    """查"页 key → 中立绘图规格函数"；未迁移或取不到 ⇒ ``None``（调用方回退 PNG）。"""
+def _spec_fn_for(key: str, side: str = "ml"):
+    """查"页 key → 中立绘图规格函数"；未迁移或取不到 ⇒ ``None``（调用方回退 PNG）。
+
+    ⚠ **两侧各有一张表**（ML 在 `methods/specs`、优化在 `opt/specs`），
+    且**入参不同**：ML 的 spec 吃 `result`，优化的吃 `record` 本身
+    （优化的"结果"就是 `history`）⇒ 调用处按 `side` 取对应对象。
+    """
     try:
+        from ml_toolbox.core import persistence
+        if side == "opt":
+            # ⭐ 经 core 的槽取（opt 自己注册的）——**不 import opt 层**（宪章纪律，
+            #   判据用 `ast.walk` 静态守着，连函数体内的静默 import 也算违规）。
+            return persistence.opt_spec_for_key(key)
         from ml_toolbox.methods import specs
         return specs.spec_for_key(key)
     except Exception:
@@ -375,14 +402,16 @@ def page_body(side: str, rec, key: str, kind: str, spec, run_id: str) -> str:
 
     if kind == "mpl":
         # ⭐ 已迁移到中立契约的页：**在 web 端用 SVG 画**（矢量、贴合页面风格）。
-        #   未迁移的页回退到 PNG（服务端 matplotlib）—— 迁移进度见 `methods/specs.SPEC_BY_KEY`。
-        spec_fn = _spec_fn_for(key)
+        #   未迁移的页回退到 PNG（服务端 matplotlib）——迁移进度见两张 `SPEC_BY_KEY`。
+        spec_fn = _spec_fn_for(key, side)
         if spec_fn is not None:
             try:
                 from . import panel_svg
                 from ml_toolbox.core import plot_mpl
                 plot_mpl.apply_page_style()          # 中文与页面同一族字体
-                svg = panel_svg.svg(spec_fn(rec.result if side == "ml" else rec))
+                # ⚠ 入参按侧区分：ML 的 spec 吃 `result`，优化的吃 `record` 本身
+                target = rec if side == "opt" else getattr(rec, "result", rec)
+                svg = panel_svg.svg(spec_fn(target))
                 return f'<div class="chart">{svg}</div>'
             except Exception as exc:
                 # ⚠ **响亮**：SVG 画失败要说出来（不是回退成空白），并说明已回退

@@ -132,6 +132,25 @@ def opt_pages(rec) -> list:
     return list(fn(rec)) if fn else []
 
 
+#: 优化侧的"页 key → 绘图规格函数"查表（`key -> fn|None`）。
+#: 与上面几个槽同源：**面板要用，但边界层不许 import opt 层** ⇒ 由 opt 注册、core 代转。
+_OPT_SPEC_FN: dict = {}
+
+
+def register_opt_spec_lookup(fn) -> None:
+    """由优化层在 import 时调用（幂等）。"""
+    _OPT_SPEC_FN["lookup"] = fn
+
+
+def opt_spec_for_key(key: str):
+    """优化侧的规格函数查表；未注册 ⇒ ``None``（调用方回退 PNG）。"""
+    fn = _OPT_SPEC_FN.get("lookup")
+    try:
+        return fn(key) if fn else None
+    except Exception:
+        return None
+
+
 def load_run_record(run_id: str):
     """``record.json`` + ``artifacts.npz`` → 可检视的 ``RunRecord``（**无 estimator**）。
 

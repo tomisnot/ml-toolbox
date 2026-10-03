@@ -23,16 +23,12 @@ def plot_fit_1d(ax, result):
 
 
 def plot_residual(ax, result):
-    a = result.artifacts
-    yt, yp = np.asarray(a["y_true"], float), np.asarray(a["y_pred"], float)
-    resid = yt - yp
-    ax.scatter(yp, resid, s=14, alpha=0.55, color="tab:blue")
-    ax.axhline(0, color="k", lw=0.8)
-    sd = float(np.nanstd(resid))
-    if sd > 0:
-        ax.axhspan(-sd, sd, color="tab:orange", alpha=0.12, label="±1σ")
-    ax.set_xlabel("预测值"); ax.set_ylabel("残差")
-    ax.legend(fontsize=16); ax.grid(alpha=0.25)
+    """残差图：预测值 vs 残差 + 零线 + ±1σ 带。
+
+    ⚠ **已迁移**：数由 `specs.spec_residual` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_residual(result), ax)
 
 
 def plot_importance(ax, result):
@@ -63,24 +59,14 @@ def plot_roc(ax, result):
 
 
 def plot_pr(ax, result):
-    from sklearn.metrics import precision_recall_curve, average_precision_score
-    a = result.artifacts
-    prob = a.get("y_prob")
-    yt = np.asarray(a["y_true"])
-    if prob is None:
-        return
-    prob = np.asarray(prob, float)
-    classes = np.unique(yt)
-    if len(classes) == 2:
-        p = prob[:, 1] if prob.ndim == 2 else prob
-        prec, rec, _ = precision_recall_curve(yt, p, pos_label=classes[1])
-        ax.plot(rec, prec, lw=1.4,
-                label=f"AP={average_precision_score(yt, p):.3f}")
-    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
-    ax.legend(fontsize=14); ax.grid(alpha=0.25)
+    """PR 曲线（二分类）。
+
+    ⚠ **已迁移**：数由 `specs.spec_pr` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_pr(result), ax)
 
 
-# ---------------------------------------------------------------- 无监督
 def _discrete_colors(labels):
     """整数标签 -> 离散 RGBA 颜色数组。
     注意：tab10 是 ListedColormap，用分数位置调用会插值出灰调——
@@ -98,70 +84,41 @@ def _discrete_colors(labels):
 
 
 def plot_scatter_emb(ax, result):
-    """2D 嵌入散点（聚类/降维共用），按标签着色。"""
-    a = result.artifacts
-    emb = np.asarray(a.get("embedding", a.get("scores")), float)
-    if emb.ndim != 2 or emb.shape[1] < 2:
-        return
-    labels = a.get("labels")
-    if labels is not None:
-        labels = np.asarray(labels)
-        ax.scatter(emb[:, 0], emb[:, 1], c=_discrete_colors(labels),
-                   s=12, alpha=0.8, edgecolors="none")
-    else:
-        ax.scatter(emb[:, 0], emb[:, 1], s=12, alpha=0.6, color="tab:blue")
-    ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
-    ax.grid(alpha=0.25)
+    """2D 嵌入散点，按标签逐点着色。
+
+    ⚠ **已迁移**：数由 `specs.spec_scatter_emb` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_scatter_emb(result), ax)
 
 
 def plot_silhouette(ax, result):
-    from sklearn.metrics import silhouette_samples, silhouette_score
-    a = result.artifacts
-    X = a.get("X_scaled")
-    labels = np.asarray(a.get("labels", []))
-    if X is None or len(labels) < 2 or len(np.unique(labels)) < 2:
-        return
-    s_vals = silhouette_samples(np.asarray(X, float), labels)
-    y_lower = 10
-    for i in np.unique(labels):
-        vals = np.sort(s_vals[labels == i])
-        y_upper = y_lower + len(vals)
-        ax.fill_betweenx(np.arange(y_lower, y_upper), 0, vals, alpha=0.7)
-        ax.text(-0.05, y_lower + 0.5 * len(vals), str(i), fontsize=14)
-        y_lower = y_upper + 10
-    ax.axvline(silhouette_score(np.asarray(X, float), labels),
-               color="red", ls="--", lw=1, label="均值")
-    ax.set_xlabel("silhouette value"); ax.set_ylabel("cluster")
-    ax.legend(fontsize=14)
+    """轮廓系数：每簇一条面积带 + 均值竖线。
+
+    ⚠ **已迁移**：数由 `specs.spec_silhouette` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_silhouette(result), ax)
 
 
 def plot_explained_variance(ax, result):
-    evr = result.artifacts.get("explained_variance_ratio")
-    if evr is None:
-        return
-    evr = np.asarray(evr, float)
-    ax.bar(range(1, len(evr) + 1), evr, color="tab:purple", alpha=0.75)
-    ax.plot(range(1, len(evr) + 1), np.cumsum(evr), "o-", color="k", lw=1,
-            ms=3, label="累计")
-    ax.set_xlabel("component"); ax.set_ylabel("variance ratio")
-    ax.legend(fontsize=14); ax.grid(alpha=0.25, axis="y")
+    """方差解释：条形 + 累计曲线。
+
+    ⚠ **已迁移**：数由 `specs.spec_explained_variance` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_explained_variance(result), ax)
 
 
 def plot_anomaly_score(ax, result):
-    a = result.artifacts
-    s = np.asarray(a["scores"], float)
-    labels = np.asarray(a.get("labels", np.zeros_like(s)))
-    ax.hist(s, bins=40, color="lightgray", label="全体")
-    if (labels == 1).any():
-        ax.hist(s[labels == 1], bins=40, color="tab:red", alpha=0.8,
-                label="判为异常")
-    thr = a.get("threshold")
-    if thr is not None:
-        ax.axvline(float(thr), color="k", ls="--", lw=1, label=f"阈值={float(thr):.3f}")
-    ax.set_xlabel("anomaly score"); ax.legend(fontsize=14); ax.grid(alpha=0.25)
+    """异常分数直方图 + 阈值竖线。
+
+    ⚠ **已迁移**：数由 `specs.spec_anomaly_score` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_anomaly_score(result), ax)
 
 
-# ---------------------------------------------------------------- 时序
 def plot_forecast(ax, result):
     """时序预测：实际 / 预测 + 95% 区间带。
 
@@ -172,16 +129,14 @@ def plot_forecast(ax, result):
 
 
 def plot_ts_residual(ax, result):
-    a = result.artifacts
-    y, f = np.asarray(a["y_true"], float), np.asarray(a["forecast"], float)
-    resid = y - f
-    ax.plot(np.arange(len(resid)), resid, lw=1, color="tab:blue")
-    ax.axhline(0, color="k", lw=0.8)
-    ax.set_xlabel("t"); ax.set_ylabel("residual")
-    ax.grid(alpha=0.25)
+    """时序残差折线 + 零线。
+
+    ⚠ **已迁移**：数由 `specs.spec_ts_residual` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_ts_residual(result), ax)
 
 
-# ---------------------------------------------------------------- 兜底页（C3）
 def auto_pages(method, spec) -> list:
     """方法未声明检视页时，按 task 给出兜底页（UI 永远有东西可显示）。
 
