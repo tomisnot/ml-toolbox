@@ -28,8 +28,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
-from ...core.contracts import (MLMethod, PageSpec, ParamSpec, TASK_SUPERVISED,
+from ...core.contracts import (AUX_GRAPH, MLMethod, PageSpec, ParamSpec,
+                               TASK_SUPERVISED,
                                classification_metrics, regression_metrics)
 from ...core.pipeline import _infer_kind
 from . import nnplots
@@ -58,6 +60,10 @@ class CustomNNMethod(MLMethod):
     task = TASK_SUPERVISED
     target_kind = None
     tags = ("deep", "nonlinear", "custom", "gpu")
+    #: ⭐ **声明支持图**：数据带了 `aux["graph"]` 时，本方法会走 `_fit_graph`
+    #: （整图前向 + 节点掩码）。没有这条声明的话 `Problem.require("graph")`
+    #: 会结构化拒绝 —— 这正是"能力要声明，不许静默丢弃"那条纪律。
+    accepts_aux = (AUX_GRAPH,)
 
     #: 训练超参：**只列自定义网络真正会消费的那些**（循环由 trainer 托管）。
     #: ⚠ 这张表是"哪些覆写被接受"的单一真源（引擎的 `clean_overrides` 按它校验）；
@@ -106,10 +112,21 @@ class CustomNNMethod(MLMethod):
         return compile_network(code)
 
     # ------------------------------------------------ 训练
-    def fit(self, X, y, cfg, diag: bool = False):
+    def fit(self, problem, cfg, diag: bool = False):
+        """按**数据形态**分派：普通表格走 `_fit_table`，带结构（图）走 `_fit_graph`。
+
+        ⚠ 分派依据是 `problem.partition_mode()`（**由数据决定，不由方法决定**）：
+        带了辅助结构就意味着"行不独立"（图=按边相连）⇒ 必须用**节点掩码**划分、
+        整图前向，不能按行切（切了边索引失效、且训练节点会沿边看到验证节点）。
+        """
+        if problem.partition_mode() == "masks":
+            return self._fit_graph(problem, cfg, diag=diag)
+        return self._fit_table(problem, cfg, diag=diag)
+
+    def _fit_table(self, problem, cfg, diag: bool = False):
         import torch
 
-        from . import tb_log as _tb
+        X, y = problem.rows("train")
 
         # ⚠ **训练超参走 `self.params(cfg)`**（= 声明默认 + 运行级覆写），
         #   不是 `cfg.extras`：覆写是经 `cfg.overrides` 进来的，而 extras 只承载
@@ -212,8 +229,168 @@ class CustomNNMethod(MLMethod):
                                         if callable(getattr(net, h, None)))}
         return res
 
+    # ------------------------------------------------ 图任务（GNN）
+    def _fit_graph(self, problem, cfg, diag: bool = False):
+        """**图任务**：一张图、节点掩码划分、整图前向。
+
+        与 `_fit_table` 的四处本质差别（全部源于"行不独立"）：
+        1. `n_in` 从**全量**节点特征取（不切行 ⇒ 边索引始终有效）；
+        2. 训练/验证靠 `problem.masks()` 的**布尔掩码**，不是切行；
+        3. 前向走 `Network.forward_graph(model, ctx)`（不写就用 `model(x)` 全图）；
+        4. **在 fit 里就把测试节点的预测算好**（`run_one` 的 `predict(Xte, ...)` 那条
+           路对图不成立——它只给测试行，而图前向需要整张图）。
+        """
+        import torch
+
+        p = self.params(cfg)
+        run_extras = cfg.extras or {}
+        compiled = self._network()
+        net = compiled.instance
+        n_in = int(problem.X.shape[1])
+        # 标签：图任务按"节点分类"语义（一行一个节点一个标签）
+        yv = np.asarray(problem.y)
+        kind = problem.target_kind or _infer_kind(problem.y)
+        self._le = None
+        if kind == "classification":
+            from sklearn.preprocessing import LabelEncoder
+            self._le = LabelEncoder()
+            yv = self._le.fit_transform(yv)
+            n_out = len(self._le.classes_)
+        else:
+            yv = yv.astype(float)
+            n_out = 1
+        # 把编码后的标签写回一个**仅本次用**的 spec（trainer.train_graph 读 problem.y）
+        problem.spec.y = pd.Series(yv)
+
+        from ml_mecha.sandbox import call_network_build
+        model = call_network_build(net, n_in, n_out, torch.nn)
+
+        if callable(getattr(net, "loss", None)):
+            lossf = net.loss(nn=torch.nn, n_out=n_out)
+        else:
+            lossf = (torch.nn.CrossEntropyLoss() if kind == "classification"
+                     else torch.nn.MSELoss())
+        lr = float(p.get("lr", 1e-3))
+        wd = float(p.get("weight_decay", 0.0))
+        if callable(getattr(net, "configure", None)):
+            opt = net.configure(model, torch=torch, lr=lr, weight_decay=wd)
+        else:
+            opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+
+        run_id = str(run_extras.get("run_id") or "")
+        n_nodes = int(len(problem.X))
+        m_tr, _m_te = problem.masks()
+        rec = TrainingRecorder(model, int(m_tr.sum()), int(p.get("epochs", 60)),
+                               latent_every=int(p.get("latent_every", 5)),
+                               run_id=run_id, tb_root=self._tb_root())
+        # ⭐ 探针前向：图模型不能喂裸张量（需要 edge_index）⇒ 交给 recorder 一个
+        #   无参可调用（它只用来采 dead-ReLU / latent 帧，不参与训练）。
+        #   ctx 走 `trainer.graph_ctx`（**单一构造点**——内联拼会漏键）。
+        fg = getattr(net, "forward_graph", None)
+
+        def _probe_forward():
+            c = _trainer.graph_ctx(problem, torch)
+            return (fg(model, c) if callable(fg) else model(c["x"]))
+
+        probe_nodes = np.where(m_tr)[0][:min(256, int(m_tr.sum()))]
+        rec.set_probe(torch.zeros((len(probe_nodes), n_in)), labels=yv[probe_nodes],
+                      probe_idx=probe_nodes, probe_fn=_probe_forward)
+        self._probe_idx = probe_nodes
+
+        res = self._new_result(target_kind=kind, params={"lr": lr})
+        res._torch = torch
+        res._dev = torch.device("cpu")
+        res._mu = np.zeros(n_in)
+        res._sd = np.ones(n_in)
+        res.classes_ = (self._le.classes_ if self._le is not None else None)
+        try:
+            stats = _trainer.train_graph(
+                rec, model=model, problem=problem, torch=torch, nn=torch.nn,
+                epochs=int(p.get("epochs", 60)), lr=lr, loss_fn=lossf, optimizer=opt,
+                grad_clip=float(p.get("grad_clip", 0.0)),
+                early_stop=str(p.get("early_stop", "off")) == "on",
+                patience=int(p.get("early_stop_patience", 10)),
+                on_progress=run_extras.get("on_progress"),
+                forward_graph=fg if callable(fg) else None)
+        except Exception as exc:                             # noqa: BLE001
+            import traceback
+            res.error = ("图任务训练失败："
+                         f"{type(exc).__name__}: {exc}\n"
+                         + traceback.format_exc(limit=6))
+            return res
+        res.est = model
+        res._is_graph = True
+        # ⭐ 测试节点的预测在 fit 里算（`run_one` 的 predict(Xte) 对图不成立：
+        #   图前向需要整张图的边，而那条路只给测试行）。
+        #   `predict_graph` 直接回**只含 test 节点**的定型数组
+        #   （**不是 object 数组**——object 数组写进 npz 会读不回来，实测踩过）。
+        try:
+            pred, prob = _trainer.predict_graph(
+                model, problem, torch,
+                forward_graph=fg if callable(fg) else None,
+                classes=(self._le.classes_ if self._le is not None else None))
+            te = np.asarray(problem.test_idx, dtype=int)
+            y_all = np.asarray(problem.y)
+            # `y_true` 要**原始标签**（不是编码后的 0..k-1）——指标与检视页都按原始
+            # 标签比对（与 `torch_mlp` 同口径）。
+            if self._le is not None:
+                y_true_te = self._le.inverse_transform(y_all[te].astype(int))
+            else:
+                y_true_te = y_all[te]
+            res.artifacts["y_true"] = np.asarray(y_true_te)
+            res.artifacts["y_pred"] = np.asarray(pred)
+            if prob is not None:
+                res.artifacts["y_prob"] = np.asarray(prob, dtype=float)
+        except Exception as exc:                             # noqa: BLE001
+            import traceback
+            res.error = (f"图任务预测阶段失败：{type(exc).__name__}: {exc}\n"
+                         + traceback.format_exc(limit=6))
+        res.artifacts["nn_epochs_run"] = np.array([int(stats["epochs_run"])])
+        res.artifacts["nn_cancelled"] = np.array([1 if stats.get("cancelled") else 0])
+        if stats.get("best_epoch") is not None:
+            res.artifacts["nn_best_epoch"] = np.array([int(stats["best_epoch"])])
+            res.artifacts["nn_best_val"] = np.array([float(stats["best_watch"])])
+        try:
+            arts = rec.finalize()
+            arts.update({k: v for k, v in res.artifacts.items()})
+            res.artifacts = arts
+        except Exception:
+            pass
+        res.artifacts["custom_network_source"] = np.array([str(compiled.source)])
+        # 图事实（节点/边/度分布/isolation）——AI 与人都该看得到
+        facts = problem.graph_facts()
+        if facts:
+            res.artifacts["graph_n_nodes"] = np.array([int(facts["n_nodes"])])
+            res.artifacts["graph_n_edges"] = np.array([int(facts["n_edges"])])
+        if stats.get("cancelled"):
+            res.error = ("训练被协作式取消（在 epoch 边界停下）："
+                         f"已跑 {stats['epochs_run']} 轮。")
+        if diag:
+            # ⚠ `problem.test_idx` 是 **numpy 数组** ⇒ 不能写 `x or []`
+            #   （会触发"数组真值不明确"的 ValueError，实测踩过）。
+            n_test = int(len(problem.test_idx)) if problem.test_idx is not None else n_nodes
+            res.diag = {"task_mode": "graph", "n_nodes": n_nodes,
+                        "n_train_nodes": int(m_tr.sum()),
+                        "n_test_nodes": n_test,
+                        "epochs": int(p.get("epochs", 60)),
+                        "epochs_run": stats["epochs_run"],
+                        "early_stopped_at": stats["stopped_at"],
+                        "best_epoch": stats.get("best_epoch"),
+                        "best_val": stats.get("best_watch"),
+                        "n_in": n_in, "n_out": n_out,
+                        "graph": facts,
+                        "hooks": sorted(h for h in ("build", "loss", "configure",
+                                                    "forward_step", "forward_graph")
+                                        if callable(getattr(net, h, None)))}
+        return res
+
     # ------------------------------------------------ 预测（与 TorchMLP 同构）
     def predict(self, X, result):
+        if getattr(result, "_is_graph", False):
+            raise NotImplementedError(
+                "图模型的预测需要**整张图的边**，而这里只拿到一批新行（X）"
+                "⇒ 对新数据预测在图任务上不成立。测试节点的预测已随运行产出"
+                "（`y_pred` 按 test 掩码对齐）；要预测新节点，请把新节点并进图后重跑。")
         torch = result._torch
         Xs = (X.to_numpy(float) - result._mu) / result._sd
         t = torch.tensor(Xs, dtype=torch.float32)

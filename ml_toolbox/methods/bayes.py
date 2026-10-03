@@ -59,12 +59,15 @@ class MultinomialNB(SklearnSupervised):
         from sklearn.naive_bayes import MultinomialNB
         return MultinomialNB(alpha=float(p["alpha"]))
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
         # 多项式 NB 要求非负特征：管道缩放后可能为负，内部统一 MinMax 平移
         # （CV 复用实例，fit 时必须重拟 scaler）
+        # ⚠ 变换后用 `problem.subset(...)` 包回一个"全量即训练"的问题再委托基类
+        #   —— 这样基类里"取 rows('train')"照旧成立，不必为本方法开特例。
+        X, y = problem.rows("train")
         from sklearn.preprocessing import MinMaxScaler
         self._scaler = MinMaxScaler().fit(X.to_numpy(float))
-        return super().fit(self._apply(X), y, cfg, diag)
+        return super().fit(problem.subset(self._apply(X), y), cfg, diag)
 
     def predict(self, X, result):
         return super().predict(self._apply(X), result)

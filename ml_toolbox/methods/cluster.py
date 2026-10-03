@@ -19,7 +19,8 @@ class ClusterMethod(MLMethod):
     def clusterer(self, p: dict):
         raise NotImplementedError
 
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         est = self.clusterer(p)
         Xv = X.to_numpy(float)
@@ -94,7 +95,8 @@ class GMM(ClusterMethod):
                                covariance_type=p["covariance"],
                                random_state=42)
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         est = self.clusterer(p)
         Xv = X.to_numpy(float)

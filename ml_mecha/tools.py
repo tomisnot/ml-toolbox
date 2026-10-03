@@ -458,7 +458,8 @@ def _prepare_dataset(engine: MLEngine, wrap,
     def execute(*, source: Mapping[str, Any], name: str = "",
                 target: str = "", time_col: str = "",
                 diag: bool = False,
-                pipeline: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+                pipeline: Mapping[str, Any] | None = None,
+                graph: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "prepare_dataset", "source": source,
                                 "diag": bool(diag)}
         if name:
@@ -469,6 +470,8 @@ def _prepare_dataset(engine: MLEngine, wrap,
             spec["time_col"] = time_col
         if pipeline:
             spec["pipeline"] = dict(pipeline)
+        if graph:
+            spec["graph"] = dict(graph)
         receipt = _raise_on_failure(
             engine.run(spec, context=_local_context()))
         dataset = receipt.get("dataset") or {}
@@ -482,6 +485,7 @@ def _prepare_dataset(engine: MLEngine, wrap,
                 # 而且不用去猜"我配的切分到底生效了没有"。
                 "pipeline_chain": list(receipt.get("pipeline_chain") or []),
                 "split_policy": dict(receipt.get("split_policy") or {}),
+                "graph": dict(receipt.get("graph") or {}),
                 "warnings": list(receipt.get("warnings", [])),
                 "error": receipt.get("error", "")}
 
@@ -514,6 +518,15 @@ def _prepare_dataset(engine: MLEngine, wrap,
                                         "'split': {'test_size': 0.2, 'stratify': true, "
                                         "'seed': 7}}。顺序即执行顺序；未知键/未知步骤/"
                                         "坏取值都会**报错而不是静默忽略**。"},
+            "graph": {"type": "object",
+                      "description": "**图结构**（GNN 用，可选）："
+                                     "{'edges': [[src, dst], ...]} 或 "
+                                     "{'edges_path': 'edges.csv', 'src': 's', 'dst': 'd', "
+                                     "'weight': 'w'}。**行号指向观测表的行**（节点=行）；"
+                                     "默认按无向图自动补反向边；边指向不存在的节点会报错。"
+                                     "带了图之后，只有声明支持图的方法（run_custom 的"
+                                     "自定义网络）能消费它——别的方法会被明确拒绝，"
+                                     "不会**静默忽略**拓扑。"},
         },
         output_schema={"type": "object",
                        "required": ["ok", "dataset_id", "pipeline_id", "n_rows",

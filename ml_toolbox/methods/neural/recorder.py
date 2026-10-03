@@ -60,6 +60,8 @@ class TrainingRecorder:
         self._probe = None
         self._probe_labels = None
         self._probe_idx = None
+        #: 可选探针前向（图/多输入模型用；见 `set_probe`）。
+        self._probe_fn = None
         self._probe_selection = None
         self.last_labels = None
         self.last_idx = None
@@ -154,12 +156,19 @@ class TrainingRecorder:
         if self.tb is not None:
             self.tb.log_epoch(ep, self.history, self.grads)
 
-    def set_probe(self, X_tensor, labels=None, probe_idx=None):
-        """设置 probe；只计算一次行选择，标签/原行号与 latent 帧永久对齐。"""
+    def set_probe(self, X_tensor, labels=None, probe_idx=None, probe_fn=None):
+        """设置 probe；只计算一次行选择，标签/原行号与 latent 帧永久对齐。
+
+        ``probe_fn``：**可选的探针前向**（无参可调用，返回该次前向的输出）。
+        为什么不总是 `self.model(self._probe)`：图任务（GNN）的前向需要
+        `edge_index`，喂一个裸张量会直接抛——而且多输入模型同理。
+        ⇒ 给了 `probe_fn` 就用它，否则沿用"喂张量"的老路（**零行为变化**）。
+        """
         self._probe = X_tensor
         self._probe_labels = labels
         self._probe_idx = probe_idx
-        n = int(X_tensor.shape[0])
+        self._probe_fn = probe_fn
+        n = int(X_tensor.shape[0]) if X_tensor is not None else 0
         sel = np.arange(n)
         if n > self.max_latent:
             sel = np.linspace(0, n - 1, self.max_latent).astype(int)
@@ -179,7 +188,10 @@ class TrainingRecorder:
         try:
             self.model.eval()
             with torch.no_grad():
-                self.model(self._probe)
+                if self._probe_fn is not None:
+                    self._probe_fn()          # 图/多输入：由调用方给出前向
+                else:
+                    self.model(self._probe)
             self.probe_forward_count += 1
             vals = []
             for act in self._relu_activations:

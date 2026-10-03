@@ -666,7 +666,7 @@ _MIN_ARGS = {
 #: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
 #: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
-_EXPECTED_OPTIONAL_PARAMS = 46
+_EXPECTED_OPTIONAL_PARAMS = 47
 
 
 def test_null_shim_rule_partitions_every_optional_param():

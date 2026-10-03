@@ -48,6 +48,17 @@ PHASE_HEAVY = ["smoke_test.py", "test_ui.py", "test_opt.py", "test_regressions.p
 PHASE_SENSITIVE = ["test_dsh_panel.py", "test_tensorboard.py",
                    "test_panel_web.py", "test_plot_spec.py"]
 
+#: 阶段 3：**图/范式判据**（`test_problem.py`）。**串行**跑，且在前面两个阶段之后。
+#:
+#: ⚠ 为什么单开一个阶段（**实测根因，不是保守**）：把它并进阶段 1 时，
+#: 那一阶段的墙钟从 ~60s 涨到 **114.6s**，并把**三个本来全绿的套件**
+#: （`smoke_test` / `test_opt` / `test_regressions`）一起拖红；三者**单独跑
+#: 全是绿的**（0 失败 / 43 通过 / 全部方法通过）⇒ 那是**CPU 争用造成的假红**。
+#: ⇒ 按本仓纪律**不抬阈值**（抬阈值＝把响亮的失败改成沉默的通过），
+#: 而是再加一个阶段：它是"跑真训练（torch）+ 单套件就占满多核"那一类，
+#: 资源画像与前两个阶段都不同。
+PHASE_GRAPH = ["test_problem.py"]
+
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。
 MECHA_ROOT = os.environ.get("MECHA_ROOT") or os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "mecha"))
@@ -56,7 +67,8 @@ if MECHA_PRESENT:
     PHASE_SENSITIVE += ["test_ml_mecha.py", "test_ml_capabilities.py",
                         "test_ml_delivery.py"]
 
-PHASES = [("重负载", PHASE_HEAVY), ("时延敏感", PHASE_SENSITIVE)]
+PHASES = [("重负载", PHASE_HEAVY), ("时延敏感", PHASE_SENSITIVE),
+          ("图/范式", PHASE_GRAPH)]
 SCRIPTS = [s for _, group in PHASES for s in group]
 
 
@@ -110,7 +122,7 @@ def main():
         print(f"\n########## {s} ##########")
         print(outputs[s].rstrip())
 
-    print("\n================ 回归门汇总（两阶段并行墙钟） ================")
+    print("\n================ 回归门汇总（三阶段墙钟） ================")
     for name, dt in phase_wall:
         print(f"  阶段[{name}] {dt:6.1f}s")
     for s, dt in sorted(timing, key=lambda x: -x[1]):

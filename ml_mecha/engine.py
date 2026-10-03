@@ -44,7 +44,7 @@ from mecha.surface import Engine, ExecutionContext
 
 from ml_toolbox.api import RunRequest, Session, SessionError
 from ml_toolbox.core import registry
-from ml_toolbox.core.contracts import DataSpec, is_lower_better
+from ml_toolbox.core.contracts import AUX_GRAPH, DataSpec, is_lower_better
 from ml_toolbox.core.dataset import Dataset
 from ml_toolbox.core.pipeline import Pipeline
 from ml_toolbox.core.resources import (ResourceBudget, ResourceEstimate,
@@ -951,6 +951,9 @@ class MLEngine(Engine):
         #   （**零行为变化**——既有调用方一行不用改）。
         pipeline = self._pipeline_from_spec(spec)
         fitted = self.session.prepare_fitted(dataset, pipeline=pipeline, diag=diag)
+        # ⭐ **图结构**（可选）：边表进 `spec.aux`，供声明了 `accepts_aux` 的方法消费。
+        #   为什么放 aux 而不是塞进特征表：它是"观测之间的关系"，不是特征。
+        graph_facts = self._attach_graph(fitted.spec, spec, dataset)
         dataset_id = self._next_dataset_id(dataset.name)
         entry = self._build_entry(dataset_id, dataset, fitted.spec, source_desc, diag)
         # 写权门拒绝时**不留半拉子状态**：登记 → 写门 → 失败即回滚（真题试过，
@@ -984,6 +987,9 @@ class MLEngine(Engine):
                                 "skipped": bool(c.get("skipped"))}
                                for c in entry.spec.meta.get("chain", [])],
             "split_policy": dict(entry.spec.meta.get("split_policy") or {}),
+            # 图事实（节点/边/度分布/孤立点）——带了图才有；让人和 AI 一眼看见
+            # "这份数据的拓扑长什么样"（图的坑大多在这儿）。
+            "graph": dict(graph_facts or {}),
             "error": "",
         }
 
@@ -1015,6 +1021,82 @@ class MLEngine(Engine):
             return build_pipeline(decl, compile_fn=_compile)
         except StepDeclError as exc:
             raise MechaError(exc.teaching_text(), kind=exc.kind) from exc
+
+    def _attach_graph(self, spec: Any, request: Mapping[str, Any],
+                      dataset: Any) -> dict:
+        """把 `request["graph"]` 声明的边表装进 `spec.aux["graph"]`（可选）。
+
+        ## 声明形状（JSON 可序列化 ⇒ 能进存档）
+
+        ```jsonc
+        "graph": {
+          "edges": [[0,1],[1,2],[2,0]],          // 内联边表（小图/示例）
+          "edges_path": "edges.csv",             // 或：CSV（相对数据集根）
+          "src": "src", "dst": "dst", "weight": "w",   // CSV 的列名（可省）
+          "directed": false                      // false（默认）⇒ 自动补反向边
+        }
+        ```
+
+        ⚠ **度数/自环等事实进回执**（`graph_facts`）：图数据的坑大多在"边指向了
+        不存在的节点""有孤立点"这类事上，让它们可见比事后猜便宜得多。
+        ⚠ 边索引**越界即拒绝**（不静默裁剪）——裁掉一条边等于悄悄改拓扑。
+        """
+        decl = request.get("graph")
+        if not decl:
+            return {}
+        if not isinstance(decl, Mapping):
+            raise MechaError("graph 需要对象", kind="bad_graph_declaration",
+                             hint='例如 {"edges": [[0,1],[1,0]]}')
+        import pandas as pd
+        n_nodes = int(len(spec.X))
+        rows: list = []
+        if decl.get("edges") is not None:
+            for item in decl["edges"] or []:
+                if isinstance(item, Mapping):
+                    rows.append((int(item["src"]), int(item["dst"]),
+                                 float(item.get("weight", 1.0))))
+                else:
+                    seq = list(item)
+                    if len(seq) < 2:
+                        raise MechaError(
+                            "graph.edges 的每一项至少要有 [src, dst]",
+                            kind="bad_graph_edge", hint=f"收到 {item!r}")
+                    rows.append((int(seq[0]), int(seq[1]),
+                                 float(seq[2]) if len(seq) > 2 else 1.0))
+        elif decl.get("edges_path"):
+            path = self._resolve_data_path(str(decl["edges_path"]))
+            frame = pd.read_csv(path)
+            src_col = str(decl.get("src") or frame.columns[0])
+            dst_col = str(decl.get("dst") or frame.columns[1])
+            w_col = decl.get("weight") or ""
+            for _, r in frame.iterrows():
+                rows.append((int(r[src_col]), int(r[dst_col]),
+                             float(r[w_col]) if w_col else 1.0))
+        else:
+            raise MechaError("graph 声明要给 `edges`（内联）或 `edges_path`（CSV）",
+                             kind="bad_graph_declaration")
+        edge = pd.DataFrame(rows, columns=["src", "dst", "weight"])
+        if not bool(decl.get("directed", False)) and len(edge):
+            rev = edge.rename(columns={"src": "dst", "dst": "src"})
+            edge = pd.concat([edge, rev], ignore_index=True)
+        # 越界检查（**不裁剪**：裁边等于悄悄改拓扑）
+        if len(edge):
+            bad = edge[(edge["src"] < 0) | (edge["src"] >= n_nodes)
+                       | (edge["dst"] < 0) | (edge["dst"] >= n_nodes)]
+            if len(bad):
+                raise MechaError(
+                    f"边表里有 {len(bad)} 条边指向不存在的节点"
+                    f"（节点数 {n_nodes}，行号应在 [0, {n_nodes - 1}]）",
+                    kind="graph_edge_out_of_range",
+                    hint="edge_index 用的是**行号**（指向观测表的行）",
+                    suggest=f"最大合法行号 {n_nodes - 1}")
+        spec.aux = dict(spec.aux or {})
+        spec.aux[AUX_GRAPH] = edge
+        try:
+            from ml_toolbox.core.contracts import Problem
+            return Problem(spec, allowed=(AUX_GRAPH,)).graph_facts()
+        except Exception:                                     # noqa: BLE001
+            return {"n_nodes": n_nodes, "n_edges": int(len(edge))}
 
     def _cmd_run_method(self, spec: dict[str, Any], context: Any) -> Mapping[str, Any]:
         """在已准备的数据视图上运行一个方法。

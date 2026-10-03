@@ -116,12 +116,19 @@ class TorchMLP(MLMethod):
     ]
 
     # ------------------------------------------------ 训练
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        """内置 MLP（`Problem` 范式）：只吃训练段，就是原来的 (Xtr, ytr)。
+
+        ⚠ 结构化数据（图）不走这里：`torch_mlp` 的 `accepts_aux=()`（不声明支持），
+        带辅助结构的数据应由 `run_custom` 的 Network 代码消费 —— 否则会被
+        `Problem.require` 结构化拒绝（**不静默忽略**）。
+        """
         import torch
         import torch.nn as nn
         from torch.utils.data import TensorDataset, DataLoader
         from .recorder import TrainingRecorder
 
+        X, y = problem.rows("train")
         p = self.params(cfg)
         dev = self._device(p, torch, cfg)
         torch.manual_seed(cfg.seed)

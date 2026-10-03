@@ -122,6 +122,20 @@ def test_lightgbm_import_order():
         assert li < min(qi), "lightgbm 必须早于任何 PyQt5 模块被 import"
 
 
+def _problem(X, y=None, *, kind=None):
+    """造一个"全量即训练"的 `Problem`（判据里直接调 `fit` 时用）。
+
+    ⚠ 范式已扩张为 `fit(problem, cfg, diag)`（见 `docs/契约.md` §1）⇒ 判据不该再
+    按 `fit(X, y, ...)` 调。这个助手让"全量训练"的语义与 `runner` 一致
+    （`train_idx/test_idx` 都指全量 ⇒ 方法里 `rows("train")` 拿到全量）。
+    """
+    from ml_toolbox.core.contracts import DataSpec, Problem
+    import numpy as _np
+    idx = _np.arange(len(X))
+    spec = DataSpec(X=X, y=y, train_idx=idx, test_idx=idx, target_kind=kind)
+    return Problem(spec)
+
+
 def test_anomaly_direction():
     """坑 L8：分数越大越异常、label 1=异常（在全量数据上直接 fit 验证）。"""
     from ml_toolbox.core import registry
@@ -132,7 +146,7 @@ def test_anomaly_direction():
     X.iloc[:10] += 6
     y = pd.Series(np.where(np.arange(200) < 10, 1, 0))
     m = registry.get("iforest")
-    r = m.fit(X, y, RunConfig())
+    r = m.fit(_problem(X, y), RunConfig())
     assert r.ok
     a = r.artifacts
     assert a["labels"][:10].mean() > 0.5, "注入的异常应被标 1"
@@ -270,7 +284,7 @@ def test_predict_with_fresh_instance():
                                n_informative=4, n_redundant=1, random_state=0)
     y = np.array([f"cls_{v}" for v in y])          # 字符串标签
     spec = Pipeline.default().run(Dataset.from_arrays(X, y, "t"))
-    r = registry.get("logistic").fit(spec.X, spec.y, RunConfig())
+    r = registry.get("logistic").fit(_problem(spec.X, spec.y), RunConfig())
     fresh = registry.get("logistic")               # 全新实例
     pred = fresh.predict(spec.X.iloc[:10], r)
     assert set(np.unique(pred)) <= {"cls_0", "cls_1", "cls_2"}, \
@@ -607,7 +621,7 @@ def test_neural_fresh_predict_string_labels():
                                n_informative=4, random_state=0)
     y = np.array([f"c{v}" for v in y])
     spec = Pipeline.default().run(Dataset.from_arrays(X, y, "t"))
-    r = registry.get("torch_mlp").fit(spec.X, spec.y,
+    r = registry.get("torch_mlp").fit(_problem(spec.X, spec.y),
                                       RunConfig(overrides={"epochs": 8}))
     pred = registry.get("torch_mlp").predict(spec.X.iloc[:10], r)   # 全新实例
     assert set(np.unique(pred)) <= {"c0", "c1", "c2"}

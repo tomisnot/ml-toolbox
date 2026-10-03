@@ -103,12 +103,16 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "{'key': 'my_step', 'code': 'class Step(StepBase): ...'}], "
                          "'split': {'test_size': 0.2, 'stratify': true, 'seed': 7}}；"
                          "省略 = 用默认链（缺失值→编码→缩放→划分）"),
+            CommandParam("graph", "object", False,
+                         "图结构声明（可选）：{'edges': [[src,dst],...]} 或 "
+                         "{'edges_path': 'edges.csv', 'src': 's', 'dst': 'd'}；"
+                         "行号指向观测表的行；不给 directed 会自动补反向边"),
         ),
         writes_state=("current.dataset_id", "current.pipeline_id"),
         side_effect=SIDE_EFFECT_DOMAIN_STATE,
         risk=RISK_LOW,
         extra_receipt_keys=("dataset_id", "pipeline_id", "dataset",
-                            "pipeline_chain", "split_policy"),
+                            "pipeline_chain", "split_policy", "graph"),
     ),
     CommandSpec(
         name="run_method",

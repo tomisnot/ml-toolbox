@@ -69,7 +69,8 @@ class _QuantumKernelSupervised(MLMethod):
         return None
 
     # ------------------------------------------------ 契约实现
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         Xv = _as_np(X)
         res = self._new_result(params=p)
@@ -329,7 +330,8 @@ class QuantumKMeans(MLMethod):
         ParamSpec("max_iter", "最大迭代", "int", 40, min=2, max=200),
     ]
 
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         Xv = _as_np(X)
         m = Xv.shape[0]
@@ -426,7 +428,8 @@ class QuantumDMEPCA(MLMethod):
         ParamSpec("n_iter", "幂迭代次数", "int", 60, min=5, max=300),
     ]
 
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         Xv = _as_np(X)
         res = self._new_result(target_kind=None, params=p)
@@ -505,7 +508,8 @@ class QuantumReservoir(MLMethod):
         ParamSpec("ridge", "读出正则 λ", "number", 0.0001, min=1e-8, max=1.0),
     ]
 
-    def fit(self, X, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         s = np.asarray(pd.Series(y).to_numpy(float), float)
         n = len(s)

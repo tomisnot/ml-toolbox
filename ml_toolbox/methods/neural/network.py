@@ -38,7 +38,27 @@ class Network:
         return model(x), y
 ```
 
-## ⚠ 三条硬纪律
+## 图任务（GNN）：`forward_graph` + 节点掩码
+
+图数据经 `Problem.aux["graph"]` 进来（列 `src`/`dst`/可选 `weight`，都是**行号**）。
+图**不切行、整图前向**，训练/验证靠**节点掩码**区分：
+
+```python
+    def forward_graph(self, model, ctx):        # 可选：图任务的全图前向
+        h = model.encode(ctx["x"])
+        for layer in model.layers:
+            h = layer(h, ctx["edge_index"])
+        return model.head(h)
+```
+
+- 勾了 `forward_graph` ⇒ 走 `trainer.train_graph`（全图 + 掩码损失）；
+- `ctx` 里有：`edge_index`(2×E)、`edge_weight`(E)、`n_nodes`、
+  `train_mask`/`test_mask`(bool)、`kind`、`torch`、`nn`；
+- **不写也能跑图数据**（`model(x)` 全图前向）——比如节点特征已含结构信息，
+  或只想先跑通；
+- ⚠ **图任务不走交叉验证**：CV 按行切片会让边索引静默失真，`default_cv` 明确拒绝。
+
+## ⚠ 四条硬纪律
 
 1. **只经返回值交付效果**：`Network` 的代码**不许**自己写盘、不许碰 GUI、
    不许改 `runs/`——观测与存档由适配器统一负责。这样"AI 写的代码"与

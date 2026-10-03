@@ -27,7 +27,14 @@ class SklearnSupervised(MLMethod):
         raise NotImplementedError
 
     # ------------------------------------------------ 统一实现
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        """经典监督：只吃 `problem.rows("train")` —— 就是原来的 (Xtr, ytr)。
+
+        ⚠ 范式已扩张为 `fit(problem, cfg, diag)`（见 `docs/契约.md` §1）：
+        本类作为**经典监督的唯一实现**，服务 29 个 `make` 型方法；
+        它们（linear/svm/knn/ensemble/bayes）一行都不用改。
+        """
+        X, y = problem.rows("train")
         params = self.params(cfg)
         kind = self.target_kind or _infer_kind(y)
         est = self.make(params, kind)

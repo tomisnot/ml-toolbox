@@ -1274,6 +1274,116 @@ def test_ai_can_assemble_the_preprocessing_chain(app):
         assert "internal_error" not in blob, f"坏声明被归成内部错误：{blob[:200]}"
 
 
+#: 一个**真的图卷积**（AI 通过工具面提交的 GNN；仓库依赖里没有 PyG/DGL，也不需要）。
+_GCN_TOOL_CODE = '''
+class GCNLayer(nn.Module):
+    def __init__(self, n_in, n_out):
+        super().__init__()
+        self.lin = nn.Linear(n_in, n_out)
+
+    def forward(self, h, edge_index, n_nodes, edge_weight=None):
+        idx = torch.arange(n_nodes)
+        src = torch.cat([edge_index[0], idx])
+        dst = torch.cat([edge_index[1], idx])
+        w = torch.cat([edge_weight, torch.ones(n_nodes)]) if edge_weight is not None \\
+            else torch.ones(src.numel())
+        A = torch.zeros(n_nodes, n_nodes)
+        A.index_put_((src, dst), w, accumulate=True)
+        A = A.clamp(max=1.0)
+        deg = A.sum(1).clamp(min=1e-6)
+        Dm = torch.diag(deg.pow(-0.5))
+        return self.lin(Dm @ A @ Dm @ h)
+
+
+class Net(nn.Module):
+    def __init__(self, n_in, n_hidden, n_out):
+        super().__init__()
+        self.g1 = GCNLayer(n_in, n_hidden)
+        self.g2 = GCNLayer(n_hidden, n_out)
+
+    def forward(self, x, edge_index, n_nodes, edge_weight=None):
+        h = torch.relu(self.g1(x, edge_index, n_nodes, edge_weight))
+        return self.g2(h, edge_index, n_nodes, edge_weight)
+
+
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        return Net(n_in, 16, n_out)
+
+    def forward_graph(self, model, ctx):
+        return model(ctx["x"], ctx["edge_index"], ctx["n_nodes"],
+                     ctx.get("edge_weight"))
+'''
+
+
+def _sbm_graph(n_per=20, seed=3):
+    """随机块模型（工具面判据用）：返回 (X 列表, y 列表, 边列表)。"""
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    labels = np.repeat([0, 1, 2], n_per)
+    centers = np.array([[2.0, 0.0], [0.0, 2.0], [-2.0, -2.0]])
+    X = centers[labels] + rng.normal(scale=0.6, size=(len(labels), 2))
+    edges = []
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            p = 0.35 if labels[i] == labels[j] else 0.03
+            if rng.rand() < p:
+                edges.append([int(i), int(j)])
+    return X.tolist(), labels.tolist(), edges
+
+
+def test_gnn_runs_through_the_tool_face(app):
+    """⭐ **AI 经工具面跑 GNN**：`prepare_dataset(graph=...)` + `run_custom` 的图网络。
+
+    这条是"目标达成"的用户可见证据（不是内部能跑就行）：
+    1. 工具面**收得下图**（边表 + 节点特征 + 节点标签），并把拓扑事实回报出来；
+    2. 不声明支持图的方法**被明确拒绝**（不静默忽略拓扑）；
+    3. AI 写的图卷积**真能跑通**，且观测面/工件与表格任务同构
+       （`describe_training` 有逐 epoch 曲线；`y_pred` 按 **test 掩码**对齐）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    ml = app
+    _prepared(ml)                       # 开 AI 闸
+    X, y, edges = _sbm_graph()
+    n = len(y)
+
+    got = ml.tools.execute("prepare_dataset", {
+        "source": {"kind": "arrays", "X": X, "y": y},
+        "name": "gnn_tool", "target": "target",
+        "graph": {"edges": edges},
+        "pipeline": {"steps": [{"key": "scale"}]}})
+    assert got["is_error"] is False, got
+    v = got["value"]
+    ds = v["dataset_id"]
+    # ① 工具面回报拓扑事实（无向图 ⇒ 边数翻倍）
+    gf = v.get("graph") or {}
+    assert gf.get("n_nodes") == n, gf
+    assert gf.get("n_edges") == 2 * len(edges), (gf, len(edges))
+
+    # ② 不声明支持图的方法 → 明确拒绝（不是静默按独立节点跑）
+    bad = ml.tools.execute("run_method", {"method": "torch_mlp", "dataset_id": ds,
+                                          "overrides": {"epochs": 5}})
+    assert bad["is_error"] is True, "带图数据跑 torch_mlp 竟然成功了"
+    assert "辅助结构" in json.dumps(bad, ensure_ascii=False)
+
+    # ③ GNN 跑通 + 观测面同构
+    out = ml.tools.execute("run_custom", {
+        "code": _GCN_TOOL_CODE, "dataset_id": ds, "name": "gcn_tool",
+        "diag": True, "seed": 8080, "overrides": {"epochs": 30, "lr": 0.05}})
+    assert out["is_error"] is False, out
+    val = out["value"]
+    assert val["ok"] is True, val
+    rid = val["run_id"]
+    train = ml.tools.execute("describe_training",
+                             {"run_id": rid, "include_series": True})["value"]
+    assert train["available"] is True, train.get("reason")
+    assert len(train["series"]["loss"]["values"]) == 30, train["series"]["loss"]
+    detail = ml.tools.execute("describe_run", {"run_id": rid})["value"]
+    assert "graph_n_nodes" in detail["artifact_keys"], detail["artifact_keys"]
+
+
 def test_dataset_query_exposes_chain_params_and_real_split_policy(app):
     """⭐ AI 能看见**预处理链每一步的参数**与**真实的划分口径**。
 

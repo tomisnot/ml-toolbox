@@ -33,7 +33,8 @@ class AnomalyMethod(MLMethod):
     def detector(self, p: dict):
         raise NotImplementedError
 
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         est = self.detector(p)
         Xv = X.to_numpy(float)
@@ -122,9 +123,9 @@ class OneClassSVM(AnomalyMethod):
         from sklearn.svm import OneClassSVM
         return OneClassSVM(nu=float(p["nu"]), gamma=p["gamma"])
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
         # OneClassSVM 无 decision_scores_：用 score_samples
-        res = super().fit(X, y, cfg, diag)
+        res = super().fit(problem, cfg, diag)
         return res
 
 
@@ -141,7 +142,8 @@ class Mahalanobis(AnomalyMethod):
     def detector(self, p):
         raise NotImplementedError
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         Xv = X.to_numpy(float)
         mu = np.nanmean(Xv, axis=0)

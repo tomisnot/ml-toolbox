@@ -246,7 +246,9 @@ class MyMethod(MLMethod):
     tags = ("fast",)                      # purposes 自动推导
     param_schema = [ParamSpec("k", label="K", kind="int", default=3, min=1)]
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
+        # `problem` 承载"观测 + 标签 + 观测之间的关系"（见 docs/契约.md §1）：
+        X, y = problem.rows("train")      # 经典方法就这一行
         p = self.params(cfg)              # 自动清洗 UI 覆写
         ...
         return self._new_result(metrics={...}, artifacts={...}, params=p)
@@ -254,6 +256,10 @@ class MyMethod(MLMethod):
     def inspect_pages(self, cfg):         # 可选：声明专属核心图
         return [PageSpec("my", "我的图", "mpl", lambda ax, r: ax.plot(...))]
 ```
+
+> 图方法（GNN）用 `problem.require("graph")` + `problem.masks()`（**节点掩码**，
+> 不切行），并声明 `accepts_aux = (AUX_GRAPH,)`；时序方法用 `problem.y`（整条序列，
+> 外生特征在 `problem.X` 里）。
 
 在 `methods/__init__.py` 加一行 import 即完成接入——注册表、遍历、对比、画廊、
 参数面板、导出、历史全部自动可用，无需改框架任何代码。

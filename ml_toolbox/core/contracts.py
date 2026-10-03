@@ -11,11 +11,12 @@
 MLMethod 子类必须声明 ClassVar：
   name / family / task / tags / param_schema
 并实现：
-  fit(X, y, cfg, diag)            -> MLResult
+  fit(problem, cfg, diag)         -> MLResult   （problem: Problem，见下"范式"节）
 可选覆写：
   predict(X, result)              -> np.ndarray
   evaluate(result, X, y)          -> dict   （默认按 task 自动计算）
   cross_validate(X, y, cfg, cv)   -> dict   （默认按 task 自动交叉验证）
+  accepts_aux                     -> tuple  （声明支持哪些辅助结构，如图 AUX_GRAPH）
 
 MLResult.artifacts 约定键（UI 按此消费，缺失即显示语义化占位）：
   supervised : y_true, y_pred, y_prob, residual, feature_importance
@@ -150,6 +151,10 @@ class DataSpec:
     target_kind: Optional[str] = None    # 'regression' | 'classification' | None
     n_classes: int = 0
     meta: dict = field(default_factory=dict)
+    #: **辅助结构**（观测之间的关系：图边表 / 将来的多视图、序列掩码…）。
+    #: 保留键见 `AUX_GRAPH`。放 DataSpec 上（而不是只放 Problem）是为了让它
+    #: 随管道/存档一起走 —— 纯加法字段，没有辅助结构的路径一行不变。
+    aux: dict = field(default_factory=dict)
 
     def split(self):
         """返回 (Xtr, Xte, ytr, yte)；无划分时 train==test 全量。"""
@@ -158,6 +163,223 @@ class DataSpec:
         ytr = self.y.iloc[tr] if self.y is not None else None
         yte = self.y.iloc[te] if self.y is not None else None
         return self.X.iloc[tr], self.X.iloc[te], ytr, yte
+
+
+#: 辅助表（`Problem.aux`）里的**保留键**。约定固定、可校验（见 `Problem.require`）。
+#: 目前只有图；将来多视图/序列掩码/元学习 episode 各占一个键，**不动契约**。
+AUX_GRAPH = "graph"
+
+#: `aux["graph"]` 的列约定：`src`/`dst` 是**行号**（指向 `spec.X` 的行）。
+#: 可选 `weight`（缺省全 1）。节点数 = `len(spec.X)`。
+GRAPH_COLUMNS = ("src", "dst", "weight")
+
+
+class Problem:
+    """**一个可学习问题**：观测 + 标签 + （可选的）观测之间的关系与划分。
+
+    ## 为什么要它（用户裁决的范式扩张）
+
+    原来的方法接口是 ``fit(X, y, cfg, diag)``。把仓库里所有方法族摊开看，
+    真正在变的从来不是"数据有几个参数"，而是**"观测是什么、观测之间有什么关系"**：
+
+    | 族 | 观测 | 观测之间的关系 | 预测单位 |
+    |---|---|---|---|
+    | 经典监督 | 一行一个样本 | **无关**（条件独立） | 一行一个标签 |
+    | 时序 | 一个时间点 | **有序** | 一个时间点一个值 |
+    | 聚类/降维/异常 | 一行一个样本 | 无关 | 一行一个分数/坐标 |
+    | **图** | **一个节点** | **按边相连** | 一个节点一个标签 |
+
+    ⇒ "观测单位"和"预测单位"四族完全一样，唯一变的是**中间那列**。
+    而老契约只有前两列（`X` 是观测、`y` 是标签），第三列**无处安放**——
+    ``Dataset.time_col`` 是给它打的第一个补丁（只有"有序"一种，还是特命名字段）。
+
+    ⇒ 本类把"观测 + 标签 + 关系"收成一个对象，`fit` 只收它。
+
+    ## 与 `DataSpec` 的关系（**承载，不是替代**）
+
+    `Problem` **持有**一个 `DataSpec`：管道/存档/UI 全都继续用 `DataSpec`，
+    一行不改。`fit` 收到的是 `Problem`；`problem.spec` 就是原来那个 spec。
+
+    ## 三个视图（方法只该用这三个）
+
+    - ``problem.X`` / ``problem.y`` —— 观测与标签（时序之外都直接可用）；
+    - ``problem.rows("train"|"test")`` —— **按划分取行**（经典方法就这一行）；
+    - ``problem.require("graph")`` —— 取辅助结构；**没声明支持就结构化拒绝**
+      （不许"数据带了而方法悄悄扔掉"——那正是 `time_col` 时代的老毛病）。
+    """
+
+    def __init__(self, spec: DataSpec, *,
+                 aux: Optional[dict] = None,
+                 allowed: tuple = (),
+                 task: Optional[str] = None) -> None:
+        self.spec = spec
+        #: 辅助表：保留键见 `AUX_GRAPH`。值一律是 DataFrame（可序列化、可存档）。
+        #: 默认取 `spec.aux`（管道/存档带过来的）；显式传 aux 可覆盖（判据用）。
+        self.aux: dict = dict(spec.aux if aux is None else aux)
+        #: 本方法**声明支持**的辅助键（来自 `MLMethod.accepts_aux`）。空 = 都不支持。
+        self.allowed: tuple = tuple(allowed or ())
+        self.task = task
+
+    # ------------------------------------------------------------ 直通（省得层层 .spec）
+    @property
+    def X(self):
+        return self.spec.X
+
+    @property
+    def y(self):
+        return self.spec.y
+
+    @property
+    def train_idx(self):
+        return self.spec.train_idx
+
+    @property
+    def test_idx(self):
+        return self.spec.test_idx
+
+    @property
+    def target_kind(self):
+        return self.spec.target_kind
+
+    @property
+    def meta(self) -> dict:
+        return self.spec.meta
+
+    def __len__(self) -> int:
+        return int(len(self.spec.X))
+
+    # ------------------------------------------------------------ 视图
+    def rows(self, part: str = "train"):
+        """按划分取行 → ``(X, y)``。``part`` ∈ train/test/all。
+
+        ⚠ **图任务用 `masks()` 而不是这个**：图不能按行切（切了边就没了/会泄漏），
+        见 `masks()` 的说明。
+        """
+        tr, te = self.spec.train_idx, self.spec.test_idx
+        if part == "train":
+            idx = tr if tr is not None else np.arange(len(self.spec.X))
+        elif part == "test":
+            idx = te if te is not None else np.arange(len(self.spec.X))
+        else:
+            idx = np.arange(len(self.spec.X))
+        X = self.spec.X.iloc[idx]
+        y = self.spec.y.iloc[idx] if self.spec.y is not None else None
+        return X, y
+
+    def masks(self) -> tuple:
+        """``(train_mask, test_mask)`` —— **布尔掩码**，索引仍是全量行号。
+
+        为什么要它（图任务的正解）：图上的划分不能靠切行——
+        ① 训练节点会沿边"看到"验证节点的特征（消息传递），分数会被乐观化；
+        ② 切行会让边索引失效/要重编号。
+        ⇒ 图任务的标准做法是**同一张图、只对指定节点算损失**，即"节点掩码"。
+        这与时序的 `time_split` 是同一类修正（都是"行不独立"），只是图的版本。
+        """
+        n = len(self.spec.X)
+        tr = self.spec.train_idx if self.spec.train_idx is not None else np.arange(n)
+        te = self.spec.test_idx if self.spec.test_idx is not None else np.arange(n)
+        m_tr = np.zeros(n, dtype=bool)
+        m_te = np.zeros(n, dtype=bool)
+        m_tr[np.asarray(tr, dtype=int)] = True
+        m_te[np.asarray(te, dtype=int)] = True
+        return m_tr, m_te
+
+    def subset(self, X, y=None) -> "Problem":
+        """造一个"**全量即训练**"的子问题（换了表/标签，划分与关系照旧）。
+
+        用途：某些方法在交给基类之前要先做一次**自己的**预处理
+        （如 MultinomialNB 内部 MinMax 平移）⇒ 它把变换后的表包成子问题再委托，
+        这样基类里那段"取 rows('train')"仍然成立，不必为它开特例。
+        """
+        idx = np.arange(len(X))
+        sub = DataSpec(X=X.reset_index(drop=True),
+                       y=(y.reset_index(drop=True) if y is not None else None),
+                       train_idx=idx, test_idx=idx,
+                       target_kind=self.spec.target_kind, meta=self.spec.meta)
+        return Problem(sub, aux=self.aux, allowed=self.allowed, task=self.task)
+
+    # ------------------------------------------------------------ 划分模式
+    def partition_mode(self) -> str:
+        """划分该按什么单位做（**由数据决定，不由方法决定**）。
+
+        - ``"masks"``：带了**结构化关系**（图/序列）⇒ 按**节点掩码**划分。
+          为什么：图的边按行号写，切行会让边索引失效；更要命的是训练节点会沿边
+          "看到"验证节点（消息传递）⇒ 分数乐观化。这与时序的 `time_split` 是
+          **同一类修正**（都是"行不独立"），只是图的版本。
+        - ``"rows"``：普通表格 ⇒ 沿用既有 `spec.split()`（一行一个样本，行无关）。
+        """
+        return "masks" if self.aux else "rows"
+
+    # ------------------------------------------------------------ 能力声明
+    def aux_keys(self) -> list:
+        """这份数据带了哪些辅助结构（稳定排序）。"""
+        return sorted(self.aux)
+
+    def require(self, key: str):
+        """取一个辅助结构；**数据没有或方法没声明支持**都结构化拒绝。
+
+        两种拒绝要分开说，因为改法不同：
+        - 方法**没声明**支持它 ⇒ 是"这个方法吃不了这种数据"（换方法，或申请支持）；
+        - 声明了但**数据没带** ⇒ 是"这份数据缺这个结构"（补数据）。
+        ⚠ 绝不静默返回 None —— 那会让方法以为"没有边"而按独立样本跑，
+        得到一个**看起来正常但其实错**的结果（`time_col` 时代的老毛病）。
+        """
+        if key not in self.allowed:
+            raise ValueError(
+                f"方法没有声明支持辅助结构 {key!r}"
+                f"（`accepts_aux` 里没有它）⇒ 拒绝让它消费这份数据。"
+                f"已声明：{list(self.allowed)}")
+        if key not in self.aux:
+            raise ValueError(
+                f"这份数据没有带辅助结构 {key!r}（带了的是：{self.aux_keys()}）")
+        return self.aux[key]
+
+    def has_aux(self, key: str) -> bool:
+        return key in self.aux
+
+    # ------------------------------------------------------------ 图任务的读取口
+    def graph(self):
+        """取图结构 → ``(edge_index, edge_weight)``（torch 友好的两个张量）。
+
+        边表的 `src`/`dst` 是**行号**（指向 `spec.X` 的行）⇒ 直接就是
+        `edge_index`，不需要节点重编号（因为我们不切行）。
+        """
+        tbl = self.require(AUX_GRAPH)
+        import numpy as np
+        src = np.asarray(tbl["src"], dtype=np.int64)
+        dst = np.asarray(tbl["dst"], dtype=np.int64)
+        edge_index = np.stack([src, dst], axis=0)
+        if "weight" in tbl.columns:
+            w = np.asarray(tbl["weight"], dtype=np.float32)
+        else:
+            w = np.ones(len(src), dtype=np.float32)
+        return edge_index, w
+
+    def graph_facts(self) -> dict:
+        """图的规模摘要（进 diag / 工具回执；没有图就回空 dict）。"""
+        if AUX_GRAPH not in self.aux:
+            return {}
+        tbl = self.aux[AUX_GRAPH]
+        n = len(self.spec.X)
+        deg = None
+        try:
+            import numpy as np
+            d = np.zeros(n, dtype=np.int64)
+            for col in ("src", "dst"):
+                vals = np.asarray(tbl[col], dtype=np.int64)
+                vals = vals[(vals >= 0) & (vals < n)]
+                np.add.at(d, vals, 1)
+            deg = {"mean": float(d.mean()) if n else 0.0,
+                   "min": int(d.min()) if n else 0, "max": int(d.max()) if n else 0}
+        except Exception:
+            deg = None
+        return {"n_nodes": n, "n_edges": int(len(tbl)),
+                "has_weight": "weight" in tbl.columns, "degree": deg,
+                "isolated": int((deg or {}).get("min", 0) == 0) if deg else None}
+
+    def __repr__(self) -> str:
+        return (f"Problem(n={len(self)}, target_kind={self.spec.target_kind!r}, "
+                f"task={self.task!r}, aux={self.aux_keys()})")
 
 
 # ---------------------------------------------------------------- 参数 schema
@@ -278,10 +500,27 @@ class MLMethod(abc.ABC):
     param_schema: ClassVar[list] = []
     supports_sample_weight: ClassVar[bool] = False
     requires_numeric: ClassVar[bool] = True       # False = 内部自行编码（如原始 RF）
+    #: **声明**本方法支持哪些辅助结构（`Problem.aux` 的保留键，见 `AUX_GRAPH`）。
+    #: 默认空 = 只吃"观测 + 标签"（经典方法都是这样，一行不用改）。
+    #: ⚠ 数据带了辅助结构而方法没声明支持 ⇒ `Problem.require` **结构化拒绝**，
+    #: 不允许"悄悄扔掉"（`time_col` 时代"时序忽略外生 X"就是那么来的）。
+    accepts_aux: ClassVar[tuple] = ()
 
     # ------------------------------------------------ 子类必须实现
     @abc.abstractmethod
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False) -> MLResult:
+    def fit(self, problem: "Problem", cfg: RunConfig,
+            diag: bool = False) -> MLResult:
+        """在**一个问题**上拟合。
+
+        ## 范式（2026-10-03 扩张，取代 ``fit(X, y, cfg, diag)``）
+
+        老接口只能表达"观测 + 标签"，表达不了**观测之间的关系**（图 = 按边相连、
+        时序 = 有序）⇒ 图方法无处安放。现在统一收一个 :class:`Problem`。
+
+        - 经典方法：``X, y = problem.rows("train")``（就是原来那两样）；
+        - 时序：``problem.y`` 是整条序列，外生特征在 ``problem.X`` 里；
+        - 图：``problem.require("graph")`` + ``problem.masks()``。
+        """
         ...
 
     # ------------------------------------------------ 可选覆写
@@ -291,6 +530,10 @@ class MLMethod(abc.ABC):
     def fit_extra_artifacts(self, X: pd.DataFrame, result: MLResult) -> dict:
         """run_one 在 predict 前调用：概率等附加产物（默认无）。"""
         return {}
+
+    def problem(self, spec: DataSpec, *, aux: Optional[dict] = None) -> "Problem":
+        """由 `DataSpec`（+ 可选辅助结构）造一个 `Problem`（带上本方法的能力声明）。"""
+        return Problem(spec, aux=aux, allowed=self.accepts_aux, task=self.task)
 
     def evaluate(self, result: MLResult, X: pd.DataFrame, y) -> dict:
         """默认评估：按 task/target_kind 自动计算标准指标。"""
@@ -307,9 +550,16 @@ class MLMethod(abc.ABC):
         return m
 
     def cross_validate(self, X: pd.DataFrame, y, cfg: RunConfig,
-                       cv_folds: int = 5) -> dict:
-        """默认交叉验证：k 折重跑 fit，统计主指标 mean±std。"""
-        return default_cv(self, X, y, cfg, cv_folds)
+                       cv_folds: int = 5, *,
+                       target_kind: Optional[str] = None,
+                       aux: Optional[dict] = None) -> dict:
+        """默认交叉验证：k 折重跑 fit，统计主指标 mean±std。
+
+        ⚠ `aux`（图边表等）**必须传进来**：CV 按行切片，对图数据会静默失真
+        ⇒ `default_cv` 要据此**响亮拒绝**（而不是算出一个看起来正常的错分数）。
+        """
+        return default_cv(self, X, y, cfg, cv_folds,
+                          target_kind=target_kind, aux=aux)
 
     # ------------------------------------------------ 检视页声明（默认空 = UI 兜底页）
     def inspect_pages(self, cfg: RunConfig) -> list[PageSpec]:
@@ -414,9 +664,26 @@ def default_primary(task: str, target_kind: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------- 默认 CV
-def default_cv(method: MLMethod, X, y, cfg: RunConfig, cv_folds: int = 5) -> dict:
-    """k 折交叉验证（按 task 选折法），返回 {主指标: mean/std/scores}。"""
+def default_cv(method: MLMethod, X, y, cfg: RunConfig, cv_folds: int = 5,
+               *, target_kind: Optional[str] = None,
+               aux: Optional[dict] = None) -> dict:
+    """k 折交叉验证（按 task 选折法），返回 {主指标: mean/std/scores}。
+
+    ## 与 `Problem` 范式的关系
+
+    `fit` 现在收 `Problem`，而 CV 的"折"**就是一次划分** ⇒ 每一折造一个只含该折
+    划分的 `DataSpec`，再包成 `Problem` 交给 `fit` ⇒ 与 `run_one` 走同一条路。
+
+    ⚠ **带辅助结构（图）的数据不走 CV**：CV 是"按行切片"，而图的边表是按行号写的
+    ⇒ 切片会让边索引指到折外/失效，**静默失真**。所以这里直接拒绝（响亮），
+    而不是算出一个看起来正常但错的分数。
+    """
     from sklearn.model_selection import KFold, StratifiedKFold
+    if aux:
+        raise ValueError(
+            f"带辅助结构的数据不支持交叉验证（带了 {sorted(aux)}）："
+            "CV 按行切片，而图的边表按行号索引 ⇒ 切片会让它静默失真。"
+            "请用单次划分（problem.masks() 那套节点掩码），或去掉 cv_folds。")
     n = len(X)
     cv_folds = max(2, min(cv_folds, n))
     if method.task == TASK_SUPERVISED and method.target_kind != "regression" \
@@ -431,7 +698,7 @@ def default_cv(method: MLMethod, X, y, cfg: RunConfig, cv_folds: int = 5) -> dic
     else:
         folds = list(KFold(cv_folds, shuffle=True,
                            random_state=cfg.seed).split(X))
-
+    kind = target_kind or method.target_kind
     scores = []
     primary = ""
     for tr, te in folds:
@@ -440,7 +707,14 @@ def default_cv(method: MLMethod, X, y, cfg: RunConfig, cv_folds: int = 5) -> dic
         ytr = (y.iloc[tr] if hasattr(y, "iloc") else y[tr])
         yte = (y.iloc[te] if hasattr(y, "iloc") else y[te])
         try:
-            res = method.fit(Xtr, ytr, cfg, diag=False)
+            k = kind or infer_kind(ytr)
+            # 折内：全量即训练（train_idx/test_idx 都指全量，方法只该用 rows("train")）
+            fold_spec = DataSpec(
+                X=Xtr.reset_index(drop=True),
+                y=(ytr.reset_index(drop=True) if ytr is not None else None),
+                train_idx=np.arange(len(Xtr)), test_idx=np.arange(len(Xtr)),
+                target_kind=k)
+            res = method.fit(method.problem(fold_spec), cfg, diag=False)
             if not res.ok:
                 continue
             pred = method.predict(Xte, res)

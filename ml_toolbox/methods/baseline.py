@@ -28,7 +28,9 @@ class DummyBaseline(MLMethod):
                   choices=["prior", "uniform", "most_frequent", "median"]),
     ]
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
+        """参照基线（`Problem` 范式）：只吃训练段，就是原来的 (Xtr, ytr)。"""
+        X, y = problem.rows("train")
         from sklearn.dummy import DummyRegressor, DummyClassifier
         from ..core.pipeline import _infer_kind
         p = self.params(cfg)

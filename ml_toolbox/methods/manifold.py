@@ -18,7 +18,8 @@ class ManifoldMethod(MLMethod):
     def reducer(self, p: dict):
         raise NotImplementedError
 
-    def fit(self, X: pd.DataFrame, y, cfg: RunConfig, diag: bool = False):
+    def fit(self, problem, cfg: RunConfig, diag: bool = False):
+        X, y = problem.rows("train")
         p = self.params(cfg)
         est = self.reducer(p)
         Xv = X.to_numpy(float)
@@ -103,7 +104,8 @@ class LDAProj(ManifoldMethod):
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
         return LinearDiscriminantAnalysis(n_components=int(p["n_components"]))
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):
+        X, y = problem.rows("train")
         if y is None:
             res = self._new_result(target_kind=None, params=self.params(cfg))
             res.error = "LDA 投影需要标签列（在数据集里指定目标列）"

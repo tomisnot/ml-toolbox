@@ -104,7 +104,7 @@ def run_one(method: MLMethod, spec: DataSpec,
     run_id = cfg.extras.get("run_id") or _run_id(method.name, cfg.seed)
     cfg.extras["run_id"] = run_id
     #: **方法内部的进度钩子**（可选，逗号（epoch, total）之外不承诺任何形状）。
-    #: 为什么走 extras 而不是新增 `fit` 形参：`fit(X, y, cfg, diag)` 是方法层契约，
+    #: 为什么走 extras 而不是新增 `fit` 形参：`fit(problem, cfg, diag)` 是方法层契约，
     #: 为了一个可选观测能力去改**每个方法**的签名不划算；而 extras 本来就是
     #: "任务级扩展"的通道（cv_folds 等已在用）。
     #: ⚠ **它不落盘、不进指纹**：运行结束前必须摘掉，否则 RunConfig 会被
@@ -113,19 +113,54 @@ def run_one(method: MLMethod, spec: DataSpec,
     try:
         with timer.stage("guard"):
             resource_estimate = _resource_guard(method, spec, cfg)
+        # ⭐ **能力闸**：数据带了辅助结构（图边表等）而方法**没声明支持** ⇒ 拒绝。
+        #   为什么必须在这里拦（而不是等方法自己调 `require`）：不拦的话
+        #   `torch_mlp` 这类只读 `rows("train")` 的方法会**静默忽略**掉图结构，
+        #   然后按"节点互相独立"跑出一个看起来正常、其实错的分数。
+        #   （老契约下"时序忽略外生 X"就是这么静默发生的。）
+        present = set(spec.aux or {})
+        declared = set(getattr(method, "accepts_aux", ()) or ())
+        if present - declared:
+            missing = sorted(present - declared)
+            res = MLResult(
+                method_name=method.name, task=method.task,
+                error=(f"{method.name} 不支持这份数据带的辅助结构 {missing}"
+                       f"（它声明支持的是 {sorted(declared)}）。"
+                       "带图结构的数据请用能消费它的方法（如 run_custom 的自定义网络，"
+                       "它声明了 accepts_aux=(AUX_GRAPH,)）。"))
+            return RunRecord(run_id=run_id, method=method.name,
+                             family=method.family, task=method.task,
+                             target_kind=spec.target_kind, dataset=spec.meta.get("dataset", ""),
+                             pipeline_id=spec.meta.get("pipeline_id", ""),
+                             config={"overrides": dict(cfg.overrides), "diag": bool(cfg.diag),
+                                     "seed": int(cfg.seed),
+                                     "extras": {k: v for k, v in cfg.extras.items()
+                                                if k != "on_progress"}},
+                             result=res, timings={"total": 0.0})
+        # ⭐ 范式：方法收到的是**一个问题**（观测 + 标签 + 关系），不是裸的 (X, y)。
+        #   `problem` 承载 spec（含 `spec.aux` 里的图边表等）⇒ predict/evaluate
+        #   那两段仍用 `spec.split()`（测试数据本来就是 (X, y) 形状，不必绕一圈）。
+        problem = method.problem(spec)
         with timer.stage("split"):
             Xtr, Xte, ytr, yte = spec.split()
         with timer.stage("fit"):
-            res = method.fit(Xtr, ytr, cfg, diag=cfg.diag)
+            res = method.fit(problem, cfg, diag=cfg.diag)
         if res.ok and method.task == TASK_SUPERVISED:
-            with timer.stage("predict"):
-                try:
-                    res.artifacts.update(method.fit_extra_artifacts(Xte, res))
-                    pred = method.predict(Xte, res)
-                    res.artifacts["y_true"] = np.asarray(yte)
-                    res.artifacts["y_pred"] = np.asarray(pred)
-                except Exception:
-                    res.error = "predict 失败:\n" + traceback.format_exc(limit=6)
+            if problem.partition_mode() == "masks":
+                # ⭐ **结构化数据（图）不走这条 predict**：这里只拿得到**测试行**
+                #   （`Xte`），而图的前向需要**整张图的边** ⇒ 由方法自己的
+                #   `fit` 在掩码语义下把 `y_pred`/`y_true` 算好（见
+                #   `custom._fit_graph`）。指标评估照旧走 `evaluate`（它只读 artifacts）。
+                pass
+            else:
+                with timer.stage("predict"):
+                    try:
+                        res.artifacts.update(method.fit_extra_artifacts(Xte, res))
+                        pred = method.predict(Xte, res)
+                        res.artifacts["y_true"] = np.asarray(yte)
+                        res.artifacts["y_pred"] = np.asarray(pred)
+                    except Exception:
+                        res.error = "predict 失败:\n" + traceback.format_exc(limit=6)
         elif res.ok and method.task == TASK_TIMESERIES:
             pass  # fit 内部已产出 forecast/actual
     except ResourceBudgetExceeded as e:
@@ -157,15 +192,23 @@ def run_one(method: MLMethod, spec: DataSpec,
         if cv_folds >= 2 and method.task == TASK_SUPERVISED:
             with timer.stage("cv"):
                 try:
-                    cv = method.cross_validate(spec.X, spec.y, cfg, cv_folds)
+                    # ⚠ 把 `aux` 传进去 ⇒ 带图的数据会被 `default_cv` **响亮拒绝**
+                    #   （CV 按行切片会让边索引静默失真）。这里不吞掉那条拒绝：
+                    #   把原因写进 diag，让"为什么没跑 CV"看得见。
+                    cv = method.cross_validate(spec.X, spec.y, cfg, cv_folds,
+                                               target_kind=spec.target_kind,
+                                               aux=dict(spec.aux or {}))
                     for k, v in cv.items():
                         if k == "cv_scores":
                             res.diag = dict(res.diag or {})
                             res.diag["cv_scores"] = v
                         else:
                             res.metrics[k] = v
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # ⚠ **不静默**：CV 没跑成要留下原因（带图的数据会被明确拒绝，
+                    #   那条拒绝就是这里最有价值的信息）。
+                    res.diag = dict(res.diag or {})
+                    res.diag["cv_skipped"] = f"{type(exc).__name__}: {exc}"
     timer.ensure("guard", "split", "fit", "predict", "evaluate", "cv")
     timer.values["legacy_elapsed"] = res.elapsed
     timer.values["total"] = max(0.0, time.perf_counter() - perf0)

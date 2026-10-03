@@ -86,7 +86,13 @@ class AutoTunerObjective(Objective):
                                 and k.endswith("_mean")), None)
                 score = cv.get(key, float("nan"))
             else:
-                res = self._m.fit(X, y, cfg)
+                # ⭐ 范式：`fit` 收 `Problem`。这里"全量即训练"（调参就是在一份
+                #    数据上反复拟合）⇒ 造一个 train==test==全量的 spec 包成 Problem。
+                from ..core.contracts import DataSpec
+                from ..core.contracts import infer_kind as _kind
+                spec = DataSpec(X=X, y=y, train_idx=None, test_idx=None,
+                                target_kind=_kind(y))
+                res = self._m.fit(self._m.problem(spec), cfg)
                 pred = self._m.predict(X, res)
                 res.artifacts["y_true"] = np.asarray(y)
                 res.artifacts["y_pred"] = np.asarray(pred)
