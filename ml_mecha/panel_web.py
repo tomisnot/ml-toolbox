@@ -354,6 +354,15 @@ def _dataspec_of(rec):
 _KIND_DEPENDENT_PAGES = frozenset({"cm", "roc", "pr"})
 
 
+def _spec_fn_for(key: str):
+    """查"页 key → 中立绘图规格函数"；未迁移或取不到 ⇒ ``None``（调用方回退 PNG）。"""
+    try:
+        from ml_toolbox.methods import specs
+        return specs.spec_for_key(key)
+    except Exception:
+        return None
+
+
 def page_body(side: str, rec, key: str, kind: str, spec, run_id: str) -> str:
     """**一页的正文 HTML**（按 kind 分派；与 GUI 的 `InspectPage.show_result` 同构）。"""
     from . import panel_view as V
@@ -365,6 +374,23 @@ def page_body(side: str, rec, key: str, kind: str, spec, run_id: str) -> str:
         return V.placeholder(f"「{getattr(spec, 'title', key)}」画不出来", conflict)
 
     if kind == "mpl":
+        # ⭐ 已迁移到中立契约的页：**在 web 端用 SVG 画**（矢量、贴合页面风格）。
+        #   未迁移的页回退到 PNG（服务端 matplotlib）—— 迁移进度见 `methods/specs.SPEC_BY_KEY`。
+        spec_fn = _spec_fn_for(key)
+        if spec_fn is not None:
+            try:
+                from . import panel_svg
+                from ml_toolbox.core import plot_mpl
+                plot_mpl.apply_page_style()          # 中文与页面同一族字体
+                svg = panel_svg.svg(spec_fn(rec.result if side == "ml" else rec))
+                return f'<div class="chart">{svg}</div>'
+            except Exception as exc:
+                # ⚠ **响亮**：SVG 画失败要说出来（不是回退成空白），并说明已回退
+                return V.unreadable(
+                    f"「{getattr(spec, 'title', key)}」的 SVG 渲染失败",
+                    f"{type(exc).__name__}: {exc}") + V.plot_html(
+                    f"/plot?run={V.esc(run_id)}&page={V.esc(key)}",
+                    title="", note="（上面失败，这里回退到服务端 PNG）")
         if getattr(spec, "plot", None) is None:
             return V.placeholder(f"「{spec.title}」没有绘图函数",
                                  "该方法声明了这一页但没给 plot ⇒ 属于声明不全。")

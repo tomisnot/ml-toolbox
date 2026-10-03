@@ -45,7 +45,8 @@ PHASE_HEAVY = ["smoke_test.py", "test_ui.py", "test_opt.py", "test_regressions.p
 #: `test_tensorboard.py` 一并放这一阶段：它跑一次真训练（产出事件文件）再读回，
 #: 属"起东西 + 往返"那一类。
 #: `test_panel_web.py` 同理：它起一次只读 HTTP 服务（渲染 PNG、走端口文件）。
-PHASE_SENSITIVE = ["test_dsh_panel.py", "test_tensorboard.py", "test_panel_web.py"]
+PHASE_SENSITIVE = ["test_dsh_panel.py", "test_tensorboard.py",
+                   "test_panel_web.py", "test_plot_spec.py"]
 
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。

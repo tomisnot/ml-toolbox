@@ -100,6 +100,9 @@ table{border-collapse:collapse;width:100%}
 th,td{border:1px solid #d0d7de;padding:4px 8px;text-align:left;vertical-align:top}
 th{background:#f6f8fa}
 img.plot{max-width:100%;border:1px solid #d0d7de;border-radius:6px;background:#fff}
+/* SVG 图：**不加边框**（矢量图直接坐在页面上，与页签/表格同层） */
+.chart{max-width:900px}
+.chart svg{display:block;width:100%;height:auto}
 pre{margin:0;padding:10px;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;
     overflow:auto;white-space:pre-wrap}
 .muted{color:#57606a}

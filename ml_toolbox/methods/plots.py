@@ -8,19 +8,18 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..core import plot_mpl
+from . import specs as _specs
+
 
 # ---------------------------------------------------------------- 监督·回归
 def plot_fit_1d(ax, result):
-    """一维回归：散点 + 拟合曲线（按 x 排序连线）。"""
-    a = result.artifacts
-    yt, yp = np.asarray(a["y_true"], float), np.asarray(a["y_pred"], float)
-    order = np.argsort(yt)
-    ax.scatter(yt, yp, s=14, alpha=0.55, label="样本")
-    ax.plot(yt[order], yp[order], lw=1.2, color="tab:red", label="拟合")
-    lo, hi = yt.min(), yt.max()
-    ax.plot([lo, hi], [lo, hi], "k--", lw=0.8, alpha=0.5, label="理想 y=x")
-    ax.set_xlabel("真实值"); ax.set_ylabel("预测值")
-    ax.legend(fontsize=16); ax.grid(alpha=0.25)
+    """一维回归：散点 + 拟合曲线 + 理想 y=x。
+
+    ⚠ **已迁移**：数由 `specs.spec_fit_1d` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_fit_1d(result), ax)
 
 
 def plot_residual(ax, result):
@@ -37,60 +36,30 @@ def plot_residual(ax, result):
 
 
 def plot_importance(ax, result):
-    fi = result.artifacts.get("feature_importance")
-    if fi is None or fi.empty:
-        return
-    s = fi["importance"].sort_values()
-    top = s.tail(20)
-    ax.barh(range(len(top)), top.values, color="tab:green", alpha=0.8)
-    ax.set_yticks(range(len(top)))
-    ax.set_yticklabels([str(i)[:28] for i in top.index], fontsize=14)
-    ax.set_xlabel("importance"); ax.grid(alpha=0.25, axis="x")
+    """特征重要性：横向条形（最多 20 条）。
+
+    ⚠ **已迁移**：数由 `specs.spec_importance` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_importance(result), ax)
 
 
-# ---------------------------------------------------------------- 监督·分类
 def plot_confusion(ax, result):
-    from sklearn.metrics import confusion_matrix
-    a = result.artifacts
-    yt, yp = np.asarray(a["y_true"]), np.asarray(a["y_pred"])
-    labels = np.unique(np.concatenate([yt, yp]))
-    cm = confusion_matrix(yt, yp, labels=labels)
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(len(labels)))
-    ax.set_yticks(range(len(labels)))
-    ax.set_xticklabels([str(l)[:10] for l in labels], fontsize=14)
-    ax.set_yticklabels([str(l)[:10] for l in labels], fontsize=14)
-    thresh = cm.max() / 2
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=14,
-                    color="white" if cm[i, j] > thresh else "black")
-    ax.set_xlabel("预测"); ax.set_ylabel("真实")
+    """混淆矩阵（每格标数字）。
+
+    ⚠ **已迁移**：数由 `specs.spec_confusion` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_confusion(result), ax)
 
 
 def plot_roc(ax, result):
-    from sklearn.metrics import roc_curve, auc, precision_recall_curve
-    a = result.artifacts
-    prob = a.get("y_prob")
-    yt = np.asarray(a["y_true"])
-    if prob is None:
-        return
-    prob = np.asarray(prob, float)
-    classes = np.unique(yt)
-    if len(classes) == 2:
-        p = prob[:, 1] if prob.ndim == 2 else prob
-        fpr, tpr, _ = roc_curve(yt, p, pos_label=classes[1])
-        ax.plot(fpr, tpr, lw=1.4, label=f"AUC={auc(fpr, tpr):.3f}")
-    elif prob.ndim == 2 and prob.shape[1] == len(classes):
-        for i, c in enumerate(classes):
-            yb = (yt == c).astype(int)
-            fpr, tpr, _ = roc_curve(yb, prob[:, i])
-            ax.plot(fpr, tpr, lw=1.1, label=f"{str(c)[:10]} {auc(fpr, tpr):.2f}")
-    else:
-        return
-    ax.plot([0, 1], [0, 1], "k--", lw=0.7, alpha=0.5)
-    ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
-    ax.legend(fontsize=14); ax.grid(alpha=0.25)
+    """ROC 曲线（二分类一条 / 多分类每类一条）。
+
+    ⚠ **已迁移**：数由 `specs.spec_roc` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_roc(result), ax)
 
 
 def plot_pr(ax, result):
@@ -194,19 +163,12 @@ def plot_anomaly_score(ax, result):
 
 # ---------------------------------------------------------------- 时序
 def plot_forecast(ax, result):
-    a = result.artifacts
-    t = np.asarray(a["t_true"], float)
-    y = np.asarray(a["y_true"], float)
-    f = np.asarray(a["forecast"], float)
-    ax.plot(t, y, "o-", ms=3, lw=1, color="tab:blue", label="历史/实际")
-    ax.plot(t, f, "s--", ms=3, lw=1, color="tab:red", label="拟合/预测")
-    ci = a.get("ci")
-    if ci is not None:
-        ci = np.asarray(ci, float)
-        ax.fill_between(t, f - ci, f + ci, color="tab:red", alpha=0.12,
-                        label="95% 区间")
-    ax.set_xlabel("t"); ax.set_ylabel("y")
-    ax.legend(fontsize=14); ax.grid(alpha=0.25)
+    """时序预测：实际 / 预测 + 95% 区间带。
+
+    ⚠ **已迁移**：数由 `specs.spec_forecast` 取，画法归 `core.plot_mpl` 渲染器。
+    保留本函数名是因为 GUI 的 `PageSpec.plot` 指向它（调用点一行不改）。
+    """
+    plot_mpl.draw(_specs.spec_forecast(result), ax)
 
 
 def plot_ts_residual(ax, result):
