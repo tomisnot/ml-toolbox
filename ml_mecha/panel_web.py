@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -53,8 +54,10 @@ WEB_PORT_FILE = ".mlweb-port"
 #: 渲染 PNG 的缓存目录（放在 run 自己的目录下，与 `record.json` 并列）。
 PLOT_CACHE_DIRNAME = "web"
 
-#: 单张图的像素（够看清又不至于让页面爆）。
-PLOT_DPI = 110
+#: 单张图的渲染参数。⚠ 这两个数**直接决定"首次进某页要等多久"**（实测冷渲染 ~1.1 s，
+#: 且耗时与像素数近似成正比）：110→90 dpi 把像素砍掉约 1/3。
+#: 判据：90 dpi 下 7.2in 宽的图仍有 ~650 px，屏幕上足够看清；要更清晰就调回 110（代价是等待）。
+PLOT_DPI = 90
 PLOT_FIGSIZE = (7.2, 4.4)
 
 
@@ -98,17 +101,82 @@ def preload_modules(names) -> list[str]:
     return failed
 
 
+def _runs_root() -> str:
+    """`runs/` 的根（取不到就回空串）。**取不到不抛**：调用方按"没有数据"处理。"""
+    try:
+        from ml_toolbox.core.persistence import RUNS_DIR
+        return str(RUNS_DIR)
+    except Exception:
+        return ""
+
+
+#: `runs/` 的"目录集"签名 → (ml 记录, opt 记录)。见 `_runs_signature` / `_cached_records`。
+_RUNS_CACHE: dict = {}
+
+
+def _runs_signature(root: Path) -> tuple:
+    """`runs/` 的**目录集**签名（子目录名 + 数量 + 最大 mtime）。
+
+    ⚠ 为什么用"子目录集"而不是整个目录的 mtime：我们每渲染一张图会在
+    `runs/<id>/web/` 里**新建 PNG**；若拿 `runs/` 的 mtime 当依据，就会被自己写图
+    **反复失效**（缓存等于没有）——同名目录的 mtime 不变，所以签名不受影响。
+    ⚠ 为什么"新 run 一定会改签名"：`save_record` 逐个 `run_id` **新建目录**
+    （`os.makedirs`）⇒ 多一个 run 必然多一个子目录条目。这条性质让签名既**便宜**又**准**。
+    """
+    try:
+        names, latest = [], 0.0
+        with os.scandir(root) as it:
+            for e in it:
+                if e.is_dir():
+                    names.append(e.name)
+                    try:
+                        latest = max(latest, e.stat().st_mtime)
+                    except OSError:
+                        pass
+        names.sort()
+        return (len(names), round(latest, 3), tuple(names[-8:]), names[0] if names else "")
+    except OSError:
+        return ()
+
+
+def _cached_records(root: Path, kind: str) -> list[dict]:
+    """取（或重读）某一侧的**原始记录表**，按目录集签名缓存。
+
+    ⚠ **缓存原始表，而不是过滤后的结果**：否则按 `(view, limit)` 分开缓存，
+    切 view 的第一下仍要重读 1473 个 json（实测 293–336 ms）。缓存原始表 ⇒
+    **一次重读、三个 view 共享**，过滤在内存里做（微秒级）。
+    """
+    sig = _runs_signature(root)
+    slot = _RUNS_CACHE.setdefault(kind, {})
+    if slot.get("sig") == sig and "rows" in slot:
+        return slot["rows"]
+    from ml_toolbox.core import persistence
+    rows = list(persistence.list_opt_records() if kind == "opt"
+                else persistence.list_records())
+    slot["sig"], slot["rows"] = sig, rows
+    return rows
+
+
 def list_runs(kind: str = "ml", limit: int = 300) -> list[dict]:
     """列 run（新→旧）。``kind`` ∈ ``{"ml","nn"}`` / ``{"opt"}``。
 
     ⚠ ``ml`` 与 ``nn`` 用**同一份存档**（神经网络就是方法族之一），
-    区别只在方法名以 `torch_` / `nn` 开头——**不另存一份**（避免两份真相）。
+    区别只在方法族/方法名——**不另存一份**（避免两份真相）。
+
+    ## ⭐ 为什么必须缓存（实测）
+
+    底层 `list_records()` 要读 **1473 个 `record.json`**，实测 **293–336 ms**；
+    而**每一次页签点击**都会走一遍列表（web 是无状态的整页重载）⇒ 叠上冷渲染就是"几秒"。
+    ⇒ 见 `_cached_records`：按目录集签名缓存**原始表**，三个 view 共享一次重读。
     """
     from ml_toolbox.core import persistence
-    if kind == "opt":
-        rows = persistence.list_opt_records()      # ⭐ 经 core 的槽取（不 import opt 层）
-    else:
-        rows = persistence.list_records()
+    try:
+        root = Path(persistence.RUNS_DIR)
+    except Exception:
+        root = None
+    if root is None:
+        return []
+    rows = _cached_records(root, "opt" if kind == "opt" else "ml")
 
     out = []
     for r in rows[: max(0, int(limit))]:
@@ -133,6 +201,12 @@ def list_runs(kind: str = "ml", limit: int = 300) -> list[dict]:
     return out
 
 
+#: `run_id` → (`side`, 记录对象)。存档**写完就不变**（`save_record` 一次性落盘）⇒ 可以常驻。
+#: 上限只是防"开着面板跑上千个 run"时无限长（超出就整个清掉，不搞 LRU 那套复杂度）。
+_LOADED_CACHE: dict = {}
+_LOADED_CACHE_MAX = 200
+
+
 def load_any(run_id: str):
     """按 run_id 找它属于哪一侧，回 ``("ml"|"opt", 记录对象)``；找不到回 ``(None, None)``。
 
@@ -145,20 +219,29 @@ def load_any(run_id: str):
     """
     if not run_id:
         return None, None
+    hit = _LOADED_CACHE.get(run_id)
+    if hit is not None:
+        return hit
     from ml_toolbox.core import persistence
+    got = (None, None)
     try:
         rec = persistence.load_run_record(run_id)
         if rec is not None:
-            return "ml", rec
+            got = ("ml", rec)
     except Exception:
         pass
-    try:
-        rec = persistence.load_opt_record(run_id)
-        if rec is not None:
-            return "opt", rec
-    except Exception:
-        pass
-    return None, None
+    if got[0] is None:
+        try:
+            rec = persistence.load_opt_record(run_id)
+            if rec is not None:
+                got = ("opt", rec)
+        except Exception:
+            pass
+    if got[0] is not None:
+        if len(_LOADED_CACHE) >= _LOADED_CACHE_MAX:
+            _LOADED_CACHE.clear()          # 只防无限长；不做 LRU（复杂度不值）
+        _LOADED_CACHE[run_id] = got
+    return got
 
 
 #: 指标名 → 它属于哪一类 target_kind（用于**探测档内自相矛盾**）。
@@ -345,8 +428,9 @@ def render_plot(side: str, rec, spec, run_id: str, key: str) -> Path:
     fig, ax = plt.subplots(figsize=PLOT_FIGSIZE, dpi=PLOT_DPI)
     try:
         spec.plot(ax, target)
-        fig.tight_layout()
-        fig.savefig(out, dpi=PLOT_DPI)
+        # ⚠ 用 `bbox_inches="tight"` 而不是 `fig.tight_layout()`：
+        #   后者要跑一遍布局解算（实测是冷渲染里可观的一块），前者在 savefig 内部做同一件事。
+        fig.savefig(out, dpi=PLOT_DPI, bbox_inches="tight")
     finally:
         plt.close(fig)
     return out

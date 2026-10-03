@@ -291,6 +291,43 @@ def test_resolve_panel_base_rejects_stale_port_file():
         pf.unlink(missing_ok=True)
 
 
+def test_runs_cache_is_fast_and_never_stale():
+    """⭐ 运行列表有缓存（否则每次页签点击重读 1473 个 json），且**不会静默变陈旧**。
+
+    为什么必须有：`list_records()` 要读 `runs/` 下每个 `record.json`
+    （实测 1473 个 ⇒ **293–336 ms**），而 web 面板每次点页签都是
+    **无状态的整页重载** ⇒ 不缓存就是"每点一下等一秒"。
+    但缓存最危险的失效方式是**悄悄陈旧**（新跑完的 run 看不见）
+    ⇒ 本条两件都钉：快（命中缓存）＋准（新 run 出现后**立刻**能被看到）。
+    """
+    import time
+    W.list_runs("ml")                                   # 预热
+    t0 = time.perf_counter()
+    for _ in range(3):
+        W.list_runs("ml")
+    warm = (time.perf_counter() - t0) / 3 * 1000
+    assert warm < 60, f"缓存没生效：命中一次仍要 {warm:.0f} ms"
+
+    root = Path(W._runs_root())
+    assert root.is_dir(), "取不到 runs/ 目录，判据无法成立"
+    # 准：真加一个带 record.json 的 run ⇒ 必须出现（这条才是"不陈旧"的正面证据）
+    real = root / "cache-probe-1-42"
+    try:
+        real.mkdir(exist_ok=True)
+        (real / "record.json").write_text(
+            '{"run_id": "cache-probe-1-42", "method": "ridge", "family": "linear",'
+            ' "task": "supervised", "target_kind": "regression",'
+            ' "metrics": {"rmse": 0.5}, "primary_metric": "rmse"}', encoding="utf-8")
+        got = [r["run_id"] for r in W.list_runs("ml", limit=100000)]
+        assert "cache-probe-1-42" in got, "新落盘的 run 没出现在列表里（缓存陈旧了）"
+    finally:
+        try:
+            (real / "record.json").unlink(missing_ok=True)
+            real.rmdir()
+        except OSError:
+            pass
+
+
 # ============================================================ 直跑入口
 _TESTS = [
     test_esc_and_numbers_never_guess,
@@ -306,6 +343,7 @@ _TESTS = [
     test_plot_failure_returns_explanatory_png,
     test_server_serves_views_and_port_file,
     test_resolve_panel_base_rejects_stale_port_file,
+    test_runs_cache_is_fast_and_never_stale,
 ]
 
 
