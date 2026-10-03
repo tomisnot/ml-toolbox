@@ -320,11 +320,13 @@ def _spawn_panel(monitor_port: int | None, tb_url: str | None = None):
     # ⚠ 常量**就地取**：顶层 import `panel_web` 会把 matplotlib 等重依赖拉进 launcher 的
     #   启动路径（只为拿一个文件名，不值得）。文件名的单一真源仍在 `ml_mecha/panel_web.py`。
     from ml_mecha.panel_web import WEB_PORT_FILE as PANEL_PORT_FILE
+    from ml_mecha.panel_web import resolve_panel_base
     port_file = HERE / PANEL_PORT_FILE
-    # ⚠ 起之前**先清陈旧的端口文件**：上一次会话可能留下一个指向**死进程**的端口号
-    #   （`terminate()`／任务被收掉都**不跑** `finally` ⇒ 收尾那一次清不掉），不清就会
-    #   等/读到上一代的端口，或把浏览器开到**没人听**的地址上——现象是"面板打不开/端口不对"。
-    #   规则与 `mecha.portfile` 一致（启动前无条件清陈旧；收尾只删自己写的那个）。
+    # ⚠ 起之前**先清陈旧的端口文件**（`mecha.portfile` 的规则）。
+    #   为什么：`terminate()`／任务被收掉都**不跑** `finally` ⇒ 上一次的端口会留在文件里，
+    #   指向一个**死进程**。不清就有两个后果：等到上一代的端口；或把浏览器开到没人听的地址上。
+    #   ⭐ 这正是用户实测到的现象：浏览器打开的端口 ≠ 命令行打印的端口（一个读到旧值、
+    #   一个是新绑的真端口）。**下面还会再验一次**（清得够快不应是唯一保障）。
     clear_port_file(port_file)
     cmd = [PY, "-m", "ml_mecha.panel_web", "--port-file", str(port_file)]
     # ⭐ application 层指定"本服务要用到的层"：优化侧的读档能力是 opt 层 import 时
@@ -339,20 +341,23 @@ def _spawn_panel(monitor_port: int | None, tb_url: str | None = None):
     if proc is None:
         _log("⚠ ML 面板没起来（能做什么：AI 模式与 MCP 工具照常）。")
         return None
-    # 等端口文件（**探端口**，不靠 sleep 猜）
+    # ⭐ **只认"探得通"的地址**：读端口文件之后连一下 `/health`。
+    #   为什么不能只读文件：端口文件是**发现辅助、不是真值**（`mecha.portfile` 的既定语义），
+    #   而强杀场景下它必然可能残留。⇒ "清陈旧"是快路径，"探活"才是**正确性保障**
+    #   （清得够快不该是唯一防线——那是时序竞争，用户已经踩过一次）。
     url = None
     deadline = time.time() + 15.0
     while time.time() < deadline:
         if proc.poll() is not None:
             _log("⚠ ML 面板进程立刻退出了 ⇒ 本次没有这个窗口（AI 模式照常）。")
             return None
-        port = read_port(port_file)
-        if port:
-            url = f"http://127.0.0.1:{int(port)}/"
+        url = resolve_panel_base(port_file)
+        if url:
             break
-        time.sleep(0.2)
+        time.sleep(0.3)
     if not url:
-        _log("⚠ ML 面板端口文件没出现 ⇒ 本次没有这个窗口（AI 模式照常）。")
+        _log("⚠ ML 面板等不到可连的地址（端口文件没出现，或那个端口没人应）"
+             "⇒ 本次没有这个窗口（AI 模式照常）。")
         return proc
     _log("ML 面板：%s" % url)
     _open_browser(url)

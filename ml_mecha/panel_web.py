@@ -382,6 +382,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _html(self, text: str, code: int = 200) -> None:
         self._send(text.encode("utf-8"), "text/html; charset=utf-8", code)
 
+    def _redirect(self, location: str) -> None:
+        """303 ⇒ 起完 TensorBoard 后回到本页（浏览器重新取，iframe 就有地址了）。"""
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _json(self, obj, code: int = 200) -> None:
         self._send(json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"),
                    "application/json; charset=utf-8", code)
@@ -401,8 +408,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._plot(q)
             if path == "/page":
                 return self._json(ep.page_meta(q))
+            if path == "/tensorboard":
+                # `?open=1` ⇒ 起它并回到 NN 的「训练过程」页；否则只回状态（JSON）
+                want_open = (q.get("open") or [""])[0] in ("1", "true", "yes")
+                got = ep.ensure_tensorboard() if want_open else ep.tb_status()
+                if not want_open:
+                    return self._json(got)
+                if got.get("ready"):
+                    return self._redirect("/?view=nn&page=__tb__")
+                return self._html(ep.render_error("/tensorboard",
+                                                  RuntimeError(got.get("reason") or "起不来")),
+                                  500)
             if path == "/health":
-                return self._json({"ok": True, "routes": ["/", "/runs", "/plot", "/page"]})
+                return self._json({"ok": True,
+                                   "routes": ["/", "/runs", "/plot", "/page",
+                                              "/tensorboard", "/health"]})
             return self._html(ep.render_notfound(path), 404)
         except Exception as exc:                       # ⚠ **响亮**：读不到不当成空页
             # ⚠ **也写日志**：只把原因放进响应体 = 日志一片安静，运维/我自己都会以为没事。
@@ -444,6 +464,8 @@ class PanelWeb:
         self._server = None
         self._thread = None
         self._port: int | None = None
+        #: TensorBoard 辅进程（**按需**：NN 页点按钮或调 `/tensorboard?open=1` 才起）
+        self._tb: Any = None
 
     # ------------------------------------------------------------ 事实面
     @property
@@ -479,6 +501,14 @@ class PanelWeb:
     def stop(self, timeout: float = 5.0) -> None:
         srv, self._server = self._server, None
         port, self._port = self._port, None
+        # ⚠ 顺手收掉**自己按需起的** TensorBoard 辅进程：否则面板一停就留一个孤儿 Web 占端口
+        #   （与 `MonitorEndpoint.stop` 同一条纪律）。**只收自己起的那个**。
+        tb, self._tb = self._tb, None
+        if tb is not None:
+            try:
+                tb.stop()
+            except Exception:
+                pass
         if srv is not None:
             try:
                 srv.shutdown()
@@ -610,16 +640,53 @@ class PanelWeb:
                       runs_html=V.runs_pane(rows, active=run_id, view=view))
 
     def _tb_frame(self, V) -> str:
-        """NN 的「训练过程」页 = **TensorBoard iframe**（用户裁决：嵌进 viewer）。"""
+        """NN 的「训练过程」页 = **TensorBoard iframe**（用户裁决：嵌进 viewer）。
+
+        ⚠ **按需起**：没起来时给个按钮（`GET /tensorboard?open=1`），点了起它并回到本页。
+        这样**面板自己就能把 TensorBoard 拉起来** —— 不必依赖 launcher 传地址、
+        也不必你手动开第二个进程（"更正规更简洁直接"：少一个前置条件）。
+        """
         if self.tensorboard_url:
             return (f'<iframe src="{V.esc(self.tensorboard_url)}" '
                     f'title="TensorBoard"></iframe>'
                     '<div class="note">上面这块是 TensorBoard（它自己的全套面板）。'
-                    '若空白，说明它还没起来或有跨源限制 —— 用「打开仪表盘」按钮单独开一个窗口。</div>')
+                    '若空白，说明它还没起来或有跨源限制 —— 用下面这个链接单独开窗口。</div>'
+                    f'<p><a class="btn" href="{V.esc(self.tensorboard_url)}" '
+                    f'target="_blank" rel="noopener">单独开一个窗口打开 TensorBoard</a></p>')
         return V.placeholder(
             "TensorBoard 还没起来",
-            "它按需启动（只挂 --logdir，只读）。请用 GET /dashboard 起它，"
-            "或直接 tensorboard --logdir runs/<run_id>。")
+            "它按需启动（只挂 --logdir，只读）。点下面这个按钮起它；"
+            "起来之后本页会自动嵌入。") + (
+            '<p><a class="btn" href="/tensorboard?open=1">启动 TensorBoard</a></p>')
+
+    def tb_status(self) -> dict:
+        """TensorBoard 辅进程的状态（**不**顺手起它——起是 `/tensorboard?open=1` 的事）。"""
+        if self.tensorboard_url:
+            return {"ready": True, "url": self.tensorboard_url}
+        if self._tb is not None and self._tb.running:
+            self.tensorboard_url = self._tb.url
+            return {"ready": True, "url": self._tb.url}
+        return {"ready": False, "reason": "未启动（POST/GET /tensorboard?open=1 可起它）"}
+
+    def ensure_tensorboard(self) -> dict:
+        """按需起 TensorBoard 辅进程，并把地址记成**状态**（不是每次现起）。
+
+        ⚠ 起不来时回**可读原因**（不假装起了）。
+        """
+        if self.tensorboard_url:
+            return {"ready": True, "url": self.tensorboard_url, "reused": True}
+        from .dashboard import TensorBoardSidecar
+        if self._tb is None:
+            try:
+                from ml_toolbox.core.persistence import RUNS_DIR
+            except Exception as exc:
+                return {"ready": False,
+                        "reason": f"取不到 runs/ 目录：{type(exc).__name__}: {exc}"}
+            self._tb = TensorBoardSidecar(RUNS_DIR, log=self._say)
+        got = self._tb.start()
+        if got.get("ready") and got.get("url"):
+            self.tensorboard_url = str(got["url"])
+        return got
 
     def render_notfound(self, path: str) -> str:
         from . import panel_view as V

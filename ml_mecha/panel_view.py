@@ -90,6 +90,9 @@ pre{margin:0;padding:10px;background:#f6f8fa;border:1px solid #d0d7de;border-rad
 .ph{padding:14px;border:1px dashed #d0d7de;border-radius:6px;color:#57606a}
 iframe{width:100%;height:78vh;border:1px solid #d0d7de;border-radius:6px;background:#fff}
 .note{padding:8px 12px;color:#57606a;border-top:1px solid #d0d7de}
+a.btn{display:inline-block;padding:5px 12px;border:1px solid #0969da;border-radius:6px;
+      background:#0969da;color:#fff;text-decoration:none}
+a.btn:hover{background:#0550ae}
 """
 
 
