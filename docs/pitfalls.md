@@ -343,3 +343,122 @@
   高维而消失。
 - **修法**：`qsim.fidelity_kernel` 采样后 `(K+Kᵀ)/2` 对称化、对角强置 1（自身重叠无噪声）；
   UI 默认 shots=0（理想核），shots 仅用于演示有限测量涨落，不当加速宣称。
+
+## AI 调用面（工具 / 查询 / 任务）
+
+### A1. 逐 epoch 进度钩子挂晚了：`RunRequest.config()` 是**一次性拷贝**
+- **症状**：后台 `submit_run` 跑的神经网络训练，`read_job` 的 `progress` **恒为空**
+  （只有批次级 `run_method_batch` 那一条有）；而**同步** `run_method` 看起来一切正常。
+- **原因**：钩子先挂在 `engine._execute_one` 里（往 `request.extras` 塞
+  `on_progress`），但 `Session.run` 一进来就调 `request.config()`，而
+  ``RunRequest.config()`` 是 `extras=dict(self.extras)` 的**快照**
+  （`api.py:89-94`）⇒ 之后塞的东西**传不到 cfg**，方法层永远收不到。
+  **"同步看着正常"是探针的假绿**：直接调 `_execute_one` 的那条路绕开了命令面，
+  只有真 job 才暴露——正好复现"人看得见、AI 看不见"。
+- **修法**：在三个命令体里、`_build_request` 之后立刻挂（`_attach_progress`），
+  永远早于任何 `session.run`。判据：
+  `test_progress_hook_must_be_attached_before_session_run`（机制，直接断言
+  `config()` 认得出钩子）＋ `test_per_epoch_progress_reaches_read_job`（走真 job）。
+  **教训**：加钩子类能力时，判据必须走**最严的那条真实路径**，不能只验"我以为挂上了"。
+
+### A2. `SplitStep` 摘要里的 `test_size` **不决定**划分
+- **症状**：按界面/工具给的 `test = 25%` 去复现，实际划分却不是那个比例
+  （像模像样地错，且没人报错）。
+- **原因**：`SplitStep.apply` 把 `self.params.get("test_size", 0.25)` 写进摘要，
+  而真正划分用的是 `Pipeline.test_size`（`pipeline.py::_split`）⇒ 两个来源，
+  步骤参数改了摘要会跟着变、划分却不变。
+- **修法**：展示层**剔除**那个数（`engine._chain_summary`），真值由
+  `dataset_detail.split_policy`（取自 Pipeline 本体）单独给。
+  判据：`test_dataset_query_exposes_chain_params_and_real_split_policy`。
+- **附带（未修，属契约问题）**：`Pipeline.fingerprint()` 不含 `seed`
+  （`pipeline.py:391-395`）⇒ 换种子重切分**指纹不变**；若要"指纹能区分数据视图"，
+  得先改契约（`docs/契约.md`）再动实现。
+
+### A3. "表格能画出来"≠"面板喂得对参"：`surrogate` 的假迁移
+- **症状**：代理切片页在 web 端每次都"SVG 渲染失败 + 回退 PNG"（响亮，但根因被掩盖）。
+- **原因**：`opt/specs.SPEC_BY_KEY` 把 `surrogate` 登记成"已迁移到中立契约"，
+  但 `spec_surrogate_1d(bundle)` 吃的是**六元组**（要活的优化器实例算出的 GP 后验），
+  不是 `OptRecord` ⇒ 面板按统一约定喂 record 必抛 `TypeError`。
+  `test_plot_spec.py` 只按**页 key（字符串）**验"表里的函数能渲染"，
+  验不到"面板喂得对不对"。
+- **修法**：显式列为 `panel_web._PNG_ONLY_PAGES`，页面上说明为什么只有 PNG。
+  判据：`test_surrogate_page_is_honestly_png_only`（拿**真的 PageSpec** 走一遍）。
+  **教训**：迁移类判据要拿**声明对象**验，光验名字表会漏。
+
+### A4. 工具**声明了**参数、处理函数却没收：`run_method.diag` 从来调不通
+- **症状**：调用方按 `parameters` 声明传 `diag` ⇒
+  `execute() got an unexpected keyword argument 'diag'`。
+- **原因**：`run_method` 的 `parameters` 里有 `diag`，但 `_run_method.execute`
+  的签名里**没有**它（声明与实现漂移）。而既有的 null 垫片探针只验
+  "显式 null 被丢掉"、`EXPECTED_DEFAULTED` 只看声明 ⇒ **没有一条真把
+  `diag=True` 发下去**，所以一直没被发现。
+- **修法**：补上签名并把 `diag` 放进 spec；判据
+  `test_ml_delivery.py::test_tool_params_stay_within_command_declaration`
+  两个方向一起钉（工具参数 ⊆ 命令声明；端到端真发一次并检验产物）。
+- **同批**：`submit_run` 缺 `persist`/`diag` ⇒ 长训练只能走它，于是
+  "AI 跑完人回 GUI 历史里看不到 / 拿不到归因页"。已补。
+- **教训**：给工具加参数时，**判据必须真调一次那个参数**，不能只比声明表。
+
+### A5. 从 `cfg.extras` 读"训练超参"：用户的覆写被静默忽略
+- **症状**：`run_custom(overrides={"epochs": 6})` 跑出来 60 个 loss 点
+  （默认 60 轮），参数看起来"设了"。
+- **原因**：方法体写成 `p = cfg.extras`，而**覆写是经 `cfg.overrides` 进来的**
+  （`extras` 只承载 `run_id` / `device` / `on_progress` / 自定义代码这些
+  **非参数**的运行级东西）⇒ `p.get("epochs", 60)` 永远拿默认值。
+- **修法**：用 `self.params(cfg)`（= 声明默认 + 运行级覆写，单一真源）。
+  判据：`test_ml_mecha.py::test_custom_network_runs_and_keeps_the_observation_surface`
+  断言"6 epoch 就是 6 个点"。
+- **为什么值得单列**：这是"参数形同生效"的又一例，而且**只在端到端断言
+  （点数）时才显形**——单元层看不出（`extras` 里确实没有那个键）。
+
+### A6. `run_id` 是确定性的 ⇒ 重跑会往**同一个** `tb/` 里追加
+- **症状**：一次 6 epoch 的训练，`describe_training` 读出 **60** 个 loss 点。
+- **原因**：`runner._run_id(method, seed)` 只由"方法名 + 种子"决定
+  ⇒ 同方法同种子**重跑会复用同一个 `runs/<id>/tb/`**（这是刻意的：让
+  TensorBoard 直播目录在跑之前就定死）。多份事件文件叠在同一目录里，
+  步数就累加了。
+- **修法**：这是**有意行为**，别当 bug 修；但**用固定 run_id 的判据必须
+  给一个独特的种子**（否则上一轮的事件会污染断言）。
+  代码侧的留痕机制是 `tb_series.read_run` 的 `duplicate_steps`
+  （同一步被写多次时如实报出来，不静默去重）。
+
+- **症状**：一次 6 epoch 的训练，`describe_training` 读出 **60** 个 loss 点。
+- **原因**：`runner._run_id(method, seed)` 只由"方法名 + 种子"决定
+  ⇒ 同方法同种子**重跑会复用同一个 `runs/<id>/tb/`**（这是刻意的：让
+  TensorBoard 直播目录在跑之前就定死）。多份事件文件叠在同一目录里，
+  步数就累加了。
+- **修法**：这是**有意行为**，别当 bug 修；但**用固定 run_id 的判据必须
+  给一个独特的种子**（否则上一轮的事件会污染断言）。
+  代码侧的留痕机制是 `tb_series.read_run` 的 `duplicate_steps`
+  （同一步被写多次时如实报出来，不静默去重）。
+
+### A7. 内部标记经 spec 传递 ⇒ 被当成"未声明的参数"，job 瞬间假完成
+- **症状**：给后台请求打了内部标记之后，job **立刻**以 `state=done` 结束、
+  `result_ref` 为空、进度 0 条。看着像"训练秒完"，**真相是它根本没跑**。
+- **原因**：标记是塞进 `spec` 的（`{"job_run": True}`），
+  而 `validate_spec` 只认**命令声明的参数** ⇒ 当场判"接受了未声明的参数"，
+  返回 `ok=False`。**最坏的地方是它不响亮**：job 的状态机把"函数正常返回"
+  记成 `done`，于是"失败"被包成"完成"。
+- **修法**：引擎在 `run` 里**校验之前**把标记摘出来（`clean_spec`），
+  转成显式形参 `self._job_run` 供 `_build_request` 消费。
+  判据：`test_ml_mecha.py::test_internal_job_marker_never_leaks_into_command_params`
+  （两个方向：标记不在任何命令参数面里；带标记跑一次**仍然成功且真落盘**）。
+- **教训**：凡是要给引擎传"内部意图"，**别走 spec**（那是命令参数面，有校验）；
+  走显式形参或 context。而且"job 说 done"不等于"事情做成了"——
+  要看 `result_ref` 与产物在不在。
+
+### A8. 同步 vs 后台：长任务只能用"信号 + 轮询"
+- **症状**：自定义网络的长训练用同步 `run_custom` 跑 ⇒ 10 分钟后客户端超时，
+  AI **拿不到 `run_id`**，训练白跑（数据在盘上，但没人知道它叫什么）。
+- **原因**（接口形态，不是 bug）：LLM 的一次工具调用本质是 HTTP 请求，
+  客户端**必须有超时**（本实例 `TOOL_CALL_TIMEOUT_MS = 600000`）；
+  且 MCP **没有"服务端主动推给模型"**这条路。
+  ⇒ "发一个开始信号 + 之后主动轮询"是**唯一可行**的长任务形态。
+- **修法**：`submit_run` 支持 `code=`（提交 `run_custom`），并补齐轮询面：
+  进度带 `loss`/`val_loss`（有界窗口，够判断早停）、带 **`run_id`**
+  （`result_ref` 只在终态才有 ⇒ 不带它就没法"边跑边查曲线"）、
+  后台任务**终态自动落盘**（job 状态只在进程内存，权威一重启句柄就没了）。
+- **配套**：`trainer` 的 epoch 边界现在是**协作式取消点** ⇒ `cancel_run`
+  对正在跑的训练真的能停（在此之前只能等它跑完）。
+  判据：`test_ml_mecha.py::test_background_custom_network_reports_progress_and_run_id`
+  （在**还在 running** 时就断言三件事，然后取消收尾）。

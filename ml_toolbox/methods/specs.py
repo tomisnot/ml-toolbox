@@ -14,10 +14,15 @@
 
 ## 迁移进度（如实标注，避免"看起来全迁完了"）
 
-已迁移：`fit_1d` · `importance` · `confusion` · `roc` · `forecast`。
-其余（`residual` · `pr` · `scatter_emb` · `silhouette` · `explained_variance` ·
-`anomaly_score` · `ts_residual` · `nn_dynamics` · `feature_attribution` · opt 那 5 个）
-**仍在 `plots.py` 里直接画**，逐批迁移；未迁移的页在 web 端仍走 PNG。
+- **ML 侧 14 个页 key 全在这张表里**（见下 `SPEC_BY_KEY`）；
+- 优化侧另有一张同款表（`opt/specs.SPEC_BY_KEY`，5 个 key）；
+- **还没迁的只有量子启发方法的 3 个页**（`qk` 量子核矩阵 / `qdist` 保真度距离 /
+  `mc` 记忆容量，住在 `methods/quantum.py`，仍在函数里直接调 `ax`）
+  ⇒ 这 3 页在 web 端走服务端 PNG；
+- ⚠ **`surrogate`（代理切片）不在上面任何一张表里，而且不该在里面**：
+  它由优化器实例在 `bo.py::inspect_pages` 现造，图要那个实例的 GP 后验，
+  不是"只吃存档"的自足页 ⇒ 面板显式把它列为**只能走 PNG**（见
+  `ml_mecha/panel_web.py::_PNG_ONLY_PAGES` 与被 `test_plot_spec.py` 钉住的那条判据）。
 """
 
 from __future__ import annotations
