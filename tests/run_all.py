@@ -38,9 +38,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PHASE_HEAVY = ["smoke_test.py", "test_ui.py", "test_opt.py", "test_regressions.py"]
 
 #: 阶段 2：时延敏感型（起服务/端点/dsh、HTTP 往返、`node --test`）。彼此并行，且在阶段 1 之后。
-#: `test_dsh_panel.py` **无条件**在列：它跑的是**仓内**的共享面板判据（`node --test`），
+#: `test_dsh_panel.py` **无条件**在列：它跑的是**本仓自有**的面板判据（`node --test`），
 #: 不依赖 mecha 仓；**硬依赖 `node`**（缺 node 即红——不把"存在但从不执行"当绿）。
-PHASE_SENSITIVE = ["test_dsh_panel.py"]
+#: ⚠ 2026-10-02：面板改成依赖 `@mecha/dsh-panel` 之后，**共享单测归框架门禁**
+#: （`mecha/checks/dsh_panel_selfcheck.py`），本入口只跑本仓自有的两份。
+#: `test_tensorboard.py` 一并放这一阶段：它跑一次真训练（产出事件文件）再读回，
+#: 属"起东西 + 往返"那一类。
+PHASE_SENSITIVE = ["test_dsh_panel.py", "test_tensorboard.py"]
 
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。

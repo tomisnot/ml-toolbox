@@ -74,7 +74,9 @@ ai = [
     "uvicorn>=0.30",
 ]
 #: 神经网络方法族（torch_mlp）。未装时其余方法照常可用。
-neural = ["torch>=2.0"]
+#: ``tensorboard`` 是**可选**的：装了才写事件文件（训练直播用）；没装训练照常
+#: ——见 `ml_toolbox/methods/neural/tb_log.py` 的三处 fail-safe。
+neural = ["torch>=2.0", "tensorboard>=2.0"]
 #: 优化框架的 TPE/ASHA 引擎适配。未装时自研引擎照常可用。
 optuna = ["optuna>=3.0"]
 

@@ -27,6 +27,20 @@ class TorchMLP(MLMethod):
     task = TASK_SUPERVISED
     target_kind = None
     tags = ("deep", "nonlinear", "gpu")
+
+    @staticmethod
+    def _tb_root():
+        """TensorBoard 事件目录的根（= 落盘同一个 ``RUNS_DIR``）。
+
+        ⚠ **惰性 import**：``core.persistence`` 会 import 本族的注册面，模块顶层 import 它会成环。
+        取不到就回 ``None`` ⇒ 调用方（recorder）退化成"不写 TensorBoard"，**训练照常**。
+        """
+        try:
+            from ...core.persistence import RUNS_DIR
+            return RUNS_DIR
+        except Exception:
+            return None
+
     param_schema = [
         ParamSpec("hidden", "隐藏层", "text", "64,32",
                   hint="逗号分隔的每层宽度，如 128,64,32"),
@@ -81,7 +95,12 @@ class TorchMLP(MLMethod):
         model = self._build(p, Xs.shape[1], n_out, nn).to(dev)
         hidden = self._hidden_list(p)
         rec = TrainingRecorder(model, len(tr_idx), int(p["epochs"]),
-                               latent_every=int(p["latent_every"]))
+                               latent_every=int(p["latent_every"]),
+                               # ⭐ 直播：runner 在跑之前就定好 run_id（见 core/runner.py），
+                               #   经 cfg.extras 传下来 ⇒ 事件目录 runs/<run_id>/tb/ 全程不变，
+                               #   TensorBoard 指着它就能看曲线逐 epoch 长出来。
+                               run_id=str(getattr(cfg, "extras", {}).get("run_id") or ""),
+                               tb_root=self._tb_root())
         probe_n = min(256, len(tr_idx))
         probe_rows = tr_idx[:probe_n]
         probe = torch.tensor(Xs[probe_rows], dtype=torch.float32, device=dev)

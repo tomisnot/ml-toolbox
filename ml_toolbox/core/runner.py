@@ -97,6 +97,12 @@ def run_one(method: MLMethod, spec: DataSpec,
     perf0 = time.perf_counter()
     timer = _StageTimer()
     resource_estimate = None
+    # ⭐ **跑之前就定死 run_id**（原来在 return 处现算）。
+    # 为什么必须在前面：神经网络族的 TensorBoard 事件要**逐 epoch 实时写**到
+    # `runs/<run_id>/tb/`，而那个目录一路不能变（变了直播就断）。
+    # 经 `cfg.extras` 往下传；末态构造 RunRecord 时**复用同一个值** ⇒ 目录名与记录名一致。
+    run_id = cfg.extras.get("run_id") or _run_id(method.name, cfg.seed)
+    cfg.extras["run_id"] = run_id
     try:
         with timer.stage("guard"):
             resource_estimate = _resource_guard(method, spec, cfg)
@@ -149,7 +155,7 @@ def run_one(method: MLMethod, spec: DataSpec,
     timer.ensure("guard", "split", "fit", "predict", "evaluate", "cv")
     timer.values["legacy_elapsed"] = res.elapsed
     timer.values["total"] = max(0.0, time.perf_counter() - perf0)
-    return RunRecord(run_id=_run_id(method.name, cfg.seed),
+    return RunRecord(run_id=run_id,
                      method=method.name, family=method.family,
                      task=method.task, target_kind=spec.target_kind,
                      dataset=spec.meta.get("dataset", ""),

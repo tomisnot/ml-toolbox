@@ -15,18 +15,36 @@ from __future__ import annotations
 
 import numpy as np
 
+try:                                    # ⚠ 可选：TensorBoard 不在时训练照常
+    from .tb_log import TensorBoardLog
+except Exception:                       # pragma: no cover - 包结构异常时的兜底
+    TensorBoardLog = None               # type: ignore[assignment]
+
 
 class TrainingRecorder:
-    """挂在 torch 训练循环上的采集器（torch 惰性 import）。"""
+    """挂在 torch 训练循环上的采集器（torch 惰性 import）。
+
+    ## TensorBoard（可选、逐 epoch 直播）
+
+    传 ``run_id`` + ``tb_root`` 时，每个 epoch 会把已采集的量**实时**写进
+    ``<tb_root>/<run_id>/tb/``（见 ``tb_log.py`` 的轴映射）。⇒ TensorBoard 进程
+    指着 ``<tb_root>/<run_id>`` 就能看到曲线**逐 epoch 长出来**（人看 Web，
+    AI 用 ``EventAccumulator`` 读同一份）。
+    ⚠ **不传就是纯采集器**，行为与从前逐字一致（老调用方零改动）。
+    """
 
     def __init__(self, model, n_samples: int, epochs: int,
                  latent_every: int = 5, max_latent_samples: int = 600,
-                 dead_threshold: float = 1e-6):
+                 dead_threshold: float = 1e-6,
+                 run_id: str = "", tb_root=None, tb_enabled: bool = True):
         self.model = model
         self.epochs = epochs
         self.latent_every = max(1, latent_every)
         self.max_latent = max(1, max_latent_samples)
         self.dead_thr = dead_threshold
+        self.tb = (TensorBoardLog(run_id, tb_root, enabled=tb_enabled)
+                   if (TensorBoardLog is not None and run_id and tb_root is not None)
+                   else None)
         self.history = {"epoch": [], "loss": [], "val_loss": [], "lr": [],
                         "grad_norm": [], "dead_relu": []}
         self._layer_names = [n for n, p in model.named_parameters()
@@ -132,6 +150,10 @@ class TrainingRecorder:
                                    or ep == self.epochs - 1):
             self._snapshots.append((ep, self._project_latent(latent)))
 
+        # ⭐ 逐 epoch 直播（本 epoch 的量已在上面全部采集完）——写失败只记账，不拖垮训练。
+        if self.tb is not None:
+            self.tb.log_epoch(ep, self.history, self.grads)
+
     def set_probe(self, X_tensor, labels=None, probe_idx=None):
         """设置 probe；只计算一次行选择，标签/原行号与 latent 帧永久对齐。"""
         self._probe = X_tensor
@@ -235,4 +257,20 @@ class TrainingRecorder:
             "权重范数": [float(np.linalg.norm(last[n])) for n in rows],
             "死ReLU比例": dead_col,
         }, index=rows)
+
+        # ⭐ TensorBoard 收尾：权重直方图 / 范数、latent 帧、逐层健康表。
+        # 标量已在每个 epoch 实时写过；这里补"只在收尾才完整"的那几轴。
+        if self.tb is not None:
+            last_ep = int(self.history["epoch"][-1]) if self.history["epoch"] else 0
+            self.tb.log_weights(out["nn_weights"], last_ep)
+            if "nn_latent" in out:
+                self.tb.log_latent_frames(out["nn_latent"],
+                                          out.get("nn_latent_epochs"))
+            self.tb.log_layers_table(out.get("nn_layers"), last_ep)
+            self.tb.close()
         return out
+
+    @property
+    def tb_errors(self) -> tuple[str, ...]:
+        """TensorBoard 写失败记录（诊断用；空 = 一路顺利）。"""
+        return self.tb.errors if self.tb is not None else ()

@@ -2,19 +2,22 @@
 """dsh 面板判据（TS 侧）的**仓内入口**：把 `node --test` 挂进 ML 的门禁。
 
 为什么要有它（R10：**全绿只对判据覆盖到的路径成立**）：面板的两条关键性质
-（地址路由"绝不回落"、面板"绝不空白/读不到≠空表"）写在 TS 里、跑在 `node --test` 下，
+(地址路由"绝不回落"、面板"绝不空白/读不到≠空表"）写在 TS 里、跑在 `node --test` 下，
 而本仓的门禁是 `python tests/run_all.py`。不把入口挂进来 ⇒ 那些判据**存在但从不在门禁里执行**
 ——正是 mecha README 点名的"存在但从不执行"的假绿。
 
-跑的是 **6 份**文件（都不需要 `dsh/node_modules`，只需 PATH 上有 `node` ≥ 22.6 原生剥类型）：
+## ⚠ 2026-10-02：资产副本删掉之后，这里只剩【本仓自有】的两份
 
-* **共享 4 份**（与 `mecha/dsh-panel/` 参考实现逐字一致，**不许改**；
-  `dsh/test/panel-assets.test.ts` 的常量指纹守卫钉着它们）：
-  `src/dsh-panel/monitor-url.test.ts` / `monitor-client.test.ts` /
-  `panel-data.test.ts` / `panel-view.test.ts`；
-* **本仓自有 2 份**（不在指纹表里 ⇒ 用例数下限单独守，见下）：
-  `test/panel-assets.test.ts`（指纹 + 入口级导入闭包）、
-  `test/panel-extra-pages.test.ts`（附加页声明与真渲染）。
+面板主体已改成**依赖** `@mecha/dsh-panel`（junction，单一副本在 mecha 仓）⇒
+
+* **共享单测 7 份**（原 `src/dsh-panel/*.test.ts`）**不再随本仓**，
+  改由**框架门禁** `mecha/checks/dsh_panel_selfcheck.py` 跑（78 条，硬依赖 node、不许 skip）。
+  ⇒ 本入口**不再重复跑它们**（跑两遍是同一条性质的两处实现，且副本已不存在）。
+* `test/panel-assets.test.ts`（指纹 + "副本没漂"）**随副本一起删除**：它守的对象
+  （"三份副本与参考实现逐字一致"）已被"单一副本"**结构性消灭**——不是不守了，是无可守。
+* 本仓保留下来的都是**本仓自己的**性质：注入往返、client 闭包零 `node:`、附加页声明与真渲染。
+
+跑的是 **2 份**文件（都不需要 `dsh/node_modules`，只需 PATH 上有 `node` ≥ 22.6 原生剥类型）。
 
 ⚠ **硬依赖 `node`：缺 node 即红，不软跳过**（软跳过就是上面那种假绿；框架侧与 GP 同款纪律）。
 ⚠ **只看 exit code 不够**：`node --test` 在"全被跳过"时也是 0 ⇒ 本入口断言
@@ -34,27 +37,25 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 DSH_DIR = REPO / "dsh"
 
-#: 相对 `dsh/` 的判据文件（**共享 4 份在前**，本仓自有 2 份在后）。
+#: 相对 `dsh/` 的判据文件（**全是本仓自有**；共享的那 7 份归框架门禁，见模块 docstring）。
 NODE_TEST_FILES = (
-    "src/dsh-panel/monitor-url.test.ts",
-    "src/dsh-panel/monitor-client.test.ts",
-    "src/dsh-panel/panel-data.test.ts",
-    "src/dsh-panel/panel-view.test.ts",
-    "test/panel-assets.test.ts",
+    "test/ml-panel.test.ts",
     "test/panel-extra-pages.test.ts",
 )
 
-#: **本仓自有**的那两份（不在参考指纹表里）。
-PROJECT_TEST_FILES = ("test/panel-assets.test.ts", "test/panel-extra-pages.test.ts")
+#: **本仓自有**的判据（= 上面那两份；名字保留，语义从"不在参考指纹表里"变为"本仓独有"）。
+PROJECT_TEST_FILES = ("test/ml-panel.test.ts", "test/panel-extra-pages.test.ts")
 
-#: 本仓自有判据的**用例数下限**（写下限时的实测值 = 10：指纹 3 + 闭包 1 + 附加页 6）。
+#: 本仓自有判据的**用例数下限**（写下限时的实测值 = 10：`ml-panel.test.ts` 4 + `panel-extra-pages.test.ts` 6）。
 #:
-#: 为什么单独守它：共享 4 份**在**指纹表里 ⇒ 改它们必红；而这两份是项目自有、**不在**表里
-#: ⇒ 删掉若干用例时，指纹守卫与"全绿"都不会响——那就是"守卫被悄悄抽空"。
+#: 为什么单独守它：这两份是项目自有、**不在**任何指纹表里
+#: ⇒ 删掉若干用例时，"全绿"不会响——那就是"守卫被悄悄抽空"。
 #: ⚠ **有意增删用例时同步改这个数**，并在下面留一行变更记录。
 #:
 #: 变更记录：
 #: * — → **10**（2026-09-26 首次挂门禁）：指纹 3 条 + 入口级闭包 1 条 + 附加页 6 条。
+#: * **10 → 10**（2026-10-02 副本删除后重组）：指纹 3 条与"副本"一起退场；
+#:   闭包/注入往返 4 条移到 `ml-panel.test.ts`（1+3），附加页仍 6 条 ⇒ **合计不变**。
 PROJECT_TEST_FLOOR = 10
 
 _COUNT_RE = re.compile(r"^\u2139\s+(tests|pass|fail|skipped)\s+(\d+)\s*$", re.M)

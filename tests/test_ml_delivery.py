@@ -1275,8 +1275,22 @@ def test_monitor_runs_route_fails_loud_instead_of_faking_empty():
 
 
 def test_monitor_extra_routes_are_registered_and_core_routes_untouched():
-    """两条 ML 附加路由经框架 ``add_route`` 注册，且不覆盖四个核心路由。"""
+    """ML 的附加路由经框架 ``add_route`` 注册，且不覆盖四个核心路由。
+
+    ## 为什么这里钉的是**全集**（而不是"至少包含某几条"）
+
+    多注册一条 = 面板/AI 多一个能读的面（**面是承诺**），漏注册一条 = 承诺了却调不到。
+    两者都该被看见 ⇒ 钉全集，**有意增删时同步改这里并说明**。
+
+    变更记录：
+    * — → `{"/runs", "/summary"}`（迁移到框架 cockpit 时的两条附加页数据源）。
+    * — → 加 `{"/latest", "/series", "/dashboard"}`（2026-10-02 TensorBoard 集成）：
+      `/latest` 与 `/series` 给 AI 与人读训练数值（读事件文件）；
+      `/dashboard` 起 TensorBoard 辅进程并回它的地址（**起不来会回可读 reason，不假装**）。
+    """
     from ml_mecha.monitor_http import MonitorEndpoint
+
+    expected = {"/runs", "/summary", "/latest", "/series", "/dashboard"}
 
     with tempfile.TemporaryDirectory(prefix="ml-delivery-routes-") as td:
         root = Path(td)
@@ -1284,9 +1298,12 @@ def test_monitor_extra_routes_are_registered_and_core_routes_untouched():
             monitor = MonitorEndpoint(ml, mcp_port=host.port,
                                       port_file=root / ".ml-monitor-port")
             try:
-                assert monitor.routes() == ["/runs", "/summary"], monitor.routes()
-                # 重名 fail loud（核心路由不可覆盖；两条附加路由不可重注册）
-                for path in ("/status", "/summary"):
+                got = set(monitor.routes())
+                assert got == expected, (
+                    f"附加路由全集对不上。缺={sorted(expected - got)} "
+                    f"多={sorted(got - expected)}（有意增删请同步改本判据并留变更记录）")
+                # 重名 fail loud（核心路由不可覆盖；已注册的附加路由不可重注册）
+                for path in ("/status", "/summary", "/latest", "/dashboard"):
                     try:
                         monitor._endpoint.add_route(path, lambda _q: {})
                     except Exception as exc:                     # noqa: BLE001
@@ -1386,7 +1403,7 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
         "host 半不该自己写端口文件名（单一来源是参数块 PANEL_CONFIG.PORT_FILE）"
 
     # 页签：标准两页的文案默认在资产里；ML 的两条附加页文案在本仓 client 数据层里
-    panel_data = (dsh_dir / "src" / "dsh-panel" / "panel-data.ts").read_text(
+    panel_data = (dsh_dir / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-data.ts").read_text(
         encoding="utf-8")
     for label in ("飞行记录仪", "配置态"):
         assert label in panel_data, f"共享面板缺少标准页签 {label!r}"
@@ -1408,7 +1425,7 @@ def test_panel_runs_page_shows_readable_error_instead_of_blank():
     """
     client = (REPO / "dsh" / "src" / "client" / "extraPages.ts").read_text(
         encoding="utf-8")
-    view = (REPO / "dsh" / "src" / "dsh-panel" / "panel-view.ts").read_text(
+    view = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-view.ts").read_text(
         encoding="utf-8")
     # 资产把"读不到"渲染成 `unreadableText` + 真因（不是空表）
     assert "spec.unreadableText" in view and "result.failure.detail" in view, \
@@ -1419,12 +1436,12 @@ def test_panel_runs_page_shows_readable_error_instead_of_blank():
     assert "不是空的" in client, "错误文案没有与「确实没有数据」区分开"
     assert "磁盘存档读取失败" in client, "附加页缺少可读的失败文案"
     # 资产自测覆盖"每条分支都非空"（这条性质在 npm test 里跑；此处确认判据存在，不是被删了）
-    view_test = (REPO / "dsh" / "src" / "dsh-panel" / "panel-view.test.ts").read_text(
+    view_test = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-view.test.ts").read_text(
         encoding="utf-8")
     assert "每条分支都返回**非空**可读 HTML" in view_test, \
         "资产自测里少了「每条分支都非空」那条（性质没被守）"
     # 附加页失败**不牵连**标准两页：取数把它们单独返回（不塞进 panelState 的 extra）
-    data = (REPO / "dsh" / "src" / "dsh-panel" / "panel-data.ts").read_text(
+    data = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-data.ts").read_text(
         encoding="utf-8")
     assert "extraRoutes: ExtraRoute[] = []" in data and "extras[r.id] =" in data, \
         "loadPanel 没有把附加页取数单独返回（失败会牵连标准两页）"
@@ -1690,7 +1707,7 @@ def test_panel_client_half_uses_same_origin_fetch_not_command():
     assert got["injectedExtraIds"] == ["summary", "runs"], got
 
     # 取址走共享资产的管线：同源 fetch + `cache: no-store` + 失败落 `address` 档
-    pipeline = (REPO / "dsh" / "src" / "dsh-panel" / "monitor-client.ts").read_text(
+    pipeline = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "monitor-client.ts").read_text(
         encoding="utf-8")
     assert "doFetch(routePath, { cache: 'no-store' })" in pipeline, \
         "共享管线没有同源 fetch 地址路由"

@@ -108,6 +108,46 @@ def _limit_of(query: Mapping[str, list[str]], default: int = 50) -> int:
     return int(raw) if raw.isdigit() else default
 
 
+def _run_id_of(query: Mapping[str, list[str]]) -> str:
+    """``/latest`` 与 ``/series`` 的 ``run_id`` 参数（缺省空串）。"""
+    return str((query.get("run_id") or [""])[0] or "")
+
+
+def tb_latest(ml: Any, run_id: str = "") -> dict:
+    """**最新一轮**的训练数值（AI 与面板都读这一条）。
+
+    ``run_id`` 省略时取**最近落盘的 run**（`runs/` 新→旧的第一条）——这正是
+    "AI 刚提交完训练、想知道跑到哪了"的那一问。
+
+    ⚠ **读不到就说读不到**（``available: false`` + ``reason``），**绝不回空数组假装**。
+    """
+    from . import tb_series
+    rid = run_id
+    if not rid:
+        try:
+            recs = archived_runs(1)
+            rid = str(recs[0].get("run_id") or "") if recs else ""
+        except Exception:
+            rid = ""
+    if not rid:
+        return {"available": False, "reason": "还没有落盘的 run（先跑一次）"}
+    return tb_series.latest_of(tb_series.read_run(rid))
+
+
+def tb_run_series(run_id: str, limit: int = 500) -> dict:
+    """**整条序列**（逐 epoch 曲线）+ 表格行（供共享面板的附加页直接渲染）。"""
+    from . import tb_series
+    if not run_id:
+        return {"available": False, "reason": "需要 run_id"}
+    payload = tb_series.read_run(run_id, limit=max(1, int(limit)))
+    if payload.get("available"):
+        payload["rows"] = tb_series.rows_of(payload)
+    else:
+        payload["rows"] = []
+    return payload
+
+
+
 class MonitorEndpoint:
     """只读监控端点（薄壳：委托框架 ``MonitorEndpoint``）+ ML 的两条附加路由。
 
@@ -120,6 +160,9 @@ class MonitorEndpoint:
         self._ml = ml
         self._started_at = time.time()
         self._mcp_port = mcp_port
+        self._log = log
+        #: TensorBoard 辅进程（**惰性**：只有真被请求时才起，训练路径零开销）
+        self._tb: Any = None
         # 运行期事实：闭包持有 self，故 status_extra 每次请求都读到**当前**端口
         # （monitor_port 只有 bind 之后才知道，构造期填不了常量）。
         self._endpoint = _MonitorEndpoint(
@@ -133,6 +176,35 @@ class MonitorEndpoint:
         self._endpoint.add_route(
             "/runs", lambda query: {"rows": archived_runs(_limit_of(query)),
                                     "source": "runs/"})
+        # ---- TensorBoard：数据（读事件文件）与界面（辅进程）各一条 ----
+        # 数据：`/latest` 给"最新一轮"（AI 研判用），`/series` 给整条曲线（面板折线用）。
+        self._endpoint.add_route("/latest", lambda query: tb_latest(
+            self._ml, _run_id_of(query)))
+        self._endpoint.add_route("/series", lambda query: tb_run_series(
+            _run_id_of(query), _limit_of(query, 500)))
+        self._endpoint.add_route("/dashboard", lambda _query: self.dashboard())
+
+    # ------------------------------------------------------------ TensorBoard 辅进程
+    def dashboard(self, *, action: str = "start") -> dict:
+        """起/停/查 TensorBoard 辅进程，回它给人看的地址。
+
+        ⚠ 它是**独立进程 + 端口文件发现**：窗口的开合不归训练管（训练不需要知道它在不在）。
+        起不来时回 ``{ready: false, reason}``，**不假装起了**。
+        """
+        from .dashboard import TensorBoardSidecar
+        if action == "stop":
+            if self._tb is not None:
+                self._tb.stop()
+            return {"ready": False, "stopped": True}
+        if action == "status":
+            return ({"ready": True, "url": self._tb.url, "port": self._tb.port}
+                    if self._tb is not None and self._tb.running
+                    else {"ready": False, "reason": "未运行"})
+        if self._tb is None:
+            from ml_toolbox.core.persistence import RUNS_DIR
+            self._tb = TensorBoardSidecar(RUNS_DIR, log=self._log)
+        return self._tb.start()
+
 
     def _status_extra(self) -> dict:
         """``/status`` 的 ML 附加键（键名与迁移前逐字相同）。"""
@@ -164,6 +236,13 @@ class MonitorEndpoint:
         return self._endpoint.start()
 
     def stop(self, timeout: float = 10.0) -> None:
+        # 辅进程归本端点管：端点停 ⇒ 顺手停它（否则留一个孤儿 Web 占端口）
+        if self._tb is not None:
+            try:
+                self._tb.stop()
+            except Exception:
+                pass
+            self._tb = None
         self._endpoint.stop(timeout)
 
     def __enter__(self) -> "MonitorEndpoint":
@@ -191,4 +270,5 @@ def start_monitor_endpoint(ml: Any, *, host: str = "127.0.0.1", port: int = 0,
 #: ——它们的权威归属分别是 ``mecha.cockpit`` 与 ``ml_mecha.runtime``，本仓零消费者
 #: （判据要用就直接去那两个地方取；R1：没有消费的转发面不留）。
 __all__ = ["MonitorEndpoint", "start_monitor_endpoint", "history_records",
-           "activity_records", "config_tree", "summary_view", "archived_runs"]
+           "activity_records", "config_tree", "summary_view", "archived_runs",
+           "tb_latest", "tb_run_series"]
