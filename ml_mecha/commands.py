@@ -231,7 +231,21 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "省略则由系统按动作补一句）", ""),
             CommandParam("code", "string", True,
                          "定义 `class Network` 的 Python 代码；只需实现 "
-                         "build(n_in, n_out, *, nn)，可选 loss/configure/forward_step"),
+                         "build(n_in, n_out, *, nn)，可选 loss/configure/forward_step。"
+                         "⚠ 也可用 `code_path` 从文件读（二选一）"),
+            CommandParam("code_path", "string", False,
+                         "从**文件**读网络代码（受已有数据根授权管辖）。"
+                         "调参跑多个组合时不必把同一份代码发 N 遍；"
+                         "回执会带上这个路径，便于与文件版本对齐", ""),
+            CommandParam("dry_run", "boolean", False,
+                         "**试跑**：编译 + 建模型 + 用**真实负载**跑几次一次前向，"
+                         "回逐模块形状轨迹与结构化归因；**不反传、不落盘、不计入"
+                         "实验记录**。形状类错误用它一次看清（否则一次一个往返）",
+                         False),
+            CommandParam("batch_probes", "array", False,
+                         "试跑要试的批大小列表（默认 1、2、训练批大小）。"
+                         "⚠ 批次相关的错**只有真数据才抓得到**"
+                         "（实测：本地 B=3 全绿、真实 B=2 就错）"),
             CommandParam("dataset_id", "string", False,
                          "数据集引用；留空用最近准备的一份", ""),
             CommandParam("overrides", "object", False,
@@ -254,7 +268,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
                       "current.seed", "current.device"),
         side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
         risk=RISK_MEDIUM,
-        extra_receipt_keys=("run_id", "elapsed_s", "error", "network_name"),
+        extra_receipt_keys=("run_id", "elapsed_s", "error", "network_name",
+                            "dry_run", "shapes", "batch_sizes_checked", "runs",
+                            "n_params", "modules", "code_path", "code_lines",
+                            "failed_batch_size", "loss_first_batch"),
     ),
     # ---- 训练后：把模型交给调用方的代码（NQS 的"外部函数口"） ----
     CommandSpec(

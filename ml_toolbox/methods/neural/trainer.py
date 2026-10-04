@@ -440,6 +440,8 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
     gstep = 0
     best_state = None
     last_extra: dict = {}
+    #: 最近一次 `on_step` 上报的**步级**指标（进回执：让"步"这一级也有数字可看）
+    last_step_metrics: dict = {}
     try:
         for ep in range(total):
             tot = torch.zeros((), dtype=torch.float32, device=dev)
@@ -467,10 +469,22 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                 optimizer.step()
                 tot = tot + loss.detach() * len(xb)
                 # ⭐ **步钩子**：预热（"前 N 步先只训模长"）需要一个"步"的概念。
+                #   ⭐ 从本轮起它还**能上报步级指标**：返回 dict 就写进 TB ⇒
+                #   `describe_training` 看得到"步"这一级的曲线。
+                #   为什么需要（实测）：NLL 在前 ~100 步内就崩到 0，而 epoch 级观测
+                #   **看不出它什么时候崩的** —— 最好的诊断信息死在"看不到"上。
                 if on_step is not None:
                     try:
                         with hook_device(torch, dev):
-                            on_step(model, gstep, ctx)
+                            said = on_step(model, gstep, ctx)
+                        if isinstance(said, dict) and said:
+                            if recorder.tb is not None:
+                                recorder.tb.log_step(said, gstep)
+                            last_step_metrics.clear()
+                            last_step_metrics.update({
+                                str(k): float(v) for k, v in said.items()
+                                if isinstance(v, (int, float))
+                                and not isinstance(v, bool)})
                     except Exception:                          # noqa: BLE001
                         on_step = None        # 观测/调度失败不拖垮训练（与进度钩子同纪律）
                 gstep += 1
@@ -570,6 +584,9 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
             # 最后一轮上报的自定义指标：让它**同时进回执**（TB 那条路给"看曲线"，
             # 这条给 `describe_run`/`compare_methods` 的"看数字"）
             "last_extra": dict(last_extra),
+            # 步级指标（`on_step` 的返回）：TB 那条给**曲线**，这条给**数字**，
+            # 两者同一批 tag ⇒ 回执与曲线不会各说各话。
+            "last_step_metrics": dict(last_step_metrics),
             "last_state": last_state, "best_state": best_state}
 
 

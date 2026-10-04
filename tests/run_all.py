@@ -61,7 +61,9 @@ PHASE_GRAPH = ["test_problem.py",
                # NQS 路径（逐行负载/复数/checkpoint/eval_custom/分组留出）：
                # 它跑**真训练**（torch，多条判据各训几轮）且与 `test_problem.py`
                # 同属"张量 + 一跑就占满多核"那一类 ⇒ 同一个阶段串行跑。
-               "test_nqs_path.py"]
+               "test_nqs_path.py",
+               # AI 往返成本（试跑 / 步级观测 / code_path / 负载继承）：同样跑真 torch。
+               "test_ai_efficiency.py"]
 
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。

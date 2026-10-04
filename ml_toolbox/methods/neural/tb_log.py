@@ -211,6 +211,30 @@ class TensorBoardLog:
             if np.isfinite(v):
                 self._safe(f"scalar/{tag}", w.add_scalar, str(tag), v, step)
 
+    def log_step(self, tags: dict | None, step: int) -> None:
+        """**步级**标量（`Network.on_step` 的返回值）。
+
+        ## 为什么必须有（实测：最好的诊断信息死在"看不到"上）
+
+        反馈者的 NQS 训练里 **NLL 在前约 100 步内就崩到 0**（模型从此跑向均匀分布、
+        最终只比均匀基线好一点点），而 4500 步的训练在 epoch 级观测上只表现为
+        "每轮一个值" ⇒ **看不出它什么时候崩、崩得多快**；他只能在本地脚本里
+        逐轮打印才发现。
+
+        ⇒ 给"步"这一级一个指标面：`on_step` 返回 dict 就走这里写进 TB，
+        而 `describe_training` 读**全部** scalar tag ⇒ 立刻看得到（查询面不用改）。
+        """
+        w = self._ensure()
+        if w is None or not tags:
+            return
+        for tag, value in tags.items():
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v):
+                self._safe(f"step/{tag}", w.add_scalar, str(tag), v, int(step))
+
     def log_weights(self, weights: dict | None, step: int) -> None:
         """权重直方图 + 权重的起始/末态/更新量范数（随时间各一条标量）。"""
         w = self._ensure()

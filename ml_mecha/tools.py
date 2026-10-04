@@ -299,6 +299,8 @@ def _eval_custom(engine: MLEngine, wrap,
                 # **看得见**，而不是等代码里 KeyError 才发现
                 "n_payload_arrays": int(receipt.get("n_payload_arrays") or 0),
                 "payload_keys": list(receipt.get("payload_keys") or []),
+                # ⭐ 数据是**给的**还是**继承训练时的**（免得"评估用哪份数据"变成猜）
+                "payload_source": receipt.get("payload_source", ""),
                 "note": receipt.get("note", ""),
                 "warnings": list(receipt.get("warnings") or []),
                 "error": receipt.get("error", "")}
@@ -808,11 +810,12 @@ def _run_custom(engine: MLEngine, wrap,
     `describe_training` 观测面全部白拿，因为它跑的就是一台 `MLMethod`）。
     """
 
-    def execute(*, code: str, dataset_id: str = "",
+    def execute(*, code: str = "", dataset_id: str = "",
                 overrides: Mapping[str, Any] | None = None, seed: int | None = None,
                 diag: bool = False, persist: bool = False, name: str = "",
                 resource_guard: Mapping[str, Any] | None = None,
-                device: str = ""
+                device: str = "", dry_run: bool = False,
+                batch_probes: Any = None, code_path: str = ""
                 ) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "run_custom", "code": str(code),
                                 "diag": bool(diag), "persist": bool(persist)}
@@ -828,27 +831,75 @@ def _run_custom(engine: MLEngine, wrap,
             spec["resource_guard"] = dict(resource_guard)
         if device:
             spec["device"] = str(device)
-        receipt = _raise_on_failure(engine.run(spec, context=_local_context()))
+        if dry_run:
+            spec["dry_run"] = True
+        if batch_probes:
+            spec["batch_probes"] = list(batch_probes)
+        if code_path:
+            spec["code_path"] = str(code_path)
+        receipt = engine.run(spec, context=_local_context())
+        # ⭐ 试跑的回执与真跑**不同形**：多给形状轨迹、少给 run_id（它没有 run）
+        #
+        # ⚠ **试跑失败不抛错**：`ok=false` 不是一个"命令失败"，而是"你的代码跑不起来"
+        #   这个**问题的答案** —— 而答案里最值钱的正是**形状轨迹**（哪一层、收到什么）。
+        #   抛错会把它整条丢掉（实测：一抛就只剩一句话），那等于白跑这一趟。
+        if receipt.get("dry_run"):
+            return {"ok": bool(receipt["ok"]), "dry_run": True, "run_id": "",
+                    "network_name": receipt.get("network_name", ""),
+                    "primary_metric": "", "metrics": {},
+                    "shapes": list(receipt.get("shapes") or []),
+                    "runs": list(receipt.get("runs") or []),
+                    "batch_sizes_checked": list(receipt.get("batch_sizes_checked") or []),
+                    "failed_batch_size": receipt.get("failed_batch_size"),
+                    "n_params": int(receipt.get("n_params") or 0),
+                    "modules": list(receipt.get("modules") or []),
+                    "loss_first_batch": receipt.get("loss_first_batch"),
+                    "code_path": receipt.get("code_path", ""),
+                    "code_lines": int(receipt.get("code_lines") or 0),
+                    "elapsed_s": receipt.get("elapsed_s", 0.0),
+                    "warnings": list(receipt.get("warnings", [])),
+                    "error": receipt.get("error", ""),
+                    "error_kind": receipt.get("error_kind", ""),
+                    "error_hint": receipt.get("error_hint", "")}
+        receipt = _raise_on_failure(receipt)
         return {"ok": bool(receipt["ok"]), "run_id": receipt.get("run_id", ""),
                 "network_name": receipt.get("network_name", ""),
                 "primary_metric": receipt.get("primary_metric", ""),
                 "metrics": dict(receipt.get("metrics", {})),
                 "elapsed_s": receipt.get("elapsed_s", 0.0),
+                "code_path": receipt.get("code_path", ""),
                 "warnings": list(receipt.get("warnings", [])),
                 "error": receipt.get("error", "")}
 
     return define_tool(
         name="run_custom",
         description="跑一段**自定义网络代码**：代码只需要定义 `class Network` 并实现 "
-                    "`build(self, n_in, n_out, *, nn)`（返回 nn.Module），"
-                    "可选 `loss` / `configure` / `forward_step`。"
+                    "`build(self, n_in, n_out, *, nn, ctx=None)`（返回 nn.Module；"
+                    "`ctx` 给负载形状），可选 `loss` / `configure` / `forward_step` / "
+                    "`forward_graph` / `on_step` / `metrics`。"
                     "训练循环、TensorBoard、逐 epoch 观测、指标、存档、检视页"
                     "**全部由系统代管**（所以残差/多分支/任意前向都能跑，"
                     "而 describe_training 照样读得到曲线）。"
-                    "⚠ 代码只写结构：**不许**自己写盘或碰 GUI（观测由系统统一负责）。",
+                    "⚠ 代码只写结构：**不许**自己写盘或碰 GUI（观测由系统统一负责）。"
+                    "⭐ **`dry_run=true` 先试跑**：用真实负载跑几次一次前向，"
+                    "回逐模块形状轨迹与结构化归因（不反传/不落盘/不计入记录）"
+                    "—— 形状类错误用它一次看清，否则一次一个往返。",
         parameters={
             "code": {"type": "string",
-                     "description": "定义 `class Network` 的 Python 代码"},
+                     "description": "定义 `class Network` 的 Python 代码；"
+                                    "也可用 `code_path` 从文件读（二选一）",
+                     "default": ""},
+            "code_path": {"type": "string",
+                          "description": "从**文件**读网络代码（受已有数据根授权管辖）"
+                                         "—— 调参跑多个组合时不必重发同一份代码",
+                          "default": ""},
+            "dry_run": {"type": "boolean",
+                        "description": "**只试跑**：编译 + 建模型 + 真实负载上一次前向，"
+                                       "回形状轨迹；不反传、不落盘、不计入实验记录",
+                        "default": False},
+            "batch_probes": {"type": "array",
+                             "description": "试跑要试的批大小（默认 1、2、训练批大小）。"
+                                            "⚠ 批次相关的错只有**真数据**才抓得到"},
             "dataset_id": {"type": "string",
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},

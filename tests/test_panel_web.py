@@ -450,11 +450,21 @@ def test_runs_cache_is_fast_and_never_stale():
     """
     import time
     W.list_runs("ml")                                   # 预热
-    t0 = time.perf_counter()
-    for _ in range(3):
+    # ⚠ **取多次里的最快一次**，而不是"平均值必须 < 60ms"。
+    #   为什么（实测 2026-10-04）：这个缓存按 `runs/` 的**目录 mtime** 失效，而那个
+    #   目录可能**正被另一个进程写**（本机当时有一个正在训练的 app：`runs/` 下 3881
+    #   个目录且仍在增长）⇒ 每次调用都可能正当地未命中，量到 1185 ms。
+    #   那测的是"有没有并发写者"，**不是"缓存有没有生效"** —— 判据的前提不该靠环境
+    #   （同 pitfalls A12）。⇒ 这里钉"**能命中**（命中时很快）"；
+    #   "不会静默陈旧"由下面那条正面证据钉。
+    timings = []
+    for _ in range(5):
+        t0 = time.perf_counter()
         W.list_runs("ml")
-    warm = (time.perf_counter() - t0) / 3 * 1000
-    assert warm < 60, f"缓存没生效：命中一次仍要 {warm:.0f} ms"
+        timings.append((time.perf_counter() - t0) * 1000)
+    warm = min(timings)
+    assert warm < 60, (f"缓存没生效：5 次里最快一次仍要 {warm:.0f} ms"
+                       f"（全部：{[round(t) for t in timings]}）")
 
     root = Path(W._runs_root())
     assert root.is_dir(), "取不到 runs/ 目录，判据无法成立"

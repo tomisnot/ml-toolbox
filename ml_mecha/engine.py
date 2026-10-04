@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextvars
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1018,16 +1019,36 @@ class MLEngine(Engine):
         decl = spec.get("payload")
         if decl:
             payload = {**payload, **self._parse_payload_decl(decl, n_rows=None)}
-        # ⚠ **刻意不"继承训练时的负载"**：评估通常要看**训练没见过**的数据（需求原文
-        #   就是"换个没见过的 N 评估"）⇒ 悄悄拿训练数据来评估会给出一个"看着对、
-        #   其实在测内插"的数字，那正是本仓最忌的假事实。
-        #   ⇒ 没有数据时**明说**（回执 warnings + 取负载时的可教学 KeyError）。
+        # ⭐ **默认继承训练时的负载**（反馈建议 4，他两次提到）：不显式给数据时，
+        #   从 checkpoint 里那份**声明**重建（`arrays` 直接用；`hdf5` 按路径重读，
+        #   受同一套数据根授权管辖 ⇒ 跨重启也成立）。
+        #   ⚠ 为什么这次改主意（上一轮我刻意不继承）：他的用法是"在原数据上复评"，
+        #   每次重传几十 KB 是纯粹的浪费。但**继承必须响亮**——回执会写
+        #   `payload_source`，免得"评估用的到底是哪份数据"变成猜的。
+        payload_source = ("given" if payload else "")
         warn: list[str] = []
+        # ⚠ **"显式说了"与"没说"要区分**：调用方给了 `payload`/`dataset_id` 就是明确表态，
+        #   哪怕解析出来是空的（例如 `{"arrays": {}}`）—— 那时**不去继承**，
+        #   否则"我明确说了不要数据"会被悄悄改成"用训练那份"（实测踩过）。
+        explicit = bool(spec.get("payload")) or bool(ds_id)
+        if not payload and not explicit:
+            from ml_toolbox.methods.neural.custom import load_checkpoint_meta
+            meta_ck = load_checkpoint_meta(run_id, which=str(spec.get("which") or "best"))
+            decl_ck = meta_ck.get("payload_decl") or {}
+            if decl_ck:
+                try:
+                    payload = self._parse_payload_decl(decl_ck, n_rows=None)
+                    payload_source = "inherited_from_training"
+                except Exception as exc:                       # noqa: BLE001
+                    warn.append(
+                        f"继承训练负载失败（{type(exc).__name__}: {exc}）⇒ 这次评估"
+                        "**没有负载**；要评估请显式给 `dataset_id` 或 `payload`。")
         if not payload:
             warn.append(
                 "这次评估**没有负载**：若代码要读 `ctx['payload']`，请给 "
                 "`dataset_id=…`（复用会话里某份数据集）或 `payload=…`（现场给新数据）。"
-                "⚠ 训练时的负载**不随 checkpoint 走**（刻意如此：评估该用没见过数据）。")
+                "⚠ 正常情况下会**自动继承训练时的负载**；这次没有，多半是"
+                "**那次训练本身没给负载**，或声明里的 HDF5 已经读不到。")
         out = run_eval_code(run_id, code, which=str(spec.get("which") or "best"),
                             payload=payload, dataset_id=ds_id)
         return {
@@ -1039,6 +1060,8 @@ class MLEngine(Engine):
             "extra_keys": sorted((out.get("extra") or {}).keys()),
             "n_payload_arrays": len(payload),
             "payload_keys": sorted(payload),
+            # ⭐ 数据**从哪来**要看得见（given / inherited_from_training / 空）
+            "payload_source": payload_source,
             "note": out.get("note", ""),
             "error": out.get("error", ""),
             "error_kind": out.get("error_kind", ""),
@@ -1066,8 +1089,16 @@ class MLEngine(Engine):
         `finally` 里撤，连失败路径也不留垃圾。
         """
         code = str(spec.get("code") or "")
+        # ⭐ **代码可以从文件读**（反馈建议 3）：调参要跑 N 个组合时，
+        #   同一份 9 KB 代码不必发 N 遍。⚠ 受**已有**的 `dataset_roots` 管辖
+        #   （不新增授权面：读文件的口子只有一个）。
+        code_path = str(spec.get("code_path") or "")
+        if not code.strip() and code_path:
+            code = self._read_code_file(code_path)
+            spec = {**spec, "code": code}
         if not code.strip():
-            raise MechaError("run_custom 需要 code（定义 `class Network` 的代码）",
+            raise MechaError("run_custom 需要 code（定义 `class Network` 的代码）"
+                             "或 code_path（指向代码文件）",
                              kind="missing_code",
                              hint="code 是字符串；只需要实现 build(n_in, n_out, *, nn)")
         dataset_id = str(spec.get("dataset_id") or self._last_dataset_id() or "")
@@ -1075,6 +1106,14 @@ class MLEngine(Engine):
         entry = self.dataset_entry(dataset_id)
         assert entry is not None
         name = str(spec.get("name") or "").strip() or "custom"
+        # ⭐⭐ **试跑**（反馈建议 1，他评为最高性价比）：编译 + 建模型 + 用**真实负载**
+        #   跑几次一次前向，回逐模块形状轨迹与结构化归因。
+        #   ⚠ 三条边界：**不反传、不落盘、不计入实验记录**（不写状态、不建 run）。
+        #   为什么值得单开一条：他这次约 15 个往返都花在形状错上，而其中一类
+        #   （批次相关）**只有用真实负载才抓得到**。
+        if bool(spec.get("dry_run", False)):
+            return self._cmd_dry_run_custom(spec, entry, code, code_path, name,
+                                            context)
         method_name = _custom_method_name()
         # ⚠ **先注册再按注册表取 schema**：这样覆写校验用的就是"运行时真正那个方法"
         #   的声明，而不是另抄一份；且里外只有一个来源。
@@ -1088,6 +1127,14 @@ class MLEngine(Engine):
                 param_schema=self.method_param_schema(method_name))
             # ⭐ 代码经 extras 下传（字符串 ⇒ JSON 可序列化 ⇒ 能原样进 record.json）
             request.extras[_custom_code_key()] = code
+            # ⭐ **负载的"声明"也下传**：checkpoint 要把它存起来，`eval_custom` 才能
+            #   默认继承训练时的数据（反馈建议 4）。只存声明（HDF5 路径/小数组），
+            #   大数组留在原处按需读。
+            #   ⚠ 声明来自**登记数据那一步**（`spec.meta`），不在本次 `run_custom`
+            #     的参数里 —— 实测踩过：只看 `spec["payload"]` 会永远是空的。
+            request.extras["payload_decl"] = dict(
+                spec.get("payload") or entry.spec.meta.get("payload_decl") or {})
+            request.extras["code_path"] = code_path
             request.extras["network_name"] = name
             _attach_progress(request, context)
             self._write_state(
@@ -1118,6 +1165,10 @@ class MLEngine(Engine):
             "warnings": [warning] if warning else [],
             "run_id": summary.run_id,
             "network_name": name,
+            # ⭐ 代码从文件读时**把路径带出去**：AI 才能把它和文件版本对齐
+            #   （"我改了文件、跑的是不是新版本"是反馈里那类反复出现的疑问）
+            "code_path": code_path,
+            "code_lines": len(code.splitlines()),
             "elapsed_s": summary.elapsed_s,
             "error": warning,
             # 同 `run_method`：失败的可教学三件套（自定义网络的失败同样要能教）
@@ -1125,6 +1176,98 @@ class MLEngine(Engine):
             "error_hint": summary.error_hint,
             "error_suggest": summary.error_suggest,
         }
+
+    def _read_code_file(self, code_path: str) -> str:
+        """从文件读网络代码（反馈建议 3：`code_path`）。
+
+        ⚠ **受既有 `dataset_roots` 管辖**：读文件的口子只有一个（不新增授权面）。
+        路径不在允许根下 ⇒ 沿用 `_resolve_data_path` 的 fail-closed 拒绝。
+        """
+        path = self._resolve_data_path(code_path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = path.read_text(encoding="gbk")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise MechaError(
+                    f"读代码文件失败（要从 UTF-8 或 GBK 读）：{code_path}",
+                    kind="code_path_unreadable",
+                    hint="把源码存成 UTF-8 再试") from exc
+        except OSError as exc:
+            raise MechaError(
+                f"读代码文件失败：{code_path}（{exc}）",
+                kind="code_path_unreadable",
+                hint="确认路径存在；它必须在**已授权的数据根**之下"
+                     "（`dataset_roots.txt` / `--dataset-roots`）") from exc
+        if not text.strip():
+            raise MechaError(f"代码文件是空的：{code_path}",
+                             kind="code_path_empty",
+                             hint="文件里要定义 `class Network`")
+        return text
+
+    def _cmd_dry_run_custom(self, spec: dict[str, Any], entry: Any, code: str,
+                            code_path: str, name: str, context: Any
+                            ) -> Mapping[str, Any]:
+        """**试跑**：不反传、不落盘、不计入实验记录（反馈建议 1）。
+
+        为什么它不是"另开一条执行面"：它复用真跑的**同一套**准备与调用约定
+        （`prepare_supervised` / `_build_ctx` / `forward_step`）⇒ 试跑通过
+        **真的意味着**真跑的形状对得上。否则试跑只是另一种"看着对"。
+
+        ⚠ 它**仍然受写权门管辖**（同一个 `run_custom` 命令）：它在权威进程里
+        执行调用方的代码 —— "不写盘"不等于"无需授权"。
+        """
+        import torch                                          # noqa: F401
+        from ml_toolbox.methods.neural import dryrun as _dry
+        from ml_toolbox.methods.neural.custom import _network_of
+        from ml_toolbox.core.contracts import Problem
+
+        try:
+            net = _network_of(code)
+        except Exception as exc:                               # noqa: BLE001
+            return {"ok": False, "command": "run_custom", "dry_run": True,
+                    "run_ids": [], "primary_metric": "", "metrics": {},
+                    "warnings": [str(exc)], "run_id": "", "network_name": name,
+                    "error": str(exc),
+                    "error_kind": getattr(exc, "kind", "") or "code_error",
+                    "error_hint": getattr(exc, "detail", ""),
+                    "shapes": [], "batch_sizes_checked": [], "runs": [],
+                    "n_params": 0, "modules": [], "code_path": code_path,
+                    "code_lines": len(code.splitlines()),
+                    "elapsed_s": 0.0}
+        payload = dict(getattr(entry.spec, "aux", {}).get("payload") or {})
+        problem = Problem(entry.spec, allowed=tuple(entry.spec.aux or ()))
+        options = spec.get("overrides") or {}
+        # ⚠ `method_param_schema` 回的是**列表**（每项一个 dict），不是映射
+        #   （实测：当映射用会 `'list' object has no attribute 'items'`）
+        defaults = {str(d["key"]): d.get("default")
+                    for d in self.method_param_schema(_custom_method_name())
+                    if isinstance(d, dict) and "key" in d}
+        params = {**defaults, **dict(options)}
+        params["batch"] = int(params.get("batch", 64) or 64)
+        params["val_split"] = float(params.get("val_split", 0.2))
+        t0 = time.time()
+        # ⚠ 设备要**过清洗再 describe()**：`self._device` 是 DeviceSpec 对象，
+        #   直接 `str()` 会得到 `devicespec(kind='auto', …)`；而 `to_state()` 回的是
+        #   **dict**（`str(dict)` 同样不是 torch 认的字符串）——两条都是实测踩过的坑。
+        #   `describe()` 才是那个"能给 torch 的字符串"。
+        dev_state = clean_device(spec.get("device") or self._device).describe()
+        out = _dry.dry_run_network(
+            net=net, problem=problem, params=params, torch=torch,
+            device=str(dev_state), payload=payload,
+            batch_probes=spec.get("batch_probes"))
+        out.update({"command": "run_custom", "dry_run": True, "run_ids": [],
+                    "primary_metric": "", "metrics": {},
+                    "warnings": [], "run_id": "", "network_name": name,
+                    "code_path": code_path,
+                    "code_lines": len(code.splitlines()),
+                    "elapsed_s": round(time.time() - t0, 3)})
+        if out.get("ok"):
+            out["warnings"] = [] if out.get("loss_first_batch") is not None else [
+                "这次试跑**没能算损失**（网络没有 `loss` 钩子，或 target_kind=custom）"
+                "—— 形状对了，但损失语义没验"]
+        return out
 
     @staticmethod
     def _register_custom_method(code: str = "") -> None:
@@ -1476,6 +1619,11 @@ class MLEngine(Engine):
             return {}
         spec.aux = dict(spec.aux or {})
         spec.aux[AUX_PAYLOAD] = out
+        # ⭐ **声明本身也留一份**（`spec.meta`）：`run_custom` 要把它写进 checkpoint，
+        #   `eval_custom` 才能**默认继承训练时的数据**（反馈建议 4）。
+        #   ⚠ 存的只是**声明**（HDF5 路径 / 小数组），不是大数组。
+        spec.meta = dict(spec.meta or {})
+        spec.meta["payload_decl"] = dict(decl)
         try:
             from ml_toolbox.core.contracts import Problem
             return Problem(spec, allowed=(AUX_PAYLOAD,)).payload_facts()

@@ -516,8 +516,11 @@ EXPECTED_DEFAULTED = {
     "read_job": ["wait_s"],
     # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
     #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
-    # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）。
-    "run_custom": ["dataset_id", "device", "diag", "name", "persist"],
+    # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）；
+    # `dry_run`（False）与 `code_path`（""）也进了这张表。
+    # ⚠ `code` 现在**也有**默认（`""`）：为的是 `code_path` 能单独用（二选一）。
+    "run_custom": ["code", "code_path", "dataset_id", "device", "diag", "dry_run",
+                   "name", "persist"],
     "run_method": ["dataset_id", "device", "diag", "persist"],
     "run_method_batch": ["dataset_id"],
     # `method`/`code`/`name` 都声明了 `""` 默认 ⇒ 进这张表（"未给"= 空串）。
@@ -578,6 +581,8 @@ _DEFAULTED_PROBES = (
     ("run_custom", {"code": _MIN_NET_CODE}, "diag", True),
     ("run_custom", {"code": _MIN_NET_CODE}, "persist", True),
     ("run_custom", {"code": _MIN_NET_CODE}, "device", "cpu"),
+    ("run_custom", {"code": _MIN_NET_CODE}, "dry_run", True),
+    ("run_custom", {"code": _MIN_NET_CODE}, "code_path", "net.py"),
     ("run_method_batch", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("compare_methods", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
@@ -704,7 +709,7 @@ _MIN_ARGS = {
 #: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
 #: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
-_EXPECTED_OPTIONAL_PARAMS = 57
+_EXPECTED_OPTIONAL_PARAMS = 60
 
 
 def test_null_shim_rule_partitions_every_optional_param():

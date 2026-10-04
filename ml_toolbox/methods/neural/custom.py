@@ -145,6 +145,8 @@ class CustomNNMethod(MLMethod):
         dev = _trainer.resolve_device(run_extras.get("device", "auto"), torch)
         # ⭐ **逐行负载**（NQS 需求）：变长/复数数组按行切开，逐批放进 `forward_step` 的 ctx
         payload = _payload_of(problem)
+        # 训练负载的**声明**（引擎经 extras 下传）⇒ 写进 checkpoint，供 eval_custom 继承
+        payload_decl = dict(run_extras.get("payload_decl") or {})
         # ⚠ `SandboxError` 走**惰性 import**：本模块顶层 import ml_mecha 会成环
         #   （ml_mecha → ml_toolbox.api → methods）。别提到模块顶部。
         from ml_mecha.sandbox import SandboxError
@@ -184,11 +186,11 @@ class CustomNNMethod(MLMethod):
         from ml_mecha.sandbox import call_network_build
         # ⭐ **`build` 拿得到负载形状**（反馈 §2-缺口1）：只在 `build` 里"猜维度"，
         #   换个 N / 加一维特征就会**静默跑偏**（那是本仓最忌的假绿）。
-        model = call_network_build(
-            net, n_in, n_out, torch.nn,
-            ctx=_build_ctx(payload, n_rows=int(len(prep.Xs)), n_features=n_in,
-                           n_out=n_out, target_kind=kind, device=str(dev)))
-
+        #   ⚠ 这份 ctx 还要**进 checkpoint**（`build_ctx`）：否则 `eval_custom`
+        #   重建模型时给不出它，`build` 里读 `payload_shapes` 的网络会直接炸。
+        build_ctx = _build_ctx(payload, n_rows=int(len(prep.Xs)), n_features=n_in,
+                               n_out=n_out, target_kind=kind, device=str(dev))
+        model = call_network_build(net, n_in, n_out, torch.nn, ctx=build_ctx)
         # 损失/优化器：有钩子用钩子，否则给与 torch_mlp 一致的默认
         if callable(getattr(net, "loss", None)):
             lossf = net.loss(nn=torch.nn, n_out=n_out)
@@ -284,7 +286,12 @@ class CustomNNMethod(MLMethod):
         if learned:
             res.metrics.update({str(k): float(v) for k, v in learned.items()
                                 if isinstance(v, (int, float))})
-        if kind == "custom" or learned:
+        # ⭐ **步级指标**（`on_step` 的返回）也进回执：与 TB 曲线同一批 tag，
+        #   所以"回执里的数字"和"曲线上的点"不会各说各话。
+        step_m = dict(stats.get("last_step_metrics") or {})
+        if step_m:
+            res.metrics.update(step_m)
+        if kind == "custom" or learned or step_m:
             # 主指标：网络可显式声明（`Network.primary_metric = "fid/mean"`）；
             # 否则取**字典序第一个**（确定、可复现；不猜哪个"更重要"）。
             # ⚠ 自定义任务**必须覆盖** `_new_result` 给的默认（那是按 task/target_kind
@@ -329,7 +336,8 @@ class CustomNNMethod(MLMethod):
             run_id=run_id, res=res, stats=stats, source=str(compiled.source),
             params={k: v for k, v in p.items() if k != "custom_network_code"},
             target_kind=kind, n_in=n_in, n_out=n_out, device=str(dev),
-            meta={"n_train": int(len(prep.tr_idx)), "n_val": int(len(prep.va_idx))})
+            meta={"n_train": int(len(prep.tr_idx)), "n_val": int(len(prep.va_idx))},
+            payload_decl=payload_decl, build_ctx=build_ctx)
         if ckpt:
             res.artifacts["checkpoint_dir"] = np.array([ckpt["dir"]])
             # ⚠ 不能存 object 数组（写进 npz 读不回，实测踩过 `allow_pickle=False`）
@@ -366,6 +374,7 @@ class CustomNNMethod(MLMethod):
 
         p = self.params(cfg)
         run_extras = cfg.extras or {}
+        payload_decl = dict(run_extras.get("payload_decl") or {})
         dev = _trainer.resolve_device(run_extras.get("device", "auto"), torch)
         # ⚠ `SandboxError` 走**惰性 import**：本模块顶层 import ml_mecha 会成环
         #   （ml_mecha → ml_toolbox.api → methods）。别提到模块顶部。
@@ -401,10 +410,9 @@ class CustomNNMethod(MLMethod):
         problem.spec.y = pd.Series(yv)
 
         from ml_mecha.sandbox import call_network_build
-        model = call_network_build(
-            net, n_in, n_out, torch.nn,
-            ctx=_build_ctx(None, n_rows=int(len(problem.X)), n_features=n_in,
-                           n_out=n_out, target_kind=kind, device=str(dev)))
+        build_ctx = _build_ctx(None, n_rows=int(len(problem.X)), n_features=n_in,
+                               n_out=n_out, target_kind=kind, device=str(dev))
+        model = call_network_build(net, n_in, n_out, torch.nn, ctx=build_ctx)
 
         if callable(getattr(net, "loss", None)):
             lossf = net.loss(nn=torch.nn, n_out=n_out)
@@ -506,7 +514,8 @@ class CustomNNMethod(MLMethod):
             run_id=run_id, res=res, stats=stats, source=str(compiled.source),
             params={k: v for k, v in p.items()}, target_kind=kind,
             n_in=n_in, n_out=n_out, device=str(dev),
-            meta={"task_mode": "graph", "n_nodes": n_nodes})
+            meta={"task_mode": "graph", "n_nodes": n_nodes},
+            payload_decl=payload_decl, build_ctx=build_ctx)
         if ckpt:
             res.artifacts["checkpoint_dir"] = np.array([ckpt["dir"]])
             res.artifacts["checkpoint_files"] = np.array(["|".join(ckpt["files"])])
@@ -612,6 +621,35 @@ def make_custom_instance(code: str) -> CustomNNMethod:
 
 
 # ---------------------------------------------------------------- 网络钩子 / 负载 / 存档
+def load_checkpoint_meta(run_id: str, *, which: str = "best") -> dict:
+    """只读 checkpoint 的**元信息**（不装载模型、不内联权重）。
+
+    用途：`eval_custom` 要判断"训练时用的是什么负载"（反馈建议 4：默认继承）。
+    ⚠ 返回的是**声明**（`payload_decl`：HDF5 路径 + 数据集名，或小的内联数组），
+    不是大数组本身 —— 大数组留在原处按需读。
+    """
+    import torch
+    from ...core.persistence import RUNS_DIR
+
+    w = "last" if str(which or "best").lower() in ("last", "final") else "best"
+    path = Path(RUNS_DIR) / str(run_id) / "checkpoint" / f"{w}.pt"
+    if not path.is_file():
+        return {}
+    try:
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:                                          # noqa: BLE001
+        return {}
+    return {k: v for k, v in ck.items() if k != "state_dict"}
+
+
+def _network_of(code: str):
+    """编译一段代码并回**网络实例**（`Network` 的对象；试跑用）。
+
+    ⚠ 与 `CustomNNMethod._network()` **同一条编译路径**：试跑与真跑若各编一遍，
+    迟早会出现"试跑过的代码"与"真跑的代码"不是同一份 —— 那正是最坏的假绿。
+    """
+    from ml_mecha.sandbox import compile_network
+    return compile_network(str(code or "")).instance
 def _device_error_hint(exc: BaseException) -> str:
     """识别"设备混用"这类错并给**可教学**的说法（认不出就回空串）。
 
@@ -653,8 +691,19 @@ def load_checkpoint(run_id: str, *, which: str = "best"):
                              else "（该 run 目录都不存在）"))
     ck = torch.load(path, map_location="cpu", weights_only=False)
     compiled = compile_network(str(ck.get("source") or ""))
+    # ⚠ **重建模型必须把它 `build` 时需要的东西也给它**：既然 `build` 可以收
+    #   `ctx`（负载形状），checkpoint 就得存下那份 ctx —— 否则"能重建"是假的
+    #   （实测：网络在 build 里读 `ctx["payload_shapes"]` 时，`eval_custom` 直接炸）。
+    build_ctx = dict(ck.get("build_ctx") or {})
+    if not build_ctx:
+        build_ctx = {"n_in": int(ck.get("n_in") or 0),
+                     "n_out": int(ck.get("n_out") or 0),
+                     "payload_shapes": {}, "payload_dtypes": {},
+                     "target_kind": str(ck.get("target_kind") or ""),
+                     "device": "cpu", "n_rows": 0,
+                     "note": "旧存档没存 build_ctx ⇒ 只给了最基本的形状事实"}
     model = call_network_build(compiled.instance, int(ck.get("n_in") or 0),
-                               int(ck.get("n_out") or 0), torch.nn)
+                              int(ck.get("n_out") or 0), torch.nn, ctx=build_ctx)
     model.load_state_dict(ck["state_dict"])
     model.eval()
     return model, ck
@@ -700,16 +749,18 @@ class _PayloadMap(dict):
     """评估用的负载映射：**取不到键时给可教学的话**（不甩一个裸 `KeyError: 'xr'`）。
 
     反馈原文："技能里'换一个没见过的 N 评估'的示例写法会直接 `KeyError: 'xr'`。"
-    —— 裸 KeyError 只说"没有这个键"，不说"你该给数据"。这里把**怎么办**写进消息
-    （以及"训练时的负载不随 checkpoint 走"这条事实）。
+    —— 裸 KeyError 只说"没有这个键"，不说"你该给数据"。这里把**怎么办**写进消息，
+    也把**取数的顺序**（显式 ⇒ 继承训练那份）说清楚。
     """
 
     def __missing__(self, key):
         raise KeyError(
             f"评估负载里没有 {key!r}（本次可用：{sorted(self) or '（空）'}）。"
-            "评估用的数据要**显式**给：`dataset_id=…`（复用会话里某份数据集）"
-            "或 `payload=…`（现场给新数据，例如换个没见过的 N）。"
-            "⚠ 训练时的负载**不随 checkpoint 走**（刻意如此：评估该用没见过数据）。")
+            "评估用的数据按这个顺序取：① 本次显式给的 `payload` / `dataset_id`；"
+            "② **默认继承训练时那份负载**（从 checkpoint 里的声明重建）。"
+            "这次是空的 ⇒ 多半是**那次训练本身没给负载**，或声明里的 HDF5 已读不到。"
+            "⇒ 请显式给 `dataset_id=…`（复用会话里某份数据集）或 `payload=…`"
+            "（现场给新数据，例如换个没见过的 N）。")
 
 
 def run_eval_code(run_id: str, code: str, *, which: str = "best",
@@ -867,7 +918,8 @@ def _payload_of(problem):
 
 def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dict,
                       target_kind: str, n_in: int, n_out: int, device: str,
-                      meta: dict) -> dict | None:
+                      meta: dict, payload_decl: dict | None = None,
+                      build_ctx: dict | None = None) -> dict | None:
     """把**完整** `state_dict` 落盘（`best` 与 `last` 各一份）+ 结构源码 + 元信息。
 
     ## 为什么必须另存（不能靠 `nn_weights`）
@@ -895,7 +947,17 @@ def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dic
         payload_common = {"source": source, "params": dict(params or {}),
                           "target_kind": target_kind, "n_in": int(n_in),
                           "n_out": int(n_out), "tensors_on": "cpu",
-                          "trained_on": str(device), **dict(meta or {})}
+                          "trained_on": str(device),
+                          # ⭐ **训练负载的"声明"跟着 checkpoint 走**（不是数组）：
+                          #   这样 `eval_custom` 默认就能**继承训练时的数据**
+                          #   （反馈建议 4），跨重启也成立（声明里有 HDF5 路径就重读）。
+                          #   ⚠ 只存**声明**、不存数组：大数组（2^N 复振幅）不该进 .pt。
+                          "payload_decl": dict(payload_decl or {}),
+                          # ⚠ **重建模型的充分条件**：`build` 可能依赖这份 ctx
+                          #   （负载形状）⇒ 不存它，"能重建"就是假的（实测踩过：
+                          #   网络在 build 里读 `payload_shapes` 时 eval_custom 直接炸）。
+                          "build_ctx": dict(build_ctx or {}),
+                          **dict(meta or {})}
         for tag, key in (("best", "best_state"), ("last", "last_state")):
             state = stats.get(key)
             if not state:

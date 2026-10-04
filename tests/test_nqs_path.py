@@ -846,24 +846,36 @@ def test_eval_custom_accepts_dataset_id_and_teaches_missing_payload():
             assert v["metrics"]["has_amps"] == 1.0, v["metrics"]
             assert v["n_payload_arrays"] == 3, v          # "拿到几份负载"要看得见
 
-            # ② 没给数据：**回执明说**（不是等代码里 KeyError）
+            # ② 没显式给数据 ⇒ **默认继承训练那份**（反馈建议 4），且回执**明说**
+            #   数据从哪来（否则"评估用的到底是哪份数据"就变成猜的）。
+            #   ⚠ 这条原先钉的是旧行为（"没给就明说没有"）；行为改了判据跟着改，
+            #     "真的没有数据"那条路由 `test_ai_efficiency.py` 的继承判据覆盖。
             quiet = ml.tools.execute("eval_custom", {
                 "run_id": rid,
                 "code": "def evaluate(model, ctx):\n    return {'ok': 1.0}"})
             assert quiet["is_error"] is False, quiet
-            assert quiet["value"]["n_payload_arrays"] == 0
-            assert any("没有负载" in w for w in quiet["value"]["warnings"]), \
-                quiet["value"]["warnings"]
+            assert quiet["value"]["payload_source"] == "inherited_from_training", \
+                quiet["value"]
+            assert quiet["value"]["n_payload_arrays"] == 3, quiet["value"]
 
-            # ③ 代码里去取不存在的负载 ⇒ **可教学**（不是裸 KeyError: 'xr'）
+            # ③ 显式给一份**空**负载 ⇒ 这次真的没有数据：**回执明说**
+            empty = ml.tools.execute("eval_custom", {
+                "run_id": rid, "payload": {"arrays": {}},
+                "code": "def evaluate(model, ctx):\n    return {'ok': 1.0}"})
+            assert empty["is_error"] is False, empty
+            assert empty["value"]["n_payload_arrays"] == 0, empty["value"]
+            assert any("没有负载" in w for w in empty["value"]["warnings"]), \
+                empty["value"]["warnings"]
+
+            # ④ 代码里去取不存在的负载 ⇒ **可教学**（不是裸 KeyError: 'xr'）
             boom = ml.tools.execute("eval_custom", {
-                "run_id": rid,
+                "run_id": rid, "payload": {"arrays": {}},
                 "code": 'def evaluate(model, ctx):\n'
                         '    return {"x": float(ctx["payload"]["xr"].sum())}'})
             assert boom["is_error"] is True, boom
             msg = ((boom.get("error") or {}).get("message") or "")
             assert "dataset_id" in msg and "payload" in msg, msg
-            assert "不随 checkpoint 走" in msg, msg
+            assert "继承" in msg, msg       # 说明白"默认会继承"这条新语义
         finally:
             ml.close()
 
