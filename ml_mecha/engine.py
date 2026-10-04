@@ -1048,6 +1048,10 @@ class MLEngine(Engine):
             else:
                 try:
                     payload = self._parse_payload_decl(decl_ck, n_rows=None)
+                    if not payload:
+                        # ⚠ 内联负载：声明里只剩形状/dtype ⇒ **真值在存档的
+                        #   `inline_payload` 里**（不让它静默失效）。
+                        payload = dict(meta_ck.get("inline_payload") or {})
                     payload_source = "inherited_from_training"
                     payload_source_reason = "inherited"
                 except Exception as exc:                       # noqa: BLE001
@@ -1657,8 +1661,12 @@ class MLEngine(Engine):
         # ⭐ **声明本身也留一份**（`spec.meta`）：`run_custom` 要把它写进 checkpoint，
         #   `eval_custom` 才能**默认继承训练时的数据**（反馈建议 4）。
         #   ⚠ 存的只是**声明**（HDF5 路径 / 小数组），不是大数组。
+        #   ⚠⚠ **必须 JSON 安全**：这份声明会进 `request.extras`，而后台 job 会**序列化**
+        #   它 ⇒ 里面留着 ndarray 会让**一次成功的运行**在 job 路径上被判失败
+        #   （实测：`TypeError: Object of type ndarray is not JSON serializable`，
+        #   只在 `submit_run` 路径复现、同步路径看不出来）。⇒ 内联数组只留形状/dtype。
         spec.meta = dict(spec.meta or {})
-        spec.meta["payload_decl"] = dict(decl)
+        spec.meta["payload_decl"] = _jsonable_payload_decl(decl)
         try:
             from ml_toolbox.core.contracts import Problem
             return Problem(spec, allowed=(AUX_PAYLOAD,)).payload_facts()
@@ -2472,6 +2480,40 @@ def _empty_frame():
     """一张 0 行的空表（`eval_custom` 现场读负载时当占位：那份负载不跟任何数据集绑定）。"""
     import pandas as pd
     return pd.DataFrame()
+
+
+def _jsonable_payload_decl(decl: Mapping[str, Any]) -> dict:
+    """把负载**声明**转成 **JSON 安全**的形式（会被后台 job 序列化）。
+
+    ## 为什么要它（实测：一次**成功**的运行被判失败）
+
+    `payload_decl` 会经 `request.extras` 下传，而后台 job 会把 extras/回执**序列化**
+    ⇒ 声明里留着 **ndarray** 会让 `submit_run` 路径报
+    `TypeError: Object of type ndarray is not JSON serializable`，
+    而那次运行**其实跑成功了**（有 run_id、有进度）。⚠ 同步 `run_custom` 看不到这个错
+    （同步路径不序列化 extras）⇒ 只有后台任务才会暴露。
+
+    ⇒ 规则：`hdf5`（全是**路径与数据集名**，本来就安全）**原样保留**；
+    内联 `arrays` **只留形状与 dtype**（值不需要——真值在 `spec.aux` 里供训练用，
+    而"继承"要的是重读路径或小数组，后者由 checkpoint 单独携带）。
+    """
+    out: dict[str, Any] = {}
+    h5 = decl.get("hdf5")
+    if isinstance(h5, Mapping) and h5:
+        out["hdf5"] = {str(k): (dict(v) if isinstance(v, Mapping) else v)
+                       for k, v in h5.items()}
+    arrays = decl.get("arrays")
+    if isinstance(arrays, Mapping) and arrays:
+        import numpy as np
+        out["inline"] = {}
+        for k, v in arrays.items():
+            try:
+                a = np.asarray(v)
+                out["inline"][str(k)] = {"shape": list(a.shape),
+                                         "dtype": str(a.dtype)}
+            except Exception:                                  # noqa: BLE001
+                out["inline"][str(k)] = {"shape": None, "dtype": None}
+    return out
 
 
 def _hdf5_first_dim(path: str, datasets: Mapping[str, Any]) -> int:

@@ -175,6 +175,11 @@ cancel_run(job_id)              → 在 epoch 边界停下（协作式）
 - 后台任务**终态自动落盘** ⇒ 就算后来丢了 `job_id`，结果还在 `runs/<run_id>/`；
   **重启后 `job_id` 会失效**（作业表只活在会话里）⇒ 那时 `read_job` 会回一句
   "盘上最近的 run 是 …"，用 `describe_run(run_id=…)` 接着查。
+  ⚠ **重启后 `dataset_id` 也失效**（数据集只活在会话里）⇒ 要**重新 `prepare_dataset`**
+  再提交；否则命令会失败，而 `read_job` 会把那条失败**原样告诉你**（不再静默）。
+- **`read_job` 的语义**：`state=done` 只表示"job 跑完了"，**不等于命令成功** ——
+  命令层的失败会以**可教学错误**抛出（kind 是命令自己的，如 `unknown_dataset`、
+  `dataset_path_denied`）。看到它就按它说的修，别当成"训练跑完了但没结果"。
 - **并发上限是 4**（超额会回 `too_many_jobs`，不排队）：要跑更多先等前一批结束。
 - 提交前会**同步预检写权**：LOCKED 下当场拒（不会"提交成功再发现失败"）。
 

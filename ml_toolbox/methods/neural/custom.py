@@ -337,7 +337,8 @@ class CustomNNMethod(MLMethod):
             params={k: v for k, v in p.items() if k != "custom_network_code"},
             target_kind=kind, n_in=n_in, n_out=n_out, device=str(dev),
             meta={"n_train": int(len(prep.tr_idx)), "n_val": int(len(prep.va_idx))},
-            payload_decl=payload_decl, build_ctx=build_ctx)
+            payload_decl=payload_decl,
+            build_ctx=build_ctx, inline_payload=_inline_payload_of(payload_decl, payload))
         if ckpt:
             res.artifacts["checkpoint_dir"] = np.array([ckpt["dir"]])
             # ⚠ 不能存 object 数组（写进 npz 读不回，实测踩过 `allow_pickle=False`）
@@ -515,7 +516,10 @@ class CustomNNMethod(MLMethod):
             params={k: v for k, v in p.items()}, target_kind=kind,
             n_in=n_in, n_out=n_out, device=str(dev),
             meta={"task_mode": "graph", "n_nodes": n_nodes},
-            payload_decl=payload_decl, build_ctx=build_ctx)
+            payload_decl=payload_decl,
+            # ⚠ 图路径**没有 `payload` 局部变量**（负载是表格路径的东西）⇒ 显式给 None，
+            #   否则 `NameError`（实测：这一处漏了会连带把 GNN 判据打红）。
+            build_ctx=build_ctx, inline_payload=_inline_payload_of(payload_decl, None))
         if ckpt:
             res.artifacts["checkpoint_dir"] = np.array([ckpt["dir"]])
             res.artifacts["checkpoint_files"] = np.array(["|".join(ckpt["files"])])
@@ -916,10 +920,22 @@ def _payload_of(problem):
     return {str(k): v for k, v in dict(pay).items()}
 
 
+def _inline_payload_of(payload_decl, payload):
+    """内联负载的**真值**（只有内联的才给；HDF5 那种靠路径重读，不进存档）。
+
+    ⚠ 判据是**声明里有没有 `inline`**：`_jsonable_payload_decl` 会把内联 `arrays`
+    转成形状/dtype 摘要并打上 `inline` 键 ⇒ 有它才说明"这份数据的真值只在内存里"。
+    """
+    if not isinstance(payload_decl, dict) or "inline" not in payload_decl:
+        return None
+    return {str(k): v for k, v in dict(payload or {}).items()}
+
+
 def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dict,
                       target_kind: str, n_in: int, n_out: int, device: str,
                       meta: dict, payload_decl: dict | None = None,
-                      build_ctx: dict | None = None) -> dict | None:
+                      build_ctx: dict | None = None,
+                      inline_payload: dict | None = None) -> dict | None:
     """把**完整** `state_dict` 落盘（`best` 与 `last` 各一份）+ 结构源码 + 元信息。
 
     ## 为什么必须另存（不能靠 `nn_weights`）
@@ -951,8 +967,13 @@ def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dic
                           # ⭐ **训练负载的"声明"跟着 checkpoint 走**（不是数组）：
                           #   这样 `eval_custom` 默认就能**继承训练时的数据**
                           #   （反馈建议 4），跨重启也成立（声明里有 HDF5 路径就重读）。
-                          #   ⚠ 只存**声明**、不存数组：大数组（2^N 复振幅）不该进 .pt。
+                          #   ⚠ **大数组不进 .pt**：HDF5 那种靠**路径**重读。
                           "payload_decl": dict(payload_decl or {}),
+                          # ⚠ 但**内联**负载（`payload={"arrays": …}`）的真值必须随存档走：
+                          #   声明里只剩形状/dtype（声明必须 JSON 安全，见
+                          #   `_jsonable_payload_decl`）⇒ 否则 `eval_custom` 的
+                          #   "默认继承"对内联数据会**静默失效**。`torch.save` 能存 numpy。
+                          "inline_payload": inline_payload,
                           # ⚠ **重建模型的充分条件**：`build` 可能依赖这份 ctx
                           #   （负载形状）⇒ 不存它，"能重建"就是假的（实测踩过：
                           #   网络在 build 里读 `payload_shapes` 时 eval_custom 直接炸）。

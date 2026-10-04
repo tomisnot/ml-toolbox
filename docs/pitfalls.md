@@ -848,3 +848,38 @@
 - **判据**：`test_ai_efficiency.py::test_cuda_device_assert_is_told_apart_from_its_echo`
   （走真实入口 `_summarize_record`，并钉"无关错误不受影响"）。
 
+### A37. **job 完成 ≠ 命令成功**：命令层失败被 job 层吞成"静默死亡"
+- **症状**（使用者实测）：`submit_run(run_custom, code_path=…)` → `ok:true, job_id`；
+  随后 `read_job` 显示 **`state:"done"`、`run_id:""`、`progress:[]`、`epochs:[]`、
+  `error:""`**，而 `runs/` 下**没有新目录**、`logs/` 也没有新条目。
+  同一份配置**重启前成功**（23:08 产出 `custom_network-6491588-701`）、**重启后重投
+  就静默死亡**。
+- **根因**（复现确认）：**命令自己失败了** —— 错误留在 **`job.result`（命令回执）**里，
+  而 job 层只记**它自己**的异常（`job.error`）⇒ `read_job` 只读 job 级 error，
+  于是一个失败的 job 长得**和成功一样**（`done` + 空 error + 无 run_id + 无进度）。
+  实测的两种触发：**重启后 `dataset_id` 失效**（`unknown_dataset`）、
+  `code_path` 不在授权数据根内（`dataset_path_denied`）。
+- **修法**：`read_job` 现在读 job 的**回执**，命令层失败就**抛可教学错误**
+  （kind 用命令自己的，如 `unknown_dataset` + 它带的 hint/suggest），而不是回一个"成功"。
+  ⚠ **`state=cancelled` 例外、一律不抛**：取消是调用方主动要的正常结局，而且它的回执
+  本身就是 `ok=false`（"训练被协作式取消…"）⇒ 只看 `ok=false` 会把它误报成失败
+  （实测：这条把 `cancel_run` 之后的读状态判据打红）。
+- **判据**：`test_ai_efficiency.py::test_submitted_job_reports_command_level_failure`
+  （两条失败路径都钉，且要求回执里说"没有产出可用的运行"）。
+
+### A38. 进 `extras` 的东西**必须 JSON 安全**（否则成功会被判失败，且只在 job 路径暴露）
+- **症状**：`submit_run` 提交一次**其实成功**的运行（有 run_id、有进度），
+  回执却是 `ok=false` + `internal_error`：
+  `TypeError: Object of type ndarray is not JSON serializable`。
+- **根因**（我的 bug）：我把**负载声明** `payload_decl` 原样放进 `request.extras`，
+  而内联负载（`payload={"arrays": …}`）的声明里**装着真 ndarray**；后台 job 会
+  **序列化** extras/回执 ⇒ 序列化失败把成功翻成失败。
+  ⚠ **同步 `run_custom` 完全看不出来**（同步路径不序列化 extras）⇒ 只有 `submit_run` 暴露。
+- **修法**：`_jsonable_payload_decl` —— `hdf5`（路径+数据集名，本来就安全）原样保留；
+  内联 `arrays` **只留形状/dtype**。而"默认继承"要用的**内联真值**改由 **checkpoint**
+  携带（`torch.save` 能存 numpy）⇒ 继承能力不丢。
+- **教训**：**在跨进程序列化的边界上，"我没写盘"不等于"它不落任何序列化器"**。
+  凡是进 `extras`／回执／审计事件的东西，都要先问一句"它能被 `json.dumps` 吗"。
+- **判据**：`test_ai_efficiency.py::test_inline_payload_declaration_is_json_safe`
+  （声明可 `json.dumps` + 走**后台 job** 真跑一次必须有 run_id）。
+

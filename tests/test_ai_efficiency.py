@@ -754,6 +754,108 @@ def test_cuda_device_assert_is_told_apart_from_its_echo():
     _CUDA_POISON.clear()
 
 
+def test_submitted_job_reports_command_level_failure():
+    """⭐ **job 完成 ≠ 命令成功**：命令层失败必须说出来（否则就是"静默死亡"）。
+
+    使用者实测：`submit_run` → `ok:true, job_id`；随后 `read_job` 显示 `state=done`、
+    `run_id=""`、`progress=[]`、`error=""`，而 `runs/` 下**什么都没有**、日志也无新条目
+    —— 同一份配置重启前成功、重启后重投**静默死亡**。
+    实测根因：**命令自己失败**了（`unknown_dataset` / `dataset_path_denied`），
+    错误留在**回执**里，而 job 层只记它**自己**的异常 ⇒ `read_job` 只读 job 级 error
+    就只看到"成功"。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-silent-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=12, with_target=True)
+            # ① 过期的 dataset_id（重启后的典型情形）
+            job = ml.tools.execute("submit_run", {
+                "code": GOOD, "dataset_id": "ds-001-已失效", "name": "stale",
+                "device": _DEV, "overrides": {"epochs": 2}})
+            assert job["is_error"] is False, job
+            jid = job["value"]["job_id"]
+            got = None
+            for _ in range(15):
+                time.sleep(1.5)
+                got = ml.tools.execute("read_job", {"job_id": jid, "wait_s": 2})
+                if got.get("is_error"):
+                    break
+            assert got is not None and got.get("is_error") is True, (
+                f"命令失败了，read_job 却回了个'成功'：{got}")
+            info = (got.get("error") or {}).get("info") or {}
+            assert info.get("kind") == "unknown_dataset", info
+            assert "没有产出可用的运行" in got["error"]["message"], got["error"]
+            # ② 越界的 code_path（另一条"命令失败"路径）
+            outside = Path(tempfile.mkdtemp(prefix="eff-out-")) / "net.py"
+            outside.write_text(GOOD, encoding="utf-8")
+            job2 = ml.tools.execute("submit_run", {
+                "code_path": str(outside), "dataset_id": ds, "name": "outside",
+                "device": _DEV, "overrides": {"epochs": 2}})
+            assert job2["is_error"] is False, job2
+            jid2 = job2["value"]["job_id"]
+            got2 = None
+            for _ in range(15):
+                time.sleep(1.5)
+                got2 = ml.tools.execute("read_job", {"job_id": jid2, "wait_s": 2})
+                if got2.get("is_error"):
+                    break
+            assert got2 is not None and got2.get("is_error") is True, got2
+            # ⚠ 两种 fail-closed 都算对：**没声明任何数据根**时拒
+            #   `dataset_roots_required`；声明了根但路径在根外时拒
+            #   `dataset_path_denied`。本判据用的是"没声明根"的装配 ⇒ 认第一种
+            #   （两种都表示"拒绝读越界文件"）。
+            kind2 = (got2["error"].get("info") or {}).get("kind")
+            assert kind2 in ("dataset_roots_required", "dataset_path_denied"), \
+                got2["error"]
+        finally:
+            ml.close()
+
+
+def test_inline_payload_declaration_is_json_safe():
+    """⭐ 负载**声明必须 JSON 安全**：内联 `arrays` 的真值不能进 extras。
+
+    实测（我自己的 bug）：声明里留着 ndarray ⇒ **一次成功的运行**在 job 路径上被判失败
+    （`TypeError: Object of type ndarray is not JSON serializable`），而同步 `run_custom`
+    完全看不出来（同步路径不序列化 extras）⇒ 只有 `submit_run` 会暴露。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import json
+    with tempfile.TemporaryDirectory(prefix="eff-jdecl-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=12, with_target=True)
+            # ① 声明本身可 JSON 序列化，且内联数组只留形状/dtype
+            entry = ml.engine.dataset_entry(ds)
+            decl = dict((entry.spec.meta or {}).get("payload_decl") or {})
+            assert decl, "登记时没留下负载声明"
+            json.dumps(decl)                     # 不可序列化就会抛
+            assert "inline" in decl, decl
+            for k, v in decl["inline"].items():
+                assert set(v) == {"shape", "dtype"}, (k, v)
+            # ② 走**后台 job** 真跑一次：必须产出 run_id（而不是被判失败）
+            job = ml.tools.execute("submit_run", {
+                "code": TGT_NET, "dataset_id": ds, "name": "jdecl",
+                "device": _DEV, "overrides": {"epochs": 2, "batch": 4}})
+            assert job["is_error"] is False, job
+            jid = job["value"]["job_id"]
+            st = {}
+            for _ in range(20):
+                time.sleep(2)
+                got = ml.tools.execute("read_job", {"job_id": jid, "wait_s": 3})
+                assert got.get("is_error") is False, got      # 不许静默/不许误判失败
+                st = got["value"]
+                if st["state"] in ("done", "failed", "cancelled") and st["run_id"]:
+                    break
+            assert st.get("run_id"), f"后台 job 没产出 run_id：{st}"
+        finally:
+            ml.close()
+
+
 _TESTS = [
     test_dry_run_catches_a_shape_error_in_one_round_trip,
     test_dry_run_passes_on_a_correct_net_and_reports_the_trace,
@@ -773,6 +875,9 @@ _TESTS = [
     test_describe_training_summarizes_grad_by_layer,
     # ---- CUDA 断言与它的回声（多N合并-进展与阻塞.md 的实测代价）----
     test_cuda_device_assert_is_told_apart_from_its_echo,
+    # ---- 静默死亡：命令层失败被 job 层吞掉 / 声明非 JSON 安全 ----
+    test_submitted_job_reports_command_level_failure,
+    test_inline_payload_declaration_is_json_safe,
 ]
 
 

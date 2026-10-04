@@ -1432,6 +1432,46 @@ def _read_job(host: Any,
             extra = {}
         latest = dict(progress[-1]) if progress else {}
         latest.update(extra.get("latest") or {})
+        # ⭐⭐ **job 完成 ≠ 命令成功**：命令层的失败（`ok=false`）留在**回执**里，
+        #   而 job 层只记**它自己**的异常 ⇒ 否则 `read_job` 会显示
+        #   `state=done / error="" / 无 run_id / 无进度`，`runs/` 下也什么都没有
+        #   —— 使用者实测的"**静默死亡**"就是这个（原话：同一份配置重启前成功、
+        #   重启后重投就静默死亡）。⇒ 必须把**命令层的失败**说出来。
+        state = str(status.get("state") or "")
+        job_error = str(status.get("error") or "")
+        result: Any = None
+        try:
+            result = getattr(ml.jobs.get(job_id), "result", None)
+        except Exception:                                       # noqa: BLE001
+            result = None
+        if state in ("done", "failed", "cancelled") or job_error:
+            cmd_ok = (result or {}).get("ok") if isinstance(result, Mapping) else None
+            # ⚠ **`cancelled` 一律不抛**：取消是调用方主动要的正常结局，而且它的**回执
+            #   本身就是 `ok=false`**（"训练被协作式取消…"）⇒ 只看 `ok=false` 会把它
+            #   误报成"命令失败"（实测：这条把 `cancel_run` 之后的读状态判据打红）。
+            #   ⇒ 只有**真失败**才抛：job 自己抛了（`job_error`）/ `state=failed` /
+            #   非取消态下命令回了 `ok=false`。
+            if job_error or state == "failed" or (cmd_ok is False
+                                                  and state != "cancelled"):
+                detail = (str(result.get("error") or "")
+                          if isinstance(result, Mapping) else "")
+                kind = (str(result.get("error_kind") or "")
+                        if isinstance(result, Mapping) else "")
+                hint = (str(result.get("error_hint") or "")
+                        if isinstance(result, Mapping) else "")
+                suggest = (str(result.get("error_suggest") or "")
+                           if isinstance(result, Mapping) else "")
+                rid = str(extra.get("run_id") or "")
+                tail_note = (f"⚠ 这次运行**其实跑过了**（run_id={rid}）："
+                             f"去看 `describe_run(run_id={rid!r})`。") if rid else ""
+                raise MechaError(
+                    f"这个 job 没有产出可用的运行：state={state}；"
+                    f"命令层错误：{detail or job_error or '（空）'}",
+                    kind=kind or "job_command_failed",
+                    hint=(hint or "命令本身失败了 —— 原因见 message；"
+                                  "⚠ 不是'框架坏了'，多半是入参/数据引用/权限问题")
+                         + ("；" + tail_note if tail_note else ""),
+                    suggest=suggest)
         # ⭐⭐ **默认只回"摘要"**（缺口 A，实测：AI 因为 `progress` 太长**放弃了官方
         #   轮询姿势**——他原话"后面我不再直接轮询它了"）。"最新状态"与"全量历史"
         #   是两个需求，之前被绑在同一个必填键里。
