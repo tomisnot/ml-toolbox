@@ -155,11 +155,18 @@ def classify_shape_error(exc: BaseException, trace: list[dict]) -> dict:
 def dry_run_network(*, net, problem, params: dict, torch, device,
                     payload: dict | None = None,
                     batch_probes: Any = None,
-                    max_trace: int = 80) -> dict:
+                    max_trace: int = 80,
+                    verbosity: str = "trace") -> dict:
     """对一段网络代码**试跑**：编译 → 建模型 → 真实负载上跑几次前向。
 
+    @param verbosity ``trace``（默认：每档批量的完整轨迹）或 ``summary``
+        （只回**逐模块唯一的形状对**）—— Transformer 栈那种"65 个模块 × 3 档批量"
+        的网络用它能省掉大半回执（反馈 §2.3）。
     @returns ``{"ok", "batch_sizes_checked", "runs", "shapes", "n_params",
                 "modules", "error", "error_kind", "error_hint", ...}``
+
+    ⚠ 顶层 `shapes` 与 `runs[].shapes` **不再各来一份**：顶层只给**失败那一档**
+    （没有失败就给**训练批大小那一档**）—— 同一批数据重复两遍纯属浪费上下文。
     """
     from . import trainer as _trainer
     from .custom import _build_ctx, _hook
@@ -215,6 +222,7 @@ def dry_run_network(*, net, problem, params: dict, torch, device,
         if b not in probes:
             probes.append(b)
 
+    traces: list[tuple[int, list]] = []           # (batch_size, trace)
     for b in probes:
         rows = tr[:b]
         ctx = {"torch": torch, "nn": torch.nn, "device": str(dev), "step": 0,
@@ -256,16 +264,35 @@ def dry_run_network(*, net, problem, params: dict, torch, device,
             rec.update(ok=False, error=f"{type(exc).__name__}: {exc}",
                        error_kind=info["kind"], error_hint=info["hint"])
         rec["n_shapes"] = len(trace)
-        rec["shapes"] = trace[:max_trace]
+        # ⚠ 逐档轨迹只在 `trace` 档给；`summary` 档省掉它（回执大小可调）。
+        #   ⚠ 摘要必须从**完整轨迹**算（`traces`），不能从可能已被清空的
+        #   `rec["shapes"]` 里算 —— 我第一版就是这么错的（摘要回了空数组）。
+        traces.append((b, list(trace)))
+        rec["shapes"] = trace[:max_trace] if verbosity != "summary" else []
         out["runs"].append(rec)
         out["batch_sizes_checked"].append(b)
-        if trace and not out["shapes"]:
+        # 顶层只留**一档**：失败那档（下面 return 前会覆盖），否则**训练批大小**那档
+        if trace:
             out["shapes"] = trace[:max_trace]
         if not rec["ok"]:
             out.update(ok=False, error=rec["error"], error_kind=rec["error_kind"],
                        error_hint=rec["error_hint"], failed_batch_size=b)
+            out["shapes"] = trace[:max_trace]        # 顶层 = **失败那一档**
             return out                                  # 第一处失败就停（省时间）
     out["ok"] = True
+    # ⭐ 去重后的"逐模块唯一形状对"（`summary` 档的主产物；`trace` 档也顺手给，
+    #   因为它才是"一次看清"最省上下文的那份视图）。
+    seen: dict = {}
+    for _b, tr in traces:
+        for e in tr:
+            key = (e["module"], str(e["in"]), str(e["out"]))
+            seen.setdefault(key, {"module": e["module"], "in": e["in"],
+                                  "out": e["out"]})
+    out["shapes_summary"] = list(seen.values())[:max_trace]
+    if verbosity == "summary":
+        out["shapes"] = out["shapes_summary"]        # 顶层也给摘要（不重复全量）
+        for r in out["runs"]:
+            r.pop("shapes", None)
     losses = [r["loss"] for r in out["runs"] if r["loss"] is not None]
     if losses:
         out["loss_first_batch"] = losses[0]

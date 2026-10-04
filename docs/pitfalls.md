@@ -753,3 +753,27 @@
 - **教训**：**"这个字段此刻为空"有两种可能** —— 真没有，或者**你要的东西根本不在
   这一层**。遇到空先问一句"它应该由谁提供"。这与 A21（文档承诺没人跑）同族。
 
+### A31. "看起来像读到了"：两个来源同时给时**静默取了一个**
+- **症状**（反馈 §2.2，实测）：`run_custom` 同时给 `code`（3 行占位符）与
+  `code_path`（156 行真文件）时，**跑的是内联那段**，而回执把 `code_path` **原样
+  回显**、`code_lines: 3` ⇒ 用户以为"读的是文件"（他靠 `n_params: 2` 才识破）。
+- **根因**：`code` 优先、`code_path` 只作回显 —— 一个"两个来源都收、但只用一个"的
+  参数面对。这类设计的通病：**回执回显了你给的东西，却没说你用了哪一个**。
+- **修法**：① 同时给 ⇒ **明确报错**（`bad_code_source`，"只能给一个"），不猜；
+  ② 回执加 **`code_source`**（`file` / `inline`），让"实际用了哪一份源码"不必推断。
+- **顺带**：他报的"`code` 必填 ⇒ 只给 `code_path` 发不出去"**已是旧行为**
+  （实测当前只给 `code_path` 可用）—— 真因是**客户端缓存了工具表**（MCP 会话建立时
+  取一次 schema）⇒ 参数必填性变了要重连才看得到。这条也写进了 skill。
+- **判据**：`test_ai_efficiency.py::test_code_path_is_exclusive_and_says_which_source_was_used`。
+
+### A32. "没有负载"要能说清**为什么没有**
+- **症状**（反馈 §3.1）：他实测"继承没生效"，回执只说"没有负载 —— 多半是那次训练
+  没给负载，或声明里的 HDF5 读不到"。而他**知道**那次训练带了 payload ⇒ 只能猜。
+- **实测查明的真因**：那个 checkpoint 的键集里**根本没有 `payload_decl`**
+  ⇒ 它**早于**"声明随存档走"这次改动（旧存档）。
+- **教训**：**文案把可能性都列出来了 ≠ 系统知道答案**。凡"多因一果"的失败，回执应给
+  **判别结果**而不是可能性清单（`payload_source_reason`：`no_declaration` /
+  `declaration_unreadable` / `no_checkpoint` / `inherited` / `explicit`）。
+- **判据**：`test_ai_efficiency.py::test_eval_custom_says_why_the_payload_source_is_what_it_is`
+  （**真的把声明从存档里抹掉**再查，而不是构造一个假的返回）。
+

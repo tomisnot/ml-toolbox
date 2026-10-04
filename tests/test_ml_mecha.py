@@ -526,7 +526,8 @@ def test_writes_state_declaration_matches_actual_history(app):
                  {"command": "compare_methods", "methods": ["logistic", "svc"],
                   "dataset_id": dataset_id},
                  {"command": "run_custom", "dataset_id": dataset_id,
-                  "code": _RESIDUAL_CODE, "overrides": {"epochs": 5}},
+                  "code": _RESIDUAL_CODE, "overrides": {"epochs": 5},
+                  "device": "cpu"},
                  # ⚠ `eval_custom` 声明 `writes_state=()`（它不改配置台面）⇒ 这里
                  #   **允许它失败**（没有 checkpoint 自然会失败），但要求它
                  #   **一个状态键都不写** —— "不改台面的命令，失败也不能改台面"。
@@ -890,7 +891,8 @@ def test_custom_network_runs_and_keeps_the_observation_surface(app):
     dataset_id = _prepared(app)
     try:
         got = app.tools.execute("run_custom", {
-            "code": _RESIDUAL_CODE, "dataset_id": dataset_id, "name": "resnet_crit",
+            "device": "cpu", "code": _RESIDUAL_CODE,
+            "dataset_id": dataset_id, "name": "resnet_crit",
             "diag": True, "persist": True, "seed": 4242,
             "overrides": {"epochs": 6, "lr": 0.01}})
         assert got["is_error"] is False, got
@@ -970,7 +972,8 @@ def test_custom_network_reuse_by_name_avoids_repasting(app):
     made: list[str] = []
     try:
         first = app.tools.execute("run_custom", {
-            "code": _RESIDUAL_CODE, "dataset_id": dataset_id, "name": "reuse_crit",
+            "device": "cpu", "code": _RESIDUAL_CODE,
+            "dataset_id": dataset_id, "name": "reuse_crit",
             "persist": True, "overrides": {"epochs": 5}})["value"]
         made.append(first["run_id"])
 
@@ -987,7 +990,8 @@ def test_custom_network_reuse_by_name_avoids_repasting(app):
         tweaked = got["code"].replace("blocks=2", "blocks=3")
         assert tweaked != got["code"]
         second = app.tools.execute("run_custom", {
-            "code": tweaked, "dataset_id": dataset_id, "name": "reuse_deep",
+            "device": "cpu", "code": tweaked,
+            "dataset_id": dataset_id, "name": "reuse_deep",
             "persist": True, "overrides": {"epochs": 5}})["value"]
         made.append(second["run_id"])
         assert second["ok"] is True, second
@@ -1019,7 +1023,8 @@ def test_custom_network_errors_are_readable_not_raw_stacks(app):
          "        return 42\n", "build_wrong_type"),
     ]
     for label, code, want_kind in cases:
-        got = app.tools.execute("run_custom", {"code": code, "dataset_id": dataset_id})
+        got = app.tools.execute("run_custom", {"device": "cpu", "code": code,
+                                           "dataset_id": dataset_id})
         assert got["is_error"] is True, f"{label} 竟然没报错"
         blob = json.dumps(got, ensure_ascii=False)
         assert want_kind in blob or "Network" in blob or "语法" in blob, \
@@ -1057,7 +1062,8 @@ def test_background_custom_network_reports_progress_and_run_id(app):
     job_id = ""
     try:
         got = app.tools.execute("submit_run", {
-            "code": _RESIDUAL_CODE, "name": "bg_crit", "dataset_id": dataset_id,
+            "device": "cpu", "code": _RESIDUAL_CODE, "name": "bg_crit",
+            "dataset_id": dataset_id,
             "seed": 5150, "diag": True,
             "overrides": {"epochs": 400, "batch": 2, "lr": 0.05}})
         assert got["is_error"] is False, got
@@ -1179,7 +1185,8 @@ def test_background_job_persists_without_asking(app):
     rid = ""
     try:
         got = app.tools.execute("submit_run", {
-            "code": _MIN_NET_CODE, "name": "persist_crit", "dataset_id": dataset_id,
+            "device": "cpu", "code": _MIN_NET_CODE, "name": "persist_crit",
+            "dataset_id": dataset_id,
             "seed": 6160, "overrides": {"epochs": 5}})
         assert got["is_error"] is False, got
         job_id = got["value"]["job_id"]
@@ -1397,7 +1404,8 @@ def test_gnn_runs_through_the_tool_face(app):
 
     # ③ GNN 跑通 + 观测面同构
     out = ml.tools.execute("run_custom", {
-        "code": _GCN_TOOL_CODE, "dataset_id": ds, "name": "gcn_tool",
+        "device": "cpu", "code": _GCN_TOOL_CODE, "dataset_id": ds,
+        "name": "gcn_tool",
         "diag": True, "seed": 8080, "overrides": {"epochs": 30, "lr": 0.05}})
     assert out["is_error"] is False, out
     val = out["value"]

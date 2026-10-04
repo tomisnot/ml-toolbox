@@ -246,6 +246,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "试跑要试的批大小列表（默认 1、2、训练批大小）。"
                          "⚠ 批次相关的错**只有真数据才抓得到**"
                          "（实测：本地 B=3 全绿、真实 B=2 就错）"),
+            CommandParam("shapes_verbosity", "string", False,
+                         "试跑回执的形状详细度：trace（默认，逐档完整轨迹）/ "
+                         "summary（只回逐模块唯一形状对；几十模块 × 3 档的网络用它能"
+                         "省掉大半回执）", "trace"),
             CommandParam("dataset_id", "string", False,
                          "数据集引用；留空用最近准备的一份", ""),
             CommandParam("overrides", "object", False,
@@ -269,9 +273,11 @@ COMMANDS: tuple[CommandSpec, ...] = (
         side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
         risk=RISK_MEDIUM,
         extra_receipt_keys=("run_id", "elapsed_s", "error", "network_name",
-                            "dry_run", "shapes", "batch_sizes_checked", "runs",
-                            "n_params", "modules", "code_path", "code_lines",
-                            "failed_batch_size", "loss_first_batch"),
+                            "dry_run", "shapes", "shapes_summary",
+                            "batch_sizes_checked", "runs", "n_params", "modules",
+                            "code_path", "code_source", "code_lines",
+                            "shapes_verbosity", "failed_batch_size",
+                            "loss_first_batch"),
     ),
     # ---- 训练后：把模型交给调用方的代码（NQS 的"外部函数口"） ----
     CommandSpec(

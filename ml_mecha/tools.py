@@ -299,8 +299,11 @@ def _eval_custom(engine: MLEngine, wrap,
                 # **看得见**，而不是等代码里 KeyError 才发现
                 "n_payload_arrays": int(receipt.get("n_payload_arrays") or 0),
                 "payload_keys": list(receipt.get("payload_keys") or []),
-                # ⭐ 数据是**给的**还是**继承训练时的**（免得"评估用哪份数据"变成猜）
+                # ⭐ 数据是**给的**还是**继承训练时的**（免得"评估用哪份数据"变成猜），
+                #   以及**为什么**是这个来源（`explicit` / `inherited` /
+                #   `no_declaration` / `declaration_unreadable` / `no_checkpoint`）
                 "payload_source": receipt.get("payload_source", ""),
+                "payload_source_reason": receipt.get("payload_source_reason", ""),
                 "note": receipt.get("note", ""),
                 "warnings": list(receipt.get("warnings") or []),
                 "error": receipt.get("error", "")}
@@ -815,7 +818,8 @@ def _run_custom(engine: MLEngine, wrap,
                 diag: bool = False, persist: bool = False, name: str = "",
                 resource_guard: Mapping[str, Any] | None = None,
                 device: str = "", dry_run: bool = False,
-                batch_probes: Any = None, code_path: str = ""
+                batch_probes: Any = None, code_path: str = "",
+                shapes_verbosity: str = ""
                 ) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "run_custom", "code": str(code),
                                 "diag": bool(diag), "persist": bool(persist)}
@@ -837,6 +841,8 @@ def _run_custom(engine: MLEngine, wrap,
             spec["batch_probes"] = list(batch_probes)
         if code_path:
             spec["code_path"] = str(code_path)
+        if shapes_verbosity:
+            spec["shapes_verbosity"] = str(shapes_verbosity)
         receipt = engine.run(spec, context=_local_context())
         # ⭐ 试跑的回执与真跑**不同形**：多给形状轨迹、少给 run_id（它没有 run）
         #
@@ -848,6 +854,7 @@ def _run_custom(engine: MLEngine, wrap,
                     "network_name": receipt.get("network_name", ""),
                     "primary_metric": "", "metrics": {},
                     "shapes": list(receipt.get("shapes") or []),
+                    "shapes_summary": list(receipt.get("shapes_summary") or []),
                     "runs": list(receipt.get("runs") or []),
                     "batch_sizes_checked": list(receipt.get("batch_sizes_checked") or []),
                     "failed_batch_size": receipt.get("failed_batch_size"),
@@ -855,7 +862,9 @@ def _run_custom(engine: MLEngine, wrap,
                     "modules": list(receipt.get("modules") or []),
                     "loss_first_batch": receipt.get("loss_first_batch"),
                     "code_path": receipt.get("code_path", ""),
+                    "code_source": receipt.get("code_source", ""),
                     "code_lines": int(receipt.get("code_lines") or 0),
+                    "shapes_verbosity": receipt.get("shapes_verbosity", "trace"),
                     "elapsed_s": receipt.get("elapsed_s", 0.0),
                     "warnings": list(receipt.get("warnings", [])),
                     "error": receipt.get("error", ""),
@@ -900,6 +909,11 @@ def _run_custom(engine: MLEngine, wrap,
             "batch_probes": {"type": "array",
                              "description": "试跑要试的批大小（默认 1、2、训练批大小）。"
                                             "⚠ 批次相关的错只有**真数据**才抓得到"},
+            "shapes_verbosity": {"type": "string",
+                                 "description": "试跑回执的形状详细度：trace（默认，逐档"
+                                                "完整轨迹）/ summary（只回逐模块唯一形状对"
+                                                "—— 几十模块 × 3 档的网络能省掉大半回执）",
+                                 "default": "trace"},
             "dataset_id": {"type": "string",
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},

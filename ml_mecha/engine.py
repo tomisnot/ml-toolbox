@@ -1026,6 +1026,9 @@ class MLEngine(Engine):
         #   每次重传几十 KB 是纯粹的浪费。但**继承必须响亮**——回执会写
         #   `payload_source`，免得"评估用的到底是哪份数据"变成猜的。
         payload_source = ("given" if payload else "")
+        #: ⭐ **为什么是这个来源**（反馈 §3.1：他只看到"没有负载"，只能靠猜是
+        #: "声明没落盘"还是"HDF5 读不到"）⇒ 把判别结果直接给出来。
+        payload_source_reason = "explicit" if payload else ""
         warn: list[str] = []
         # ⚠ **"显式说了"与"没说"要区分**：调用方给了 `payload`/`dataset_id` 就是明确表态，
         #   哪怕解析出来是空的（例如 `{"arrays": {}}`）—— 那时**不去继承**，
@@ -1035,11 +1038,19 @@ class MLEngine(Engine):
             from ml_toolbox.methods.neural.custom import load_checkpoint_meta
             meta_ck = load_checkpoint_meta(run_id, which=str(spec.get("which") or "best"))
             decl_ck = meta_ck.get("payload_decl") or {}
-            if decl_ck:
+            if not meta_ck:
+                payload_source_reason = "no_checkpoint"
+            elif not decl_ck:
+                # ⚠ 最常见的一种：那次训练的存档**早于**"声明随存档走"这次改动
+                #   （旧 checkpoint 的键集里根本没有 `payload_decl`）。
+                payload_source_reason = "no_declaration"
+            else:
                 try:
                     payload = self._parse_payload_decl(decl_ck, n_rows=None)
                     payload_source = "inherited_from_training"
+                    payload_source_reason = "inherited"
                 except Exception as exc:                       # noqa: BLE001
+                    payload_source_reason = "declaration_unreadable"
                     warn.append(
                         f"继承训练负载失败（{type(exc).__name__}: {exc}）⇒ 这次评估"
                         "**没有负载**；要评估请显式给 `dataset_id` 或 `payload`。")
@@ -1060,8 +1071,10 @@ class MLEngine(Engine):
             "extra_keys": sorted((out.get("extra") or {}).keys()),
             "n_payload_arrays": len(payload),
             "payload_keys": sorted(payload),
-            # ⭐ 数据**从哪来**要看得见（given / inherited_from_training / 空）
+            # ⭐ 数据**从哪来**要看得见（given / inherited_from_training / 空），
+            #   以及**为什么**是这个来源（别让 AI 靠猜 —— 反馈 §3.1）
             "payload_source": payload_source,
+            "payload_source_reason": payload_source_reason,
             "note": out.get("note", ""),
             "error": out.get("error", ""),
             "error_kind": out.get("error_kind", ""),
@@ -1093,9 +1106,20 @@ class MLEngine(Engine):
         #   同一份 9 KB 代码不必发 N 遍。⚠ 受**已有**的 `dataset_roots` 管辖
         #   （不新增授权面：读文件的口子只有一个）。
         code_path = str(spec.get("code_path") or "")
+        # ⚠ **二选一，禁止同时给**（反馈 §2.2 实测：同时给时 `code` **静默覆盖**
+        #   `code_path`，而回执又把 `code_path` 原样回显 ⇒ "看起来像读到了文件"，
+        #   实际跑的是内联那段 —— 最容易骗人的那种组合。他给了 3 行占位符 +
+        #   156 行的真文件，回执写着 `code_path` 与 `code_lines: 3`）。
+        if code.strip() and code_path.strip():
+            raise MechaError(
+                "`code` 与 `code_path` **只能给一个**（同时给时无法判断你想跑哪一份）",
+                kind="bad_code_source",
+                hint="要跑文件里那份：只给 `code_path`；要跑内联那段：只给 `code`。"
+                     "⚠ 同时给时旧行为是**静默取 code**，那会让'我改了文件'变成假的")
+        code_source = "inline"
         if not code.strip() and code_path:
             code = self._read_code_file(code_path)
-            spec = {**spec, "code": code}
+            code_source = "file"
         if not code.strip():
             raise MechaError("run_custom 需要 code（定义 `class Network` 的代码）"
                              "或 code_path（指向代码文件）",
@@ -1113,7 +1137,7 @@ class MLEngine(Engine):
         #   （批次相关）**只有用真实负载才抓得到**。
         if bool(spec.get("dry_run", False)):
             return self._cmd_dry_run_custom(spec, entry, code, code_path, name,
-                                            context)
+                                            context, code_source)
         method_name = _custom_method_name()
         # ⚠ **先注册再按注册表取 schema**：这样覆写校验用的就是"运行时真正那个方法"
         #   的声明，而不是另抄一份；且里外只有一个来源。
@@ -1168,6 +1192,9 @@ class MLEngine(Engine):
             # ⭐ 代码从文件读时**把路径带出去**：AI 才能把它和文件版本对齐
             #   （"我改了文件、跑的是不是新版本"是反馈里那类反复出现的疑问）
             "code_path": code_path,
+            # ⭐ **这次实际用的是哪一份源码**（`file` / `inline`）——反馈 §2.2 的
+            #   教训：只回显 `code_path` 会让人以为"读的是文件"。
+            "code_source": code_source,
             "code_lines": len(code.splitlines()),
             "elapsed_s": summary.elapsed_s,
             "error": warning,
@@ -1207,7 +1234,8 @@ class MLEngine(Engine):
         return text
 
     def _cmd_dry_run_custom(self, spec: dict[str, Any], entry: Any, code: str,
-                            code_path: str, name: str, context: Any
+                            code_path: str, name: str, context: Any,
+                            code_source: str = "inline"
                             ) -> Mapping[str, Any]:
         """**试跑**：不反传、不落盘、不计入实验记录（反馈建议 1）。
 
@@ -1256,12 +1284,16 @@ class MLEngine(Engine):
         out = _dry.dry_run_network(
             net=net, problem=problem, params=params, torch=torch,
             device=str(dev_state), payload=payload,
-            batch_probes=spec.get("batch_probes"))
+            batch_probes=spec.get("batch_probes"),
+            # ⭐ 回执大小可调（反馈 §2.3）：他 65 个模块 × 3 档批量 ⇒ 顶层 `shapes`
+            #   与 `runs[].shapes` 各来一份，同一批数据重复两遍。
+            verbosity=str(spec.get("shapes_verbosity") or "trace"))
         out.update({"command": "run_custom", "dry_run": True, "run_ids": [],
                     "primary_metric": "", "metrics": {},
                     "warnings": [], "run_id": "", "network_name": name,
-                    "code_path": code_path,
+                    "code_path": code_path, "code_source": code_source,
                     "code_lines": len(code.splitlines()),
+                    "shapes_verbosity": str(spec.get("shapes_verbosity") or "trace"),
                     "elapsed_s": round(time.time() - t0, 3)})
         if out.get("ok"):
             out["warnings"] = [] if out.get("loss_first_batch") is not None else [

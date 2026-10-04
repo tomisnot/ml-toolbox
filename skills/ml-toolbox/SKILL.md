@@ -95,7 +95,15 @@ whenToUse: >-
 **② 调参跑多个组合 → `code_path`**
 
 网络源码存成一个文件，之后只报路径（受**已有**数据根授权管辖，不新增授权面）。
-同一份 9 KB 代码不必发 N 遍；回执带回 `code_path` / `code_lines`，便于与文件版本对齐。
+同一份 9 KB 代码不必发 N 遍；回执带回 `code_path` / **`code_source`**（`file` / `inline`）
+与 `code_lines`，便于与文件版本对齐。
+
+⚠ **`code` 与 `code_path` 只能给一个**（同时给会报 `bad_code_source`）——
+旧行为是"静默取 `code`"，那会让"我改了文件"变成假的。
+⚠ 若你换过参数却收到 "Field required" 这类校验错，多半是**客户端缓存的旧工具表**
+⇒ 重连/刷新一次会话（工具表在会话建立时取一次）。
+⚠ 形状轨迹太长时（几十模块 × 3 档批量）用 `shapes_verbosity: "summary"`：
+只回**逐模块唯一形状对**，回执能小一大截；顶层 `shapes` 也不再与 `runs[]` 重复。
 
 **③ 训练动态要看"步"这一级 → `on_step` 返回 dict**
 
@@ -112,7 +120,10 @@ def on_step(self, model, step, ctx):
 
 `eval_custom` 不给数据时**自动继承训练时的负载**（从 checkpoint 里的**声明**重建，
 HDF5 会按原路径重读）；要换新数据就显式给 `payload` / `dataset_id`。
-回执的 **`payload_source`** 说清这次用的是哪一份（`given` / `inherited_from_training`）。
+回执的 **`payload_source`**（`given` / `inherited_from_training`）与
+**`payload_source_reason`**（`explicit` / `inherited` / `no_declaration` /
+`declaration_unreadable` / `no_checkpoint`）说清**用的是哪一份、以及为什么**——
+`no_declaration` 通常意味着**那次训练的存档早于"声明随存档走"这次改动**。
 
 ---
 

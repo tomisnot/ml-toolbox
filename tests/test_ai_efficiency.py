@@ -376,6 +376,124 @@ def test_eval_custom_inherits_the_training_payload():
             ml.close()
 
 
+def test_code_path_is_exclusive_and_says_which_source_was_used():
+    """⭐ `code` 与 `code_path` **二选一**；回执必须说清**实际用了哪一份**。
+
+    实测缺口（反馈 §2.2）：同时给时 `code` **静默覆盖** `code_path`，而回执还把
+    `code_path` 原样回显 ⇒ "看起来像读到了文件"，实际跑的是内联那段
+    （他给了 3 行占位符 + 156 行真文件，回执写着 `code_path` 与 `code_lines: 3`）。
+    "看起来对、其实用了另一份"正是本仓最忌的假象。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-src-") as td:
+        ml = _ml(td, roots=[td])
+        try:
+            f = Path(td) / "net.py"
+            f.write_text(GOOD, encoding="utf-8")
+            ds = _payload_ds(ml, rows=12)
+            # ① 只给 code_path ⇒ 可以（`code` 有默认 ""）
+            v = ml.tools.execute("run_custom", {
+                "code_path": str(f), "dataset_id": ds, "dry_run": True,
+                "device": _DEV})["value"]
+            assert v["ok"] is True, v
+            assert v["code_source"] == "file", v
+            assert v["code_lines"] == len(GOOD.splitlines()), v
+            # ② 同时给 ⇒ **明确报错**（不静默取一个）
+            both = ml.tools.execute("run_custom", {
+                "code": "class Network:\n    pass\n", "code_path": str(f),
+                "dataset_id": ds, "dry_run": True, "device": _DEV})
+            assert both["is_error"] is True, both
+            info = (both.get("error") or {}).get("info") or {}
+            assert info.get("kind") == "bad_code_source", info
+            assert "只给" in (info.get("hint") or ""), info
+            # ③ 只给内联 ⇒ `code_source` 说 "inline"
+            iv = ml.tools.execute("run_custom", {
+                "code": GOOD, "dataset_id": ds, "dry_run": True,
+                "device": _DEV})["value"]
+            assert iv["code_source"] == "inline", iv
+        finally:
+            ml.close()
+
+
+def test_dry_run_shapes_verbosity_is_smaller():
+    """⭐ `shapes_verbosity="summary"` 让"几十模块 × 3 档"的回执小下来（反馈 §2.3）。
+
+    同时钉住"顶层 `shapes` 与 `runs[].shapes` **不再各来一份**"（同一批数据重复
+    两遍纯属浪费上下文）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-verb-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=12)
+            full = ml.tools.execute("run_custom", {
+                "code": GOOD, "dataset_id": ds, "dry_run": True,
+                "device": _DEV})["value"]
+            small = ml.tools.execute("run_custom", {
+                "code": GOOD, "dataset_id": ds, "dry_run": True,
+                "device": _DEV, "shapes_verbosity": "summary"})["value"]
+            assert full["ok"] is True and small["ok"] is True
+            assert all("shapes" not in r for r in small["runs"]), small["runs"]
+            assert small["shapes_summary"], small
+            assert small["shapes"] == small["shapes_summary"], "摘要档的顶层也该是摘要"
+            n_full = sum(len(r.get("shapes") or []) for r in full["runs"])
+            assert len(small["shapes_summary"]) <= n_full, (small, n_full)
+            # 顶层**不再**等于"全量逐档"（否则就是与 runs[] 重复）
+            assert len(full["shapes"]) <= n_full, full["shapes"]
+        finally:
+            ml.close()
+
+
+def test_eval_custom_says_why_the_payload_source_is_what_it_is():
+    """⭐ 继承不了时要说清**为什么**（反馈 §3.1：他只能靠猜）。
+
+    他实测那次：训练**确实带了 payload**，回执却是"没有负载"，原因只能猜 ——
+    实测查明是**那个 checkpoint 早于"声明随存档走"这次改动**（键集里根本没有
+    `payload_decl`）。⇒ 补 `payload_source_reason`，把判别结果直接给出来。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import torch
+    with tempfile.TemporaryDirectory(prefix="eff-reason-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=12)
+            rid = ml.tools.execute("run_custom", {
+                "code": GOOD, "dataset_id": ds, "name": "reason",
+                "overrides": {"epochs": 2, "batch": 4}, "device": _DEV}
+            )["value"]["run_id"]
+            EVAL = ('def evaluate(model, ctx):\n'
+                    '    return {"keys": float(len(ctx["payload"]))}\n')
+            # ① 正常 ⇒ inherited
+            a = ml.tools.execute("eval_custom", {"run_id": rid, "code": EVAL})["value"]
+            assert a["payload_source"] == "inherited_from_training", a
+            assert a["payload_source_reason"] == "inherited", a
+            # ② 抹掉存档里的声明（= "这次改动之前"的旧存档）⇒ 要**说清原因**
+            #   ⚠ 路径要用 `RUNS_DIR`（存档根由装配时定，不等于测试的临时根）
+            from ml_toolbox.core.persistence import RUNS_DIR
+            ck = Path(RUNS_DIR) / rid / "checkpoint" / "best.pt"
+            assert ck.is_file(), ck
+            obj = torch.load(ck, map_location="cpu", weights_only=False)
+            obj.pop("payload_decl", None)
+            torch.save(obj, ck)
+            b = ml.tools.execute("eval_custom", {"run_id": rid, "code": EVAL})["value"]
+            assert b["payload_source"] == "", b
+            assert b["payload_source_reason"] == "no_declaration", b
+            # ③ 显式给 ⇒ explicit
+            c = ml.tools.execute("eval_custom", {
+                "run_id": rid, "code": EVAL,
+                "payload": {"arrays": {"x": np.zeros((3, 2))}}})["value"]
+            assert c["payload_source"] == "given", c
+            assert c["payload_source_reason"] == "explicit", c
+        finally:
+            ml.close()
+
+
 _TESTS = [
     test_dry_run_catches_a_shape_error_in_one_round_trip,
     test_dry_run_passes_on_a_correct_net_and_reports_the_trace,
@@ -384,6 +502,10 @@ _TESTS = [
     test_step_level_metrics_reach_the_observation_surface,
     test_code_path_reads_the_network_from_a_file,
     test_eval_custom_inherits_the_training_payload,
+    # ---- 第二轮反馈（docs/反馈-code_path接线与dry_run实测.md）----
+    test_code_path_is_exclusive_and_says_which_source_was_used,
+    test_dry_run_shapes_verbosity_is_smaller,
+    test_eval_custom_says_why_the_payload_source_is_what_it_is,
 ]
 
 
