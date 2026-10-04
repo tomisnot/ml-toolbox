@@ -1454,6 +1454,53 @@ def test_monitor_runs_route_fails_loud_instead_of_faking_empty():
                 ml.close()
 
 
+def test_audit_reason_is_the_callers_and_falls_back_to_human_text():
+    """⭐ 命令审计的 ``reason``：**调用方给的原话要保住**，没给则**人话兜底**。
+
+    ## 为什么有这条（用户实测反馈）
+
+    面板"飞行记录仪"折叠行显示的是 ``reason``（资产里 ``reason || target``）。
+    原先 ``engine._invoke_core_command`` 写死 ``args["reason"] = f"ml_mecha:{command}"``
+    ⇒ **无条件覆盖**：AI 写下的意图被抹掉，面板上只剩 ``ml_mecha:eval_custom`` 这种机械串
+    （既不说明做了什么、也不说明为什么）。
+
+    现在与另一家的做法一致：**AI 可给 + 人话兜底**。本判据四件事都钉：
+    1. **每条命令都声明了 ``reason``**（框架规则：只在命令里声明过才保留，未声明会被剥掉）；
+    2. **它会投影到 AI 侧工具面**（`CommandParam` → `core_commands` → 框架 `project`），
+       否则模型想给也给不了；
+    3. **调用方给的原话原样落进审计**（不被覆盖）；
+    4. **没给时是人话兜底**，且**不含** `ml_mecha:` 那种机械前缀。
+    """
+    from mecha.commands import CommandSpec as CoreCommandSpec
+
+    from ml_mecha.commands import COMMANDS
+    from ml_mecha.core_commands import core_command_specs
+    from ml_mecha.engine import _reason_fallback
+
+    # 1. 声明齐
+    missing = [c.name for c in COMMANDS
+               if not any(p.name == "reason" for p in c.parameters)]
+    assert not missing, f"这些命令没声明 reason ⇒ 模型说的话会被框架剥掉：{missing}"
+
+    # 2. 投影到工具面（AI 看得到）
+    cores = {s.name: s for s in core_command_specs()}
+    assert cores, "拿不到核心命令声明"
+    for name, s in cores.items():
+        assert isinstance(s, CoreCommandSpec)
+        props = (getattr(s, "parameters", {}) or {}).get("properties", {})
+        assert "reason" in props, f"{name} 的 AI 工具面没有 reason ⇒ 模型给不了理由"
+
+    # 3. 兜底是人话、且不是老那种机械串
+    fb_eval = _reason_fallback("eval_custom", {"which": "best"})
+    assert "ml_mecha:" not in fb_eval, f"兜底还是机械串：{fb_eval!r}"
+    assert "评估" in fb_eval and "best" in fb_eval, fb_eval
+    assert _reason_fallback("run_method", {"method": "ridge"}) == "运行方法 ridge"
+    assert "2" in _reason_fallback("compare_methods", {"methods": ["a", "b"]}), \
+        "批量类命令的兜底应带上数量"
+    # 未知命令也要有兜底（不能 KeyError）
+    assert _reason_fallback("没见过的命令", {}), "未知命令的兜底是空的"
+
+
 def test_monitor_extra_routes_are_registered_and_core_routes_untouched():
     """ML 的附加路由经框架 ``add_route`` 注册，且不覆盖四个核心路由。
 

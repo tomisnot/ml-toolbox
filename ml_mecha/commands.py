@@ -92,6 +92,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         name="prepare_dataset",
         summary="登记一份数据并在训练部分上拟合预处理链，返回数据集引用与管道指纹；数据来源可给文件路径、进程内表格、数组或合成规格。",
         parameters=(
+            # ⭐ **AI 能写"为什么"**：`reason` 是框架的**保留参数**（`RESERVED_ARGS`），
+            #   会被抽走送进命令审计事件 —— 就是监控面板"飞行记录仪"折叠行上显示的那句话。
+            #   ⚠ 框架规则是**只在命令里声明过才保留**（未声明的参数会被剥掉）⇒ 必须逐条声明，
+            #   否则模型传了也到不了审计（实测：不声明时调用方给的 reason 被丢弃）。
+            #   没给时由 `engine.py` 按命令补一句**动作语义**的人话（见 `_reason_fallback`），
+            #   而不是 `ml_mecha:<命令名>` 这种机械串。
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
             CommandParam("source", "object", True,
                          "数据来源声明，例如 {'kind': 'csv', 'path': 'x.csv'}、{'kind': 'frame', 'frame': <表格>}、{'kind': 'arrays', 'X': [...], 'y': [...]}、{'kind': 'synthetic', 'task': 'classification'}"),
             CommandParam("name", "string", False, "数据集显示名", "dataset"),
@@ -128,6 +137,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         name="run_method",
         summary="在已准备的数据视图上运行一个机器学习方法并返回运行编号与指标摘要；预测数组等大产物留在结果侧，此处只给运行编号。",
         parameters=(
+            # ⭐ **AI 能写"为什么"**：`reason` 是框架的**保留参数**（`RESERVED_ARGS`），
+            #   会被抽走送进命令审计事件 —— 就是监控面板"飞行记录仪"折叠行上显示的那句话。
+            #   ⚠ 框架规则是**只在命令里声明过才保留**（未声明的参数会被剥掉）⇒ 必须逐条声明，
+            #   否则模型传了也到不了审计（实测：不声明时调用方给的 reason 被丢弃）。
+            #   没给时由 `engine.py` 按命令补一句**动作语义**的人话（见 `_reason_fallback`），
+            #   而不是 `ml_mecha:<命令名>` 这种机械串。
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
             CommandParam("method", "string", True, "已注册的方法名"),
             CommandParam("dataset_id", "string", False, "数据集引用；留空用最近准备的一份", ""),
             CommandParam("overrides", "object", False, "运行级参数覆写（不改全局默认）"),
@@ -151,6 +169,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         name="run_method_batch",
         summary="在同一份数据视图上顺序运行多个方法，逐方法隔离失败；返回每个方法的运行编号与指标，失败项只给编号与原因。",
         parameters=(
+            # ⭐ **AI 能写"为什么"**：`reason` 是框架的**保留参数**（`RESERVED_ARGS`），
+            #   会被抽走送进命令审计事件 —— 就是监控面板"飞行记录仪"折叠行上显示的那句话。
+            #   ⚠ 框架规则是**只在命令里声明过才保留**（未声明的参数会被剥掉）⇒ 必须逐条声明，
+            #   否则模型传了也到不了审计（实测：不声明时调用方给的 reason 被丢弃）。
+            #   没给时由 `engine.py` 按命令补一句**动作语义**的人话（见 `_reason_fallback`），
+            #   而不是 `ml_mecha:<命令名>` 这种机械串。
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
             CommandParam("methods", "array", True, "按顺序运行的方法名列表（受数量上限约束）"),
             CommandParam("dataset_id", "string", False, "数据集引用；留空用最近准备的一份", ""),
             CommandParam("overrides", "object", False, "所有方法共用的运行级参数覆写"),
@@ -167,6 +194,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         name="compare_methods",
         summary="在同一份数据视图上对比多个方法的主指标，返回可排序对比表与最优方法；逐方法隔离失败，失败项只给运行编号与失败原因。",
         parameters=(
+            # ⭐ **AI 能写"为什么"**：`reason` 是框架的**保留参数**（`RESERVED_ARGS`），
+            #   会被抽走送进命令审计事件 —— 就是监控面板"飞行记录仪"折叠行上显示的那句话。
+            #   ⚠ 框架规则是**只在命令里声明过才保留**（未声明的参数会被剥掉）⇒ 必须逐条声明，
+            #   否则模型传了也到不了审计（实测：不声明时调用方给的 reason 被丢弃）。
+            #   没给时由 `engine.py` 按命令补一句**动作语义**的人话（见 `_reason_fallback`），
+            #   而不是 `ml_mecha:<命令名>` 这种机械串。
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
             CommandParam("methods", "array", True, "参与对比的方法名列表"),
             CommandParam("dataset_id", "string", False, "数据集引用；留空用最近准备的一份", ""),
             CommandParam("seed", "integer", False, "随机种子（整数）"),
@@ -184,6 +220,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         summary="跑一段**由调用方给出的网络定义代码**：代码只写结构（Network 契约），"
                 "训练循环/观测/存档由系统代管；返回运行编号与指标。",
         parameters=(
+            # ⭐ **AI 能写"为什么"**：`reason` 是框架的**保留参数**（`RESERVED_ARGS`），
+            #   会被抽走送进命令审计事件 —— 就是监控面板"飞行记录仪"折叠行上显示的那句话。
+            #   ⚠ 框架规则是**只在命令里声明过才保留**（未声明的参数会被剥掉）⇒ 必须逐条声明，
+            #   否则模型传了也到不了审计（实测：不声明时调用方给的 reason 被丢弃）。
+            #   没给时由 `engine.py` 按命令补一句**动作语义**的人话（见 `_reason_fallback`），
+            #   而不是 `ml_mecha:<命令名>` 这种机械串。
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
             CommandParam("code", "string", True,
                          "定义 `class Network` 的 Python 代码；只需实现 "
                          "build(n_in, n_out, *, nn)，可选 loss/configure/forward_step"),
@@ -217,6 +262,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         summary="装载某次自定义网络的 checkpoint，把模型交给调用方代码去评估"
                 "（采样/算能量/换尺寸外推），返回它上报的指标",
         parameters=(
+            # ⭐ **AI 能写"为什么"**：`reason` 是框架的**保留参数**（`RESERVED_ARGS`），
+            #   会被抽走送进命令审计事件 —— 就是监控面板"飞行记录仪"折叠行上显示的那句话。
+            #   ⚠ 框架规则是**只在命令里声明过才保留**（未声明的参数会被剥掉）⇒ 必须逐条声明，
+            #   否则模型传了也到不了审计（实测：不声明时调用方给的 reason 被丢弃）。
+            #   没给时由 `engine.py` 按命令补一句**动作语义**的人话（见 `_reason_fallback`），
+            #   而不是 `ml_mecha:<命令名>` 这种机械串。
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
             CommandParam("run_id", "string", True,
                          "要装载哪一次运行（run_custom 的 run_id）"),
             CommandParam("code", "string", True,
@@ -242,9 +296,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="clear_current_state",
         summary="把当前配置台面清零：每个已设置的状态键写回默认（留空=默认）",
-        #: 无参数：语义就是"全部清零"。要"清一部分"的需求今天不存在，
+        #: 无**业务**参数：语义就是"全部清零"。要"清一部分"的需求今天不存在，
         #: 而给它加个 keys 参数等于自己造一个"部分状态"的语义面（先不做）。
-        parameters=(),
+        #: ⚠ `reason` 不是业务参数，是框架的**保留参数**（送审计）⇒ 它必须有，
+        #:   否则这一类审计事件会退回机械串（详见 `prepare_dataset` 处那段说明）。
+        parameters=(
+            CommandParam("reason", "string", False,
+                         "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
+                         "省略则由系统按动作补一句）", ""),
+        ),
         #: ⚠ 声明的就是**全部**状态键（不是子集）：清零的定义是"整张台面"，
         #:   声明成子集会让"哪些键其实没被清"变成注释里的事。
         writes_state=("current.dataset_id", "current.pipeline_id",

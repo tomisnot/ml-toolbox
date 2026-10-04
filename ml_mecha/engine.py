@@ -268,6 +268,52 @@ def make_state_writer(gate: Any) -> Callable[[str, Mapping[str, Any], str], list
     return write
 
 
+#: 命令 → 人话兜底模板（**调用方没给 reason 时**用；`{k}` 取该命令声明的参数值）。
+#:
+#: ## 为什么需要（用户实测反馈）
+#
+# 面板"飞行记录仪"的折叠行显示的是 **`reason`**（资产里是 `reason || target`）。
+# 而这里原先是 `args["reason"] = f"ml_mecha:{command}"` —— **无条件覆盖**：
+# 既抹掉了调用方/AI 写下的意图，写出来的又只是"模块:命令名"这种机械串
+# （每次 custom 运行都显示 `ml_mecha:eval_custom`，既不说明做了什么、也不说明为什么）。
+#
+# 对照另一家的做法（GP）：**"AI 可给 reason + 人话兜底"**
+# （`reason=reason or f"落库引文边 {aid}"`）。本表就是那条兜底。
+#
+# ⚠ 兜底**只描述"这条命令干了什么"**，不替调用方编"为什么"。
+_REASON_FALLBACK: dict = {
+    "prepare_dataset": "准备数据集「{name}」",
+    "run_method": "运行方法 {method}",
+    "run_method_batch": "批量运行 {n} 个方法",
+    "compare_methods": "对比 {n} 个方法",
+    "run_custom": "运行自定义网络「{name}」",
+    "eval_custom": "评估自定义网络（{which} 权重）",
+    "clear_current_state": "清空当前配置台面",
+}
+
+
+def _reason_fallback(command: str, spec: Mapping[str, Any]) -> str:
+    """按"这条命令干了什么"补一句人话（拿不到关键参数时退回最朴素的描述）。"""
+    tpl = _REASON_FALLBACK.get(command)
+    if not tpl:
+        return "执行命令 " + str(command)
+    ctx: dict = {"n": 0}
+    try:
+        if isinstance(spec.get("methods"), (list, tuple)):
+            ctx["n"] = len(spec["methods"])
+        for key in ("name", "method", "which"):
+            if spec.get(key) not in (None, ""):
+                ctx[key] = str(spec[key])
+    except Exception:
+        pass
+    try:
+        return tpl.format(**ctx)
+    except Exception:
+        return tpl.replace("「{name}」", "").replace("{name}", "") \
+                  .replace("{method}", "").replace("{which}", "") \
+                  .replace("{n}", "若干").strip()
+
+
 class MLEngine(Engine):
     """ML 宿主的 Engine Provider：受控命令分派 + 紧凑回执 + 资源估算。"""
 
@@ -829,7 +875,13 @@ class MLEngine(Engine):
                              context: ExecutionContext | None) -> Mapping[str, Any]:
         """经核心 CommandRegistry 调用命令（审计/result_ref 由核心写）。"""
         args = {k: v for k, v in spec.items() if k != "command"}
-        args["reason"] = f"ml_mecha:{command}"
+        # ⭐ **保留调用方给的 reason**；没给才由本层按动作补一句人话。
+        #   ⚠ 原先写死 `f"ml_mecha:{command}"` —— 那会**抹掉** AI 写下的意图，
+        #   面板"飞行记录仪"折叠行上就只剩机械串（用户实测反馈的那条）。
+        #   现在与另一家的做法一致："AI 可给 + 人话兜底"。
+        given = args.get("reason")
+        args["reason"] = (str(given).strip() if given else "") or \
+            _reason_fallback(command, spec)
         args["call_id"] = _call_id()
         result = self._commands.invoke(
             command, args, context=context, gate=self._command_gate,
@@ -950,23 +1002,43 @@ class MLEngine(Engine):
                              kind="missing_eval_code",
                              hint="契约：`def evaluate(model, ctx) -> dict`")
         # 数据：① 复用会话里的某份数据集；② 或现场读一份新负载（"换个 N 评估"的用法）
+        #
+        # ⚠ **这里曾经是个确定性 bug**（反馈 §2-缺口2 定位准确）：
+        #   `check_dataset_ref` 返回的是 **facts 字典**，不是带 `.spec` 的 DatasetEntry
+        #   ⇒ `getattr(entry.spec, …)` 必然 `AttributeError: 'dict' object has no
+        #   attribute 'spec'`。而**判据没抓到它**，因为我的判据只走了 `payload` 那条路
+        #   —— "文档推荐的用法没人跑过"正是典型的假绿。现在两条路都有判据。
         payload: dict[str, Any] = {}
         ds_id = str(spec.get("dataset_id") or "").strip()
         if ds_id:
-            entry = self._validator.check_dataset_ref(ds_id)
-            payload = dict(getattr(entry.spec, "aux", {}).get("payload") or {})
+            self._validator.check_dataset_ref(ds_id)      # 先按既有口径校验存在性
+            entry = self.dataset_entry(ds_id)
+            if entry is not None:
+                payload = dict(getattr(entry.spec, "aux", {}).get("payload") or {})
         decl = spec.get("payload")
         if decl:
             payload = {**payload, **self._parse_payload_decl(decl, n_rows=None)}
+        # ⚠ **刻意不"继承训练时的负载"**：评估通常要看**训练没见过**的数据（需求原文
+        #   就是"换个没见过的 N 评估"）⇒ 悄悄拿训练数据来评估会给出一个"看着对、
+        #   其实在测内插"的数字，那正是本仓最忌的假事实。
+        #   ⇒ 没有数据时**明说**（回执 warnings + 取负载时的可教学 KeyError）。
+        warn: list[str] = []
+        if not payload:
+            warn.append(
+                "这次评估**没有负载**：若代码要读 `ctx['payload']`，请给 "
+                "`dataset_id=…`（复用会话里某份数据集）或 `payload=…`（现场给新数据）。"
+                "⚠ 训练时的负载**不随 checkpoint 走**（刻意如此：评估该用没见过数据）。")
         out = run_eval_code(run_id, code, which=str(spec.get("which") or "best"),
                             payload=payload, dataset_id=ds_id)
         return {
             "ok": bool(out.get("ok")), "command": "eval_custom",
             "run_ids": [run_id] if out.get("ok") else [],
             "primary_metric": "", "metrics": dict(out.get("metrics") or {}),
-            "warnings": [out["hint"]] if out.get("hint") else [],
+            "warnings": ([out["hint"]] if out.get("hint") else []) + warn,
             "run_id": run_id, "which": out.get("which", ""),
             "extra_keys": sorted((out.get("extra") or {}).keys()),
+            "n_payload_arrays": len(payload),
+            "payload_keys": sorted(payload),
             "note": out.get("note", ""),
             "error": out.get("error", ""),
             "error_kind": out.get("error_kind", ""),
