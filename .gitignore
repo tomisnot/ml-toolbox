@@ -42,6 +42,13 @@ logs/
 # AI 模式运行期生成的 dsh overlay（每次启动按实际端口重写）
 runtime/
 
+# dsh 的工作区目录：`.dsh/skills/<name>` 是指向 `skills/<name>` 的 **junction**
+# （同一份文件、两个路径）。AI 实际加载的是 `.dsh/` 下那份，而**权威源入库**。
+# ⚠ `git` 看不见 `.dsh/` ⇒ 改 SKILL 请改 `skills/`（junction 让两边同时变）；
+#   若有人把 junction 换成真副本，`tests/test_skill_surface.py` 会当场红。
+#   建/修 junction：`python checks/link_skills.py`
+.dsh/
+
 .vscode/
 # Trae IDE 的文档目录（AI 编辑器的过程产物；曾入库现已不在树）
 .trae/

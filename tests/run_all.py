@@ -65,7 +65,11 @@ MECHA_ROOT = os.environ.get("MECHA_ROOT") or os.path.normpath(os.path.join(os.pa
 MECHA_PRESENT = os.path.isdir(MECHA_ROOT)
 if MECHA_PRESENT:
     PHASE_SENSITIVE += ["test_ml_mecha.py", "test_ml_capabilities.py",
-                        "test_ml_delivery.py"]
+                        "test_ml_delivery.py",
+                        # skill 说明书 ⇄ 真能力面的守卫（AI 可见面）：静态、秒级，
+                        # 与上面三套同属"AI 面"这一主题，故放同一阶段。
+                        # ⚠ 它需要 mecha（import ml_mecha）⇒ 放在这个条件块里。
+                        "test_skill_surface.py"]
 
 PHASES = [("重负载", PHASE_HEAVY), ("时延敏感", PHASE_SENSITIVE),
           ("图/范式", PHASE_GRAPH)]
