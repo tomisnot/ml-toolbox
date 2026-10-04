@@ -21,10 +21,14 @@
 - 命令面只覆盖宪章 §11.2 的"只读 + 单次执行 + 批量对比"三段；
   ``tune_method`` / ``run_benchmark`` / ``predict_new`` / ``export_prediction``
   按"最小可运行优先"显式推迟（未声明即 fail loud，不静默降级）。
+  ⚠ 其中 **`predict_new` 是最容易误判的一个**：会话层**已有** `Session.predict`
+  （`api.py:281`，GUI 的"对新数据预测"就在用它），只是**没有命令/工具入口**
+  ⇒ 属于"能调但没接线"，不是"能力不存在"。接它是一条命令 + 一个工具的量。
 - 数据集/管道/记录都**只在内存**（会话级）。跨进程找回要等 mecha 的
   Artifact / Job Contract 补齐（见汇报里的接口缺口清单）。
-- ``device`` 只做声明与校验，不真的切设备：ML 方法层尚未消费该字段，
-  本层不替方法层做决定（诚实推迟，不假装已生效）。
+- ~~``device`` 只做声明与校验，不真的切设备~~ ⇒ **已修（2026-10-03）**：
+  `device` 现在一路透传到方法层（优先级"具体 > auto"），判据
+  `test_ml_mecha.py::test_device_declaration_reaches_the_method_layer` 钉住它。
 """
 from __future__ import annotations
 
