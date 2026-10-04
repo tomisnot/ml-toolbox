@@ -245,18 +245,13 @@ def test_scalar_layout_is_written_and_readable():
 
 
 # ---------------------------------------------------------------- 直跑入口
-_TESTS = [
-    test_events_are_written_with_all_axes,
-    test_series_matches_artifacts,
-    test_latest_reads_the_newest_step,
-    test_scalar_layout_is_written_and_readable,
-    test_duplicate_steps_are_deduped_and_flagged,
-    test_new_event_file_is_picked_up,
-    test_missing_run_reports_reason_not_empty,
-    test_run_id_path_traversal_is_rejected,
-    test_sidecar_refuses_missing_logdir_with_reason,
-    test_sidecar_stop_is_idempotent,
-]
+#: ⭐ **内省收集**（2026-10-03 改）：此前这里是**手写**的判据清单，而门禁用
+#: **脚本**方式跑本文件 ⇒ 新判据忘了加进来就**永远不会进闸**。实锤：
+#: `test_ml_delivery.py::test_tool_params_stay_within_command_declaration`
+#: （"工具声明与实现漂移"那条）从未在门禁里跑过。
+#: ⇒ 定义即入闸，漂移不可能。（前提：本文件的 `test_*` 都是无参函数。）
+_TESTS = [fn for name, fn in sorted(globals().items())
+          if name.startswith("test_") and callable(fn)]
 
 
 def main() -> int:

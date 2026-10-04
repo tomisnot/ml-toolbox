@@ -197,6 +197,24 @@ COMMANDS: tuple[CommandSpec, ...] = (
         risk=RISK_MEDIUM,
         extra_receipt_keys=("run_id", "elapsed_s", "error", "network_name"),
     ),
+    # ---- 清零入口（指导意见 §1-P1-5：别让 AI 在别人没收拾的台面上干活） ----
+    CommandSpec(
+        name="clear_current_state",
+        summary="把当前配置台面清零：每个已设置的状态键写回默认（留空=默认）",
+        #: 无参数：语义就是"全部清零"。要"清一部分"的需求今天不存在，
+        #: 而给它加个 keys 参数等于自己造一个"部分状态"的语义面（先不做）。
+        parameters=(),
+        #: ⚠ 声明的就是**全部**状态键（不是子集）：清零的定义是"整张台面"，
+        #:   声明成子集会让"哪些键其实没被清"变成注释里的事。
+        writes_state=("current.dataset_id", "current.pipeline_id",
+                      "current.method", "current.overrides", "current.seed",
+                      "current.device", "current.resource_guard",
+                      "current.export_root"),
+        side_effect=SIDE_EFFECT_DOMAIN_STATE,
+        risk=RISK_LOW,
+        extra_receipt_keys=("cleared", "already_clean", "n_cleared",
+                            "n_already_clean", "readback", "error"),
+    ),
 )
 
 

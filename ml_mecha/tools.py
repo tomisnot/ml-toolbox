@@ -40,6 +40,7 @@ from typing import Any
 
 from mecha.errors import MechaError
 from mecha.gate import Channel
+from mecha.providers.codeact import Action
 from mecha.surface import ExecutionContext
 from mecha.tools import ToolDefinition, define_tool
 
@@ -108,10 +109,82 @@ def _local_context() -> ExecutionContext:
     return ExecutionContext()
 
 
+#: ⭐ **描述里不许出现的实现词汇**（指导意见 §5：模型可见文本只含任务概念）。
+#:
+#: ⚠ 为什么必须是**真词表**：这条纪律的管道早铺好了（`define_tool(banned_words=...)`
+#: 会在**构造期**校验 description，撞词就 `bad_description` 造不出工具），但一直
+#: 传的是**空表** ⇒ **纪律铺了却没启用**——比没铺更坏，因为它看起来"已经有守卫了"。
+#: （实测于 2026-10-03：`register_ml_tools` 调用处没传 `banned_words`。）
+#:
+#: 词表原则：**框架/传输/内部结构的词**不该出现在模型读的文本里（那是设计者的词汇）；
+#: 而"运行/指标/数据集/方法/存档"是**任务概念**，可以用。加词时先问：
+#: "AI 看到这个词，会不会去猜一个它不该关心的东西？"
+BANNED_WORDS: tuple[str, ...] = (
+    "gate", "authority", "history", "surface", "monitor",       # 框架机制
+    "channel", "contextvar", "snapshot", "快照", "写权",          # 内部状态
+    "registry", "provider", "adapter",                          # 结构词汇
+    "contextvar", "daemon", "线程", "轮询", "semaphore",          # 执行细节
+    "contextvars", "jobregistry", "toolregistry", "engine_kwargs",
+)
+
+
+def _pick(obj: Any, paths: Any) -> dict:
+    """按**键路径**投影，只回关注量（指导意见 §1-P1-6：扫 N 个点别撑爆上下文）。
+
+    ## 三条纪律（照指导意见）
+
+    1. **整键优先**：JSON 的键本身可以含点 ⇒ 先按整键取；取不到再按 `.` 拆路径。
+    2. **缺失不静默**：取不到的键如实列进 `_missing`，**绝不回 null 冒充"值是空"**
+       —— "没有这个键"与"这个键的值是 null"是两件不同的事。
+    3. **空投影 = 不投影**：`paths` 为空/None ⇒ 原样返回（调用方没要求投影）。
+
+    @param paths 键路径列表，如 ``["run_id", "metrics.f1", "series.loss.values"]``
+    """
+    if not paths:
+        return dict(obj) if isinstance(obj, Mapping) else {"value": obj}
+    if not isinstance(paths, (list, tuple)):
+        paths = [paths]
+    got: dict = {}
+    missing: list = []
+    for raw in paths:
+        key = str(raw)
+        if isinstance(obj, Mapping) and key in obj:
+            got[key] = obj[key]                      # ① 整键优先
+            continue
+        cur: Any = obj
+        ok = True
+        for part in key.split("."):
+            if isinstance(cur, Mapping) and part in cur:
+                cur = cur[part]
+            elif isinstance(cur, (list, tuple)) and part.isdigit() \
+                    and int(part) < len(cur):
+                cur = cur[int(part)]
+            else:
+                ok = False
+                break
+        if ok:
+            got[key] = cur
+        else:
+            missing.append(key)
+    if missing:
+        got["_missing"] = missing                    # ② 缺失如实列（不静默 null）
+    return got
+
+
+#: 读工具共用的 `pick` 参数声明（**一处定义**，免得各写一份描述而走样）。
+PICK_PARAM: dict = {
+    "type": "array",
+    "description": "只回这些键路径（可选），例如 ['run_id','metrics.f1']；支持点号下钻。"
+                   "取不到的键会如实列进 `_missing`（不会静默回 null）。"
+                   "**扫多个结果/对比时用它**，免得把整份回执灌进上下文。",
+}
+
+
 def build_ml_tools(engine: MLEngine, *, actor: str = LOCAL_ACTOR,
                    side: str = "human",
                    banned_words: tuple[str, ...] = (),
-                   host: Any = None) -> list[ToolDefinition]:
+                   host: Any = None,
+                   codeact: Any = None) -> list[ToolDefinition]:
     """构造 ML 工具面（顺序稳定；宿主注册进自己的 ToolRegistry）。
 
     工具按**内容**分类，不按传输形态分类：本地 Python 宿主、dsh/MCP 宿主
@@ -149,7 +222,220 @@ def build_ml_tools(engine: MLEngine, *, actor: str = LOCAL_ACTOR,
         _submit_run(host, side, banned_words),
         _read_job(host, banned_words),
         _cancel_run(host, banned_words),
+        _clear_current_state(engine, _with_channel, banned_words),
+        _run_queries(engine, codeact, banned_words),
     ]
+
+
+#: 一段编排最多多少步。**项目要自己想上限**（指导意见 §3：框架给机制，
+#: "上限"是项目策略）：不封顶的话一段动作可以把整个能力面扫一遍，
+#: 上下文与 CPU 都会被打满，而模型自己毫无察觉。
+MAX_ACTIONS = 25
+
+#: CodeAct 的**内置动作**（框架侧，与只读查询并列）。照抄框架 `_dispatch`
+#: 的实现，附上各自的参数形状——这样预检能覆盖全部 op，而不是只覆盖查询。
+_BUILTIN_ACTIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "run": (("spec",), ("spec",)),          # 走 Surface.run（受控命令面）
+    "estimate": (("spec",), ()),
+    "summary": ((), ()),
+    "schema": ((), ()),
+}
+
+
+def _action_ops(engine: MLEngine) -> set:
+    """能力面里可用的 op（内置动作 + 已注册的只读查询）。"""
+    from .engine import READ_QUERY_NAMES
+    return set(_BUILTIN_ACTIONS) | set(READ_QUERY_NAMES)
+
+
+def _action_arg_spec(engine: MLEngine,
+                     op: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """某个 op 的 ``(可给参数, 必给参数)``；不在能力面 ⇒ ``None``。
+
+    ⚠ 查询那部分**从实现签名派生**（`engine.query_arg_spec`），不手写表
+    —— 手写的必与实现漂移，而漂移会以"预检放行、运行期 TypeError"的形式出现。
+    """
+    if op in _BUILTIN_ACTIONS:
+        return _BUILTIN_ACTIONS[op]
+    return engine.query_arg_spec(op)
+
+
+def _run_queries(engine: MLEngine, codeact: Any,
+                 banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """⭐ **一次往返里跑一串只读查询**（指导意见 §4 的模型入口）。
+
+    ## 为什么值得占一个工具位
+
+    没有它时，"列方法 → 看几个方法的参数 → 查数据集 → 查最近两次训练"这种
+    **常见组合**要 6+ 次往返。编排省下的回合是实打实的（每次往返都带着
+    一大坨上下文）。判据（指导意见）："只读能力超过 10 条、或扫描/多步组合
+    是常见用法时"——我们 7 条只读查询 + **扫描/多步组合确实是常见用法**。
+
+    ## 回执形状（照指导思想，**逐项都有**）
+
+    ```json
+    {"ok": true, "steps": [
+      {"index": 0, "op": "method_catalog", "ok": true, "detail": "…短摘要…",
+       "output": {...}},
+      {"index": 1, "op": "method_detail", "ok": false,
+       "detail": "[unknown_method] …教学原因…", "output": null}],
+     "stopped_at": 1, "n_steps": 2, "error": ""}
+    ```
+
+    - **output 直接挂在步里**（不是顶层的**位置数组**——那会逼调用方自己对齐，
+      "省下的回合又花回去"）；
+    - 成功步 `detail` 给**短摘要**，失败步 `detail` 是**教学原因**；
+    - ⚠ **首个失败就停**（`stopped_at` 指出是哪步）：后面的步骤可能依赖前一步的
+      结果，硬跑下去只会得到一串"因为前面失败而失败"的噪声。
+
+    ## 能力边界（如实说，不假装）
+
+    够得到的只有**只读查询**（外加 4 个内置动作 `summary`/`schema`/`estimate`/`run`）。
+    **写操作不在编排里**：每条写仍要单独经受控命令面（各自过闸、各自留痕）。
+    ⇒ 要用它来"多步写"是不行的，也不该行。
+    """
+
+    def execute(*, actions: Any = None, pick: Any = None) -> Mapping[str, Any]:
+        if codeact is None:
+            raise MechaError(
+                "本实例没有接上编排器",
+                kind="no_codeact",
+                hint="装配点未注入 CodeAct；逐条调用只读查询工具同样有效",
+                suggest="改用 describe_methods / describe_run 等单个查询",
+            )
+        if not isinstance(actions, (list, tuple)) or not actions:
+            raise MechaError(
+                "actions 需要一个非空数组",
+                kind="bad_actions",
+                hint='每项形如 {"op": "method_catalog", "args": {}}',
+                suggest='[{"op": "method_catalog"}, {"op": "dataset_detail"}]',
+            )
+        if len(actions) > MAX_ACTIONS:
+            raise MechaError(
+                f"一段编排最多 {MAX_ACTIONS} 步，收到 {len(actions)} 步",
+                kind="too_many_actions",
+                hint="拆成几段；每段都返回后你可以据此决定下一段",
+            )
+        parsed = []
+        for i, raw in enumerate(actions):
+            if not isinstance(raw, Mapping) or not str(raw.get("op") or "").strip():
+                raise MechaError(
+                    f"第 {i + 1} 步缺 `op`",
+                    kind="bad_action",
+                    hint='每项形如 {"op": "method_catalog", "args": {"family": "neural"}}',
+                )
+            args = raw.get("args") or {}
+            if not isinstance(args, Mapping):
+                raise MechaError(f"第 {i + 1} 步的 args 需要对象", kind="bad_action")
+            parsed.append(Action(str(raw["op"]), dict(args)))
+        # ⭐ **跑之前先把每一步的参数查清**（同步拒绝 > 半路炸）。
+        #   为什么必须预检（实测踩过）：不查就交给 Python，错参数会抛
+        #   `TypeError: ..._query_method_detail() got an unexpected keyword argument`
+        #   —— 那条消息**泄露内部符号**、也不告诉 AI 正确的参数名是什么
+        #   （`banned_words` 管不到错误消息，它只管工具描述）。
+        #   ⚠ 一次全查、有错就**一个都不跑**：避免"跑了前几步才发现第 5 步写错"。
+        allowed_ops = _action_ops(engine)
+        for i, act in enumerate(parsed):
+            spec = _action_arg_spec(engine, act.op)
+            if spec is None:
+                raise MechaError(
+                    f"第 {i + 1} 步的 op {act.op!r} 不在能力面",
+                    kind="unknown_action",
+                    hint=f"可用的 op：{sorted(allowed_ops)}",
+                )
+            allowed, required = spec
+            unknown = sorted(set(act.args) - set(allowed))
+            if unknown:
+                raise MechaError(
+                    f"第 {i + 1} 步（{act.op}）不认识参数 {unknown}",
+                    kind="unknown_action_arg",
+                    hint=f"{act.op!r} 可给：{list(allowed)}；必给：{list(required)}",
+                )
+            missing = sorted(set(required) - set(act.args))
+            if missing:
+                raise MechaError(
+                    f"第 {i + 1} 步（{act.op}）缺必给参数 {missing}",
+                    kind="missing_action_arg",
+                    hint=f"{act.op!r} 必给：{list(required)}；可给：{list(allowed)}",
+                )
+        result = codeact.run(parsed)
+        steps = []
+        for log in result.steps:
+            out = (result.outputs[log.index]
+                   if log.ok and log.index < len(result.outputs) else None)
+            step: dict = {"index": int(log.index), "op": str(log.op),
+                          "ok": bool(log.ok), "detail": str(log.detail or ""),
+                          "output": None}
+            if log.ok:
+                body = out if isinstance(out, Mapping) else {"value": out}
+                step["output"] = _pick(body, pick) if pick else dict(body)
+                keys = [k for k in step["output"] if not k.startswith("_")]
+                step["detail"] = step["detail"] or \
+                    f"{len(keys)} 个字段：" + ", ".join(sorted(keys)[:6])
+            steps.append(step)
+        return {"ok": result.stopped_at < 0, "steps": steps,
+                "stopped_at": int(result.stopped_at),
+                "n_steps": len(steps), "error": ""}
+
+    return define_tool(
+        name="run_queries",
+        description="**一次往返跑一串只读查询**（列方法→看参数→查数据集→看训练…），"
+                    "比一条条调省很多来回。给 `actions`，每步形如 "
+                    '{"op": "method_catalog", "args": {}}；可用的 op 就是那些只读查询'
+                    "的名字（见各 describe_* 工具）。回执每步都带自己的结果与短摘要；"
+                    "**某步失败就停在那里**（`stopped_at` 指出是哪步），"
+                    "因为后面的步骤常依赖前一步的结果。"
+                    "⚠ 它**只读**：写操作（准备数据、跑方法、改配置）仍要单独调用，"
+                    "各自生效、各自留痕。",
+        parameters={
+            "actions": {"type": "array",
+                        "description": "动作序列；每项 {'op': 查询名, 'args': {...}}"},
+            "pick": PICK_PARAM,
+        },
+        output_schema={"type": "object",
+                       "required": ["ok", "steps", "stopped_at", "n_steps", "error"]},
+        execute=execute,
+        banned_words=banned_words,
+    )
+
+
+def _clear_current_state(engine: MLEngine, wrap,
+                  banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """⭐ 把配置台面清零（指导意见 §1-P1-5）。
+
+    为什么 AI 需要一个"打扫"入口：配置是**跨会话残留**的。上一轮留下的
+    "最近用的方法/数据集/覆写"会让这一轮的"我用默认配置跑一下"变成假话，
+    而**没有入口能回到干净状态**时，AI 只能在一个不知底细的台面上干活。
+
+    ⚠ 回执**逐键给 before/readback**（写前值 / 写后读回）：调用方不必再问一次
+    "清干净了没有"。若某键读回不为空 ⇒ 回执里如实 `warnings`（半清状态比不清更坏）。
+    """
+
+    def execute() -> Mapping[str, Any]:
+        receipt = _raise_on_failure(engine.run(
+            {"command": "clear_current_state"}, context=_local_context()))
+        return {"ok": bool(receipt["ok"]),
+                "n_cleared": int(receipt.get("n_cleared", 0)),
+                "n_already_clean": int(receipt.get("n_already_clean", 0)),
+                "cleared": list(receipt.get("cleared") or []),
+                "already_clean": list(receipt.get("already_clean") or []),
+                "readback": dict(receipt.get("readback") or {}),
+                "warnings": list(receipt.get("warnings") or []),
+                "error": receipt.get("error", "")}
+
+    return define_tool(
+        name="clear_current_state",
+        description="把当前配置清零、回到默认状态（数据集引用、方法、参数覆写、"
+                    "随机种子、设备等都清空）。**要在干净台面上开始时先调它**；"
+                    "回执逐项给出清空前的值与清空后读回的值，所以不用再查一次。",
+        parameters={},
+        output_schema={"type": "object",
+                       "required": ["ok", "n_cleared", "n_already_clean",
+                                    "cleared", "already_clean", "readback",
+                                    "warnings", "error"]},
+        execute=wrap(execute),
+        banned_words=banned_words,
+    )
 
 
 # ---------------------------------------------------------------- 只读投影
@@ -242,6 +528,12 @@ def _describe_dataset(engine: MLEngine,
 
 def _describe_run(engine: MLEngine,
                   banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """⚠ **故意不给 `pick`**：这个回执的大头（`metrics` / `artifact_keys`）都是
+    **声明过的必填键** ⇒ 工具面会校验它们在不在，`pick` 删不掉它们，
+    那就不该提供"看起来能省其实省不了"的旋钮（省 token 的正解是
+    `compare_methods` 的对比表，或 `describe_training` 的 `pick`）。
+    """
+
     def execute(*, run_id: str = "") -> Mapping[str, Any]:
         if not run_id:
             records = engine.session.export_state()["records"]
@@ -258,7 +550,9 @@ def _describe_run(engine: MLEngine,
     return define_tool(
         name="describe_run",
         description="按运行编号回看一次机器学习运行的方法、指标、生效参数与产物类别；"
-                    "大规模数值产物只给类别名与运行编号，不内联。",
+                    "大规模数值产物只给类别名与运行编号，不内联。"
+                    "**要比多个 run 时用 compare_methods**（它直接给对比表，"
+                    "不必逐个拉再自己对齐）。",
         parameters={"run_id": {"type": "string",
                                "description": "运行编号；留空用最近一次运行",
                                "default": ""}},
@@ -287,11 +581,27 @@ def _describe_training(engine: MLEngine,
     """
 
     def execute(*, run_id: str = "", include_series: bool = False,
-                limit: int = 200) -> Mapping[str, Any]:
+                limit: int = 200, pick: Any = None) -> Mapping[str, Any]:
         detail = engine.query("training_detail", run_id=run_id,
                               include_series=bool(include_series),
                               limit=int(limit))
-        return {"ok": True, **detail, "error": ""}
+        out = {"ok": True, **detail, "error": ""}
+        # ⚠ `pick` 的**边界**（实测踩过，别想当然）：回执里声明的**必填键**
+        #   （`output_schema.required`）必须始终在 ⇒ 工具面会校验、缺了直接
+        #   `bad_tool_output`。所以 pick 是"**补集**"：骨架照给，另外把你点名的
+        #   深层路径**精确取出来**。本项目里它真正省 token 的地方是 `series`
+        #   —— 那是**非必填**的大负载（`pick=["series.loss.values"]` 时不再回整条
+        #   `series`，只回 loss 那几个点）。
+        if pick:
+            required = {k: out[k] for k in ("ok", "run_id", "available", "latest",
+                                            "tags", "error") if k in out}
+            body = {k: v for k, v in out.items() if k not in required}
+            merged = _pick(body, pick)
+            # 若点了必填键内部的路径（如 `latest.loss`），把它作为**额外**键给出
+            for k, v in _pick(out, pick).items():
+                merged.setdefault(k, v)
+            return {**required, **merged}
+        return out
 
     return define_tool(
         name="describe_training",
@@ -299,6 +609,8 @@ def _describe_training(engine: MLEngine,
                     "loss / val_loss / grad_norm / lr / dead_relu / 逐层梯度范数，"
                     "可选整条序列（include_series=true）用于判断趋势"
                     "（如'梯度是否在多个数量级上快速增大'）。"
+                    "序列较长时用 `pick` 只取关心的那几条（如 "
+                    "['series.loss.values']），别把整条序列灌进上下文。"
                     "⚠ 数据来自 TensorBoard 事件文件：**没有事件文件就如实说读不到**"
                     "（训练时未装 tensorboard 时如此）。",
         parameters={
@@ -311,6 +623,7 @@ def _describe_training(engine: MLEngine,
             "limit": {"type": "integer",
                       "description": "每个 tag 最多回多少点（只对 include_series 生效）",
                       "default": 200},
+            "pick": PICK_PARAM,
         },
         output_schema={"type": "object",
                        "required": ["ok", "run_id", "available", "latest",
@@ -768,7 +1081,7 @@ def _submit_run(host: Any, side: str,
     return define_tool(
         name="submit_run",
         description="把一个运行**提交为后台任务**并立刻返回任务编号（长训练就该用这条："
-                    "发一个开始信号就走，之后用 read_job 轮询）。"
+                    "发一个开始信号就走，之后用 read_job 查进度）。"
                     "给 `method` 跑内置方法；给 `code` 跑自定义网络（AI 写的结构）。"
                     "⚠ 后台跑完会**自动落盘**（runs/<run_id>/record.json）——"
                     "所以就算你后来丢了 job_id，结果也还在。",

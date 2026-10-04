@@ -216,16 +216,13 @@ def test_both_sides_are_registered_and_lookup_goes_through_core():
 
 
 # ============================================================ 直跑入口
-_TESTS = [
-    test_to_dict_is_serializable_and_never_guesses_numbers,
-    test_every_kind_draws_in_both_renderers,
-    test_unknown_kind_fails_loudly_in_both_renderers,
-    test_renderer_palettes_match,
-    test_svg_escapes_text,
-    test_placeholder_when_no_data,
-    test_migrated_pages_are_registered_and_produce_specs,
-    test_both_sides_are_registered_and_lookup_goes_through_core,
-]
+#: ⭐ **内省收集**（2026-10-03 改）：此前这里是**手写**的判据清单，而门禁用
+#: **脚本**方式跑本文件 ⇒ 新判据忘了加进来就**永远不会进闸**。实锤：
+#: `test_ml_delivery.py::test_tool_params_stay_within_command_declaration`
+#: （"工具声明与实现漂移"那条）从未在门禁里跑过。
+#: ⇒ 定义即入闸，漂移不可能。（前提：本文件的 `test_*` 都是无参函数。）
+_TESTS = [fn for name, fn in sorted(globals().items())
+          if name.startswith("test_") and callable(fn)]
 
 
 def main() -> int:

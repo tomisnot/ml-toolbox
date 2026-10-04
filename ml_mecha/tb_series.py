@@ -63,6 +63,46 @@ def tb_dir(run_id: str, root: Path | None = None) -> Path | None:
     return d if d.is_dir() else None
 
 
+def latest_run_id(root: Path | None = None) -> str:
+    """**最近写过训练事件**的 run_id（读磁盘，按 ``tb/`` 目录的改动时间取最新）。
+
+    ⚠ 为什么需要它（实测抓到的**描述与行为不符**）：`describe_training` 的工具描述
+    写着"留空则按最近落盘的 run 找"，但引擎里 `run_id` 是**直接透传**的
+    —— 留空 ⇒ `read_run("")` ⇒ 一律 `available=false`。于是那句话是**假话**，
+    而 AI 会照着它省略参数、然后得到一个"读不到"的结论（最坏那类：把
+    "我调用方式不对"读成"这次训练没有观测数据"）。
+    ⇒ 要么实现它、要么删掉那句话；这里选**实现**（"最近的训练"是常见需求）。
+
+    ⚠ 只在**真有 tb/ 目录**的 run 里挑：挑一个没有事件的 run 然后报"读不到"，
+    等于把"历史里没有事件"伪装成"最近那次没事件"。没有可选项就回 ``""``
+    （调用方据此给**明确**理由，而不是一个含糊的失败）。
+    """
+    base = root or runs_root()
+    best, best_m = "", -1.0
+    try:
+        children = list(base.iterdir())
+    except OSError:
+        return ""
+    for child in children:
+        try:
+            if not child.is_dir():
+                continue
+            d = child / "tb"
+            if not d.is_dir():
+                continue
+            # 目录里得有真事件文件（空 tb/ 不算"有观测数据"）
+            has_events = any(f.name.startswith("events.out.tfevents")
+                             for f in d.iterdir() if f.is_file())
+            if not has_events:
+                continue
+            m = d.stat().st_mtime
+        except OSError:
+            continue
+        if m > best_m:
+            best, best_m = child.name, m
+    return best
+
+
 def _accumulator(run_id: str, root: Path | None = None):
     """取（或建）该 run 的 accumulator 并 ``Reload``（**读到最新**）。
 

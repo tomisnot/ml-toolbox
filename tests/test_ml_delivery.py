@@ -83,11 +83,12 @@ from ml_mecha.mcp_host import (McpHost, build_mcp_server,       # noqa: E402
 from mecha.providers.mcp import tool_input_schema               # noqa: E402
 
 #: 工具面全量（``ToolRegistry.schemas()`` 按 name 排序）。
-TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
+TOOL_NAMES = ("cancel_run", "clear_current_state", "compare_methods",
+              "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
               "prepare_dataset", "read_job", "run_custom", "run_method",
-              "run_method_batch", "submit_run")
+              "run_method_batch", "run_queries", "submit_run")
 
 #: 每个工具的必填项（写工具取**命令声明**，只读与 job 调度面取闭包签名）。
 EXPECTED_REQUIRED = {
@@ -521,6 +522,12 @@ EXPECTED_DEFAULTED = {
     # `method`/`code`/`name` 都声明了 `""` 默认 ⇒ 进这张表（"未给"= 空串）。
     "submit_run": ["code", "dataset_id", "device", "diag", "method", "name",
                    "persist"],
+    # ---- 2026-10-03 新增（AI 调用体验）----
+    # `clear_current_state` 无参数（语义就是"全部清零"，不给"清一部分"的语义面）。
+    "clear_current_state": [],
+    # ⚠ `actions`/`pick` 都是**无默认**（None = 必给的 actions / 不投影）
+    #   ⇒ 不进 defaulted 表，但仍是**可选**参数（`actions` 由闭包签名把关必给）。
+    "run_queries": [],
 }
 
 #: 逐参数行为判据：(工具, 最小必填参数, 参数名, 真值)。
@@ -657,6 +664,13 @@ _MIN_ARGS = {
     "run_method": {"method": "logistic"},
     "run_method_batch": {"methods": ["logistic"]},
     "submit_run": {"method": "logistic"},
+    # ---- 2026-10-03 新增（AI 调用体验）----
+    # `clear_current_state` 无参数：最小必填集就是空集。
+    "clear_current_state": {},
+    # `run_queries` 的 `actions` 是必给；`pick` 可选。给一个**真能跑通**的最小动作
+    # （`summary` 是内置动作、零参数）——判据只关心 null 垫片的传输行为，
+    # 但用真动作能顺带证明"编排入口本身可用"。
+    "run_queries": {"actions": [{"op": "summary"}]},
 }
 
 #: 可选参数总数（= 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
@@ -666,7 +680,7 @@ _MIN_ARGS = {
 #: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
 #: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
-_EXPECTED_OPTIONAL_PARAMS = 47
+_EXPECTED_OPTIONAL_PARAMS = 50
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -1964,40 +1978,13 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
             launcher.await_exit([authority], timeout=20)
 
 
-_TESTS = [
-    test_required_from_signature_and_declaration_survives,
-    test_mcp_wire_declares_no_output_schema,
-    test_mcp_output_schema_judge_can_go_red,
-    test_public_surface_all_names_exist,
-    test_public_surface_judge_can_go_red,
-    test_null_shim_drops_explicit_null_for_every_defaulted_param,
-    test_null_shim_keeps_explicit_null_when_real_default_is_none,
-    test_null_shim_rule_partitions_every_optional_param,
-    test_null_shim_authority_is_declaration_only,
-    test_null_shim_single_source_mutant_is_detected,
-    test_mcp_host_exposes_every_declared_tool_over_http,
-    test_readonly_tool_returns_real_value_over_http,
-    test_write_tool_is_fail_closed_while_locked,
-    test_open_gate_write_tools_run_and_call_id_is_attributed,
-    test_port_file_written_on_start_and_removed_on_stop,
-    test_stale_port_file_from_killed_run_is_replaced_on_start,
-    test_batch_tool_preserves_partial_success,
-    test_job_tools_submit_read_and_result_ref,
-    test_cancel_run_rejects_uncancellable_job,
-    test_dataset_roots_authorization_is_fail_closed,
-    test_launcher_pick_dsh_port_skips_official_3080,
-    test_launcher_await_authority_rejects_stale_port_file,
-    test_monitor_shapes_match_el_cockpit_contract,
-    test_monitor_endpoint_rejects_stale_port_file,
-    test_monitor_runs_route_fails_loud_instead_of_faking_empty,
-    test_monitor_extra_routes_are_registered_and_core_routes_untouched,
-    test_generated_dsh_patch_composes_with_real_dsh,
-    test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port,
-    test_panel_runs_page_shows_readable_error_instead_of_blank,
-    test_panel_host_half_serves_monitor_url_route,
-    test_panel_client_half_uses_same_origin_fetch_not_command,
-    test_dsh_mounts_profile_with_all_overlays_and_stays_alive,
-]
+#: ⭐ **内省收集**（2026-10-03 改）：此前这里是**手写**的判据清单，而门禁用
+#: **脚本**方式跑本文件 ⇒ 新判据忘了加进来就**永远不会进闸**。实锤：
+#: `test_ml_delivery.py::test_tool_params_stay_within_command_declaration`
+#: （"工具声明与实现漂移"那条）从未在门禁里跑过。
+#: ⇒ 定义即入闸，漂移不可能。（前提：本文件的 `test_*` 都是无参函数。）
+_TESTS = [fn for name, fn in sorted(globals().items())
+          if name.startswith("test_") and callable(fn)]
 
 
 def main() -> int:

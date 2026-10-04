@@ -312,30 +312,50 @@ def test_plot_sources_cover_the_renderers_and_both_key_tables():
 def test_conflicting_archive_is_disclosed_not_hidden():
     """⭐ 档内自相矛盾（历史错标）⇒ **说出来**，而不是静默跳过或崩掉。
 
-    为什么必须有：那批档（47/400）**改不了**（已落盘），展示层必须扛得住；
-    而"按自述的 target_kind 挑页"会挑到混淆矩阵、画不出来 ⇒ 若静默跳过，
+    为什么必须有：那批档（实测前 400 条里 47 条）**改不了**（已落盘），展示层必须
+    扛得住；而"按自述的 target_kind 挑页"会挑到混淆矩阵、画不出来 ⇒ 若静默跳过，
     人看到的是"少了一页"，永远不知道根因。⇒ 必须把矛盾摆在页面上。
-    """
-    conflict = None
-    for r in W.list_runs("ml", limit=400):
-        side, rec = W.load_any(r["run_id"])
-        if rec is None:
-            continue
-        why = W.target_kind_mismatch(rec)
-        if why:
-            conflict = (r["run_id"], rec, side, why)
-            break
-    assert conflict, "找不到自相矛盾的档（前提变了？那本判据要重写）"
-    rid, rec, side, why = conflict
-    assert "target_kind" in why or "归档" in why, why
 
-    # 该档的依赖页 ⇒ 页面说矛盾；且页面顶部也带警示
-    pages = W.pages_for(side, rec)
-    dep = next((p for p in pages if p[0] in W._KIND_DEPENDENT_PAGES), None)
-    if dep is not None:
-        html = W.page_body(side, rec, dep[0], dep[2], dep[3], rid)
-        assert "归档" in html or "自述" in html, "矛盾没有被说出来"
-    assert W.target_kind_mismatch(rec), "探测函数对同一条档应稳定"
+    ⚠ **2026-10-03 修（本条原先依赖仓库历史）**：旧版在 `runs/` 里**翻找**一条自相
+    矛盾的历史档当前提，找不到就红。清掉探针 run 之后它立刻红了 —— 报错正是它自己
+    写下的那句"前提变了？那本判据要重写"。判据的前提必须**由判据自己构造**，
+    不能靠"仓库里恰好还剩那种档"（换台机器、清一次 runs 就没了）。
+    ⇒ 现在直接**造出那条矛盾档**：`target_kind` 标成"分类"而指标全是回归指标
+    （这正是旧 `run_one` 的行为：存的是**数据集**的 kind，不是方法实际用的那个）。
+    """
+    from types import SimpleNamespace
+
+    # ① 探测器：自述"分类" + 全是回归指标 ⇒ 必须回一句可读原因
+    rec = SimpleNamespace(
+        method="ridge", target_kind="classification", run_id="stub-conflict",
+        result=SimpleNamespace(metrics={"rmse": 1.0, "mae": 0.5, "r2": 0.9}),
+        artifacts={})
+    why = W.target_kind_mismatch(rec)
+    assert why, "自相矛盾的档没被探测出来"
+    assert "归档" in why or "target_kind" in why, why
+    # 同一条档两次问必须同答（探测器要稳定）
+    assert W.target_kind_mismatch(rec) == why
+
+    # ② 依赖 target_kind 的页 ⇒ 页面把**矛盾本身**说出来
+    #   （`page_body` 在这条分支上只用得到 `spec.title`，所以桩够用 ——
+    #    这也顺带钉住"矛盾检查发生在画图之前"这个顺序）
+    key = next(iter(W._KIND_DEPENDENT_PAGES))
+
+    class _Spec:
+        title = "混淆矩阵"
+
+    html = W.page_body("ml", rec, key, "mpl", _Spec(), rec.run_id)
+    assert "画不出来" in html, html[:200]
+    assert "归档" in html or "自述" in html, "矛盾没有被说出来"
+
+    # ③ 顺带（**明确不是前提**）：仓库里若真有历史错标档，也要能探出来
+    found = []
+    for r in W.list_runs("ml", limit=400):
+        _side, legacy = W.load_any(r["run_id"])
+        if legacy is not None and W.target_kind_mismatch(legacy):
+            found.append(r["run_id"])
+            break
+    print(f"    （顺带扫描：仓库里现存的历史错标档 {found or '无'}）")
 
 
 def test_plot_failure_returns_explanatory_png():
@@ -512,26 +532,13 @@ def test_layout_follows_the_four_agreed_constraints():
 
 
 # ============================================================ 直跑入口
-_TESTS = [
-    test_esc_and_numbers_never_guess,
-    test_every_branch_returns_nonempty_readable_html,
-    test_table_html_escapes_cell_content,
-    test_unknown_kind_gets_placeholder_not_blank,
-    test_runs_and_pages_for_all_three_views,
-    test_opt_records_do_not_need_a_direct_opt_import,
-    test_missing_opt_slot_degrades_honestly,
-    test_pages_for_does_not_swallow_errors,
-    test_render_plot_caches_and_returns_file,
-    test_plot_cache_is_invalidated_when_the_drawing_code_changes,
-    test_plot_sources_cover_the_renderers_and_both_key_tables,
-    test_surrogate_page_is_honestly_png_only,
-    test_conflicting_archive_is_disclosed_not_hidden,
-    test_plot_failure_returns_explanatory_png,
-    test_server_serves_views_and_port_file,
-    test_resolve_panel_base_rejects_stale_port_file,
-    test_runs_cache_is_fast_and_never_stale,
-    test_layout_follows_the_four_agreed_constraints,
-]
+#: ⭐ **内省收集**（2026-10-03 改）：此前这里是**手写**的判据清单，而门禁用
+#: **脚本**方式跑本文件 ⇒ 新判据忘了加进来就**永远不会进闸**。实锤：
+#: `test_ml_delivery.py::test_tool_params_stay_within_command_declaration`
+#: （"工具声明与实现漂移"那条）从未在门禁里跑过。
+#: ⇒ 定义即入闸，漂移不可能。（前提：本文件的 `test_*` 都是无参函数。）
+_TESTS = [fn for name, fn in sorted(globals().items())
+          if name.startswith("test_") and callable(fn)]
 
 
 def main() -> int:

@@ -380,8 +380,9 @@ class MLEngine(Engine):
             return self._surface_query(op_name, **args)
         return self._query_direct(op_name, **args)
 
-    def _query_direct(self, op_name: str, **args: Any) -> Any:
-        handlers: dict[str, Callable[..., Any]] = {
+    def _query_handler_map(self) -> dict[str, Callable[..., Any]]:
+        """只读查询的 op 名 → 实现（**单一真源**：分派与参数预检共用这一张）。"""
+        return {
             "method_catalog": self._query_method_catalog,
             "method_detail": self._query_method_detail,
             "dataset_detail": self._query_dataset_detail,
@@ -390,12 +391,56 @@ class MLEngine(Engine):
             "network_catalog": self._query_network_catalog,
             "network_source": self._query_network_source,
         }
+
+    def query_arg_spec(self, op_name: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        """某个只读查询的 ``(可给参数, 必给参数)``；op 不存在 ⇒ ``None``。
+
+        ⚠ **从真实签名派生，不手写表**：手写的参数表一定会与实现漂移，而漂移的
+        那一边（预检说"可以"，实现说"不行"）会变成运行期 `TypeError`
+        —— 那条错误消息还会**泄露内部符号**（如 `MLEngine._query_method_detail`），
+        既不可教学、又违反"模型可见文本只含任务概念"。派生出来的这份不会漂移。
+        """
+        fn = self._query_handler_map().get(str(op_name))
+        if fn is None:
+            return None
+        import inspect
+        sig = inspect.signature(fn)
+        allowed, required = [], []
+        for pname, p in sig.parameters.items():
+            if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
+                continue
+            allowed.append(pname)
+            if p.default is p.empty:
+                required.append(pname)
+        return tuple(allowed), tuple(required)
+
+    def _query_direct(self, op_name: str, **args: Any) -> Any:
+        handlers = self._query_handler_map()
         fn = handlers.get(op_name)
         if fn is None:
             raise MechaError(
                 f"未注册的只读查询 {op_name!r}",
                 kind="unknown_query",
                 hint=f"已注册查询：{sorted(handlers)}",
+            )
+        # ⭐ **参数预检**（同步、可教学），而不是等 Python 抛 TypeError：
+        #   后者的消息里带着内部方法名，对 AI 既没用又把实现细节漏出去了。
+        allowed, required = self.query_arg_spec(op_name) or ((), ())
+        unknown = sorted(set(args) - set(allowed))
+        if unknown:
+            raise MechaError(
+                f"查询 {op_name!r} 不认识参数 {unknown}",
+                kind="unknown_query_arg",
+                hint=f"{op_name!r} 可给：{list(allowed)}；必给：{list(required)}",
+                suggest=f"例如 {{'op': {op_name!r}, 'args': "
+                        f"{{{', '.join(repr(r) + ': ...' for r in required)}}}}}",
+            )
+        missing = sorted(set(required) - set(args))
+        if missing:
+            raise MechaError(
+                f"查询 {op_name!r} 缺必给参数 {missing}",
+                kind="missing_query_arg",
+                hint=f"{op_name!r} 必给：{list(required)}；可给：{list(allowed)}",
             )
         return fn(**args)
 
@@ -598,10 +643,23 @@ class MLEngine(Engine):
         """
         from . import tb_series
 
-        payload = tb_series.read_run(str(run_id or ""),
+        # ⭐ **留空 = 最近写过训练事件的那次**（实现描述里的承诺）。
+        #   ⚠ 曾经的真相：这句话只写在工具描述里，引擎是直接透传空 run_id 的
+        #   ⇒ 留空一律 `available=false`（描述与行为不符）。实测抓到后补上。
+        resolved = str(run_id or "")
+        if not resolved:
+            resolved = tb_series.latest_run_id()
+            if not resolved:
+                return {
+                    "run_id": "", "available": False,
+                    "reason": "没有任何运行写过训练过程事件（只有神经网络类方法会写）",
+                    "latest": {}, "tags": [], "histograms": [], "images": [],
+                    "text": [], "duplicate_steps": [], "max_points": 0,
+                }
+        payload = tb_series.read_run(resolved,
                                      limit=max(1, int(limit or 200)))
         out: dict[str, Any] = {
-            "run_id": str(run_id or ""),
+            "run_id": resolved,
             "available": bool(payload.get("available")),
             "reason": str(payload.get("reason") or ""),
             "latest": tb_series.latest_of(payload),
@@ -822,6 +880,7 @@ class MLEngine(Engine):
             "run_method_batch": self._cmd_run_method_batch,
             "compare_methods": self._cmd_compare_methods,
             "run_custom": self._cmd_run_custom,
+            "clear_current_state": self._cmd_clear_current_state,
         }
 
     def _cmd_run_custom(self, spec: dict[str, Any], context: Any) -> Mapping[str, Any]:
@@ -931,6 +990,60 @@ class MLEngine(Engine):
     def _unregister_custom_method() -> None:
         from ml_toolbox.core import registry
         registry.unregister(_custom_method_name())
+
+    def _cmd_clear_current_state(self, spec: dict[str, Any],
+                          context: Any) -> Mapping[str, Any]:
+        """把配置台面清零：每个**已设置**的状态键写回 `None`（= 回默认）。
+
+        ## 为什么必须有这个入口（指导意见 §1-P1-5）
+
+        状态是跨会话残留的，而没有清零入口时，AI 是在**别人（或上一轮自己）没收拾
+        的台面**上干活：上一轮留下的 `current.method` / `current.overrides` 会让
+        "我以为我在跑默认配置"变成假话，而且**没有任何办法回到干净状态**。
+
+        ## 三条纪律（照指导意见）
+
+        1. **不另造第二条落地路径**：走同一个 `_write_state` → Gate 四步
+           （写权门、校验、预检、记史），只是显式 `keep_none=True`
+           —— 因为 `None` 在这条路上**有语义**（回默认），不能被默认的过滤器吃掉。
+        2. **不走"删史/重置快照"旁路**：History 是 append-only 的硬纪律；
+           清零是**再写一批 None**，史实完整与台面干净不冲突。
+        3. **逐键留痕**：回执列出每个键的 `before` 与 `readback`
+           （写前值 / 写后从快照读回的值）⇒ 调用方不必再问一次"到底清干净没有"。
+
+        ⚠ **写的是全部状态键，不是"当前有值的那些"**：命令声明里 `writes_state`
+        就是全部 8 个，而判据 `test_writes_state_declaration_matches_actual_history`
+        要求"声明 == 实际写入"**双向相等**（多声明=谎报会写、少声明=偷偷写）。
+        只写"有值的"会让声明变成半真——那种"声明与实现不一致"正是本仓反复在防的。
+        代价是台面本来就空时也会写 8 条 None（幂等、留痕，可接受）。
+        """
+        gate = self._command_gate
+        before = dict(getattr(gate, "snapshot", {}) or {}) if gate is not None else {}
+        keys = sorted(_state_keys(self._validator))
+        if keys:
+            self._write_state("ml_mecha:clear_current_state",
+                              {k: None for k in keys}, spec, keep_none=True)
+        after = dict(getattr(gate, "snapshot", {}) or {}) if gate is not None else {}
+        entries = [{"key": k, "before": _state_value_jsonable(before.get(k)),
+                    "readback": _state_value_jsonable(after.get(k))} for k in keys]
+        # ⚠ 区分"这次真清掉的"与"本来就是空的"：两者混在一起会让
+        #   "n_cleared=N"读成"我清掉了 N 个东西"，而实际可能一个都没动过。
+        cleared = [e for e in entries if e["before"] is not None]
+        already = [e["key"] for e in entries if e["before"] is None]
+        warnings = [f"{e['key']} 读回不是空（= {e['readback']!r}）"
+                    for e in cleared if e["readback"] is not None]
+        return {
+            "ok": True, "command": "clear_current_state", "run_ids": [],
+            "primary_metric": "", "metrics": {"n_cleared": len(cleared),
+                                              "n_already_clean": len(already)},
+            # ⚠ 读回不为空就**响亮 warn**：那说明有键没被真正清掉
+            #   （半清状态比不清更坏 —— AI 会以为台面干净了）。
+            "warnings": warnings,
+            "cleared": cleared, "already_clean": already,
+            "n_cleared": len(cleared), "n_already_clean": len(already),
+            "readback": {e["key"]: e["readback"] for e in entries},
+            "error": "",
+        }
 
     def _cmd_prepare_dataset(self, spec: dict[str, Any],
                              context: Any) -> Mapping[str, Any]:
@@ -1488,9 +1601,16 @@ class MLEngine(Engine):
             )
 
     def _write_state(self, reason: str, updates: Mapping[str, Any],
-                     spec: Mapping[str, Any]) -> list[Any]:
-        """经注入的写口把状态键落到 Gate；没装配写口就 fail loud，不静默降级。"""
-        payload = {k: v for k, v in updates.items() if v is not None}
+                     spec: Mapping[str, Any], *, keep_none: bool = False) -> list[Any]:
+        """经注入的写口把状态键落到 Gate；没装配写口就 fail loud，不静默降级。
+
+        ``keep_none``：默认 **丢弃值为 None 的键**（调用方的便利——"有这个值才写"，
+        如 `pipeline_id` 可能为空）。但 **`None` 本身是有语义的**（= 回默认），
+        `clear_current_state` 要的就是"把每个键写回 None" ⇒ 那条路必须显式 `keep_none=True`。
+        ⚠ 这两种语义**必须由调用方说清**：不分明的话，"清零"会被这个过滤器
+        静默吃掉（写了个空 dict、什么都不发生），而这正是最难查的一类失败。
+        """
+        payload = {k: v for k, v in updates.items() if keep_none or v is not None}
         if not payload:
             return []
         if self._state_writer is None:
@@ -1685,6 +1805,15 @@ def _is_cancelled(context: Any) -> bool:
     return bool(getattr(context, "cancelled", False))
 
 
+#: ML adapter 的只读查询面（注册进 ``Surface``，经 ``Surface.query`` 分派）。
+#: ⚠ **这里是单一真源**：`_query_handler_map` 的键必须与它一致（有判据钉住），
+#: 编排入口 `run_queries` 的"可用 op"也从它派生。
+READ_QUERY_NAMES: tuple[str, ...] = (
+    "method_catalog", "method_detail", "dataset_detail", "run_detail",
+    "training_detail", "network_catalog", "network_source",
+)
+
+
 def _call_id() -> str:
     """读 mecha 的请求作用域 call_id（AI 侧互引；人类侧为空字符串）。"""
     try:
@@ -1789,6 +1918,29 @@ def _progress_hook(context: Any, *, run_id: str = "") -> Callable[..., bool] | N
             return False
 
     return hook
+
+
+def _state_value_jsonable(value: Any) -> Any:
+    """状态键的值 → **可进 JSON 的形态**（`clear_current_state` 回执的 before/readback 用）。
+
+    ⚠ 为什么不能拿 `_finite_or_none` 顶：那是**给指标数值**把关的
+    （非数值一律回 None）⇒ 用它来报状态值，字符串/字典键会被统统写成 `None`，
+    回执看着像"这些键本来就没设置"——**把真相说反了**（实测踩过：
+    `current.dataset_id='ds-001-d'` 被报成 `None`）。
+    状态键的值本来就有字符串/字典/None 三种形态，如实带出去即可。
+    """
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        return f if np.isfinite(f) else None
+    if isinstance(value, Mapping):
+        return {str(k): _state_value_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_state_value_jsonable(v) for v in value]
+    return str(value)
 
 
 def _finite_or_none(value: Any) -> float | None:

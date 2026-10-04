@@ -359,6 +359,14 @@ class MLValidator:
         elif key == "current.overrides":
             self._check_overrides_state(value)
         elif key == "current.seed":
+            # ⚠ `None` = **回默认**（与其余 7 个状态键一致，也与 GUI"留空=默认"同源）。
+            #   实测（2026-10-03）发现语义不统一：其余键都放行 None，只有 seed 拒绝，
+            #   于是"把台面清零"这件事在 seed 上会**只清掉一半**（7/8 成功、1 个抛错）
+            #   —— 半清状态比不清更糟（AI 会以为清干净了）。
+            #   ⚠ 只放宽**状态键**：请求路径的 seed 仍必须是整数（那里留空不是"回默认"，
+            #   而是"没说清要跑什么"，该响亮报错）。
+            if value is None:
+                return
             clean_seed(value)
         elif key == "current.device":
             clean_device(value)

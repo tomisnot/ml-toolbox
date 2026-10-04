@@ -322,15 +322,13 @@ def test_timeseries_discloses_or_uses_exogenous_columns():
 
 
 # ============================================================ 直跑入口
-_TESTS = [
-    test_rows_train_equals_the_old_fit_arguments,
-    test_masks_point_at_full_rows_not_slices,
-    test_aux_requires_declared_support_and_refuses_honestly,
-    test_aux_capability_gate_blocks_methods_that_do_not_declare_it,
-    test_gnn_runs_end_to_end_with_node_masks,
-    test_graph_predict_refuses_new_rows_with_a_readable_reason,
-    test_timeseries_discloses_or_uses_exogenous_columns,
-]
+#: ⭐ **内省收集**（2026-10-03 改）：此前这里是**手写**的判据清单，而门禁用
+#: **脚本**方式跑本文件 ⇒ 新判据忘了加进来就**永远不会进闸**。实锤：
+#: `test_ml_delivery.py::test_tool_params_stay_within_command_declaration`
+#: （"工具声明与实现漂移"那条）从未在门禁里跑过。
+#: ⇒ 定义即入闸，漂移不可能。（前提：本文件的 `test_*` 都是无参函数。）
+_TESTS = [fn for name, fn in sorted(globals().items())
+          if name.startswith("test_") and callable(fn)]
 
 
 def main() -> int:

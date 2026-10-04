@@ -136,6 +136,64 @@ def _problem(X, y=None, *, kind=None):
     return Problem(spec)
 
 
+def test_every_defined_judgement_is_actually_run_by_its_file():
+    """⭐ 判据写了就必须被跑：**定义了却没有任何清单引用** = 门禁不跑它。
+
+    ## 为什么值得一条元判据（2026-10-03 实测）
+
+    门禁（`tests/run_all.py`）用**脚本**方式跑 `test_*.py`，而每个文件的入口
+    （`main()` / `__main__`）决定跑哪些判据。此前多数文件用的是**手写清单**，
+    于是"新写的判据忘了加进清单"就**永远不会进闸**——而它看起来一切正常
+    （文件绿、CI 绿），属于本仓最忌的"存在但从不执行"。
+
+    实锤：`test_ml_mecha.py` 有 **20 条**已定义判据从未被门禁执行（含 GNN 端到端、
+    后台落盘、训练观测面），其中 `test_progress_hook_must_be_attached_before_session_run`
+    **当时就是红的**（只在 pytest 下跑过，而门禁不看 pytest）；
+    `test_ml_delivery.py` 漏了 `test_tool_params_stay_within_command_declaration`
+    （正是"工具声明与实现漂移"那条）。
+
+    ## 判法（两条，都不依赖具体清单形态）
+
+    - 用了 `globals()` **内省收集** ⇒ 定义即入闸，直接放行；
+    - 手写清单 ⇒ 每个已定义判据必须在文件里**被引用过至少一次**
+      （清单里出现即可）；引用不到的，就是"定义了却不跑"。
+    """
+    import ast
+    import pathlib
+    import re
+
+    tests_dir = pathlib.Path(__file__).resolve().parent
+    offenders = []
+    scanned = 0
+    for path in sorted(tests_dir.glob("test_*.py")):
+        # ⚠ 用 `utf-8-sig`：带 BOM 的文件用 `utf-8` 读会留下 U+FEFF，
+        #   `ast.parse` 直接抛 SyntaxError ⇒ 判据**红在自己的读取上**，
+        #   而不是红在"定义了却不跑"上（实测踩过：一次红验证就红在 BOM）。
+        src = path.read_text(encoding="utf-8-sig")
+        if "def main(" not in src and "if __name__" not in src:
+            continue                      # 只走 pytest 的文件不在本判据范围
+        scanned += 1
+        if "globals()" in src:
+            continue                      # 内省收集：定义即入闸
+        defined = {n.name for n in ast.parse(src).body
+                   if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")}
+        if not defined:
+            continue
+        # "被引用" = 除定义行之外，名字在源码里还出现过
+        referenced = set()
+        for name in defined:
+            hits = len(re.findall(r"\b%s\b" % re.escape(name), src))
+            if hits > 1:                  # 1 = 只有 def 那一处
+                referenced.add(name)
+        missing = sorted(defined - referenced)
+        if missing:
+            offenders.append((path.name, missing))
+    assert scanned >= 5, f"扫到的文件太少（{scanned}）⇒ 判据本身失效了？"
+    assert offenders == [], (
+        "这些判据**定义了却没有进任何清单** ⇒ 门禁不会跑它们："
+        + "; ".join(f"{f}: {m}" for f, m in offenders))
+
+
 def test_anomaly_direction():
     """坑 L8：分数越大越异常、label 1=异常（在全量数据上直接 fit 验证）。"""
     from ml_toolbox.core import registry

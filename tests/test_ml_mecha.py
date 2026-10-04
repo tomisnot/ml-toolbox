@@ -55,11 +55,12 @@ from ml_mecha.engine import (RECEIPT_REQUIRED_KEYS, clear_channel,  # noqa: E402
 from ml_mecha.summarizer import ml_summarizer       # noqa: E402
 from ml_mecha.validator import STATE_KEYS           # noqa: E402
 
-TOOL_NAMES = ("cancel_run", "compare_methods", "describe_dataset",
+TOOL_NAMES = ("cancel_run", "clear_current_state", "compare_methods",
+              "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
               "prepare_dataset", "read_job", "run_custom", "run_method",
-              "run_method_batch", "submit_run")
+              "run_method_batch", "run_queries", "submit_run")
 
 
 # ---------------------------------------------------------------- 夹具
@@ -232,10 +233,10 @@ def test_read_queries_are_registered_in_surface(app):
 
 
 def test_commands_registered_in_core_registry(app):
-    """ML 5 条受控命令注册进核心 CommandRegistry（双宿主消费核心机制）。"""
+    """ML 6 条受控命令注册进核心 CommandRegistry（双宿主消费核心机制）。"""
     names = set(app.software.commands.names())
     assert names == {"prepare_dataset", "run_method", "run_method_batch",
-                     "compare_methods", "run_custom"}
+                     "compare_methods", "run_custom", "clear_current_state"}
     spec = app.software.commands.spec("run_method")
     assert spec is not None and spec.side_effect is True
     assert set(spec.output_schema["required"]) == set(RECEIPT_REQUIRED_KEYS)
@@ -478,12 +479,17 @@ def test_submit_side_is_validated_and_does_not_widen_authority(app):
     assert good.result["ok"] is True, good.result
 
     # 不扩权：mode=AI 下人类通道照样被拒（不是"选了 human 就能写"）
-    human_side = app.submit({"command": "run_method", "method": "logistic",
-                             "dataset_id": dataset_id}, side="human")
-    human_status = app.wait_job(human_side, 20)
-    assert human_status["state"] == "done", human_status
-    assert human_side.result["ok"] is False, human_side.result
-    assert human_side.result["error_kind"] == "authority_mode_mismatch"
+    # ⚠ **行为变更（2026-10-03，依据 mecha 指导意见 §3-2）**：此前是
+    #   "提交成功 → 轮询 → 发现失败"；现在在 submit **之前**用
+    #   `authority.gate(side)` 预检 ⇒ **当场**抛 GateDenied、**不建 job**
+    #   （"同步拒绝 > 提交后轮询失败"）。AI 因此少白等一轮，
+    #   也不会把"权限问题"误读成"实验失败"。
+    jobs_before = len(app.list_jobs())
+    with pytest.raises(GateDenied) as denied:
+        app.submit({"command": "run_method", "method": "logistic",
+                    "dataset_id": dataset_id}, side="human")
+    assert denied.value.kind == "authority_mode_mismatch", denied.value
+    assert len(app.list_jobs()) == jobs_before, "预检失败不得留下半拉子 job"
 
 
 def test_writes_state_declaration_matches_actual_history(app):
@@ -518,7 +524,10 @@ def test_writes_state_declaration_matches_actual_history(app):
                  {"command": "compare_methods", "methods": ["logistic", "svc"],
                   "dataset_id": dataset_id},
                  {"command": "run_custom", "dataset_id": dataset_id,
-                  "code": _RESIDUAL_CODE, "overrides": {"epochs": 5}}):
+                  "code": _RESIDUAL_CODE, "overrides": {"epochs": 5}},
+                 # 清零放**最后**：它会动前面几步写下的同一批键
+                 # （声明要求"声明 == 实际写入"，而清零写的是全部状态键）。
+                 {"command": "clear_current_state"}):
         _receipt, keys = _actual(spec)
         observed[spec["command"]] = keys
 
@@ -785,10 +794,17 @@ def test_progress_hook_must_be_attached_before_session_run(app):
             self.extras = extras
 
     class _Req:
-        """照抄 `RunRequest.config()` 的**拷贝语义**（真实的那份在 `api.py:89-94`）。"""
+        """照抄 `RunRequest.config()` 的**拷贝语义**（真实的那份在 `api.py:89-94`）。
 
-        def __init__(self):
+        ⚠ 必须连 `method`/`seed` 一起给：`_attach_progress` 在算 `run_id` 时要用它们
+        （`f"{method}-{ms}-{seed}"`，与 `runner.run_one` 同一规则）。
+        这条判据此前**只在 pytest 下跑过、门禁不跑**（main 用手写列表）⇒ 桩缺字段
+        导致它一直是红的却没人看见；改成内省收集后立刻暴露。
+        """
+        def __init__(self, method="logistic", seed=7):
             self.extras = {}
+            self.method = method
+            self.seed = seed
 
         def config(self):
             return _Cfg(dict(self.extras))
@@ -1384,6 +1400,251 @@ def test_gnn_runs_through_the_tool_face(app):
     assert "graph_n_nodes" in detail["artifact_keys"], detail["artifact_keys"]
 
 
+# ---------------------------------------------------------------- AI 调用体验
+def test_clear_current_state_clears_the_bench_with_per_key_evidence(app):
+    """⭐ 清零入口（指导意见 §1-P1-5）：**逐键 before/readback**，半清要响亮。
+
+    为什么必须有这个入口：配置是**跨会话残留**的。没有它，AI 是在别人（或上一轮
+    自己）没收拾的台面上干活——"我用默认配置跑一下"会变成假话，而且**没有任何
+    办法回到干净状态**。
+
+    钉三件：
+    1. 清零真的落到域状态（读快照确认，不是只写回执）；
+    2. 回执**逐键**给 `before`（写前值）与 `readback`（写后读回）——省掉一次往返；
+    3. `n_cleared` 只数**真有值**的键，第二次调它必须诚实报 0（不是每次都报 7）。
+    """
+    ml = app
+    ds = _prepared(ml)
+    ml.tools.execute("run_method", {"method": "logistic", "dataset_id": ds})
+    before_snap = dict(ml.software.gate.snapshot)
+    assert before_snap.get("current.method") == "logistic", before_snap
+
+    got = ml.tools.execute("clear_current_state", {})
+    assert got["is_error"] is False, got
+    v = got["value"]
+    assert v["ok"] is True and v["n_cleared"] >= 4, v
+    assert not v["warnings"], v["warnings"]
+    by = {c["key"]: c for c in v["cleared"]}
+    # ① 逐键 before 说的是真话（不是被过滤成 None）
+    assert by["current.method"]["before"] == "logistic", by["current.method"]
+    assert by["current.dataset_id"]["before"] == ds, by["current.dataset_id"]
+    # ② readback 确认写后真的空了
+    assert all(c["readback"] is None for c in v["cleared"]), v["cleared"]
+    # ③ 读快照确认落地（回执不是自说自话）
+    after_snap = dict(ml.software.gate.snapshot)
+    assert all(after_snap.get(k) is None for k in by), after_snap
+    # ④ 再清一次：诚实报 0（台面本来就空了）
+    again = ml.tools.execute("clear_current_state", {})["value"]
+    assert again["n_cleared"] == 0, again
+    assert again["n_already_clean"] >= 4, again
+    # ⑤ 史必须留着（append-only）：清零是"再写一批 None"，不是删史
+    events = [e for e in ml.history.events() if "clear_current_state" in str(e)]
+    assert events, "清零必须留痕"
+
+
+def test_pick_projection_is_honest_about_missing_keys(app):
+    """⭐ `pick` 投影：只回关注量，**缺失键如实列 `_missing`**（不静默回 null）。
+
+    依据指导意见 §1-P1-6（"扫 N 个点撑爆上下文"）与 §4-4（"缺失键如实列，绝不静默
+    null"）。
+
+    ⚠ 本仓的**边界**（实测踩过）：回执里 `output_schema.required` 声明的必填键
+    **删不掉**（工具面会以 `bad_tool_output` 拒），所以 `pick` 只装在
+    **大负载不是必填键**的地方（`describe_training.series`）。本判据同时钉住：
+    投影后必填骨架仍在、大负载被换成点名的深层值。
+    """
+    ml = app
+    ds = _prepared(ml)
+    if not _has_torch():
+        print("    （跳过：未装 torch——只有神经网络会写训练事件）")
+        return
+    rid = ml.tools.execute("run_method", {
+        "method": "torch_mlp", "dataset_id": ds,
+        "overrides": {"epochs": 8}})["value"]["run_id"]
+
+    full = ml.tools.execute("describe_training",
+                            {"run_id": rid, "include_series": True})["value"]
+    assert "series" in full, full
+    picked = ml.tools.execute("describe_training", {
+        "run_id": rid, "include_series": True,
+        "pick": ["series.loss.values", "nope.nothere"]})["value"]
+    # ① 大负载被投影（整条 series 不再回）
+    assert "series" not in picked, picked.keys()
+    assert len(picked["series.loss.values"]) == 8, picked["series.loss.values"]
+    # ② 必填骨架仍在（工具面契约）
+    for k in ("ok", "run_id", "available", "latest", "tags", "error"):
+        assert k in picked, (k, sorted(picked))
+    # ③ 缺失键如实列（不与"值是 null"混为一谈）
+    assert picked["_missing"] == ["nope.nothere"], picked.get("_missing")
+
+
+def test_run_queries_orchestrates_reads_in_one_round_trip(app):
+    """⭐ 编排入口（指导意见 §4）：一次往返跑一串只读查询。
+
+    为什么值得占一个工具位：没有它时"列方法 → 看参数 → 查数据集 → 看训练"要
+    4+ 次往返。依据："只读能力超过 10 条、或扫描/多步组合是常见用法时"——
+    我们 7 条只读查询 + **多步组合确实是常见用法**。
+
+    钉四件（每件都对应指导意见的一条）：
+    1. `output` **挂在步里**（不是顶层位置数组 ⇒ 不必再花回合对齐）；
+    2. 成功步有**短摘要**，失败步是**教学原因**；
+    3. **首个失败就停**（`stopped_at`）；
+    4. 参数预检**可教学且不泄露内部符号**（`banned_words` 管不到错误消息，
+       所以这条得单独钉）。
+    """
+    ml = app
+    ds = _prepared(ml)
+    ml.tools.execute("run_method", {"method": "logistic", "dataset_id": ds})
+
+    got = ml.tools.execute("run_queries", {"actions": [
+        {"op": "method_catalog", "args": {"family": "neural"}},
+        {"op": "method_detail", "args": {"name": "logistic"}},
+        {"op": "dataset_detail", "args": {"dataset_id": ds}},
+    ]})
+    assert got["is_error"] is False, got
+    v = got["value"]
+    assert v["ok"] is True and v["stopped_at"] == -1, v
+    assert [s["op"] for s in v["steps"]] == ["method_catalog", "method_detail",
+                                             "dataset_detail"], v["steps"]
+    for s in v["steps"]:
+        assert s["output"], s                      # ① output 挂在步里
+        assert s["detail"], s                      # ② 成功步也给摘要
+        assert s["ok"] is True
+
+    # ③ 失败步：教学原因 + 就地停下（后面那步不再跑）
+    bad = ml.tools.execute("run_queries", {"actions": [
+        {"op": "method_detail", "args": {"name": "no_such_method"}},
+        {"op": "method_catalog", "args": {}},
+    ]})["value"]
+    assert bad["ok"] is False and bad["stopped_at"] == 0, bad
+    assert bad["n_steps"] == 1, bad
+    assert "no_such_method" in bad["steps"][0]["detail"], bad["steps"][0]
+
+    # ④ 参数预检：可教学（说清该给什么），且**不泄露内部符号**
+    for label, acts, kind in (
+            ("错参数名", [{"op": "method_detail", "args": {"method": "x"}}],
+             "unknown_action_arg"),
+            ("缺必给参数", [{"op": "dataset_detail", "args": {}}],
+             "missing_action_arg"),
+            ("未知 op", [{"op": "no_such_op"}], "unknown_action"),
+    ):
+        out = ml.tools.execute("run_queries", {"actions": acts})
+        assert out["is_error"] is True, (label, out)
+        info = (out.get("error") or {}).get("info") or {}
+        assert info.get("kind") == kind, (label, info)
+        assert info.get("hint"), label
+        blob = json.dumps(out, ensure_ascii=False)
+        for leak in ("MLEngine", "_query_", "Surface", "codeact"):
+            assert leak not in blob, f"{label} 的错误泄露了内部符号 {leak!r}：{blob[:200]}"
+
+    # 上界：不封顶的话一段动作能把整个能力面扫一遍
+    too_many = ml.tools.execute("run_queries",
+                                {"actions": [{"op": "summary"}] * 30})
+    assert too_many["is_error"] is True
+    assert ((too_many.get("error") or {}).get("info") or {}).get("kind") \
+        == "too_many_actions", too_many
+
+
+def test_submit_prechecks_write_authority_and_caps_concurrency(app):
+    """⭐ 提交前的两道闸（指导意见 §3-1/§3-2）。
+
+    这两条框架**只给机制、要项目自己补**：
+    - **写权预检**：不预检的话，LOCKED 下会"提交成功 → 轮询 → 发现失败"
+      （AI 白等一轮，还可能把失败读成实验结论）。预检让它**同步**被拒。
+    - **并发上限**：local job 是"每次 submit 新起线程、不排队、无上限"
+      ⇒ 不兜住的话连续提交 N 个训练会把机器打满。超额要**响亮拒绝**，
+      且名额在任务**真跑完**后释放（放在 submit 之后就等于没限）。
+    """
+    ml = app
+    _prepared(ml)
+    # ① LOCKED：同步拒绝，且**不建 job**
+    ml.lock()
+    out = ml.tools.execute("submit_run", {"method": "logistic"})
+    assert out["is_error"] is True, out
+    info = (out.get("error") or {}).get("info") or {}
+    assert info.get("kind") == "authority_locked", info
+
+    # ② 并发上限：su 满即拒（用**慢**方法占住名额）
+    ml.switch_ai()
+    ml.tools.execute("prepare_dataset", {
+        "source": {"kind": "synthetic", "task": "classification",
+                   "n_samples": 600},
+        "name": "cap", "target": "target"})
+    cap = ml.submit_max_jobs if hasattr(ml, "submit_max_jobs") else None
+    cap = cap or type(ml)._max_jobs if hasattr(type(ml), "_max_jobs") else 4
+    cap = getattr(ml, "_max_jobs", 4)
+    accepted, rejected = [], None
+    for _ in range(cap + 2):
+        got = ml.tools.execute("submit_run", {
+            "method": "random_forest",
+            "overrides": {"n_estimators": 120}})
+        if got["is_error"]:
+            rejected = (got.get("error") or {}).get("info") or {}
+            break
+        accepted.append(got["value"]["job_id"])
+    assert len(accepted) == cap, (len(accepted), cap)
+    assert rejected.get("kind") == "too_many_jobs", rejected
+    # ③ 跑完后名额释放
+    for job_id in accepted:
+        ml.tools.execute("read_job", {"job_id": job_id, "wait_s": 120})
+    after = ml.tools.execute("submit_run", {"method": "logistic"})
+    assert after["is_error"] is False, after
+    # ⚠ **最后一个 job 也要等完**：不等的话实例关闭时它还在跑，
+    #   临时目录清理会因句柄未释放而 `WinError 145`（实测踩过 —— 那条错误
+    #   还会掀翻直跑入口的汇总，让"哪条判据红"看不见）。
+    ml.tools.execute("read_job", {"job_id": after["value"]["job_id"],
+                                  "wait_s": 120})
+
+
+def test_tool_descriptions_carry_no_implementation_words(app):
+    """⭐ 词表**真的启用**了（指导意见 §5）：描述里不许出现实现词汇。
+
+    ⚠ 钉的是"**半铺好的纪律**"这类缺陷：管道一直在（`define_tool(banned_words=…)`
+    会在构造期校验、撞词就造不出工具），但装配点传的是**空表** ⇒ 纪律铺了却没启用，
+    比没铺更坏（它看起来"已经有守卫了"）。实测于 2026-10-03：`submit_run` 的描述里
+    还写着"轮询"——正是这词表把那一处抓出来的。
+
+    本判据从两侧钉：① 装配期用的是非空词表；② 线上每一条描述都不含表里的词
+    （即使有人绕过装配点加了工具，这里也会红）。
+    """
+    from ml_mecha.tools import BANNED_WORDS
+    assert BANNED_WORDS, "词表是空的 ⇒ 这条纪律等于没启用"
+    schemas = app.tools.schemas()
+    assert schemas, "没有工具面"
+    offenders = []
+    for s in schemas:
+        low = s["description"].lower()
+        for w in BANNED_WORDS:
+            if w.lower() in low:
+                offenders.append((s["name"], w))
+    assert not offenders, f"描述里出现实现词汇：{offenders}"
+
+
+def test_blank_run_id_finds_the_latest_run_with_observations(app):
+    """`describe_training` 留空 = **最近写过训练事件的那次**（描述说了就得做到）。
+
+    ⚠ 钉的是一个"描述与行为不符"的真缺陷（2026-10-03 实测）：工具描述写着
+    "留空则按最近落盘的 run 找"，而引擎把空 `run_id` **直接透传** ⇒ 一律
+    `available=false`。AI 照着描述省略参数，然后会得到"这次训练没有观测数据"
+    这个**错结论**（把"我调用方式不对"读成"数据不存在"）。
+    """
+    ml = app
+    ds = _prepared(ml)
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    rid = ml.tools.execute("run_method", {
+        "method": "torch_mlp", "dataset_id": ds,
+        "overrides": {"epochs": 6}})["value"]["run_id"]
+    got = ml.tools.execute("describe_training", {})["value"]
+    assert got["available"] is True, got
+    assert got["run_id"], got
+    assert got["tags"], got
+    # 挑的必须是**真有事件**的那次；本次刚跑的 run 至少应能被找到
+    assert got["run_id"] == rid or got["run_id"].startswith("torch_mlp"), got
+
+
+# ---------------------------------------------------------------- 门禁辅助
 def test_dataset_query_exposes_chain_params_and_real_split_policy(app):
     """⭐ AI 能看见**预处理链每一步的参数**与**真实的划分口径**。
 
@@ -1642,6 +1903,10 @@ def _ml_mecha_sources() -> list[Path]:
 
 
 #: EL 的命令名（宪章 R1：ML 不许复制它们）。
+#: ⚠ **本表列的是 EL 的名字，不是我们的**：`reset_config` / `run_actions` 就在里面
+#: ——2026-10-03 实测撞上：我按 mecha 指导意见给新能力起的这两个名字**恰好是 EL 的**
+#: ⇒ 宪章 R1 禁止复制 ⇒ 改成 ML 自己的词汇（`clear_current_state` / `run_queries`）。
+#: （一次批量改名脚本曾把**本表**也改掉，导致判据自己失效；这里保留原样。）
 EL_COMMAND_NAMES = ("set_config", "run_sim", "set_drive", "reset_config",
                     "read_waves", "run_actions")
 
@@ -1768,7 +2033,7 @@ def test_static_command_surface_is_ml_owned():
 
     assert {c.name for c in COMMANDS} == {"prepare_dataset", "run_method",
                                           "run_method_batch", "compare_methods",
-                                          "run_custom"}
+                                          "run_custom", "clear_current_state"}
     for command in COMMANDS:
         assert command.side_effect, command.name
         assert command.risk, command.name
@@ -1853,14 +2118,20 @@ def test_cancel_job_returns_core_truth_instead_of_dropping_it(app):
 #    审批通道由**调用方注入**（框架刻意不自动接线）。本组判据把这两条钉在**本适配层**。
 
 def test_core_command_specs_declare_explicit_required(app):
-    """⭐ 五条命令的**核心投影**都必须带**显式非空** `required`（否则语义翻转会开口子）。
+    """⭐ 六条命令的**核心投影**都必须带**显式非空** `required`（否则语义翻转会开口子）。
 
     这是 ADR「迁移须知 1」对 ML 的直接检查项：ML 的命令声明走
     ``commands.py → core_commands.core_command_specs()`` 机械投影，投影**无条件**写出
     ``"required": [...]``。本判据逐条核对"核心 spec 里的 required == 宿主声明里的必填"，
     并**显式要求非空**——万一哪天有人把投影改成"空就不写"，这里立刻红。
+
+    ⚠ `clear_current_state` 是**唯一的例外**：它的语义就是"整张台面清零"，本来就没有
+    参数（给它加 `keys` 等于自己造一个"部分清空"的语义面）。⇒ 显式豁免它，
+    而不是把"required 非空"这条断言整个删掉（那条断言对其它五条命令仍有价值）。
     """
     from ml_mecha.commands import COMMANDS
+    #: 语义上无参数、故 required 恒为空的命令（**显式豁免，理由见 docstring**）
+    NO_PARAM_COMMANDS = {"clear_current_state"}
     commands = app.software.commands
     checked = []
     for host in COMMANDS:
@@ -1873,14 +2144,17 @@ def test_core_command_specs_declare_explicit_required(app):
         core_required = list(params["required"])
         host_required = list(host.required_params)
         assert core_required == host_required, (host.name, core_required, host_required)
-        assert core_required, (
-            f"{host.name} 的 required 是空的 ⇒ 它现在「什么都不必填」；"
-            "若这是有意的，请删掉这条断言并说明；否则补齐声明")
+        if host.name not in NO_PARAM_COMMANDS:
+            assert core_required, (
+                f"{host.name} 的 required 是空的 ⇒ 它现在「什么都不必填」；"
+                "若这是有意的，请把它加进 NO_PARAM_COMMANDS 并写清理由；"
+                "否则补齐声明")
         # 必填项必须都在 properties 里（否则模型永远填不出来）
         assert set(core_required) <= set(dict(params["properties"])), host.name
         checked.append(host.name)
-    # R8 非退化：真的逐条比过 5 条（不是空转）
-    assert sorted(checked) == ["compare_methods", "prepare_dataset", "run_custom",
+    # R8 非退化：真的逐条比过（不是空转）
+    assert sorted(checked) == ["clear_current_state", "compare_methods",
+                               "prepare_dataset", "run_custom",
                                "run_method", "run_method_batch"], checked
 
 
@@ -1956,47 +2230,28 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     import tempfile
 
-    tests = [test_tool_projection_is_read_only_capable,
-             test_tool_errors_normalized_to_tool_failure,
-             test_authority_gate_locked_denies_writes,
-             test_authority_side_switch_cannot_be_forged,
-             test_prepare_dataset_csv_fails_closed_without_dataset_roots,
-             test_prepare_dataset_csv_allowed_inside_dataset_roots,
-             test_read_queries_are_registered_in_surface,
-             test_commands_registered_in_core_registry,
-             test_scope_policy_denies_unlisted_command_scope,
-             test_job_contract_runs_command_async,
-             test_job_contract_failure_has_no_fake_ref,
-             test_cancelled_command_entry_is_a_noop_failure,
-             test_job_path_carries_call_id_into_audit,
-             test_submit_side_is_validated_and_does_not_widen_authority,
-             test_uncancellable_command_cancel_job_is_rejected,
-             test_cancellable_command_cancel_job_is_not_rejected,
-             test_submit_unknown_command_keeps_existing_failure_path,
-             test_writes_state_declaration_matches_actual_history,
-             test_toolhost_is_the_tool_transport_seam,
-             test_run_event_carries_artifact_locator,
-             test_write_tool_failures_are_tool_failure,
-             test_run_method_end_to_end_and_receipt_contract,
-             test_resource_guard_rejects_without_escaping,
-             test_history_resource_guard_is_effective_value,
-             test_history_attribution_actor_and_call_id,
-             test_monitor_reconciles_claims_against_raw_history,
-             test_monitor_marks_deliberate_mismatch_as_disputed,
-             test_static_ml_mecha_does_not_import_el_modules,
-             test_static_ml_mecha_does_not_copy_el_command_or_state_names,
-             test_static_ml_mecha_does_not_load_gui_or_opt_layers,
-             test_static_ml_domain_keys_absent_from_mecha_core,
-             test_static_command_surface_is_ml_owned,
-             test_core_command_specs_declare_explicit_required,
-             test_missing_required_param_is_rejected_not_silently_accepted,
-             test_approval_channel_is_injected_into_invoke,
-             test_no_ml_command_declares_approval_required,
-             test_cancel_job_returns_core_truth_instead_of_dropping_it]
+    # ⭐ **内省自动收集**（2026-10-03 改）：此前这里是一张**手写**的测试名列表，
+    #   而门禁用**脚本**方式跑本文件 ⇒ 新判据忘了加进来就**永远不会被跑**。
+    #   实测：20 条已定义的判据（含 GNN 端到端、后台落盘、训练观测面）从未进过门禁，
+    #   其中一条当时就是红的。⇒ 不再手写清单：`globals()` 里所有 `test_*` 全收，
+    #   按名字排序保证顺序可复现。**漂移从此不可能**（定义即入闸）。
+    tests = [fn for name, fn in sorted(globals().items())
+             if name.startswith("test_") and callable(fn)]
+    assert tests, "没收集到任何判据（main 的内省收集坏了）"
+
+
+
     failures = []
     for fn in tests:
         if "app" in fn.__code__.co_varnames:
-            with tempfile.TemporaryDirectory(prefix="ml-mecha-test-") as td:
+            # ⚠ **临时目录的创建/清理也要纳入捕获**：Windows 上若实例关闭时还有
+            #   未结束的后台 job 握着文件句柄，`TemporaryDirectory.__exit__` 会抛
+            #   `OSError: [WinError 145] 目录不是空的` ⇒ 原写法里它**在 try 之外**，
+            #   会直接把整个直跑入口掀翻（没有 `✗`、没有汇总 —— "红看不清"）。
+            #   ⇒ 整个 with 块包进 try，让"清理失败"也变成一条可见的判据失败，
+            #   而且**不假装通过**（它是一条真实的问题：有东西没关干净）。
+            with tempfile.TemporaryDirectory(
+                    prefix="ml-mecha-test-", ignore_cleanup_errors=True) as td:
                 instance = assemble_ml_mecha(root=td, seed=13)
                 try:
                     fn(instance)
@@ -2010,7 +2265,10 @@ def main() -> int:
                 except BaseException as exc:  # noqa: BLE001
                     failures.append((fn.__name__, exc))
                 finally:
-                    instance.close()
+                    try:
+                        instance.close()
+                    except BaseException as exc:  # noqa: BLE001
+                        failures.append((fn.__name__, exc))
         else:
             try:
                 fn()

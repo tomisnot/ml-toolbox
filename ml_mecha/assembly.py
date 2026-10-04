@@ -58,6 +58,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -68,6 +70,7 @@ from mecha.errors import MechaError
 from mecha.gate import Channel
 from mecha.history import History
 from mecha.monitor import Summarizer
+from mecha.providers.codeact import Action, CodeAct
 from mecha.scopes import ScopePolicy
 from mecha.surface import EntryKind
 from mecha.tools import CURRENT_CALL_ID, ToolRegistry
@@ -76,17 +79,36 @@ from ml_toolbox.api import Session
 
 from .commands import COMMANDS as HOST_COMMANDS
 from .core_commands import core_command_specs
-from .engine import (JOB_RUN_FLAG, RUN_COMMANDS, MLEngine, clear_channel,
-                     make_state_writer, use_channel)
+from .engine import (JOB_RUN_FLAG, READ_QUERY_NAMES, RUN_COMMANDS, MLEngine,
+                     clear_channel, make_state_writer, use_channel)
 from .summarizer import ml_summarizer
-from .tools import register_ml_tools
+from .tools import BANNED_WORDS, register_ml_tools
 
 #: ML adapter 的只读查询面（注册进 ``Surface``，经 ``Surface.query`` 分派）。
-READ_QUERIES = ("method_catalog", "method_detail", "dataset_detail", "run_detail",
-                "training_detail", "network_catalog", "network_source")
+#: ⚠ **不在这里另立一份字面量**：查询名、`_query_handler_map` 的键、编排入口的
+#: "可用 op" 必须是**同一份**（指导意见 §4-2：工具名与 op 名别搞成两套账，
+#: 否则模型每次都得试一次）。⇒ 单一真源在 `engine.READ_QUERY_NAMES`。
+READ_QUERIES = READ_QUERY_NAMES
 
 #: ML adapter 自己的数据目录名（mecha 不提供默认值，必须由项目注入）。
 DATA_DIR_NAME = ".ml-mecha"
+
+#: 后台 job 的**默认并发上限**。
+#: ⚠ 为什么项目必须自己定（§3-1）：mecha 的 local job 实现是"每次 submit 新起一个
+#: daemon 线程、**不排队、无上限**"——那是**机制**；"该允许多少个同时跑"是**项目
+#: 策略**（机器核数、内存、模型规模都是项目才知道的事）。不兜住的话，AI 连续提交
+#: 十几个训练就会把机器打满（而它自己毫无察觉）。
+DEFAULT_MAX_JOBS = 4
+MAX_JOBS_ENV = "MLTB_MAX_JOBS"
+
+
+def _max_jobs() -> int:
+    """并发上限：`MLTB_MAX_JOBS` 可调；非法值回默认（**不因为环境变量写错就崩**）。"""
+    raw = os.environ.get(MAX_JOBS_ENV, "")
+    try:
+        return max(1, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_JOBS
 
 #: 人类侧默认通道标签（细标签归因用；side 才定写权）。
 HUMAN_ACTOR = "ml-gui"
@@ -106,7 +128,9 @@ class MLMecha:
         self.engine = engine
         self.scopes = scopes
         self._closed = False
-
+        #: 后台 job 的**并发名额**（§3-1：框架不排队、无上限 ⇒ 项目自己兜）。
+        self._max_jobs = _max_jobs()
+        self._jobs_sem = threading.BoundedSemaphore(self._max_jobs)
     # ---- 转发（同一实例，不是第二套） ----
     @property
     def gate(self):
@@ -182,8 +206,34 @@ class MLMecha:
     def jobs(self):
         return self.software.jobs
 
+    def bind_codeact(self, codeact: Any) -> None:
+        """接上 CodeAct 编排器（模型入口 `run_queries` 用它）。
+
+        ⚠ 为什么是"注入"而不是在本类里 new 一个：`CodeAct` 需要**同一个**
+        ``Surface`` 与 ``History``（同一实例，不是第二套）——那两样在装配点才有。
+        把实例注入进来，保证"编排里跑的查询"与"单独调查询"走的是同一条路。
+        """
+        self._codeact = codeact
+
+    @property
+    def codeact(self) -> Any:
+        """编排器；未装配 ⇒ ``None``（`run_queries` 会据此给教学拒绝）。"""
+        return getattr(self, "_codeact", None)
+
     def submit(self, spec: Mapping[str, Any], *, side: str = "ai"):
         """把一条 ML 受控命令提交成 mecha job。
+
+        ## ⭐ 两道**提交前**闸（§3：框架给机制，"上限/前置条件"由项目自己补）
+
+        1. **写权预检**（`authority.gate(side)`，只读、无副作用）：
+           让调用方**同步**拿到拒绝，而不是"提交一个注定被拒的 job、再去轮询失败"
+           —— 后者会让 AI 白等一轮，还可能把失败读成"实验结论"。
+        2. **并发上限**（`BoundedSemaphore`）：框架的 local job 实现是
+           "每次 submit 新起一个 daemon 线程、不排队、无上限" ⇒ 不兜住的话
+           连续提交 N 个训练会把机器打满。**超额响亮拒绝**（不排队、不静默丢弃）。
+           ⚠ 顺序有讲究：预检在 `acquire` **之前**（失败不留占用）。
+
+        可用 `MLTB_MAX_JOBS` 环境变量调上限（默认 4）。
 
         **submit 不扩权**：``side`` 只是"这次用哪条**既有**通道"的选择器，写权
         仍由 ``Authority`` 的当前 mode 决定——``mode=AI`` 时选 ``side="human"``
@@ -221,6 +271,21 @@ class MLMecha:
         # 没设过就是 ""（人类/脚本路径），不是伪造一个。
         call_id = CURRENT_CALL_ID.get()
 
+        # ⭐ 闸 ①：**写权预检**（只读、无副作用、同步拒绝）
+        #   框架本来会在 worker 里经 Gate 拒；但那时 job 已经建了 ⇒ 调用方要
+        #   "提交成功 → 轮询 → 发现失败"。改为**提交前**当场拒（同样经 Gate 的
+        #   判断逻辑，不另造一套）：`authority.gate(side)` 只读 mode 并抛 GateDenied。
+        self.software.authority.gate(side)
+        # ⭐ 闸 ②：**并发上限**（超额响亮拒绝；不排队、不静默丢弃）
+        if not self._jobs_sem.acquire(blocking=False):
+            raise MechaError(
+                f"后台任务已达上限（{self._max_jobs} 个在跑）",
+                kind="too_many_jobs",
+                hint="等已提交的任务结束后再提交，或用 read_job 看看它们在干什么；"
+                     "上限可用环境变量 MLTB_MAX_JOBS 调整",
+                suggest="先 read_job 轮询已有任务；要立刻跑就用同步的 run_method",
+            )
+
         def worker(ctx):
             channel_token = use_channel(channel)
             call_token = CURRENT_CALL_ID.set(call_id)
@@ -239,6 +304,10 @@ class MLMecha:
             finally:
                 CURRENT_CALL_ID.reset(call_token)
                 clear_channel(channel_token)
+                # ⭐ 释放并发名额：**job 真跑完**（含失败/取消）才放。
+                #   ⚠ 放在这里而不是 `jobs.submit` 之后：那样会在任务还在跑时就放，
+                #   上限形同虚设。
+                self._jobs_sem.release()
 
         def ref(receipt):
             if not isinstance(receipt, Mapping):
@@ -391,9 +460,26 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
     # 纯赋值、无副作用，故提前到注册工具之前不影响其它装配顺序。
     ml = MLMecha(software, engine, scopes)
 
+    # ⭐ **把 CodeAct 接上电**（指导意见 §4：缺一步就等于没有）。
+    #
+    # 框架只登记了 `provider.codeact` 这个角色，**不负责造实例**；项目要自己
+    # `CodeAct(surface, history, actor_provider)` 并把模型入口暴露出去。
+    # 它够得到的恰好是：4 个内置动作（run/summary/estimate/schema）+ **Surface 里
+    # 注册的 QUERY 项** —— 而我们的 7 条只读查询刚好都注册进去了（见上面的
+    # `READ_QUERIES` 循环）。⇒ 两边**天然对齐**，不需要再造动作集。
+    #
+    # ⚠ 边界（框架自带说明，照抄以免误读）：CodeAct **不触达 command/tool 面**，
+    #   它只到 query 那一层。所以"多步**写**编排"不在它的能力里——这也正是我们
+    #   想要的：写操作仍是一条一条经受控命令面（每条各自过闸、各自留痕）。
+    codeact = CodeAct(software.surface, software.history, lambda: AI_ACTOR)
+    ml.bind_codeact(codeact)
+
     if register_tools:
+        # ⭐ **真词表**（不是空表）：`define_tool` 会在构造期校验 description，
+        #   撞上实现词就 `bad_description` ⇒ 工具**根本注册不出来**（fail loud）。
+        #   ⚠ 此前传的是默认空表 ⇒ 纪律铺了却没启用（见 `BANNED_WORDS` 的说明）。
         register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai",
-                          host=ml)
+                          host=ml, banned_words=BANNED_WORDS, codeact=codeact)
     # ToolHost 契约的真实消费者：装配时把模型可见投影交给宿主传输面校验
     # （白名单形状不对会当场 fail loud），宿主调工具走 MLMecha.call_tool。
     software.toolhost.declare(software.tools.schemas())
