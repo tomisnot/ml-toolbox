@@ -242,7 +242,92 @@ def build_ml_tools(engine: MLEngine, *, actor: str = LOCAL_ACTOR,
         _cancel_run(host, banned_words),
         _clear_current_state(engine, _with_channel, banned_words),
         _run_queries(engine, codeact, banned_words),
+        _checkpoint_detail(engine, banned_words),
+        _eval_custom(engine, _with_channel, banned_words),
     ]
+
+
+def _checkpoint_detail(engine: MLEngine,
+                       banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """查某个 run 的 **checkpoint 摘要**（在不在、几个张量、含不含 bias、哪块设备）。
+
+    为什么单开一条：这是"**训练完能把模型拿回来**"的入口。`describe_run` 只给产物
+    **类别名**，而权重是几十万个数 ⇒ 回执只给**定位符与结构摘要**；真要用它走
+    `eval_custom`（系统装载后交给你的代码）。
+    ⚠ 它**读磁盘** ⇒ 跨重启照样有效（`describe_run` 读会话内存，重启后就查不到）。
+    """
+
+    def execute(*, run_id: str = "") -> Mapping[str, Any]:
+        got = engine.query("checkpoint_detail", run_id=str(run_id))
+        return {"ok": True, **got, "error": ""}
+
+    return define_tool(
+        name="checkpoint_detail",
+        description="查某次自定义网络运行的**模型存档**：在不在、有哪些文件、"
+                    "多少张量/参数、**含不含偏置**、在哪块设备上训的、最佳轮次是第几轮。"
+                    "⚠ 权重**不内联**（几十万个数不进对话）：要真用模型，"
+                    "调 `eval_custom` 把它交给你的代码（采样/算能量/换尺寸评估）。",
+        parameters={"run_id": {"type": "string", "description": "运行编号",
+                               "default": ""}},
+        output_schema={"type": "object",
+                       "required": ["ok", "run_id", "available", "files", "tags",
+                                    "params", "meta", "error"]},
+        execute=execute,
+        banned_words=banned_words,
+    )
+
+
+def _eval_custom(engine: MLEngine, wrap,
+                 banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    """**把训练好的模型交给调用方的代码**（NQS 需求的那个"能调外部函数的口子"）。"""
+
+    def execute(*, run_id: str, code: str, which: str = "best",
+                dataset_id: str = "",
+                payload: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        spec: dict[str, Any] = {"command": "eval_custom", "run_id": str(run_id),
+                                "code": str(code), "which": str(which or "best")}
+        if dataset_id:
+            spec["dataset_id"] = str(dataset_id)
+        if payload:
+            spec["payload"] = dict(payload)
+        receipt = _raise_on_failure(engine.run(spec, context=_local_context()))
+        return {"ok": bool(receipt["ok"]), "run_id": receipt.get("run_id", ""),
+                "which": receipt.get("which", ""),
+                "metrics": dict(receipt.get("metrics") or {}),
+                "extra_keys": list(receipt.get("extra_keys") or []),
+                "note": receipt.get("note", ""),
+                "warnings": list(receipt.get("warnings") or []),
+                "error": receipt.get("error", "")}
+
+    return define_tool(
+        name="eval_custom",
+        description="**装载某次训练的模型，交给你的代码去评估**（采样、算能量、"
+                    "换一个没见过的尺寸外推…）并回它上报的指标。"
+                    "代码只需定义 `def evaluate(model, ctx) -> dict`；`ctx` 里有 "
+                    "`payload`（逐行负载，**可以现场给新数据**）、`meta`"
+                    "（n_in/n_out/训练设备/最佳轮次）、`torch`/`nn`/`device`。"
+                    "⚠ 它在**权威进程**里执行你的代码——与 run_custom 同一口径"
+                    "（受控命令，各自留痕；沙箱负责别把宿主搞崩，不是权限边界）。",
+        parameters={
+            "run_id": {"type": "string", "description": "要装载哪一次运行"},
+            "code": {"type": "string",
+                     "description": "评估代码：定义 `def evaluate(model, ctx) -> dict`"},
+            "which": {"type": "string",
+                      "description": "装哪个权重：best（默认，验证损失最好的那轮）/ last",
+                      "default": "best"},
+            "dataset_id": {"type": "string",
+                           "description": "复用会话里某份数据集的负载", "default": ""},
+            "payload": {"type": "object",
+                        "description": "**现场给新负载**（如换一个没见过的 N）：与 "
+                                       "prepare_dataset 的 payload 同形；"
+                                       "这里**不校验行数**（负载不绑数据集）"},
+        },
+        output_schema={"type": "object",
+                       "required": ["ok", "run_id", "which", "metrics",
+                                    "extra_keys", "note", "warnings", "error"]},
+        execute=wrap(execute),
+        banned_words=banned_words,
+    )
 
 
 #: 一段编排最多多少步。**项目要自己想上限**（指导意见 §3：框架给机制，
@@ -721,7 +806,8 @@ def _run_custom(engine: MLEngine, wrap,
     def execute(*, code: str, dataset_id: str = "",
                 overrides: Mapping[str, Any] | None = None, seed: int | None = None,
                 diag: bool = False, persist: bool = False, name: str = "",
-                resource_guard: Mapping[str, Any] | None = None
+                resource_guard: Mapping[str, Any] | None = None,
+                device: str = ""
                 ) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "run_custom", "code": str(code),
                                 "diag": bool(diag), "persist": bool(persist)}
@@ -735,6 +821,8 @@ def _run_custom(engine: MLEngine, wrap,
             spec["name"] = str(name)
         if resource_guard:
             spec["resource_guard"] = dict(resource_guard)
+        if device:
+            spec["device"] = str(device)
         receipt = _raise_on_failure(engine.run(spec, context=_local_context()))
         return {"ok": bool(receipt["ok"]), "run_id": receipt.get("run_id", ""),
                 "network_name": receipt.get("network_name", ""),
@@ -775,6 +863,11 @@ def _run_custom(engine: MLEngine, wrap,
                      "default": ""},
             "resource_guard": {"type": "object",
                                "description": "资源预算声明，例如 {'max_kernel_mb': 128}"},
+            "device": {"type": "string",
+                       "description": "计算设备：auto（默认，有卡就上卡）/ cpu / cuda:0。"
+                                      "⚠ 网络代码里建张量要用 `ctx['device']`"
+                                      "（模型可能已在显卡上），否则撞'混合设备'",
+                       "default": ""},
         },
         output_schema={"type": "object",
                        "required": ["ok", "run_id", "primary_metric", "metrics",
@@ -790,7 +883,9 @@ def _prepare_dataset(engine: MLEngine, wrap,
                 target: str = "", time_col: str = "",
                 diag: bool = False,
                 pipeline: Mapping[str, Any] | None = None,
-                graph: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+                graph: Mapping[str, Any] | None = None,
+                payload: Mapping[str, Any] | None = None,
+                target_kind: str = "") -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "prepare_dataset", "source": source,
                                 "diag": bool(diag)}
         if name:
@@ -803,6 +898,10 @@ def _prepare_dataset(engine: MLEngine, wrap,
             spec["pipeline"] = dict(pipeline)
         if graph:
             spec["graph"] = dict(graph)
+        if payload:
+            spec["payload"] = dict(payload)
+        if target_kind:
+            spec["target_kind"] = str(target_kind)
         receipt = _raise_on_failure(
             engine.run(spec, context=_local_context()))
         dataset = receipt.get("dataset") or {}
@@ -817,6 +916,9 @@ def _prepare_dataset(engine: MLEngine, wrap,
                 "pipeline_chain": list(receipt.get("pipeline_chain") or []),
                 "split_policy": dict(receipt.get("split_policy") or {}),
                 "graph": dict(receipt.get("graph") or {}),
+                # 负载的**形状与 dtype**：这是"我的复数还在不在"的直接答案
+                "payload": dict(receipt.get("payload") or {}),
+                "target_kind": receipt.get("target_kind", ""),
                 "warnings": list(receipt.get("warnings", [])),
                 "error": receipt.get("error", "")}
 
@@ -855,14 +957,30 @@ def _prepare_dataset(engine: MLEngine, wrap,
                                      "{'edges_path': 'edges.csv', 'src': 's', 'dst': 'd', "
                                      "'weight': 'w'}。**行号指向观测表的行**（节点=行）；"
                                      "默认按无向图自动补反向边；边指向不存在的节点会报错。"
-                                     "带了图之后，只有声明支持图的方法（run_custom 的"
-                                     "自定义网络）能消费它——别的方法会被明确拒绝，"
-                                     "不会**静默忽略**拓扑。"},
+                                     "src/dst/weight 之外的列会当作**多分量边特征**"
+                                     "（`ctx['edge_attr']`）。带了图之后，只有声明支持图的"
+                                     "方法（run_custom 的自定义网络）能消费它——别的方法"
+                                     "会被明确拒绝，不会**静默忽略**拓扑。"},
+            "payload": {"type": "object",
+                        "description": "**逐行负载**（可选，给变长/复数的大数组）："
+                                       "{'hdf5': {'path': 'd.h5', 'datasets': "
+                                       "{'amps': '/config/amps'}}} 或 "
+                                       "{'arrays': {'名字': [[...], [...]]}}。"
+                                       "每个数组**第 0 维 = 行数**（切一批行 = 切前几维）；"
+                                       "**保住 dtype**（复数就是复数、位串是整数、"
+                                       "mask 是 bool）；变长的维要先 pad 再配 mask"
+                                       "（`core.paddings.pad_rows` 是助手）。"
+                                       "配 `target_kind='custom'` 就是"
+                                       "「没有标准标签、指标由网络自己上报」的任务。"},
+            "target_kind": {"type": "string",
+                            "description": "只有 'custom' 需要写（无标准标签、"
+                                           "标准指标不适用、由 Network.metrics 上报）；"
+                                           "回归/分类由数据自动推断", "default": ""},
         },
         output_schema={"type": "object",
                        "required": ["ok", "dataset_id", "pipeline_id", "n_rows",
                                     "n_features", "pipeline_chain", "split_policy",
-                                    "warnings", "error"]},
+                                    "payload", "target_kind", "warnings", "error"]},
         execute=wrap(execute),
         banned_words=banned_words,
     )

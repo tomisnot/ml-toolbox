@@ -83,12 +83,12 @@ from ml_mecha.mcp_host import (McpHost, build_mcp_server,       # noqa: E402
 from mecha.providers.mcp import tool_input_schema               # noqa: E402
 
 #: 工具面全量（``ToolRegistry.schemas()`` 按 name 排序）。
-TOOL_NAMES = ("cancel_run", "clear_current_state", "compare_methods",
-              "describe_dataset",
+TOOL_NAMES = ("cancel_run", "checkpoint_detail", "clear_current_state",
+              "compare_methods", "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
-              "prepare_dataset", "read_job", "run_custom", "run_method",
-              "run_method_batch", "run_queries", "submit_run")
+              "eval_custom", "prepare_dataset", "read_job", "run_custom",
+              "run_method", "run_method_batch", "run_queries", "submit_run")
 
 #: 每个工具的必填项（写工具取**命令声明**，只读与 job 调度面取闭包签名）。
 EXPECTED_REQUIRED = {
@@ -510,13 +510,14 @@ EXPECTED_DEFAULTED = {
     "describe_training": ["include_series", "limit", "run_id"],
     "describe_network": ["limit"],
     "describe_networks": ["limit"],
-    # ⚠ `pipeline` 是**可选但无默认**（None = 用默认链）⇒ 不进这张表，
+    # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
     #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
-    "prepare_dataset": ["diag", "name", "target", "time_col"],
+    "prepare_dataset": ["diag", "name", "target", "target_kind", "time_col"],
     "read_job": ["wait_s"],
     # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
     #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
-    "run_custom": ["dataset_id", "diag", "name", "persist"],
+    # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）。
+    "run_custom": ["dataset_id", "device", "diag", "name", "persist"],
     "run_method": ["dataset_id", "device", "diag", "persist"],
     "run_method_batch": ["dataset_id"],
     # `method`/`code`/`name` 都声明了 `""` 默认 ⇒ 进这张表（"未给"= 空串）。
@@ -528,6 +529,12 @@ EXPECTED_DEFAULTED = {
     # ⚠ `actions`/`pick` 都是**无默认**（None = 必给的 actions / 不投影）
     #   ⇒ 不进 defaulted 表，但仍是**可选**参数（`actions` 由闭包签名把关必给）。
     "run_queries": [],
+    # ---- 2026-10-03 新增（NQS 路径）----
+    # `checkpoint_detail` 的 `run_id` 有 `""` 默认（留空 = 没有目标，会明确报错）
+    "checkpoint_detail": ["run_id"],
+    # `eval_custom` 的 `which` 有 `"best"` 默认、`dataset_id` 有 `""` 默认；
+    # `run_id`/`code` 是必填。
+    "eval_custom": ["dataset_id", "which"],
 }
 
 #: 逐参数行为判据：(工具, 最小必填参数, 参数名, 真值)。
@@ -551,6 +558,15 @@ _DEFAULTED_PROBES = (
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "target", "target"),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "time_col", "t"),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "diag", True),
+    # ---- NQS 路径新增 ----
+    ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "target_kind", "custom"),
+    ("checkpoint_detail", {}, "run_id", "run-null-shim"),
+    ("eval_custom", {"run_id": "run-null-shim",
+                     "code": "def evaluate(model, ctx):\n    return {}"},
+     "which", "last"),
+    ("eval_custom", {"run_id": "run-null-shim",
+                     "code": "def evaluate(model, ctx):\n    return {}"},
+     "dataset_id", "ds-null-shim"),
     ("run_method", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
     ("run_method", {"method": "logistic"}, "device", "cpu"),
     ("run_method", {"method": "logistic"}, "persist", True),
@@ -561,6 +577,7 @@ _DEFAULTED_PROBES = (
     ("run_custom", {"code": _MIN_NET_CODE}, "name", "my-net"),
     ("run_custom", {"code": _MIN_NET_CODE}, "diag", True),
     ("run_custom", {"code": _MIN_NET_CODE}, "persist", True),
+    ("run_custom", {"code": _MIN_NET_CODE}, "device", "cpu"),
     ("run_method_batch", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("compare_methods", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
@@ -671,6 +688,13 @@ _MIN_ARGS = {
     # （`summary` 是内置动作、零参数）——判据只关心 null 垫片的传输行为，
     # 但用真动作能顺带证明"编排入口本身可用"。
     "run_queries": {"actions": [{"op": "summary"}]},
+    # ---- 2026-10-03 新增（NQS 路径）----
+    # `checkpoint_detail` 只读、`run_id` 有 `""` 默认 ⇒ 最小必填集是空。
+    "checkpoint_detail": {},
+    # `eval_custom` 必给 run_id + code。这里给一对**跑不出结果但有教学错误**的值即可
+    # （这条判据只关心 null 垫片的传输行为，不关心那次评估成不成）。
+    "eval_custom": {"run_id": "custom_network-0-0",
+                    "code": "def evaluate(model, ctx):\n    return {}"},
 }
 
 #: 可选参数总数（= 全部声明参数 − 必填参数）；迁移后必须仍是这个数才说明
@@ -680,7 +704,7 @@ _MIN_ARGS = {
 #: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
 #: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
-_EXPECTED_OPTIONAL_PARAMS = 50
+_EXPECTED_OPTIONAL_PARAMS = 57
 
 
 def test_null_shim_rule_partitions_every_optional_param():

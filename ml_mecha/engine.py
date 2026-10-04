@@ -48,8 +48,8 @@ from mecha.surface import Engine, ExecutionContext
 
 from ml_toolbox.api import RunRequest, Session, SessionError
 from ml_toolbox.core import registry
-from ml_toolbox.core.contracts import (AUX_GRAPH, DataSpec, ParamValueError,
-                                       is_lower_better)
+from ml_toolbox.core.contracts import (AUX_GRAPH, AUX_PAYLOAD, DataSpec,
+                                       ParamValueError, is_lower_better)
 from ml_toolbox.core.dataset import Dataset
 from ml_toolbox.core.pipeline import Pipeline
 from ml_toolbox.core.resources import (ResourceBudget, ResourceEstimate,
@@ -404,7 +404,20 @@ class MLEngine(Engine):
             "training_detail": self._query_training_detail,
             "network_catalog": self._query_network_catalog,
             "network_source": self._query_network_source,
+            "checkpoint_detail": self._query_checkpoint_detail,
         }
+
+    def _query_checkpoint_detail(self, *, run_id: str) -> dict[str, Any]:
+        """某个 run 的 **checkpoint 摘要**（只读；**不内联权重**）。
+
+        为什么单开一条（而不是塞进 `run_detail`）：
+        - `run_detail` 读的是**会话内存**，而 checkpoint 在**磁盘**上
+          ⇒ 跨重启照样查得到（这正是"训练完把模型拿回来"的入口）；
+        - 权重是几十万个数 ⇒ 回执只给**定位符与结构摘要**，
+          真要用它就走 `eval_custom`（系统装载后交给你的代码）。
+        """
+        from ml_toolbox.methods.neural.custom import describe_checkpoint
+        return describe_checkpoint(str(run_id or ""))
 
     def query_arg_spec(self, op_name: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
         """某个只读查询的 ``(可给参数, 必给参数)``；op 不存在 ⇒ ``None``。
@@ -878,9 +891,21 @@ class MLEngine(Engine):
         except MechaError as exc:
             return self._failure(command, exc, [])
         except SessionError as exc:
+            # ⭐ **把"接不住"翻译成人话**：会话层只会说"方法不可用/配置非法"，
+            #   而最常见的一种其实是**任务的标签形态不对**（NQS 需求 §3.3：
+            #   "我连我到底在哪一步失败都问不出来……怀疑是自己参数写错了"）。
+            #   ⇒ 这里按可判别的条件**加具体的 kind/hint**，别让它落进万能话
+            #   （pitfalls A14：可教学最常死在最后一公里）。
+            hint = "ML 会话拒绝了这次请求（方法不可用/配置非法）"
+            kind = "session_error"
+            if self._spec_has_no_label(spec):
+                kind = "no_label_but_not_custom"
+                hint = ("这份数据**没有标签列**，而该方法是监督任务 ⇒ 我们不知道拿什么"
+                        "算损失与指标。若标签其实在**逐行负载**里（变长/复数，例如每个"
+                        "样本采样出的振幅），请在 `prepare_dataset` 里显式写 "
+                        "`target_kind='custom'`；若确实有标签，就在那里给 `target` 列名。")
             return self._failure(command, MechaError(
-                str(exc), kind="session_error",
-                hint="ML 会话拒绝了这次请求（方法不可用/配置非法）"), [])
+                str(exc), kind=kind, hint=hint), [])
         except ParamValueError as exc:
             # ⭐ **可教学的参数错误**：用户/AI 把参数值写错了 ⇒ 原样保住它的
             #   `kind`/`hint`/`suggest`，**绝不落到下面的 internal_error**
@@ -902,6 +927,50 @@ class MLEngine(Engine):
             "compare_methods": self._cmd_compare_methods,
             "run_custom": self._cmd_run_custom,
             "clear_current_state": self._cmd_clear_current_state,
+            "eval_custom": self._cmd_eval_custom,
+        }
+
+    def _cmd_eval_custom(self, spec: dict[str, Any],
+                         context: Any) -> Mapping[str, Any]:
+        """**把训练好的模型交给调用方的代码**（NQS 的"外部函数口"）。
+
+        为什么是受控命令而不是只读查询：它**在权威进程里执行调用方的代码**
+        （可能与外部物理引擎交互）——与 `run_custom` 同一口径：走命令面、受审计与
+        Gate 管辖。⚠ 沙箱负责"别把宿主搞崩 + 错误可读"，**不是权限边界**。
+        """
+        from ml_toolbox.methods.neural.custom import run_eval_code
+        run_id = str(spec.get("run_id") or "").strip()
+        if not run_id:
+            raise MechaError("eval_custom 需要 run_id（要装载哪一次的模型）",
+                             kind="missing_run_id",
+                             hint="`checkpoint_detail(run_id=…)` 可先确认它有没有 checkpoint")
+        code = str(spec.get("code") or "")
+        if not code.strip():
+            raise MechaError("eval_custom 需要 code（定义 `evaluate(model, ctx)`）",
+                             kind="missing_eval_code",
+                             hint="契约：`def evaluate(model, ctx) -> dict`")
+        # 数据：① 复用会话里的某份数据集；② 或现场读一份新负载（"换个 N 评估"的用法）
+        payload: dict[str, Any] = {}
+        ds_id = str(spec.get("dataset_id") or "").strip()
+        if ds_id:
+            entry = self._validator.check_dataset_ref(ds_id)
+            payload = dict(getattr(entry.spec, "aux", {}).get("payload") or {})
+        decl = spec.get("payload")
+        if decl:
+            payload = {**payload, **self._parse_payload_decl(decl, n_rows=None)}
+        out = run_eval_code(run_id, code, which=str(spec.get("which") or "best"),
+                            payload=payload, dataset_id=ds_id)
+        return {
+            "ok": bool(out.get("ok")), "command": "eval_custom",
+            "run_ids": [run_id] if out.get("ok") else [],
+            "primary_metric": "", "metrics": dict(out.get("metrics") or {}),
+            "warnings": [out["hint"]] if out.get("hint") else [],
+            "run_id": run_id, "which": out.get("which", ""),
+            "extra_keys": sorted((out.get("extra") or {}).keys()),
+            "note": out.get("note", ""),
+            "error": out.get("error", ""),
+            "error_kind": out.get("error_kind", ""),
+            "error_hint": out.get("hint", ""),
         }
 
     def _cmd_run_custom(self, spec: dict[str, Any], context: Any) -> Mapping[str, Any]:
@@ -1083,6 +1152,14 @@ class MLEngine(Engine):
             dataset.time_col = str(time_col)
         diag = bool(spec.get("diag", False))
         self._validator.check_row_count(int(len(dataset.frame)))
+        # ⭐ **数据形态体检**（NQS 需求 §3.3 的正解）：接不住的形态要**当场、可教学**地拒。
+        #   ⚠ 实测过的两个失败：
+        #   - 复数列：pipeline 里 `to_numpy(float)` **静默丢掉虚部**，回执还说"成功"
+        #     （只在 stderr 有一条 ComplexWarning）⇒ 用户拿到的是被毁掉的数据；
+        #   - 变长数组列（object dtype）：冒出一句裸 numpy 广播错
+        #     `operands could not be broadcast together with shapes (256,) (1024,)`。
+        #   两者都让用户"怀疑自己参数写错了"（他的原话），而不是知道"这个形态不支持"。
+        self._validator.check_frame_shapes(dataset.frame)
 
         # ⭐ **AI 组装预处理链**（用户裁决：预处理是"自由的那一半"）。
         #   声明形状见 `core.pipeline` 的"管道装配"一节；省略整份 ⇒ 用默认链
@@ -1092,6 +1169,12 @@ class MLEngine(Engine):
         # ⭐ **图结构**（可选）：边表进 `spec.aux`，供声明了 `accepts_aux` 的方法消费。
         #   为什么放 aux 而不是塞进特征表：它是"观测之间的关系"，不是特征。
         graph_facts = self._attach_graph(fitted.spec, spec, dataset)
+        # ⭐ **逐行负载**（可选）：变长/复数的大数组进 `spec.aux["payload"]`。
+        #   与图的区别：图是"行之间怎么连"，负载是"每行自带的东西"
+        #   ⇒ 图要节点掩码划分，负载**按行切**就行（保住 row-level 语义）。
+        payload_facts = self._attach_payload(fitted.spec, spec, dataset)
+        # ⭐ **自定义任务**（无标准标签，指标由方法自己上报）
+        self._apply_target_kind(fitted.spec, spec)
         dataset_id = self._next_dataset_id(dataset.name)
         entry = self._build_entry(dataset_id, dataset, fitted.spec, source_desc, diag)
         # 写权门拒绝时**不留半拉子状态**：登记 → 写门 → 失败即回滚（真题试过，
@@ -1128,6 +1211,10 @@ class MLEngine(Engine):
             # 图事实（节点/边/度分布/孤立点）——带了图才有；让人和 AI 一眼看见
             # "这份数据的拓扑长什么样"（图的坑大多在这儿）。
             "graph": dict(graph_facts or {}),
+            # 逐行负载的形状/dtype（NQS：复振幅、位串、mask）——**别只回键名**，
+            # 形状与 dtype 才是"我的复数还在不在"的答案。
+            "payload": dict(payload_facts or {}),
+            "target_kind": str(entry.spec.target_kind or ""),
             "error": "",
         }
 
@@ -1207,6 +1294,7 @@ class MLEngine(Engine):
                 ) from None
 
         rows: list = []
+        feat_cols: list[str] = []
         if decl.get("edges") is not None:
             for item in decl["edges"] or []:
                 if isinstance(item, Mapping):
@@ -1216,9 +1304,22 @@ class MLEngine(Engine):
                             kind="bad_graph_edge",
                             hint="写成 {'src': 0, 'dst': 1} 或 [0, 1]",
                         )
-                    rows.append((int(_edge_num(item["src"], "src", item)),
-                                 int(_edge_num(item["dst"], "dst", item)),
-                                 _edge_num(item.get("weight", 1.0), "weight", item)))
+                    # ⭐ **映射形态的边可以带任意特征键**（多分量耦合）：
+                    #   `{"src":0,"dst":1,"V_re":…,"V_im":…,"dist":…}`
+                    #   ⇒ 除 src/dst/weight 外的键都成为**边特征列**（`edge_attr`）。
+                    #   旧行为只认 src/dst/weight，多出来的键被**静默丢掉**
+                    #   —— 那会逼人把物理量压成一个数（需求原文："硬压会毁掉物理量"）。
+                    extra_keys = [k for k in item
+                                  if k not in ("src", "dst", "weight")]
+                    for k in extra_keys:
+                        if str(k) not in feat_cols:
+                            feat_cols.append(str(k))
+                    row = {"src": int(_edge_num(item["src"], "src", item)),
+                           "dst": int(_edge_num(item["dst"], "dst", item)),
+                           "weight": _edge_num(item.get("weight", 1.0), "weight", item)}
+                    for k in extra_keys:
+                        row[str(k)] = _edge_num(item[k], str(k), item)
+                    rows.append(row)
                 else:
                     seq = list(item)
                     if len(seq) < 2:
@@ -1241,7 +1342,13 @@ class MLEngine(Engine):
         else:
             raise MechaError("graph 声明要给 `edges`（内联）或 `edges_path`（CSV）",
                              kind="bad_graph_declaration")
-        edge = pd.DataFrame(rows, columns=["src", "dst", "weight"])
+        if rows and isinstance(rows[0], Mapping):
+            # 映射形态：列 = src/dst/weight + **所有出现过的特征键**（列序 = 首现序）
+            cols = ["src", "dst", "weight"] + [c for c in feat_cols]
+            edge = pd.DataFrame([{c: r.get(c, 0.0) for c in cols} for r in rows],
+                                columns=cols)
+        else:
+            edge = pd.DataFrame(rows, columns=["src", "dst", "weight"])
         if not bool(decl.get("directed", False)) and len(edge):
             rev = edge.rename(columns={"src": "dst", "dst": "src"})
             edge = pd.concat([edge, rev], ignore_index=True)
@@ -1263,6 +1370,134 @@ class MLEngine(Engine):
             return Problem(spec, allowed=(AUX_GRAPH,)).graph_facts()
         except Exception:                                     # noqa: BLE001
             return {"n_nodes": n_nodes, "n_edges": int(len(edge))}
+
+    def _attach_payload(self, spec: Any, request: Mapping[str, Any],
+                        dataset: Any) -> dict:
+        """把 `request["payload"]` 声明的**逐行负载**装进 `spec.aux["payload"]`。
+
+        ## 声明形状（JSON 可序列化 ⇒ 能进存档）
+
+        ```jsonc
+        "payload": {
+          // ① HDF5（**大数组/复数的主路径**：原生复数，且不必过 JSON）
+          "hdf5": {"path": "data.h5",
+                   "datasets": {"amps": "/config/amps", "bits": "/config/bits"}},
+          // ② 内联数组（小数据、且**只有实数**——JSON 表达不了复数）
+          "arrays": {"n_atoms": [6, 8, 10]}
+        }
+        ```
+
+        ## 三条纪律
+
+        1. **第 0 维必须 = 观测表的行数**（逐行负载的定义）——否则"切一批行"
+           就对不上，且错误会以极难查的广播错形式出现。**越界即拒，不裁剪。**
+        2. **保住 dtype**：复数就是复数、位串就是整数、mask 就是 bool。
+           ⚠ 绝不 float 强转——那正是"复振幅被静默变成实数"的根因。
+        3. 变长部分由调用方**先 pad 再配 mask**（`core.paddings.pad_rows`）；
+           我们**不猜**怎么 pad，也不替它补 mask。
+        """
+        decl = request.get("payload")
+        if not decl:
+            return {}
+        out = self._parse_payload_decl(decl, n_rows=int(len(spec.X)))
+        if not out:
+            return {}
+        spec.aux = dict(spec.aux or {})
+        spec.aux[AUX_PAYLOAD] = out
+        try:
+            from ml_toolbox.core.contracts import Problem
+            return Problem(spec, allowed=(AUX_PAYLOAD,)).payload_facts()
+        except Exception:                                      # noqa: BLE001
+            return {k: {"shape": None, "dtype": None} for k in out}
+
+    def _parse_payload_decl(self, decl: Mapping[str, Any],
+                            *, n_rows: int | None) -> dict[str, Any]:
+        """解析负载声明 → ``{名字: 数组}``。
+
+        ``n_rows=None`` ⇒ **不校验行数**（评估场景：负载不跟任何数据集绑定，
+        例如"换个没见过的 N 评估"——那份数据是现场给的）。
+        """
+        if not isinstance(decl, Mapping):
+            raise MechaError("payload 需要对象", kind="bad_payload_declaration",
+                             hint='例如 {"hdf5": {"path": "d.h5", "datasets": {...}}}')
+        out: dict[str, Any] = {}
+        arrays = decl.get("arrays")
+        if arrays:
+            if not isinstance(arrays, Mapping):
+                raise MechaError("payload.arrays 需要对象", kind="bad_payload_declaration")
+            import numpy as np
+            for k, v in arrays.items():
+                arr = np.asarray(v)
+                if arr.ndim == 0:
+                    raise MechaError(
+                        f"负载 {k!r} 是标量 ⇒ 它属于**列**，不属于逐行负载",
+                        kind="bad_payload_array",
+                        hint="逐行负载要求第 0 维 = 行数；单值请放进数据表的一列")
+                if n_rows is not None and arr.shape[0] != n_rows:
+                    raise MechaError(
+                        f"负载 {k!r} 的第 0 维是 {arr.shape[0]}，而观测表有 {n_rows} 行",
+                        kind="bad_payload_rows",
+                        hint="逐行负载要求**第 0 维 = 行数**（切一批行 = 切前几维）",
+                        suggest="检查是否按行排好，或是否该先转置")
+                out[str(k)] = arr
+        h5 = decl.get("hdf5")
+        if h5:
+            if not isinstance(h5, Mapping) or not h5.get("path"):
+                raise MechaError("payload.hdf5 需要 {'path': …, 'datasets': {…}}",
+                                 kind="bad_payload_declaration")
+            from ml_toolbox.core.paddings import pack_hdf5
+            path = self._resolve_data_path(str(h5["path"]))
+            if n_rows is None:
+                n_rows = _hdf5_first_dim(str(path), dict(h5.get("datasets") or {}))
+            try:
+                out.update(pack_hdf5(str(path), dict(h5.get("datasets") or {}),
+                                     n_rows=n_rows))
+            except MechaError:
+                raise
+            except Exception as exc:                           # noqa: BLE001
+                raise MechaError(
+                    f"读 HDF5 负载失败：{type(exc).__name__}: {exc}",
+                    kind="bad_payload_hdf5",
+                    hint="检查 path / datasets 里的数据集路径是否正确；"
+                         "读 HDF5 需要 h5py",
+                ) from exc
+        return out
+
+    def _apply_target_kind(self, spec: Any, request: Mapping[str, Any]) -> None:
+        """允许 ``target_kind="custom"``：**没有标准标签**的任务（指标由方法上报）。
+
+        为什么需要（NQS 需求）：他的"标签"是每个配置采样的 64 个**复数振幅**
+        —— 变长、复数、且**在负载里**，不是表里的一列。若强行要求一个标准标签列，
+        要么得造一个假标签（标准指标随之变成假话），要么就做不了。
+
+        ⇒ 显式声明 `target_kind="custom"`：`spec.y` 保持 `None`，
+        `spec.target_kind="custom"`；**标准指标不计算、也不假装**
+        （`runner` 跳过 `evaluate`，回执里写明"自定义指标"）。
+        """
+        want = str(request.get("target_kind") or "").strip()
+        if not want:
+            return
+        if want != "custom":
+            raise MechaError(
+                f"target_kind 只接受 'custom'（自动推断的两种不用写），收到 {want!r}",
+                kind="bad_target_kind",
+                hint="回归/分类的 kind 由数据自动推断；只有'无标准标签'才需要显式写 custom")
+        spec.target_kind = "custom"
+        spec.y = None
+
+    def _spec_has_no_label(self, spec: Mapping[str, Any]) -> bool:
+        """这次请求用的数据**没有标签、也没声明自定义任务**吗？
+
+        用来把"会话层那句万能拒绝"翻译成人话（pitfalls A14：可教学最常死在最后一公里）。
+        ⚠ 一切都在 try 里：这是**诊断辅助**，它自己绝不能把失败路径搞崩。
+        """
+        try:
+            entry = self._resolve_dataset(dict(spec))
+            s = entry.spec
+            return (getattr(s, "y", None) is None
+                    and str(getattr(s, "target_kind", "") or "") != "custom")
+        except Exception:                                      # noqa: BLE001
+            return False
 
     def _cmd_run_method(self, spec: dict[str, Any], context: Any) -> Mapping[str, Any]:
         """在已准备的数据视图上运行一个方法。
@@ -1868,7 +2103,7 @@ def _is_cancelled(context: Any) -> bool:
 #: 编排入口 `run_queries` 的"可用 op"也从它派生。
 READ_QUERY_NAMES: tuple[str, ...] = (
     "method_catalog", "method_detail", "dataset_detail", "run_detail",
-    "training_detail", "network_catalog", "network_source",
+    "training_detail", "network_catalog", "network_source", "checkpoint_detail",
 )
 
 
@@ -1976,6 +2211,29 @@ def _progress_hook(context: Any, *, run_id: str = "") -> Callable[..., bool] | N
             return False
 
     return hook
+
+
+def _empty_frame():
+    """一张 0 行的空表（`eval_custom` 现场读负载时当占位：那份负载不跟任何数据集绑定）。"""
+    import pandas as pd
+    return pd.DataFrame()
+
+
+def _hdf5_first_dim(path: str, datasets: Mapping[str, Any]) -> int:
+    """读 HDF5 里第一个数据集的第 0 维（评估场景：负载不绑数据集，行数由数据自己定）。"""
+    try:
+        import h5py
+    except ImportError as exc:                                 # pragma: no cover
+        raise MechaError("读 HDF5 需要 h5py", kind="bad_payload_hdf5",
+                         hint="`pip install h5py`") from exc
+    with h5py.File(str(path), "r") as f:
+        for _name, h5path in dict(datasets or {}).items():
+            if str(h5path) in f:
+                return int(f[str(h5path)].shape[0])
+    raise MechaError(
+        "HDF5 里没找到任何声明的数据集",
+        kind="bad_payload_hdf5",
+        hint=f"声明的是 {list((datasets or {}).values())}")
 
 
 def _state_value_jsonable(value: Any) -> Any:

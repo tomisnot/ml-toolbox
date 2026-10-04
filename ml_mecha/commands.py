@@ -106,13 +106,23 @@ COMMANDS: tuple[CommandSpec, ...] = (
             CommandParam("graph", "object", False,
                          "图结构声明（可选）：{'edges': [[src,dst],...]} 或 "
                          "{'edges_path': 'edges.csv', 'src': 's', 'dst': 'd'}；"
-                         "行号指向观测表的行；不给 directed 会自动补反向边"),
+                         "行号指向观测表的行；不给 directed 会自动补反向边。"
+                         "**src/dst/weight 之外的列 = 多分量边特征**（`edge_attr`）"),
+            CommandParam("payload", "object", False,
+                         "**逐行负载**声明（可选）：{'hdf5': {'path': 'd.h5', "
+                         "'datasets': {'amps': '/config/amps'}}} 或 "
+                         "{'arrays': {'名字': [...]}}。每个数组**第 0 维 = 行数**；"
+                         "变长/复数的**大数组走这条**（HDF5 原生支持复数；JSON 不能）"),
+            CommandParam("target_kind", "string", False,
+                         "只有 'custom'（无标准标签、指标由方法自己上报）需要显式写；"
+                         "回归/分类由数据自动推断", ""),
         ),
         writes_state=("current.dataset_id", "current.pipeline_id"),
         side_effect=SIDE_EFFECT_DOMAIN_STATE,
         risk=RISK_LOW,
         extra_receipt_keys=("dataset_id", "pipeline_id", "dataset",
-                            "pipeline_chain", "split_policy", "graph"),
+                            "pipeline_chain", "split_policy", "graph",
+                            "payload", "target_kind"),
     ),
     CommandSpec(
         name="run_method",
@@ -188,6 +198,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "给这段网络起个名字（存进存档，便于之后按名字复用）", ""),
             CommandParam("resource_guard", "object", False,
                          "资源预算声明，例如 {'max_kernel_mb': 128}"),
+            CommandParam("device", "string", False,
+                         "计算设备：auto（默认，有卡就上卡）/ cpu / cuda:0。"
+                         "⚠ 要求 cuda 而没有卡会**报错**（不静默回落 CPU）；"
+                         "网络代码里建张量要用 `ctx['device']`，否则会撞'混合设备'"),
         ),
         # ⚠ 写状态的键与 run_method 一致（它本质就是"跑一个方法"），
         #   额外把 `current.method` 记成自定义网络名——审计里要看得见"跑的是代码"。
@@ -196,6 +210,33 @@ COMMANDS: tuple[CommandSpec, ...] = (
         side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
         risk=RISK_MEDIUM,
         extra_receipt_keys=("run_id", "elapsed_s", "error", "network_name"),
+    ),
+    # ---- 训练后：把模型交给调用方的代码（NQS 的"外部函数口"） ----
+    CommandSpec(
+        name="eval_custom",
+        summary="装载某次自定义网络的 checkpoint，把模型交给调用方代码去评估"
+                "（采样/算能量/换尺寸外推），返回它上报的指标",
+        parameters=(
+            CommandParam("run_id", "string", True,
+                         "要装载哪一次运行（run_custom 的 run_id）"),
+            CommandParam("code", "string", True,
+                         "评估代码：定义 `def evaluate(model, ctx) -> dict`；"
+                         "ctx 里有 payload / meta / torch / nn / device / run_id"),
+            CommandParam("which", "string", False,
+                         "装哪个权重：best（默认，验证损失最好的那轮）/ last", "best"),
+            CommandParam("dataset_id", "string", False,
+                         "复用会话里某份数据集的负载（与 payload 可并用）", ""),
+            CommandParam("payload", "object", False,
+                         "**现场给新负载**（如换一个没见过的 N）：与 prepare_dataset "
+                         "的 payload 同形；这里**不校验行数**（负载不绑数据集）"),
+        ),
+        #: 不写任何状态键（它不改配置台面）；但**必须过 Gate**：它在权威进程里
+        #: 执行调用方的代码 ⇒ 与 run_custom 同一口径，不能是"无副作用的只读命令"。
+        writes_state=(),
+        side_effect=SIDE_EFFECT_HOST_ARTIFACTS,
+        risk=RISK_MEDIUM,
+        extra_receipt_keys=("run_id", "which", "extra_keys", "note", "error",
+                            "error_kind", "error_hint"),
     ),
     # ---- 清零入口（指导意见 §1-P1-5：别让 AI 在别人没收拾的台面上干活） ----
     CommandSpec(

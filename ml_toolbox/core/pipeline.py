@@ -263,6 +263,12 @@ class Pipeline:
     test_size: float = 0.25
     stratify: bool = True
     time_split: bool = False              # 时序：按时间顺序切分，不打乱
+    #: **按列分组留出**：`group_by` 是列名，`holdout` 是要留出的取值列表。
+    #: 为什么需要它（NQS 需求）：要"训练集内 vs **尺寸外推**分开看"——随机切分
+    #: 会把外推尺寸的一部分也放进训练，那个分数就不是外推了。
+    #: ⚠ 它也是**堵同源泄漏**的正规手段（同组不许跨训练/测试）。
+    group_by: str = ""
+    holdout: tuple = ()
 
     @classmethod
     def default(cls) -> "Pipeline":
@@ -373,8 +379,13 @@ class Pipeline:
         **步骤参数**，与真实划分**解耦**（pitfalls A2）⇒ 展示层必须有一个
         权威来源。这个方法就是它，两个入口（`run` / `_fit_split_aware`）共用。
         """
-        return {"test_size": float(self.test_size), "stratify": bool(self.stratify),
-                "seed": int(self.seed), "time_split": bool(self.time_split)}
+        out = {"test_size": float(self.test_size), "stratify": bool(self.stratify),
+               "seed": int(self.seed), "time_split": bool(self.time_split)}
+        if self.group_by:
+            # ⭐ **分组留出**（NQS：按 N 留出 14/16/18 看"尺寸外推"）
+            out["group_by"] = str(self.group_by)
+            out["holdout"] = list(self.holdout)
+        return out
 
     def transform_new(self, frame: pd.DataFrame,
                       target: str | None = None) -> pd.DataFrame:
@@ -393,6 +404,32 @@ class Pipeline:
 
     def _split(self, df, y):
         n = len(df)
+        # ⭐ **按列分组留出**（`group_by` + `holdout`）——优先于其它口径。
+        #
+        # 为什么需要它（NQS 需求原文）："**训练集内 vs 尺寸外推分开看**：N≤12 参与
+        # 训练、N≥14 没见过，我要盯外推有没有崩"。随机切分做不到这件事——它会把
+        # N=14 的一部分也放进训练 ⇒ 那个"外推分数"根本不是外推。
+        # ⚠ 它顺手堵住一整族**同源泄漏**：同一组（同一物理尺寸/同一来源/同一病人）
+        # 被切开训练与测试，与时序的"未来泄漏"、图的"邻居泄漏"是同一类问题。
+        if self.group_by:
+            col = str(self.group_by)
+            cols = list(getattr(df, "columns", []))
+            if col not in cols:
+                raise ValueError(
+                    f"split.group_by={col!r} 不在数据表的列里（现有列：{cols[:12]}）")
+            hold = {v if not isinstance(v, str) else v for v in (self.holdout or ())}
+            # 容错：JSON 传进来的数字/字符串都可能，按"字符串形式相等"匹配一次
+            raw = list(df[col])
+            want = {str(v) for v in hold}
+            te = np.asarray([i for i, v in enumerate(raw) if str(v) in want], dtype=int)
+            tr = np.asarray([i for i, v in enumerate(raw) if str(v) not in want],
+                            dtype=int)
+            if len(te) == 0 or len(tr) == 0:
+                raise ValueError(
+                    f"分组留出把数据切空了：留出值 {sorted(want)} 命中 {len(te)} 行、"
+                    f"剩 {len(tr)} 行训练。该列实际取值："
+                    f"{sorted({str(v) for v in raw})[:12]}")
+            return tr, te
         if self.time_split:
             k = int(n * (1 - self.test_size))
             return np.arange(k), np.arange(k, n)
@@ -460,7 +497,8 @@ STEP_PARAM_CHOICES: dict[str, dict[str, tuple | None]] = {
 #: 声明里允许出现的顶层键（未知键硬失败）。
 _STEP_KEYS = frozenset({"key", "params", "enabled", "code"})
 _DECL_KEYS = frozenset({"steps", "split"})
-_SPLIT_KEYS = frozenset({"test_size", "stratify", "seed", "time_split"})
+_SPLIT_KEYS = frozenset({"test_size", "stratify", "seed", "time_split",
+                         "group_by", "holdout"})
 
 #: 自定义步骤代码里必须定义的类名（与 `Network` 同一约定）。
 REQUIRED_STEP_CLASS = "Step"
@@ -686,9 +724,18 @@ def build_pipeline(declaration: Any, *,
     seed = int(split.get("seed", base.seed))
     if seed < 0:
         raise StepDeclError("split.seed 需要非负整数", kind="bad_split_seed")
+    group_by = str(split.get("group_by") or "")
+    holdout = tuple(split.get("holdout") or ())
+    if bool(group_by) != bool(holdout):
+        raise StepDeclError(
+            "split.group_by 与 split.holdout 必须**成对**给",
+            kind="bad_group_split",
+            detail='例如 {"group_by": "N", "holdout": [14, 16, 18]}'
+                   "（把 N=14/16/18 整组留出，用来量**尺寸外推**）")
     return Pipeline(steps=steps, seed=seed, test_size=test_size,
                     stratify=bool(split.get("stratify", base.stratify)),
-                    time_split=bool(split.get("time_split", base.time_split)))
+                    time_split=bool(split.get("time_split", base.time_split)),
+                    group_by=group_by, holdout=holdout)
 
 
 def describe_declaration(declaration: Any) -> list[dict]:

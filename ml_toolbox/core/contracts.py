@@ -166,11 +166,21 @@ class DataSpec:
 
 
 #: 辅助表（`Problem.aux`）里的**保留键**。约定固定、可校验（见 `Problem.require`）。
-#: 目前只有图；将来多视图/序列掩码/元学习 episode 各占一个键，**不动契约**。
 AUX_GRAPH = "graph"
 
+#: **逐行负载**：``aux["payload"] = {名字: 数组}``，每个数组**第 0 维 = 行数**。
+#:
+#: 为什么需要它（NQS 需求的"最高"之一）：有些任务的"一行"自带**变长/复数**的大数组
+#: （一个里德堡阵列配置的 2^N 个复振幅、它采样的 64 个位串、逐原子特征…），
+#: 那既不是列、也不是"行之间的图"。压进一列会毁掉形状，塞进图会毁掉语义。
+#: ⇒ 给它一个**明确的槽**：`payload`；并把"切一批行"定义成"切每个数组的前几维"
+#: （于是切分/指标/存档的既有语义一行都不用改）。
+#: 变长部分由调用方**先 pad 再配 mask**（`ml_toolbox.core.paddings.pad_rows` 是助手）。
+AUX_PAYLOAD = "payload"
+
 #: `aux["graph"]` 的列约定：`src`/`dst` 是**行号**（指向 `spec.X` 的行）。
-#: 可选 `weight`（缺省全 1）。节点数 = `len(spec.X)`。
+#: 可选 `weight`（缺省全 1），**以及任意多个特征列**（多分量耦合，见 `edge_attr`）。
+#: 节点数 = `len(spec.X)`。
 GRAPH_COLUMNS = ("src", "dst", "weight")
 
 
@@ -302,13 +312,47 @@ class Problem:
     def partition_mode(self) -> str:
         """划分该按什么单位做（**由数据决定，不由方法决定**）。
 
-        - ``"masks"``：带了**结构化关系**（图/序列）⇒ 按**节点掩码**划分。
+        - ``"masks"``：带了**图**（``aux["graph"]``）⇒ 按**节点掩码**划分。
           为什么：图的边按行号写，切行会让边索引失效；更要命的是训练节点会沿边
           "看到"验证节点（消息传递）⇒ 分数乐观化。这与时序的 `time_split` 是
           **同一类修正**（都是"行不独立"），只是图的版本。
-        - ``"rows"``：普通表格 ⇒ 沿用既有 `spec.split()`（一行一个样本，行无关）。
+        - ``"rows"``：普通表格（**含只有 `payload` 的情形**）⇒ 沿用既有
+          `spec.split()`。
+
+        ⚠ **只有 `payload` 不算"行不独立"**：逐行负载是"每行自带的东西"，
+        切行完全成立（这正是我们要保住 row-level 语义的原因）。
+        早先我写成 `"masks" if self.aux else "rows"` ⇒ 一带负载就误走图路径。
         """
-        return "masks" if self.aux else "rows"
+        return "masks" if AUX_GRAPH in self.aux else "rows"
+
+    # ------------------------------------------------------------ 负载（逐行的大数组）
+    def payload_keys(self) -> list:
+        """这份数据带了哪些逐行负载（稳定排序）。"""
+        pay = self.aux.get(AUX_PAYLOAD) or {}
+        return sorted(str(k) for k in pay)
+
+    def payload(self) -> dict:
+        """取逐行负载 ``{名字: 数组}``（没有就回空 dict，**不报错**）。
+
+        ⚠ 与 `require` 的分工：负载是"**可以有**"的附加物（没有它就退化成普通表格
+        任务），而图是"**要有才对**"的结构（方法不支持就该拒）。
+        """
+        return dict(self.aux.get(AUX_PAYLOAD) or {})
+
+    def payload_facts(self) -> dict:
+        """负载的形状摘要（进 diag / 工具回执；没有就回空 dict）。"""
+        pay = self.payload()
+        if not pay:
+            return {}
+        out = {}
+        for k, v in pay.items():
+            try:
+                import numpy as _np
+                a = _np.asarray(v)
+                out[str(k)] = {"shape": list(a.shape), "dtype": str(a.dtype)}
+            except Exception:                                  # noqa: BLE001
+                out[str(k)] = {"shape": None, "dtype": None}
+        return out
 
     # ------------------------------------------------------------ 能力声明
     def aux_keys(self) -> list:
@@ -354,6 +398,33 @@ class Problem:
         else:
             w = np.ones(len(src), dtype=np.float32)
         return edge_index, w
+
+    #: `aux["graph"]` 里**不是**结构的三列（其余列都当**边特征**）。
+    _GRAPH_STRUCT_COLS = ("src", "dst", "weight")
+
+    def edge_attr(self):
+        """**多分量边特征** → ``(E, F)`` 的 float 数组（没有特征列就回 ``None``）。
+
+        为什么需要（NQS 需求）：里德堡阵列的耦合不是**一个数** —— 他们有 6 个
+        物理分量（V、J 的实虚部、A 的实虚部、距离）。硬压成一个标量权重
+        **会毁掉物理量**，而"边特征只能是一个标量"逼着人去做那种压缩。
+
+        ⇒ 约定：`aux["graph"]` 里除 `src`/`dst`/`weight` 之外的**所有数值列**
+        按列序拼成 `(E, F)`，列名就是分量名（顺序稳定 = 表的列序）。
+        复数分量请拆成 `_re`/`_im` 两列（或放进 payload —— 那里保住复数 dtype）。
+        """
+        tbl = self.require(AUX_GRAPH)
+        import numpy as np
+        cols = [c for c in tbl.columns if c not in self._GRAPH_STRUCT_COLS]
+        if not cols:
+            return None
+        return np.stack([np.asarray(tbl[c], dtype=np.float32) for c in cols],
+                        axis=1)
+
+    def edge_attr_names(self) -> list:
+        """边特征的分量名（列序；没有就回空列表）。"""
+        tbl = self.require(AUX_GRAPH)
+        return [str(c) for c in tbl.columns if c not in self._GRAPH_STRUCT_COLS]
 
     def graph_facts(self) -> dict:
         """图的规模摘要（进 diag / 工具回执；没有图就回空 dict）。"""
@@ -676,7 +747,15 @@ class MLMethod(abc.ABC):
     def can_handle(self, spec: DataSpec) -> bool:
         if self.task == TASK_SUPERVISED:
             if spec.y is None:
-                return False
+                # ⭐ **例外：自定义任务**（`target_kind="custom"`）。
+                #   为什么允许"没有标准标签"：有些任务的标签是**变长/复数**的
+                #   （NQS：每个配置采样的 64 个复振幅），它住在 `payload` 里，
+                #   标准指标对它**不成立**。若强行要求一个标签列，就只能造假标签
+                #   （标准指标随之变成假话），或者这类任务根本做不了。
+                #   ⇒ 只在**方法自己声明了消费负载**时放行（能力声明照旧兜底）。
+                return (str(spec.target_kind or "") == "custom"
+                        and bool(set(getattr(self, "accepts_aux", ()))
+                                 & set(spec.aux or {})))
             if self.target_kind and spec.target_kind != self.target_kind:
                 return False
             return True

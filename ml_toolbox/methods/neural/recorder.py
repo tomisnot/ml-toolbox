@@ -125,7 +125,14 @@ class TrainingRecorder:
 
     # ------------------------------------------------ 每 epoch 调用
     def epoch(self, ep: int, loss: float, val_loss: float | None,
-              lr: float):
+              lr: float, extra: dict | None = None):
+        """记一轮。
+
+        ``extra``：**方法层自己上报的标量**（如 `{"fid/ch0": 0.96, "nll/phase": 1.2}`）。
+        ⚠ 它们只往 TB 写（见 `tb_log.log_epoch`），**不进 `history`**——
+        `history` 的形状有产物契约（`nn_history` 的键集）钉着，加键属行为变更。
+        而"AI 看得见"这条已经由 TB 那条路满足了（`describe_training` 读**全部** tag）。
+        """
         self.history["epoch"].append(ep)
         self.history["loss"].append(float(loss))
         self.history["val_loss"].append(
@@ -154,7 +161,7 @@ class TrainingRecorder:
 
         # ⭐ 逐 epoch 直播（本 epoch 的量已在上面全部采集完）——写失败只记账，不拖垮训练。
         if self.tb is not None:
-            self.tb.log_epoch(ep, self.history, self.grads)
+            self.tb.log_epoch(ep, self.history, self.grads, extra=extra)
 
     def set_probe(self, X_tensor, labels=None, probe_idx=None, probe_fn=None):
         """设置 probe；只计算一次行选择，标签/原行号与 latent 帧永久对齐。

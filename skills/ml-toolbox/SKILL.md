@@ -41,22 +41,24 @@ whenToUse: >-
 
 ## 工具清单
 
-> 共 **17** 个。表里的名字必须与注册表逐字一致（有判据钉着）。
+> 共 **19** 个。表里的名字必须与注册表逐字一致（有判据钉着）。
 
 | 工具 | 干什么 | 长什么样的大结果 |
 |---|---|---|
 | `describe_methods` | 列可用方法（59 个） | 名字/族/任务，不列参数 |
 | `describe_method` | 某个方法的可调参数与取值范围 | 参数表 |
-| `describe_dataset` | 已准备数据的规模/指纹/预处理链逐步参数/实际划分口径 | 摘要，不内联数据 |
+| `describe_dataset` | 已准备数据的规模/指纹/预处理链逐步参数/实际划分口径；**带负载时报每个负载的形状与 dtype** | 摘要，不内联数据 |
 | `describe_run` | 按 `run_id` 回看一次运行 | 指标 + 产物类别名（数值不内联） |
-| `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + 逐层梯度 | 默认只给**最新一轮**；`include_series` 才给序列；可用 `pick` 只取几条 |
+| `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + 逐层梯度 + **网络自己上报的自定义 tag** | 默认只给**最新一轮**；`include_series` 才给序列；可用 `pick` 只取几条 |
 | `describe_networks` | 列出自定义网络（名字/指标/源码行数/用过几次） | 清单，不含源码 |
 | `describe_network` | 按名字取回网络**源码**（改一版再跑，免重贴） | 源码 + 来源 run |
-| `prepare_dataset` | 登记数据 + 拟合预处理链；可**自己组装**这条链（选步骤/换顺序/写自定义步骤/指定切分/给图边表） | `dataset_id` + 链摘要 + 划分口径 |
+| `checkpoint_detail` | 某次运行**存下来的模型**在不在、多少张量/参数、含不含偏置、在哪块设备上训的 | **权重不内联**；真要用模型走 `eval_custom` |
+| `eval_custom` | **装载某次训练的模型，交给你的代码去评估**（采样/算能量/换个尺寸外推） | 它上报的指标 |
+| `prepare_dataset` | 登记数据 + 拟合预处理链；可**自己组装**这条链（选步骤/换顺序/写自定义步骤/**分组留出**/给图边表/**给逐行负载**） | `dataset_id` + 链摘要 + 划分口径 + 负载形状 |
 | `run_method` | 跑一个内置方法（**同步**，适合短任务） | `run_id` + 指标 |
 | `run_method_batch` | 顺序跑多个方法 | 每个方法的 `run_id` + 逐项失败原因 |
 | `compare_methods` | 多方法对比 | 对比表 + 最优（**要比多个就用它**，别逐个拉） |
-| `run_custom` | 跑一段**自定义网络代码**（AI 写结构，系统管训练与观测） | `run_id` + 指标 |
+| `run_custom` | 跑一段**自定义网络代码**（AI 写结构，系统管训练与观测）；可给 `device` | `run_id` + 指标（自定义任务时是网络上报的） |
 | `submit_run` | 把一次运行提交为**后台任务**（给 `method` 或 `code`）——**长训练就走这条** | `job_id`（立刻返回） |
 | `read_job` | 查后台任务进度/结果 | 状态 + **逐代 loss/val_loss** + **中途就能拿到的 `run_id`** |
 | `cancel_run` | 请求取消后台任务 | 明确回"已请求"（在 epoch 边界生效，不谎报"已取消"） |
@@ -143,10 +145,77 @@ class Network:
                      ctx.get("edge_weight"))
 ```
 
-- `ctx` 里有：`x`、`edge_index`(2×E)、`edge_weight`、`n_nodes`、`train_mask`/`test_mask`、`torch`、`nn`。
+- `ctx` 里有：`x`、`edge_index`(2×E)、`edge_weight`、`n_nodes`、`train_mask`/`test_mask`、`torch`、`nn`、`device`；边表里 `src/dst/weight` **之外的列**会作为 `edge_attr`(E×F) + `edge_attr_names` 给你（**多分量耦合**：V/J 实虚、距离…）。
 - **划分走节点掩码**（同一张图、只对指定节点算损失）——**不要**想着按行切分。
 - **图任务不走交叉验证**（CV 按行切会静默失真 ⇒ 会被明确拒绝）。
 - **图模型不能对"一批新行"预测**（前向需要整张图的边）；测试节点的预测随运行产出。
+- ⚠ **建张量要用 `ctx["device"]`**：模型可能已经被搬到显卡上（`device=auto` 有卡就上卡），
+  随手 `torch.arange(...)` 会撞"混合设备"（框架会把这条错翻译成人话，但不如一开始就写对）。
+
+---
+
+## 逐行负载：变长 / 复数的大数组（"一行自带一份大数组"）
+
+数据表是"一行一个观测的**矩形**表"。当你的**每一行自带一份变长/复数的大数组**
+（一个配置的 2^N 个复振幅、它采样的 64 个位串、逐原子特征…）时，用 **`payload`**：
+
+```jsonc
+"payload": {                       // 二选一（可并用）
+  "hdf5": {"path": "data.h5",      // ⭐ 大数组/复数走这条：HDF5 原生支持复数
+           "datasets": {"amps": "/config/amps", "bits": "/config/bits"}},
+  "arrays": {"n_atoms": [6, 8, 10]}  // 小数据内联（**只有实数**——JSON 表达不了复数）
+},
+"target_kind": "custom"            // 没有标准标签时必写（见下）
+```
+
+三条硬约定（**违反就当场报错，不静默**）：
+
+1. **每个数组第 0 维 = 行数**（"切一批行"就等于"切每个数组的前几维"）；
+2. **dtype 原样保留**：复数就是复数、位串是整数、mask 是 bool —— 绝不 float 强转；
+3. **变长的维先 pad 再配 mask**（`core.paddings.pad_rows` 是助手；`mask=True` 表示
+   "这个位置是真的"）。⚠ 没有 mask 就分不出"填充"与"真数据 0"。
+
+网络里通过 `forward_step(model, batch, ctx)` 拿：`ctx["payload"]["<名字>"]` 是**张量**
+（已按这一批的行切好）；`ctx["row_idx"]` 是这批的行号。
+
+> ⚠ **不要**把变长数组塞进数据表的一列，也**不要**把复数列直接放进去：前者会以
+> 极难读的广播错冒出来，后者以前会**静默丢掉虚部**（回执还说成功）。现在两者都会
+> 在 `prepare_dataset` 当场被拒，并指路到 `payload`。
+
+### 没有标准标签的任务（`target_kind: "custom"`）
+
+标签就是负载里那些复数振幅、**标准指标对它不成立**时：
+
+- `target_kind: "custom"` + 省略 `target`；
+- **必须**写 `Network.loss`（没有标签，框架不知道拿什么算损失）；
+- **标准指标不计算、也不假装**：指标改为由 `Network.metrics(model, ctx)` 每轮上报，
+  写进 TensorBoard ⇒ `describe_training` **直接读得到**（AI 侧一行都不用改）。
+- 分组靠 **tag 命名**：`fid/ch0`、`fid/ood`、`nll/phase`…（TB tag 天生分层）。
+- 主指标：`Network.primary_metric = "fid/mean"` 声明；不声明就取上报指标里字典序第一个。
+
+---
+
+## 训练完把模型拿回来（三个工具串起来）
+
+```
+run_custom(..., persist=true)          # 训练结束会写 checkpoint（best + last，**全量**含偏置）
+  → checkpoint_detail(run_id=…)        # 在不在、多少张量、含不含 bias、最佳轮第几轮
+  → eval_custom(run_id=…, code=…)      # 装载模型，**交给你的代码**（采样/算能量/换 N）
+```
+
+`eval_custom` 的代码只要定义：
+
+```python
+def evaluate(model, ctx):
+    # ctx: payload（**可以现场给新数据** —— 这就是"换个没见过的 N 评估"的用法）、
+    #      meta（n_in/n_out/训练设备/最佳轮次）、torch、nn、device、run_id、which
+    return {"fid": 0.97, "n_rows": 4096}      # 数值进回执；别的原样返回
+```
+
+- `which`：`best`（默认，验证损失最好的那轮）/ `last`。
+- 存档里的张量**一律在 CPU**（不绑设备）；装载方自己 `.to(device)`。
+- ⚠ 它在**权威进程**里执行你的代码（与 `run_custom` 同一口径）。要 import 你自己的
+  物理引擎，把路径加进 `sys.path`（启动时用 `MLTB_EXTRA_PATHS`）。
 
 ---
 
@@ -154,16 +223,22 @@ class Network:
 
 ```python
 class Network:
+    primary_metric = "fid/mean"                    # 可选：主指标叫什么
     def build(self, n_in, n_out, *, nn): ...        # 必需：返回 nn.Module
     def loss(self, *, nn, n_out): ...               # 可选：默认按任务给 CE/MSE
     def configure(self, model, *, torch, lr, weight_decay): ...   # 可选：自定优化器
-    def forward_step(self, model, batch, ctx): ...  # 可选：表格任务的特殊批次
+    def forward_step(self, model, batch, ctx): ...  # 可选：特殊批次（负载就从这拿）
     def forward_graph(self, model, ctx): ...        # 可选：图任务的全图前向
+    def on_step(self, model, step, ctx): ...        # 可选：**每一步**后（预热："前 N 步先只训模长"）
+    def metrics(self, model, ctx): ...              # 可选：**每一轮**上报自定义指标
 ```
 
 - 代码**只写结构**：不许自己写盘、不许碰 GUI（观测与存档由系统统一负责）。
+- `n_out` 在**自定义任务**里是 `0`（真实输出形状由你决定，我们**不猜**）。
 - **按名字复用**：`run_custom(name="resnet18", persist=true)` 存下来之后，
   `describe_networks` 列表、`describe_network(name=…)` 取回源码改一版再跑 ⇒ **别重贴代码**。
+- `device`：`auto`（默认，有卡就上卡）/ `cpu` / `cuda:0`；**要求 cuda 而没卡会报错**，
+  不静默回落（那会留下"审计说 cuda、实跑 CPU"的假记录）。
 - ⚠ `run_id` 是**确定性**的（方法名+毫秒+种子）：同一 `seed` 重跑会**复用同一个
   `runs/<run_id>/tb/`**（事件会追加），需要干净曲线就换个 `seed`。
 
@@ -185,6 +260,9 @@ class Network:
 - **坏声明会报错**（未知步骤/未知键/坏取值），**不静默忽略**。
 - 要按**训练集统计量**变换的步骤（均值/分位数）**必须自己写 `transform`**，
   否则新数据会被按它自己的统计量变换（静默的错）。
+- **分组留出**（要看"没见过的组"上表现如何）：`{"group_by": "N", "holdout": [14, 16]}`
+  ⇒ 整组留出到测试集。⚠ 随机切分做不到这件事（它会把 N=14 的一部分也放进训练），
+  而且它顺手堵住**同源泄漏**（同一来源/同一尺寸/同一病人不许跨训练与测试）。
 
 ---
 
@@ -192,10 +270,13 @@ class Network:
 
 | 事项 | 现状 |
 |---|---|
-| 链路预测 / 图分类 | **不支持**（标签单位不是"行"） |
-| `keep_best`（取回最佳轮次权重） | **未做**；只能查 `best_epoch` |
-| `predict_new` / `export_prediction` | 工具面**没接线**（GUI 有）；会话层有实现 |
+| 链路预测 / 图分类 | **不支持**（标签单位不是"行"）。⚠ 但"一行=一个样本、附带一份图/数组" **支持**（用 `payload`，别把它当图分类） |
+| `predict_new` / `export_prediction` | 工具面**没接线**（GUI 有）；会话层有实现。要'用模型算新数据'今天走 `eval_custom` |
 | `tune_method`（自动调参入口） | 工具面**没有**（GUI 有） |
 | 图任务 × 交叉验证 | **明确拒绝**（会静默失真） |
+| 标准指标 × `target_kind=custom` | **不计算**（没有标准标签）；指标由 `Network.metrics` 上报 |
+| 复数列 / 变长数组列 | **明确拒绝**（会丢虚部 / 报裸广播错）⇒ 走 `payload` |
+| 负载第 0 维 ≠ 行数 | **明确拒绝**（不裁剪、不错位） |
 | 后台任务并发 | 上限 **4**（不排队） |
-| 设备（`device`） | 真透传到方法层（`auto`/`cpu`/`cuda`） |
+| `device` | 真上卡（`auto`/`cpu`/`cuda:0`）；要求 cuda 而没卡**报错**，不回落 CPU |
+| 只有 `run_custom` 有 checkpoint | 内置方法的权重仍只有诊断产物（`nn_weights`，不含偏置） |

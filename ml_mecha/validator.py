@@ -375,6 +375,61 @@ class MLValidator:
         elif key == "current.export_root":
             clean_export_root(value, allowed_roots=self._allowed_export_roots)
 
+    # ------------------------------------------------------------ 数据形态体检
+    def check_frame_shapes(self, frame: Any) -> None:
+        """**接不住的数据形态**要在动手之前**当场、可教学**地拒（NQS 需求 §3.3）。
+
+        ## 为什么这条比"多支持一种形态"更重要
+
+        需求者原话："我连我到底在哪一步失败都问不出来……拿到的反馈都让我怀疑是自己
+        参数写错了。"实测到的两个真实失败：
+
+        | 形态 | 旧行为 | 为什么坏 |
+        |---|---|---|
+        | **复数列**（`complex128`） | `prepare_dataset` 回**成功**，pipeline 里 `to_numpy(float)` **静默丢掉虚部**（只在 stderr 一条 `ComplexWarning`） | 用户拿到的是**被毁掉的数据**，而回执说没事 |
+        | **变长数组列**（object dtype 装 ndarray） | 裸 numpy 广播错 `operands could not be broadcast together with shapes (256,) (1024,)` | 既不可教学，也不提示"这是逐组数据" |
+
+        ⇒ 现在两者都在入口拒绝，并**指路**（复数/变长该走 `payload`）。
+
+        ⚠ 只做**能确定**的判断：dtype 是复数、object 列里装的是序列。
+        其余"看起来怪但合法"的形态（如高基数类别列）**不拦**——拦错了比不拦更坏。
+        """
+        import numpy as np
+        import pandas as pd
+
+        if not isinstance(frame, pd.DataFrame):
+            return
+        complex_cols = [str(c) for c in frame.columns
+                        if pd.api.types.is_complex_dtype(frame[c])]
+        if complex_cols:
+            raise MechaError(
+                f"这些列是**复数**，而数据表只走实数通道：{complex_cols}",
+                kind="complex_column_not_supported",
+                hint="复数**不会**被自动拆成实/虚部，也不会静默丢虚部（那会毁掉波函数）；"
+                     "请二选一：① 拆成 `xxx_re`/`xxx_im` 两列；"
+                     "② 放进逐行负载（`payload`：HDF5 原生支持复数）",
+                suggest='payload={"hdf5": {"path": "data.h5", '
+                        '"datasets": {"amps": "/config/amps"}}}')
+        ragged_cols = []
+        for c in frame.columns:
+            col = frame[c]
+            if col.dtype != object:
+                continue
+            for v in col.dropna().head(20):
+                if isinstance(v, (list, tuple, np.ndarray, dict, set)):
+                    ragged_cols.append(str(c))
+                    break
+        if ragged_cols:
+            raise MechaError(
+                f"这些列装的是**变长数组**（每行长度不同）：{ragged_cols}",
+                kind="ragged_column_not_supported",
+                hint="逐组数据不是'一行一个观测的矩形表'⇒ 它会以极难读的广播错"
+                     "（`operands could not be broadcast together`）冒出来。"
+                     "请放进**逐行负载**：`payload` 里每个数组第 0 维 = 行数，"
+                     "变长的维先 pad 再配 mask（`core.paddings.pad_rows` 是助手）",
+                suggest='payload={"hdf5": {"path": "data.h5", "datasets": '
+                        '{"amps": "/config/amps"}}}')
+
     def _check_dataset_id(self, value: Any) -> None:
         if value in (None, ""):
             return

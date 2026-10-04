@@ -55,12 +55,12 @@ from ml_mecha.engine import (RECEIPT_REQUIRED_KEYS, clear_channel,  # noqa: E402
 from ml_mecha.summarizer import ml_summarizer       # noqa: E402
 from ml_mecha.validator import STATE_KEYS           # noqa: E402
 
-TOOL_NAMES = ("cancel_run", "clear_current_state", "compare_methods",
-              "describe_dataset",
+TOOL_NAMES = ("cancel_run", "checkpoint_detail", "clear_current_state",
+              "compare_methods", "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
-              "prepare_dataset", "read_job", "run_custom", "run_method",
-              "run_method_batch", "run_queries", "submit_run")
+              "eval_custom", "prepare_dataset", "read_job", "run_custom",
+              "run_method", "run_method_batch", "run_queries", "submit_run")
 
 
 # ---------------------------------------------------------------- 夹具
@@ -236,7 +236,8 @@ def test_commands_registered_in_core_registry(app):
     """ML 6 条受控命令注册进核心 CommandRegistry（双宿主消费核心机制）。"""
     names = set(app.software.commands.names())
     assert names == {"prepare_dataset", "run_method", "run_method_batch",
-                     "compare_methods", "run_custom", "clear_current_state"}
+                     "compare_methods", "run_custom", "clear_current_state",
+                     "eval_custom"}
     spec = app.software.commands.spec("run_method")
     assert spec is not None and spec.side_effect is True
     assert set(spec.output_schema["required"]) == set(RECEIPT_REQUIRED_KEYS)
@@ -503,10 +504,11 @@ def test_writes_state_declaration_matches_actual_history(app):
 
     app.switch_ai()                     # AI 侧持有全部 4 条 scope，四条都真跑
 
-    def _actual(spec):
+    def _actual(spec, *, allow_fail=False):
         mark = len(app.history.events())
         receipt = _as(app, app.ai_channel, spec)
-        assert receipt["ok"] is True, receipt
+        if not allow_fail:
+            assert receipt["ok"] is True, receipt
         keys = {e.target for e in app.history.events()[mark:]
                 if e.actor == "ml-ai" and e.target.startswith("current.")}
         return receipt, keys
@@ -525,10 +527,16 @@ def test_writes_state_declaration_matches_actual_history(app):
                   "dataset_id": dataset_id},
                  {"command": "run_custom", "dataset_id": dataset_id,
                   "code": _RESIDUAL_CODE, "overrides": {"epochs": 5}},
+                 # ⚠ `eval_custom` 声明 `writes_state=()`（它不改配置台面）⇒ 这里
+                 #   **允许它失败**（没有 checkpoint 自然会失败），但要求它
+                 #   **一个状态键都不写** —— "不改台面的命令，失败也不能改台面"。
+                 #   这比"跳过它"强：跳过等于不检查。
+                 {"command": "eval_custom", "run_id": "custom_network-0-0",
+                  "code": "def evaluate(model, ctx):\n    return {}"},
                  # 清零放**最后**：它会动前面几步写下的同一批键
                  # （声明要求"声明 == 实际写入"，而清零写的是全部状态键）。
                  {"command": "clear_current_state"}):
-        _receipt, keys = _actual(spec)
+        _receipt, keys = _actual(spec, allow_fail=(spec["command"] == "eval_custom"))
         observed[spec["command"]] = keys
 
     declared = {name: set(spec.writes_state)
@@ -1291,19 +1299,21 @@ def test_ai_can_assemble_the_preprocessing_chain(app):
 
 
 #: 一个**真的图卷积**（AI 通过工具面提交的 GNN；仓库依赖里没有 PyG/DGL，也不需要）。
+#: ⚠ 张量一律用 `ctx["device"]` 建：**模型可能已被搬到显卡**（`device=auto` 有卡
+#: 就上卡）⇒ 随手 `torch.arange(...)` 会撞"混合设备"。这段代码同时也是**范例**。
 _GCN_TOOL_CODE = '''
 class GCNLayer(nn.Module):
     def __init__(self, n_in, n_out):
         super().__init__()
         self.lin = nn.Linear(n_in, n_out)
 
-    def forward(self, h, edge_index, n_nodes, edge_weight=None):
-        idx = torch.arange(n_nodes)
+    def forward(self, h, edge_index, n_nodes, edge_weight=None, device=None):
+        idx = torch.arange(n_nodes, device=device)
         src = torch.cat([edge_index[0], idx])
         dst = torch.cat([edge_index[1], idx])
-        w = torch.cat([edge_weight, torch.ones(n_nodes)]) if edge_weight is not None \\
-            else torch.ones(src.numel())
-        A = torch.zeros(n_nodes, n_nodes)
+        w = torch.cat([edge_weight, torch.ones(n_nodes, device=device)]) \\
+            if edge_weight is not None else torch.ones(src.numel(), device=device)
+        A = torch.zeros(n_nodes, n_nodes, device=device)
         A.index_put_((src, dst), w, accumulate=True)
         A = A.clamp(max=1.0)
         deg = A.sum(1).clamp(min=1e-6)
@@ -1317,9 +1327,9 @@ class Net(nn.Module):
         self.g1 = GCNLayer(n_in, n_hidden)
         self.g2 = GCNLayer(n_hidden, n_out)
 
-    def forward(self, x, edge_index, n_nodes, edge_weight=None):
-        h = torch.relu(self.g1(x, edge_index, n_nodes, edge_weight))
-        return self.g2(h, edge_index, n_nodes, edge_weight)
+    def forward(self, x, edge_index, n_nodes, edge_weight=None, device=None):
+        h = torch.relu(self.g1(x, edge_index, n_nodes, edge_weight, device))
+        return self.g2(h, edge_index, n_nodes, edge_weight, device)
 
 
 class Network:
@@ -1327,8 +1337,9 @@ class Network:
         return Net(n_in, 16, n_out)
 
     def forward_graph(self, model, ctx):
+        # ⚠ 设备从 ctx 取（见上）：模型可能已在显卡上
         return model(ctx["x"], ctx["edge_index"], ctx["n_nodes"],
-                     ctx.get("edge_weight"))
+                     ctx.get("edge_weight"), ctx.get("device"))
 '''
 
 
@@ -2118,7 +2129,8 @@ def test_static_command_surface_is_ml_owned():
 
     assert {c.name for c in COMMANDS} == {"prepare_dataset", "run_method",
                                           "run_method_batch", "compare_methods",
-                                          "run_custom", "clear_current_state"}
+                                          "run_custom", "clear_current_state",
+                                          "eval_custom"}
     for command in COMMANDS:
         assert command.side_effect, command.name
         assert command.risk, command.name
@@ -2239,7 +2251,7 @@ def test_core_command_specs_declare_explicit_required(app):
         checked.append(host.name)
     # R8 非退化：真的逐条比过（不是空转）
     assert sorted(checked) == ["clear_current_state", "compare_methods",
-                               "prepare_dataset", "run_custom",
+                               "eval_custom", "prepare_dataset", "run_custom",
                                "run_method", "run_method_batch"], checked
 
 

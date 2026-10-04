@@ -171,8 +171,20 @@ class TensorBoardLog:
         """writer 是否真的建起来了（判据用；不建 writer 也能过）。"""
         return self._writer is not None
 
-    def log_epoch(self, ep: int, history: dict, grads: dict) -> None:
-        """一个 epoch 的标量：5 条核心 + 每层梯度范数。"""
+    def log_epoch(self, ep: int, history: dict, grads: dict,
+                  extra: dict | None = None) -> None:
+        """一个 epoch 的标量：5 条核心 + 每层梯度范数 + **调用方自定义 tag**。
+
+        ## `extra`：让"方法自己上报想看的指标"直接落到观测面
+
+        需求来源（NQS 用户）："训练时只有一个总 loss，我分不清是哪块在拖后腿"——
+        他要 NLL/相位/保真度**各一条线**，还要**按物理通道、按分布内/外推分组**。
+
+        ⚠ **写进来就白拿**：`describe_training`（AI 侧）读的是事件文件里**全部 scalar
+        tag** ⇒ 这里多写一条，AI 那边立刻能看见，**查询面一行都不用改**。
+        分组的表达方式就是 **tag 命名约定**：`fid/ch0`、`fid/ood`、`nll/phase`…
+        （TensorBoard 的 tag 本来就分层，不必另造结构。）
+        """
         w = self._ensure()
         if w is None:
             return
@@ -189,6 +201,15 @@ class TensorBoardLog:
                 if np.isfinite(v):
                     self._safe(f"scalar/grad/{name}", w.add_scalar,
                                f"grad/{name}", v, step)
+        # ⭐ 自定义 tag（方法层每轮上报）。**非有限值不入盘**：与上面同一条纪律
+        #   —— 不在图里制造 NaN 假点（"看着有这条线"比"没有"更容易骗人）。
+        for tag, value in (extra or {}).items():
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v):
+                self._safe(f"scalar/{tag}", w.add_scalar, str(tag), v, step)
 
     def log_weights(self, weights: dict | None, step: int) -> None:
         """权重直方图 + 权重的起始/末态/更新量范数（随时间各一条标量）。"""

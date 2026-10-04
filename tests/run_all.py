@@ -57,7 +57,11 @@ PHASE_SENSITIVE = ["test_dsh_panel.py", "test_tensorboard.py",
 #: ⇒ 按本仓纪律**不抬阈值**（抬阈值＝把响亮的失败改成沉默的通过），
 #: 而是再加一个阶段：它是"跑真训练（torch）+ 单套件就占满多核"那一类，
 #: 资源画像与前两个阶段都不同。
-PHASE_GRAPH = ["test_problem.py"]
+PHASE_GRAPH = ["test_problem.py",
+               # NQS 路径（逐行负载/复数/checkpoint/eval_custom/分组留出）：
+               # 它跑**真训练**（torch，多条判据各训几轮）且与 `test_problem.py`
+               # 同属"张量 + 一跑就占满多核"那一类 ⇒ 同一个阶段串行跑。
+               "test_nqs_path.py"]
 
 #: mecha host adapter 集成判据。mecha 是同级仓；缺它时**不静默跳绿**：
 #: 成功行按实跑集合拼装，并显式打印跳过原因（最终验收审查 M1）。

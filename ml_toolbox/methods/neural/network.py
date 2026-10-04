@@ -49,6 +49,13 @@ class Network:
         for layer in model.layers:
             h = layer(h, ctx["edge_index"])
         return model.head(h)
+
+    def on_step(self, model, step, ctx):        # 可选：每步（预热/调度）
+        if step < 200:                          # 前 200 步先只训模长
+            self._warm = True
+
+    def metrics(self, model, ctx):              # 可选：每轮回自定义指标
+        return {"fid/ch0": ..., "fid/ood": ...}  # tag 名自带分组
 ```
 
 - 勾了 `forward_graph` ⇒ 走 `trainer.train_graph`（全图 + 掩码损失）；
@@ -71,4 +78,9 @@ class Network:
 from __future__ import annotations
 
 #: 适配器会按这个顺序探测的可选钩子（写在这里当单一真源，别处只引用）。
-NETWORK_HOOKS = ("build", "loss", "configure", "forward_step")
+#: - `build` / `loss` / `configure` / `forward_step` / `forward_graph`：**训练路径**用；
+#: - `on_step`：**每一步**（batch）后回调 ⇒ 预热（"前 N 步先只训模长"）靠它；
+#: - `metrics`：**每一轮**（epoch）后回报自定义指标 ⇒ 写进 TB，而
+#:   `describe_training` 读**全部** scalar tag ⇒ AI 直接白拿（查询面一行不用改）。
+NETWORK_HOOKS = ("build", "loss", "configure", "forward_step", "forward_graph",
+                 "on_step", "metrics")

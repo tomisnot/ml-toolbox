@@ -146,7 +146,14 @@ def run_one(method: MLMethod, spec: DataSpec,
         with timer.stage("fit"):
             res = method.fit(problem, cfg, diag=cfg.diag)
         if res.ok and method.task == TASK_SUPERVISED:
-            if problem.partition_mode() == "masks":
+            if str(spec.target_kind or "") == "custom":
+                # ⭐ **自定义任务没有标准标签** ⇒ 不走 predict/evaluate 那条路：
+                #   `yte` 是 None，`np.asarray(None)` 会产出 **object 数组**，而 object
+                #   数组写进 `artifacts.npz` 会在读回时炸
+                #   `Object arrays cannot be loaded when allow_pickle=False`（实测踩过）。
+                #   ⚠ 这里**不是"跳过就算"**：指标由方法自己上报（`Network.metrics`）。
+                pass
+            elif problem.partition_mode() == "masks":
                 # ⭐ **结构化数据（图）不走这条 predict**：这里只拿得到**测试行**
                 #   （`Xte`），而图的前向需要**整张图的边** ⇒ 由方法自己的
                 #   `fit` 在掩码语义下把 `y_pred`/`y_true` 算好（见
@@ -209,13 +216,22 @@ def run_one(method: MLMethod, spec: DataSpec,
     if res.ok:
         with timer.stage("evaluate"):
             try:
-                if method.task == TASK_SUPERVISED and "y_pred" in res.artifacts:
+                if str(spec.target_kind or "") == "custom":
+                    # ⭐ **自定义任务不跑标准指标**（也不假装跑了）：这类任务没有
+                    #   标准标签（标签在逐行负载里、可能是变长复数），标准指标对它
+                    #   **不成立**。指标由方法自己上报（`Network.metrics` → 回执 metrics）。
+                    res.diag = dict(res.diag or {})
+                    res.diag["metrics_note"] = (
+                        "target_kind=custom ⇒ 标准指标不适用；"
+                        "本运行的指标由方法自己上报（见 metrics）")
+                elif method.task == TASK_SUPERVISED and "y_pred" in res.artifacts:
                     res.metrics.update(method.evaluate(res, spec.X, spec.y))
             except Exception:
                 res.metrics = dict(res.metrics)
         # 可选交叉验证（cfg.extras['cv_folds']>0 时才跑，默认零开销 —— P3）
         cv_folds = int(cfg.extras.get("cv_folds", 0) or 0)
-        if cv_folds >= 2 and method.task == TASK_SUPERVISED:
+        if cv_folds >= 2 and method.task == TASK_SUPERVISED \
+                and str(spec.target_kind or "") != "custom":
             with timer.stage("cv"):
                 try:
                     # ⚠ 把 `aux` 传进去 ⇒ 带图的数据会被 `default_cv` **响亮拒绝**

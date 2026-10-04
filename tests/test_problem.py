@@ -143,14 +143,15 @@ class GCNLayer(nn.Module):
         super().__init__()
         self.lin = nn.Linear(n_in, n_out)
 
-    def forward(self, h, edge_index, n_nodes, edge_weight=None):
-        idx = torch.arange(n_nodes)
+    def forward(self, h, edge_index, n_nodes, edge_weight=None, device=None):
+        # ⚠ 张量一律带 `device`（从 ctx 取）：模型可能已被搬到显卡
+        idx = torch.arange(n_nodes, device=device)
         src = torch.cat([edge_index[0], idx])
         dst = torch.cat([edge_index[1], idx])
-        w = torch.ones(src.numel())
+        w = torch.ones(src.numel(), device=device)
         if edge_weight is not None:
-            w = torch.cat([edge_weight, torch.ones(n_nodes)])
-        A = torch.zeros(n_nodes, n_nodes)
+            w = torch.cat([edge_weight, torch.ones(n_nodes, device=device)])
+        A = torch.zeros(n_nodes, n_nodes, device=device)
         A.index_put_((src, dst), w, accumulate=True)
         A = A.clamp(max=1.0)
         deg = A.sum(1).clamp(min=1e-6)
@@ -164,9 +165,9 @@ class Net(nn.Module):
         self.g1 = GCNLayer(n_in, n_hidden)
         self.g2 = GCNLayer(n_hidden, n_out)
 
-    def forward(self, x, edge_index, n_nodes, edge_weight=None):
-        h = torch.relu(self.g1(x, edge_index, n_nodes, edge_weight))
-        return self.g2(h, edge_index, n_nodes, edge_weight)
+    def forward(self, x, edge_index, n_nodes, edge_weight=None, device=None):
+        h = torch.relu(self.g1(x, edge_index, n_nodes, edge_weight, device))
+        return self.g2(h, edge_index, n_nodes, edge_weight, device)
 
 
 class Network:
@@ -178,7 +179,7 @@ class Network:
 
     def forward_graph(self, model, ctx):
         return model(ctx["x"], ctx["edge_index"], ctx["n_nodes"],
-                     ctx.get("edge_weight"))
+                     ctx.get("edge_weight"), ctx.get("device"))
 '''
 
 

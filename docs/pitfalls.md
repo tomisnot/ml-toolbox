@@ -549,6 +549,86 @@
 - **判据**：`test_ml_mecha.py::test_ai_input_errors_are_teachable` —— 10 个"AI 参数
   写错"的场景，**逐条**要求 kind 具体（写死期望值）、hint 非空且非万能句、
   消息不含内部模块名。三层各做过一次红验证（每层停掉都必须红）。
+
+### A15. **静默丢虚部**：复数进了实数管道，回执还说"成功"
+- **症状**（由 NQS 需求者实测报告，我们复现）：把带 `complex128` 列的表交给
+  `prepare_dataset`，**回执 `ok: true`**，链摘要正常，只有 stderr 有一条
+  `ComplexWarning: Casting complex values to real discards the imaginary part`
+  —— 用户拿到的是**被毁掉的数据**，而界面/回执都说没事。
+- **原因**：管道里 `DataFrame.to_numpy(float)` 对复数**不是报错而是取实部**
+  （pandas 的语义），于是"物理量被静默改掉"这件事一路无声。
+- **同类第二条**：变长数组列（object dtype 装 ndarray）⇒ 裸 numpy 广播错
+  `operands could not be broadcast together with shapes (256,) (1024,)`
+  —— 既不可教学，也不提示"这是逐组数据"。
+- **代价**：需求者的原话是"我连我到底在哪一步失败都问不出来……来回试了好几轮才确认
+  是**任务形态本身**对不上"。这正是本仓最忌的形态：**用户以为是自己参数写错了**。
+- **修法**：`prepare_dataset` 入口做**数据形态体检**（`validator.check_frame_shapes`），
+  复数/变长列**当场拒**并**指路**到 `payload`（逐行负载）。
+  ⚠ 只拦"能确定"的（dtype 是复数、object 列里装序列），**拦错了比不拦更坏**。
+- **判据**：`test_nqs_path.py::test_unsupported_shapes_are_rejected_teachably`
+  （两条各写死 kind + hint 必须提 payload）。
+
+### A16. `Network.forward_step` 是**死的**：从来没被传给训练器
+- **症状**：说明书说"`forward_step` 可选，用于多输入/特殊批次"，但写了它**一点用没有**
+  —— 训练照常跑、不报错、也不调用它。需求者说"我还没走到 `forward_step`"，
+  一半原因是数据进不来，**另一半原因是我们根本没调用它**。
+- **原因**：`custom._fit_table` 调 `trainer.train(...)` 时**没有传 `forward_step`**
+  ⇒ `train` 里 `forward_step=None` ⇒ 永远走默认的 `model(x)` 分支。
+  这与"参数声明了却从不传递"是同一类 bug（当时另一处是 `device`，见 A18）。
+- **修法**：`forward_step=_hook(net, "forward_step")`。
+- **教训（可推广）**：**钩子/参数"声明了"不等于"被用了"**。凡是"文档说有、但没有任何
+  判据跑过它"的能力，都要怀疑它是死的 —— 本轮就是在做"让说明书说的每件事都有判据"。
+- **判据**：`test_nqs_path.py` 里所有自定义任务判据都**只写 `forward_step`**
+  （不写 `forward`）⇒ 一旦这条断了，损失根本算不出来，判据立刻红。
+
+### A17. 设备只搬了一半：模型在显卡、张量在 CPU
+- **症状**：`Expected all tensors to be on the same device, but found at least two
+  devices, cuda:0 and cpu`（在 `addmm` / `cat` 处）。
+- **原因**（三处，都是"改了一半"）：
+  1. `custom.py` 把 `res._dev` 硬编码 `cpu`，但 trainer 走 `device` ⇒ 两条路各说各话；
+  2. `predict` / `fit_extra_artifacts` 里 `torch.tensor(Xs)` **没带设备**（`mlp.py`
+     同位置是带 `result._dev` 的，我们这条漏了）；
+  3. **用户网络代码里** `torch.arange(n)` / `torch.zeros(...)` 也没带设备。
+- **为什么以前没暴露**：改之前 `run_custom` **永远在 CPU** ⇒ 混不了。
+  ⚠ **这是本轮改动带来的新风险**：任何"随手建张量"的旧网络代码在上卡后会炸。
+- **修法**：① 张量统一带 `device=result._dev`；② `ctx["device"]` 交给网络代码，
+  并在契约里写明"建张量用它"；③ 框架**翻译**这类错
+  （`_device_error_hint`）⇒ 否则报错本身对使用者毫无指向性。
+- **判据**：`test_nqs_path.py` 全链路在 `device=auto` 下跑（有卡即上卡）；
+  两个内联 GNN 判据的代码改成用 `ctx["device"]`（它们同时是**范例**）。
+
+### A18. `device` 声明了却**从不进方法层**（审计说 cuda、实跑 CPU）
+- **症状**：`run_method(device="cuda:1")` 被清洗、写进 `current.device`、留下审计，
+  但**方法层收不到** ⇒ 假记录。
+- **修法**：`_build_request` 把它放进 `RunRequest.extras`。
+- **判据**：`test_ml_mecha.py::test_device_declaration_reaches_the_method_layer`——
+  ⚠ 它**只钉管道**（extras 里有没有那个键），**不钉"实际用了哪块卡"**
+  （后者依赖本机有没有 CUDA，写成 `== "cpu"` 会在无卡机器上**永远绿**）。
+  这一轮补上了"真上卡"那条：`checkpoint` 的 meta 里记 `trained_on`，
+  `test_nqs_path.py` 断言它等于实际解析出的设备。
+
+### A19. **object 数组**写进 `artifacts.npz` ⇒ 存档读不回来
+- **症状**：训练成功、指标正常，但 `load_run_record(run_id)` 炸
+  `Object arrays cannot be loaded when allow_pickle=False`。
+- **踩过两次**：
+  1. `predict_graph` 返回 `dtype=object` 的数组；
+  2. 本轮 `target_kind="custom"` 时 `y` 是 `None` ⇒
+     `np.asarray(None)` 产出 object 数组，写进 `y_true`。
+- **修法**：产物里**只放定型的数组**；自定义任务**不走标准 predict/evaluate**
+  （`runner` 里显式跳过，并在 diag 里写明理由）；文件名列表这类"字符串集合"
+  **拼成一个字符串**存（`"|".join(...)`），不存 object 数组。
+- **判据**：`test_nqs_path.py` 的 checkpoint 判据**会真的 `load_run_record`**
+  （只要产物里有 object 数组就红）。
+
+### A20. 分组留出：随机切分**做不到**"外推评估"，还会漏掉同源泄漏
+- **症状**（需求原文）："训练集内 vs **尺寸外推**分开看：N≤12 参与训练、N≥14 没见过。"
+  随机切分会把 N=14 的一部分也放进训练 ⇒ 那个"外推分数"**根本不是外推**。
+- **同类隐患**：同一来源/同一病人/同一批次的样本被切开训练与测试 ⇒ **同源泄漏**
+  （分数乐观化，且不会报错）。这与时序的"未来泄漏"、图的"邻居泄漏"是同一族。
+- **修法**：`split.group_by` + `split.holdout`（按列整组留出）。
+  ⚠ `group_by` 与 `holdout` **必须成对**给（漏一半就 `bad_group_split`），
+  切空了也要报错并**列出该列的实际取值**（否则用户只能猜）。
+- **判据**：`test_nqs_path.py::test_group_split_holds_out_whole_groups`。
 - **教训**：机制齐全 ≠ 端到端可用。**每跨一层都要问一句"这个字段还在吗"**——
   这一条的 hint 就是被"最后一公里"的一行硬编码吃掉的，而它前面每一层都写对了。
 
