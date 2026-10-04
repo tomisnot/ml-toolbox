@@ -1644,6 +1644,91 @@ def test_blank_run_id_finds_the_latest_run_with_observations(app):
     assert got["run_id"] == rid or got["run_id"].startswith("torch_mlp"), got
 
 
+def test_ai_input_errors_are_teachable(app):
+    """⭐ **AI 写错输入时必须学到"怎么改"**，而不是"框架坏了"（指导意见 P0-3）。
+
+    ## 为什么这条是"使用者实测"的固化
+
+    指导意见的原话：*"失败必须机器可判别，否则 AI 会读成物理结论"*——
+    EL 的使用者 AI **差点把"参数崩了"当成"π 脉冲无效"的实验结论**。我用同一把尺子
+    实测了 10 个"AI 参数写错"的场景，当时 **4 处不可教学**：
+    `overrides={"epochs":"many"}` 报 `internal_error`、
+    `{"edges":[["a","b"]]}` 报 `internal_error`（连内部类名
+    `ml_toolbox.core.contracts.ParamValueError` 都漏出去）。
+
+    ## 三层修复（判据同时钉住三层，缺一层就漏）
+
+    1. `tools._raise_on_failure` 的 **最后一公里**：原先 `hint=` 写死成万能句、
+       `suggest=` 读错键名（引擎写 `error_suggest`）⇒ 引擎的 hint 全被丢掉；
+    2. `ParamSpec.clean` 抛**裸 `ValueError`** ⇒ 加 `ParamValueError`（带 kind/hint）；
+    3. `runner.run_one` 把 `method.fit` 的异常**压成一句 traceback 字符串** ⇒
+       让 `MLResult`/`RunSummary` 带着 kind/hint/suggest 穿过它。
+
+    ## 判据
+
+    每一条都要求：**kind 具体**（不是 `internal_error`/`command_failed`）、
+    **hint 非空且不是万能句**、**消息里不出现内部模块名**。
+    """
+    ml = app
+    ds = _prepared(ml)
+
+    #: (场景, 工具, 参数, 期望 kind) —— 期望 kind 写死，防止"随便给个 kind 就算过"
+    cases = [
+        ("覆写值不是数字", "run_method",
+         {"method": "logistic", "dataset_id": ds, "overrides": {"C": "很大"}},
+         "bad_param_value"),
+        ("epochs 给了字符串", "run_method",
+         {"method": "torch_mlp", "dataset_id": ds, "overrides": {"epochs": "many"}},
+         "bad_param_value"),
+        ("参数低于下限", "run_method",
+         {"method": "torch_mlp", "dataset_id": ds, "overrides": {"batch": -1}},
+         "bad_param_value"),
+        ("覆写的键不存在", "run_method",
+         {"method": "logistic", "dataset_id": ds, "overrides": {"没这个参数": 1}},
+         "unknown_key"),
+        ("seed 越界", "run_method",
+         {"method": "logistic", "dataset_id": ds, "seed": -5}, "bad_seed"),
+        ("资源声明写错", "run_method",
+         {"method": "logistic", "dataset_id": ds,
+          "resource_guard": {"max_kernel_mb": "big"}}, "bad_resource_guard"),
+        ("device 不认识", "run_method",
+         {"method": "logistic", "dataset_id": ds, "device": "tpu"}, "bad_device"),
+        ("边表不是数字", "prepare_dataset",
+         {"source": {"kind": "synthetic", "task": "classification",
+                     "n_samples": 30},
+          "name": "g", "target": "target", "graph": {"edges": [["a", "b"]]}},
+         "bad_graph_edge"),
+        ("方法名不存在", "run_method",
+         {"method": "no_such", "dataset_id": ds}, "unknown_key"),
+        ("dataset_id 不存在", "run_method",
+         {"method": "logistic", "dataset_id": "ds-999"}, "unknown_dataset"),
+    ]
+    #: 万能句（旧版所有失败都退化成它）——出现即视为"没教会任何东西"
+    GENERIC = "命令未生效；检查参数、权限与数据引用后重试"
+
+    problems = []
+    for label, tool, args, want_kind in cases:
+        got = ml.tools.execute(tool, args)
+        if not got.get("is_error"):
+            problems.append((label, "被接受了（本该失败）", ""))
+            continue
+        err = got.get("error") or {}
+        info = err.get("info") or {}
+        kind = str(info.get("kind") or "")
+        hint = str(info.get("hint") or "")
+        msg = str(err.get("message") or "")
+        if kind != want_kind:
+            problems.append((label, f"kind={kind!r} 期望 {want_kind!r}", hint))
+        elif not hint or hint == GENERIC:
+            problems.append((label, "hint 缺失或是万能句", hint))
+        elif "ml_toolbox." in msg or "ml_mecha." in msg:
+            # 内部模块名漏进**模型可见文本**：与 banned_words 同一条纪律
+            # （那条只管 description，错误消息得单独钉）
+            problems.append((label, f"消息漏出内部模块名：{msg[:70]}", hint))
+    assert not problems, "\n".join(
+        f"{a}: {b}（hint={c!r}）" for a, b, c in problems)
+
+
 # ---------------------------------------------------------------- 门禁辅助
 def test_dataset_query_exposes_chain_params_and_real_split_policy(app):
     """⭐ AI 能看见**预处理链每一步的参数**与**真实的划分口径**。

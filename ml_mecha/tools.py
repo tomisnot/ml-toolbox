@@ -64,6 +64,18 @@ def _raise_on_failure(receipt: Mapping[str, Any]) -> Mapping[str, Any]:
     引擎回执是领域层返回值（``{"ok": False, "error_kind": ...}``）；工具层若不
     转异常，``ToolRegistry.execute`` 会误判为 ``is_error=False``——AI 看到的
     是"成功但结果失败"，而不是可教学的 ``ToolFailure {message, info}``。
+
+    ## ⚠ 这里是"可教学"的**最后一公里**（2026-10-03 修，实测抓到的静默丢失）
+
+    旧版有两处把它掐断：
+    - ``hint=`` 是**硬编码**的万能句（"命令未生效；检查参数…"）⇒ 引擎精心写的
+      ``exc.hint``（如"seed 允许 0..2147483647"）**在到达 AI 之前被丢掉**；
+    - ``suggest=`` 读的键名是 ``suggest``，而引擎写的是 **``error_suggest``**
+      ⇒ **永远是空串**。
+
+    症状极具欺骗性：``kind`` 是对的（所以"机器可判别"那一条看着没问题），
+    但 AI 拿不到"**该怎么改**"。而指导意见 P0-3 的原话是"AI 读 ``info.kind``
+    决定怎么改"——**光有 kind 不够**。⇒ 现在原样透传，只在**确实没有**时才退回万能句。
     """
     if receipt.get("ok"):
         return receipt
@@ -71,11 +83,17 @@ def _raise_on_failure(receipt: Mapping[str, Any]) -> Mapping[str, Any]:
     message = str(receipt.get("error") or "")
     if not message and warnings:
         message = "；".join(warnings)
+    hint = str(receipt.get("error_hint") or "")
+    suggest = str(receipt.get("error_suggest") or "")
+    if not hint:
+        # ⚠ 只有"引擎也没给"时才用万能句：它是**兜底**，不是**默认**。
+        #   （旧版把它当默认 ⇒ 所有失败看起来都是同一句废话。）
+        hint = "命令未生效；检查参数、权限与数据引用后重试"
     raise MechaError(
         message or "ML 命令失败",
         kind=str(receipt.get("error_kind") or "command_failed"),
-        hint="命令未生效；检查参数、权限与数据引用后重试",
-        suggest=str(receipt.get("suggest") or ""),
+        hint=hint,
+        suggest=suggest,
     )
 
 

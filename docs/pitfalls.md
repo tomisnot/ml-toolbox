@@ -525,4 +525,30 @@
 - **修法**：红验证要**验证替换真的发生了**（`assert s2 != s` / 打印命中处数），
   并**读一眼红的理由**是否正好是被停掉的那条守卫。
   （`test_regressions.py` 的元判据现在用 `utf-8-sig` 读文件，就是为了不再红在 BOM 上。）
+- **补记（同一天又踩）**：给"三层修复"做逐层红验证时，**第二层的锚点跨多行**，
+  替换后把源码切出 `SyntaxError` ⇒ 判据"红了"，**但红在语法错上**。
+  ⇒ 锚点尽量选**单行且唯一**的；跨多行替换必须回读一眼被改的片段。
+
+### A14. "可教学"死在**最后一公里**：hint 被硬编码覆盖、suggest 读错键名
+- **症状**：`kind` 是对的（"机器可判别"那条看着没问题），但**每条失败的 `hint`
+  都是同一句万能话**（"命令未生效；检查参数、权限与数据引用后重试"）⇒ AI 学不到
+  "该怎么改"。指导意见 P0-3 的原话是"AI 读 `info.kind` **决定怎么改**"——光有 kind 不够。
+- **原因**（三处叠加，缺一处都不至于这么坏）：
+  1. `tools._raise_on_failure` 里 `hint=` 是**硬编码**的万能句（把引擎写好的
+     `error_hint` 覆盖掉），且 `suggest=` 读的键名是 `suggest`，而引擎写的是
+     **`error_suggest`** ⇒ 建议**永远是空串**；
+  2. `ParamSpec.clean` 抛**裸 `ValueError`** ⇒ 到 adapter 层只能归成
+     `internal_error`/`command_failed`（"你参数写错了"被读成"框架坏了"）；
+  3. `runner.run_one` 把 `method.fit` 的异常**压成一句 traceback 字符串**
+     ⇒ kind/hint 全丢，连内部类名（`ml_toolbox.core.contracts.ParamValueError`）
+     都漏进模型可见文本。
+- **修法**：让失败**带着 `kind/hint/suggest` 一路穿过去**——
+  `ParamValueError`（core，带 kind/hint/suggest）→ `MLResult`/`RunSummary`
+  （新增三字段，默认空 ⇒ 既有构造点不用改）→ 回执 `error_kind/error_hint/error_suggest`
+  → 工具层**原样透传**（万能句降级为"确实没有时"的兜底）。
+- **判据**：`test_ml_mecha.py::test_ai_input_errors_are_teachable` —— 10 个"AI 参数
+  写错"的场景，**逐条**要求 kind 具体（写死期望值）、hint 非空且非万能句、
+  消息不含内部模块名。三层各做过一次红验证（每层停掉都必须红）。
+- **教训**：机制齐全 ≠ 端到端可用。**每跨一层都要问一句"这个字段还在吗"**——
+  这一条的 hint 就是被"最后一公里"的一行硬编码吃掉的，而它前面每一层都写对了。
 

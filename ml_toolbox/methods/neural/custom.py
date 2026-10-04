@@ -135,7 +135,22 @@ class CustomNNMethod(MLMethod):
         #   （判据里表现为"6 epoch 的训练有 60 个 loss 点"）。
         p = self.params(cfg)
         run_extras = cfg.extras or {}
-        compiled = self._network()
+        # ⚠ `SandboxError` 走**惰性 import**：本模块顶层 import ml_mecha 会成环
+        #   （ml_mecha → ml_toolbox.api → methods）。别提到模块顶部。
+        from ml_mecha.sandbox import SandboxError
+        try:
+            compiled = self._network()
+        except SandboxError as exc:
+            # ⭐ **AI 写的代码出错 ⇒ 必须归成"你的代码"，不是"框架坏了"**。
+            #   ⚠ 这段原先**没有** try：异常一路逃到 `runner.run_one` 的兜底，
+            #   被压成一句 traceback 字符串 ⇒ 到 AI 那里成了 `internal_error` /
+            #   `command_failed` + 万能 hint（实测；判据
+            #   `test_custom_network_errors_are_readable_not_raw_stacks` 抓到）。
+            #   沙箱错误的 `kind`/`detail` 本来就是写给人/AI 看的 ⇒ 原样带出去。
+            #   （表格与图两条路同形，**同一个修法**。）
+            return self._new_result(target_kind=self.target_kind).fail(
+                str(exc), kind=exc.kind, hint=exc.detail,
+                suggest="改代码后重跑；`describe_network` 可取回上一次的源码对照")
         net = compiled.instance
         kind = self.target_kind or _infer_kind(y)
         prep = _trainer.prepare_supervised(
@@ -244,7 +259,22 @@ class CustomNNMethod(MLMethod):
 
         p = self.params(cfg)
         run_extras = cfg.extras or {}
-        compiled = self._network()
+        # ⚠ `SandboxError` 走**惰性 import**：本模块顶层 import ml_mecha 会成环
+        #   （ml_mecha → ml_toolbox.api → methods）。别提到模块顶部。
+        from ml_mecha.sandbox import SandboxError
+        try:
+            compiled = self._network()
+        except SandboxError as exc:
+            # ⭐ **AI 写的代码出错 ⇒ 必须归成"你的代码"，不是"框架坏了"**。
+            #   ⚠ 这段原先**没有** try：异常一路逃到 `runner.run_one` 的兜底，
+            #   被压成一句 traceback 字符串 ⇒ 到 AI 那里成了 `internal_error` /
+            #   `command_failed` + 万能 hint（实测；判据
+            #   `test_custom_network_errors_are_readable_not_raw_stacks` 抓到）。
+            #   沙箱错误的 `kind`/`detail` 本来就是写给人/AI 看的 ⇒ 原样带出去。
+            #   （表格与图两条路同形，**同一个修法**。）
+            return self._new_result(target_kind=self.target_kind).fail(
+                str(exc), kind=exc.kind, hint=exc.detail,
+                suggest="改代码后重跑；`describe_network` 可取回上一次的源码对照")
         net = compiled.instance
         n_in = int(problem.X.shape[1])
         # 标签：图任务按"节点分类"语义（一行一个节点一个标签）

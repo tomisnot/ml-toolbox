@@ -14,7 +14,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .contracts import (MLResult, MLMethod, RunConfig, DataSpec,
+from .contracts import (MLResult, MLMethod, ParamValueError, RunConfig, DataSpec,
                         is_lower_better,
                         TASK_SUPERVISED, TASK_TIMESERIES)
 from . import registry
@@ -166,9 +166,35 @@ def run_one(method: MLMethod, spec: DataSpec,
     except ResourceBudgetExceeded as e:
         res = MLResult(method_name=method.name, task=method.task, error=str(e))
         resource_estimate = e.estimate
-    except Exception:
-        res = MLResult(method_name=method.name, task=method.task,
-                       error=traceback.format_exc(limit=10))
+    except ParamValueError as exc:
+        # ⭐ **可教学的参数错误必须活着穿过 runner**：这里原先是 `except Exception`
+        #   把它压成一句 traceback 字符串 ⇒ 到 AI 那里 `error_kind` 空、hint 退化成
+        #   万能句，"你参数写错了"被读成"框架坏了"（实测：连内部类名都漏出去）。
+        res = MLResult(method_name=method.name, task=method.task).fail(
+            str(exc), kind=exc.kind, hint=exc.hint, suggest=exc.suggest)
+    except Exception as exc:
+        # ⭐ **鸭子类型识别"已分类的失败"**（2026-10-03）：
+        #   带 `kind` 属性的异常 = 上游已经判过性质的（`SandboxError.kind+detail`、
+        #   `StepDeclError.kind+detail`、`MechaError.kind+hint+suggest`…）⇒
+        #   **保住它的分类**，别压成 traceback 字符串。
+        #   为什么用鸭子类型而不是 import：core **不许**反向依赖边界层
+        #   （`ml_mecha`），而这些异常的共同语言就是这个属性。
+        #   ⚠ 实测（判据 `test_custom_network_errors_are_readable_not_raw_stacks`）：
+        #     AI 写的 `Network.build` 返回错类型时，沙箱的 `build_wrong_type`
+        #     被兜底成 `internal_error` ⇒ AI 会以为框架坏了（其实是它的代码）。
+        kind = str(getattr(exc, "kind", "") or "")
+        if kind:
+            hint = str(getattr(exc, "hint", "") or getattr(exc, "detail", "") or "")
+            res = MLResult(method_name=method.name, task=method.task).fail(
+                str(exc), kind=kind, hint=hint,
+                suggest=str(getattr(exc, "suggest", "") or ""))
+        else:
+            # 真正的**内部错误**：如实标 kind，并说清"栈在哪"——不要让它看起来像
+            # 用户的错，也不要让 hint 留空（空 hint 会退化成工具层的万能句）。
+            res = MLResult(method_name=method.name, task=method.task).fail(
+                traceback.format_exc(limit=10), kind="internal_error",
+                hint="这是框架内部的失败（不是你参数的问题）；栈留在宿主日志，"
+                     "可用 describe_run 看这次运行的 diag")
     finally:
         # ⚠ **摘掉进度钩子**（它是运行时对象，不是配置）：
         #   留在这里会在 `record.json` 写盘时炸在"不可 JSON 序列化"上，

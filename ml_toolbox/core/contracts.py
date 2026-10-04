@@ -382,6 +382,39 @@ class Problem:
                 f"task={self.task!r}, aux={self.aux_keys()})")
 
 
+# ---------------------------------------------------------------- 可教学的参数错误
+class ParamValueError(ValueError):
+    """**参数值非法**——可教学的一类失败（继承 ``ValueError`` 保持兼容）。
+
+    ## 为什么单开一个类型（2026-10-03 实测）
+
+    `ParamSpec.clean` 原先抛**裸 `ValueError`** ⇒ 到了 adapter 层只能归成
+    `internal_error`/`command_failed`，AI 读到的是"框架坏了"或一句万能话。
+    而它其实是**最该被教会**的一类：用户/AI 把参数写错了，改一下就好。
+
+    症状实测（`overrides={"epochs": "many"}`）：消息里明明写着
+    "参数 epochs 需要数字，收到 'many'"，**归类却是 internal_error**
+    —— 那正是指导意见 P0-3 最怕的形态（"把参数崩了当成物理结论"）。
+
+    ⚠ 本类**不带 mecha 依赖**（core 不许 import 边界层）：它只是"带 kind/hint 的
+    ValueError"，由 adapter 层原样转成结构化失败（`engine` 的 catch 分支）。
+    """
+
+    def __init__(self, message: str, *, kind: str = "bad_param_value",
+                 hint: str = "", suggest: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.hint = hint
+        self.suggest = suggest
+
+    def teaching_text(self) -> str:
+        out = f"[{self.kind}] {self}"
+        for label, value in (("提示", self.hint), ("建议", self.suggest)):
+            if value:
+                out += f"\n{label}：{value}"
+        return out
+
+
 # ---------------------------------------------------------------- 参数 schema
 @dataclass
 class ParamSpec:
@@ -401,7 +434,14 @@ class ParamSpec:
     log: bool = False           # 对数尺度（需 min>0；优化侧采样用，ML 侧忽略）
 
     def clean(self, raw):
-        """把 UI 原始值转成类型正确的值；非法输入抛 ValueError。"""
+        """把 UI 原始值转成类型正确的值；非法输入抛 :class:`ParamValueError`。
+
+        ⚠ 抛的是**可教学**的那种（带 kind/hint/suggest），不是裸 `ValueError`：
+        后者到了 adapter 层会变成 `internal_error` ⇒ AI 把"我参数写错了"
+        读成"框架坏了"（实测，见 `ParamValueError` 的 docstring）。
+        提示里尽量带上"合法范围"与**作者自己写的** `self.hint`——那是最贴近
+        这个参数语义的一句话。
+        """
         if raw is None or (isinstance(raw, str) and raw.strip() == ""):
             return self.default
         if self.kind == "bool":
@@ -412,20 +452,59 @@ class ParamSpec:
             try:
                 v = float(raw)
             except (TypeError, ValueError):
-                raise ValueError(f"参数 {self.key} 需要数字，收到 {raw!r}")
+                raise ParamValueError(
+                    f"参数 {self.key} 需要{'整数' if self.kind == 'int' else '数字'}，"
+                    f"收到 {raw!r}",
+                    hint=self._hint_for_kind(),
+                    suggest=f"查看该方法声明的可调参数：describe_method(name=…)"
+                            f"（本参数是 {self.key!r}）",
+                ) from None
             if self.kind == "int":
                 v = int(round(v))
             if self.min is not None and v < self.min:
-                raise ValueError(f"参数 {self.key}={v} 小于下限 {self.min}")
+                raise ParamValueError(
+                    f"参数 {self.key}={v} 小于下限 {self.min}",
+                    hint=self._range_hint(),
+                    suggest=f"把 {self.key} 调到 {self.min} 及以上",
+                )
             if self.max is not None and v > self.max:
-                raise ValueError(f"参数 {self.key}={v} 大于上限 {self.max}")
+                raise ParamValueError(
+                    f"参数 {self.key}={v} 大于上限 {self.max}",
+                    hint=self._range_hint(),
+                    suggest=f"把 {self.key} 调到 {self.max} 及以下",
+                )
             return v
         if self.kind == "select":
             v = str(raw)
             if self.choices and v not in [str(c) for c in self.choices]:
-                raise ValueError(f"参数 {self.key}={v!r} 不在候选 {self.choices}")
+                raise ParamValueError(
+                    f"参数 {self.key}={v!r} 不在候选 {self.choices}",
+                    hint=self._hint_for_kind(),
+                    suggest=f"{self.key} 只能取 {' / '.join(str(c) for c in self.choices)}",
+                )
             return v
         return str(raw)
+
+    def _range_hint(self) -> str:
+        """合法区间 + 作者写的 hint（作者那句话最贴语义，别丢）。"""
+        parts = []
+        if self.min is not None or self.max is not None:
+            lo = "−∞" if self.min is None else self.min
+            hi = "+∞" if self.max is None else self.max
+            parts.append(f"合法范围 [{lo}, {hi}]")
+        if self.hint:
+            parts.append(self.hint)
+        return "；".join(parts)
+
+    def _hint_for_kind(self) -> str:
+        base = {
+            "int": "这个参数要整数",
+            "number": "这个参数要数字",
+            "select": "这个参数要从候选里选",
+        }.get(self.kind, "")
+        if self.hint:
+            return f"{base}；{self.hint}" if base else self.hint
+        return base
 
 
 # ---------------------------------------------------------------- 运行配置
@@ -459,10 +538,30 @@ class MLResult:
     diag: Optional[dict] = None                         # cfg.diag=True 时产出
     elapsed: float = 0.0
     error: Optional[str] = None                         # 失败时记录，不抛出
+    #: ⭐ **失败的可教学三件套**（2026-10-03 补；默认空 = 旧行为不变）。
+    #:
+    #: 为什么必须放在 `MLResult` 上：`runner.run_one` 是 `method.fit` 的**唯一**
+    #: 兜底点，它原先把任何异常压成一句 `traceback` 字符串 ⇒ 到 AI 那里
+    #: `error_kind` 是空的、hint 退化成万能句，**"你参数写错了"被读成"框架坏了"**
+    #: （实测：`overrides={"C": "很大"}` 报成 `command_failed` +
+    #: `ml_toolbox.core.contracts.ParamValueError: …`，连内部类名都漏出去了）。
+    #: ⇒ 让失败**带着 kind/hint/suggest 穿过 runner**，engine 再原样送进回执。
+    error_kind: str = ""
+    error_hint: str = ""
+    error_suggest: str = ""
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    def fail(self, message: str, *, kind: str = "internal_error",
+             hint: str = "", suggest: str = "") -> "MLResult":
+        """标成失败并**保留可教学信息**（比手写 `res.error = ...` 更不容易漏字段）。"""
+        self.error = message
+        self.error_kind = kind
+        self.error_hint = hint
+        self.error_suggest = suggest
+        return self
 
 
 # ---------------------------------------------------------------- 检视页声明

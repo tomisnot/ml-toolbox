@@ -48,7 +48,8 @@ from mecha.surface import Engine, ExecutionContext
 
 from ml_toolbox.api import RunRequest, Session, SessionError
 from ml_toolbox.core import registry
-from ml_toolbox.core.contracts import AUX_GRAPH, DataSpec, is_lower_better
+from ml_toolbox.core.contracts import (AUX_GRAPH, DataSpec, ParamValueError,
+                                       is_lower_better)
 from ml_toolbox.core.dataset import Dataset
 from ml_toolbox.core.pipeline import Pipeline
 from ml_toolbox.core.resources import (ResourceBudget, ResourceEstimate,
@@ -200,6 +201,15 @@ class RunSummary:
     metrics: dict[str, float]
     elapsed_s: float
     warning: str = ""
+    #: ⭐ 失败的**可教学三件套**（2026-10-03 补；默认空 ⇒ 既有构造点一行不用改）。
+    #: 为什么走 RunSummary：它是"一次运行的紧凑投影"，而回执是由它拼的
+    #: ⇒ 不加在这里，engine 就只能从 `warning` 那句自由文本里反推失败性质
+    #: （实测：反推不出来 ⇒ AI 拿到 `command_failed` + 万能 hint）。
+    #: ⚠ **不进 `compact()`**：History 事件形状有判据钉着，加键属行为变更，
+    #:   而失败归类只在**回执**这条路上需要（要进 History 时另开一笔改）。
+    error_kind: str = ""
+    error_hint: str = ""
+    error_suggest: str = ""
 
     def compact(self) -> dict[str, Any]:
         return {
@@ -871,6 +881,13 @@ class MLEngine(Engine):
             return self._failure(command, MechaError(
                 str(exc), kind="session_error",
                 hint="ML 会话拒绝了这次请求（方法不可用/配置非法）"), [])
+        except ParamValueError as exc:
+            # ⭐ **可教学的参数错误**：用户/AI 把参数值写错了 ⇒ 原样保住它的
+            #   `kind`/`hint`/`suggest`，**绝不落到下面的 internal_error**
+            #   （那是"框架坏了"，会把"我写错了"读成"这个模型不行"）。
+            #   ⚠ 必须排在 `except Exception` **之前**。
+            return self._failure(command, MechaError(
+                str(exc), kind=exc.kind, hint=exc.hint, suggest=exc.suggest), [])
         except Exception as exc:  # noqa: BLE001 - 内部错误也要进回执，不逃逸
             return self._failure(command, MechaError(
                 f"{type(exc).__name__}: {exc}", kind="internal_error",
@@ -962,6 +979,10 @@ class MLEngine(Engine):
             "network_name": name,
             "elapsed_s": summary.elapsed_s,
             "error": warning,
+            # 同 `run_method`：失败的可教学三件套（自定义网络的失败同样要能教）
+            "error_kind": summary.error_kind,
+            "error_hint": summary.error_hint,
+            "error_suggest": summary.error_suggest,
         }
 
     @staticmethod
@@ -1166,20 +1187,48 @@ class MLEngine(Engine):
                              hint='例如 {"edges": [[0,1],[1,0]]}')
         import pandas as pd
         n_nodes = int(len(spec.X))
+
+        def _edge_num(raw: Any, what: str, item: Any) -> float:
+            """边表里的数字字段：**写错要可教学**（不是 `internal_error`）。
+
+            ⚠ 实测：`{"edges": [["a","b"]]}` 原先抛裸 `ValueError`
+            （`invalid literal for int() with base 10: 'a'`）⇒ 到 AI 那里是
+            `internal_error`，看起来像框架坏了。而它明明是"你给的边表不是数字"。
+            """
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                raise MechaError(
+                    f"边的 {what} 需要数字，收到 {raw!r}",
+                    kind="bad_graph_edge",
+                    hint="边表是 [[src, dst], …]（行号），可选第三项是权重；"
+                         "src/dst 是**行的下标**，不是节点名字",
+                    suggest='例如 {"edges": [[0, 1], [1, 2]]}',
+                ) from None
+
         rows: list = []
         if decl.get("edges") is not None:
             for item in decl["edges"] or []:
                 if isinstance(item, Mapping):
-                    rows.append((int(item["src"]), int(item["dst"]),
-                                 float(item.get("weight", 1.0))))
+                    if "src" not in item or "dst" not in item:
+                        raise MechaError(
+                            f"边 {item!r} 缺 src/dst",
+                            kind="bad_graph_edge",
+                            hint="写成 {'src': 0, 'dst': 1} 或 [0, 1]",
+                        )
+                    rows.append((int(_edge_num(item["src"], "src", item)),
+                                 int(_edge_num(item["dst"], "dst", item)),
+                                 _edge_num(item.get("weight", 1.0), "weight", item)))
                 else:
                     seq = list(item)
                     if len(seq) < 2:
                         raise MechaError(
                             "graph.edges 的每一项至少要有 [src, dst]",
                             kind="bad_graph_edge", hint=f"收到 {item!r}")
-                    rows.append((int(seq[0]), int(seq[1]),
-                                 float(seq[2]) if len(seq) > 2 else 1.0))
+                    rows.append((int(_edge_num(seq[0], "src", item)),
+                                 int(_edge_num(seq[1], "dst", item)),
+                                 _edge_num(seq[2], "weight", item)
+                                 if len(seq) > 2 else 1.0))
         elif decl.get("edges_path"):
             path = self._resolve_data_path(str(decl["edges_path"]))
             frame = pd.read_csv(path)
@@ -1257,6 +1306,11 @@ class MLEngine(Engine):
             "run_id": summary.run_id,
             "elapsed_s": summary.elapsed_s,
             "error": warning,
+            # ⭐ 失败的**可教学三件套**：少了它们，工具层只能退化成
+            #   `command_failed` + 万能 hint（实测：AI 因此学不到怎么改）。
+            "error_kind": summary.error_kind,
+            "error_hint": summary.error_hint,
+            "error_suggest": summary.error_suggest,
         }
 
     def _cmd_run_method_batch(self, spec: dict[str, Any],
@@ -2008,8 +2062,15 @@ def _summarize_record(record: Any, dataset_id: str,
     result = record.result
     metrics = _jsonable_metrics(result.metrics)
     warning = ""
+    kind = hint = suggest = ""
     if not result.ok:
         warning = (result.error or "运行失败").splitlines()[-1][:200]
+        # ⭐ 把失败归类**原样带出去**（见 `RunSummary.error_kind` 的说明）：
+        #   没有它，engine 只能拿一句自由文本去猜，猜不出就退化成 `command_failed`
+        #   + 万能 hint ⇒ AI 学不到任何东西。
+        kind = str(getattr(result, "error_kind", "") or "")
+        hint = str(getattr(result, "error_hint", "") or "")
+        suggest = str(getattr(result, "error_suggest", "") or "")
     elif not metrics:
         warning = "运行成功但没有产出可比较的数值指标"
     return RunSummary(
@@ -2019,6 +2080,7 @@ def _summarize_record(record: Any, dataset_id: str,
         metrics=metrics,
         elapsed_s=round(float(getattr(result, "elapsed", 0.0) or 0.0), 4),
         warning=warning,
+        error_kind=kind, error_hint=hint, error_suggest=suggest,
     )
 
 
