@@ -632,3 +632,66 @@
 - **教训**：机制齐全 ≠ 端到端可用。**每跨一层都要问一句"这个字段还在吗"**——
   这一条的 hint 就是被"最后一公里"的一行硬编码吃掉的，而它前面每一层都写对了。
 
+### A21. "文档推荐的用法"**从没被跑过** ⇒ 确定性 bug 藏了一轮（假绿）
+- **症状**：`eval_custom(run_id=…, dataset_id=…)` 稳定报
+  `AttributeError: 'dict' object has no attribute 'spec'`（还归成 `internal_error`）。
+- **原因**：`_validator.check_dataset_ref()` 返回的是 **facts 字典**，而代码把它当
+  带 `.spec` 的 `DatasetEntry` 用 ⇒ `getattr(entry.spec, …)` 必然炸。
+- **为什么判据没抓到**（这条比 bug 本身更值得记）：我写的 `eval_custom` 判据
+  **只走了 `payload` 那条路**，而**技能文档里推荐的却是 `dataset_id`**
+  ⇒ "文档说可行的那条路，没有任何判据跑过"。这与 A12（判据的前提不能靠仓库历史）
+  同族：**判据覆盖的是"我想到的用法"，不是"我承诺的用法"**。
+- **修法**：改走 `self.dataset_entry(ds_id)`；两条路都进判据
+  （`test_eval_custom_accepts_dataset_id_and_teaches_missing_payload`）。
+- **推广规则**：**凡写进 skill/交付说明的调用示例，都要有一条判据在跑它**；
+  否则文档就成了"未验证的承诺"，而 AI 会照着它撞墙、然后怀疑自己参数写错。
+
+### A22. 钩子声明了、**路径没统一** ⇒ 逼用户写一个**假的 `forward`**
+- **症状**（使用者反馈 §2-缺口3）：自定义任务训练到第一轮末尾就炸
+  `Module [GNN] is missing the required "forward" function` ⇒ 他被迫写一个
+  **与损失毫无关系**的 `forward`，"只为让验证别炸"，并据此怀疑 `best_epoch` 是假的。
+- **根因**（比反馈里定位的**更深一层**）：炸的**不是**验证分支，而是 **recorder 的探针**
+  （`recorder._collect_probe` 默认调 `model(self._probe)`）。验证分支当时**已经**正确
+  走 `forward_step`（上一轮就写对了 `elif`）。
+  ⇒ 这是 A13 的另一半：**红验证不只要"能红"，还要"红在正确的位置"**——
+  现象描述对、归因差一层，按错误归因去修是**修不好**的（我一开始就差点只改验证分支）。
+- **修法**：把"怎么调模型"收成**一条入口**——只要网络写了 `forward_step`，
+  **训练 / 验证 / 探针 / 预测**四条路全走它（预测那条没有负载 ⇒ 给空负载并**明说**）。
+- **判据**：`test_custom_task_needs_no_forward_when_forward_step_exists`——
+  网络里的 `forward` 明确**抛异常**，谁再回到 `model(x)` 立刻红。
+  ⚠ 该判据第一版只断言"跑得成"；红验证时发现**把验证分支改坏也不会红**
+  （`vl` 变 `None` ⇒ 验证被**静默跳过** ⇒ `best_epoch` 悄悄改用训练损失）⇒
+  加固成"让 `forward_step` 在 `kind='val'` 时返回**可辨认的常数 0.25**，断言 `val_loss` 就是它"。
+
+### A23. 设备不一致**伪装成维度错**
+- **症状**（反馈 §3.1）：`oh()` 里一个 `torch.tensor([0., 1.])` 没写 `device`，
+  而模型在显卡上 ⇒ 报的是 `Sizes of tensors must match except in dimension 2`、
+  `not enough values to unpack (expected 3, got 2)`、
+  `mat1 and mat2 shapes cannot be multiplied` —— **全都是误导**，他为此烧了十几次往返。
+- **为什么"在文档里写纪律"不够**：每漏一处就中招一次，而报错还把人往维度方向引。
+- **修法**：在**用户钩子执行期间**把 torch 默认设备摆成训练设备
+  （`trainer.hook_device`），`with` 包住那一次调用。
+  ⚠ `set_default_device` 是**进程级**设置 ⇒ 必须 `try/finally` 复原，
+  否则会渗到我们自己的代码与下一个方法（判据里**专门断言"没渗出去"**）。
+- **判据**：`test_bare_tensor_in_user_hook_lands_on_the_training_device`。
+
+### A24. 回执只说"形状"，不说"**一行之内**是什么"
+- **症状**（反馈 §2-缺口4）：负载 `(R, 5)` 被收下、回执看着正常，但切批后是 `(B, 5)`
+  而网络期待 `(B, L, 5)` ⇒ 又是那句 `mat1 and mat2 shapes cannot be multiplied`。
+  他"手工实验出要多带一维"，十几次往返。
+- **根因**：`shape` 本身**不含歧义信息**——`(R, 5)` 的"5"是"一行 5 个数"还是
+  "一行 5 个位置"必须由人解释，而**只有调用方知道** ⇒ 框架至少要把语义说清。
+- **修法**：每个负载加 **`per_row_shape`**（= `shape[1:]`，即"一行之内的完整结构"）
+  + 按 rank 的提示（`(R,d)` ⇒ "若一行是序列要给 `(R,L,d)`"；`(R,)` ⇒ "这更像一列"）
+  + 一条全局 `_semantics`。
+- **判据**：`test_payload_facts_disclose_per_row_shape`。
+
+### A25. 模型构造期拿不到**输入维度** ⇒ 写死 ⇒ 换数据**静默跑偏**
+- **症状**（反馈 §2-缺口1，他列为最高优先）：`build(n_in, n_out)` 只给得出特征表列数，
+  而真实输入维度在**负载**里 ⇒ 只能写死维度；"后果**不是报错，而是换一份数据
+  （换个 N、加一维特征）时静默跑偏**"。
+- **修法**：`build` 可多收 `ctx`（**形状事实**，不含数据）；老签名 `TypeError` 落回旧调用
+  —— 与 `on_progress` 同一个做法（"新签名优先、老签名也认"）。
+- **判据**：`test_build_receives_payload_shapes_and_old_signature_still_works`——
+  用**两份 d 不同**的数据跑同一个网络，模型宽度必须跟着变（写死维度的实现会红）。
+

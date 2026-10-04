@@ -22,6 +22,14 @@ sys.path.insert(0, str(REPO))
 from ml_toolbox.core.paddings import pad_rows                    # noqa: E402
 
 
+#: 判据默认钉 **CPU**。⚠ 别改成 `auto`：那会让**每个测试进程都加载 CUDA**
+#: （每进程 1.5–2 GB commit），与"同时在跑的 app"叠加时会把页面文件耗尽 ⇒
+#: torch 半初始化（`WinError 1455 页面文件太小` / `partially initialized module
+#: 'torch._inductor'`）⇒ 一连串**假红**。实测踩过。门禁要的是"逻辑对不对"。
+#: 只有**专测设备**的那条才用 `auto`（它必须证明张量真落在训练设备上）。
+_DEV = "cpu"
+
+
 def _has_torch() -> bool:
     try:
         import torch                                             # noqa: F401
@@ -243,7 +251,7 @@ def test_custom_task_needs_no_standard_label_and_does_not_fake_metrics():
                                        "amps": amps["values"],
                                        "amp_mask": amps["mask"]}},
                 "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
-            raw = ml.tools.execute("run_custom", {
+            raw = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": _NET, "dataset_id": ds, "name": "nqs",
                 "overrides": {"epochs": 4, "batch": 4}})
             # ⚠ 先判失败再取 `value`：直接 `["value"]` 会在失败时抛 KeyError
@@ -260,7 +268,7 @@ def test_custom_task_needs_no_standard_label_and_does_not_fake_metrics():
             # 没有 `loss` 钩子时必须**可教学地拒**（我们不知道拿什么算损失）
             noloss = _NET.replace("def loss(self, *, nn, n_out):\n"
                                   "        return nn.MSELoss()\n", "")
-            bad = ml.tools.execute("run_custom", {
+            bad = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": noloss, "dataset_id": ds, "overrides": {"epochs": 2}})
             assert bad["is_error"] is True, bad
             assert ((bad.get("error") or {}).get("info") or {}).get("kind") \
@@ -285,7 +293,7 @@ def test_custom_metrics_reach_the_observation_surface():
                                        "bit_mask": bits["mask"],
                                        "amps": amps["values"]}},
                 "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
-            rid = ml.tools.execute("run_custom", {
+            rid = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": _NET, "dataset_id": ds, "name": "tags",
                 "overrides": {"epochs": 5, "batch": 4}})["value"]["run_id"]
             tr = ml.tools.execute("describe_training",
@@ -321,7 +329,7 @@ def test_checkpoint_is_complete_including_bias_and_retrievable():
                                        "bit_mask": bits["mask"],
                                        "amps": amps["values"]}},
                 "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
-            rid = ml.tools.execute("run_custom", {
+            rid = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": _NET, "dataset_id": ds, "name": "ck",
                 "overrides": {"epochs": 6, "batch": 4}})["value"]["run_id"]
 
@@ -368,7 +376,7 @@ def test_eval_custom_hands_the_model_to_caller_code_on_new_data():
                                        "bit_mask": bits["mask"],
                                        "amps": amps["values"]}},
                 "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
-            rid = ml.tools.execute("run_custom", {
+            rid = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": _NET, "dataset_id": ds, "name": "ev",
                 "overrides": {"epochs": 4, "batch": 4}})["value"]["run_id"]
 
@@ -484,7 +492,7 @@ class Network:
             self.seen = (None if ea is None else tuple(ea.shape), tuple(names or ()))
         return model(ctx["x"])
 '''
-            out = ml.tools.execute("run_custom", {
+            out = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": CODE, "dataset_id": ds, "name": "ea",
                 "overrides": {"epochs": 2}})["value"]
             assert out["ok"] is True, out
@@ -543,7 +551,7 @@ class Network:
         out = model(x)
         return out, out
 '''
-            out = ml.tools.execute("run_custom", {
+            out = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": CODE, "dataset_id": ds, "name": "slice",
                 "overrides": {"epochs": 1, "batch": 5, "val_split": 0.0}})["value"]
             assert out["ok"] is True, out
@@ -578,7 +586,7 @@ def test_label_less_supervised_data_is_rejected_unless_declared_custom():
                                        "bit_mask": bits["mask"],
                                        "amps": amps["values"]}},
                 "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
-            got = ml.tools.execute("run_custom", {
+            got = ml.tools.execute("run_custom", {"device": _DEV, 
                 "code": _NET, "dataset_id": ds, "overrides": {"epochs": 2}})
             assert got["is_error"] is True, (
                 "无标签又没声明 custom 的任务竟然被接受了 ⇒ 它只能算出假分数")
@@ -587,6 +595,363 @@ def test_label_less_supervised_data_is_rejected_unless_declared_custom():
             assert "custom" in (info.get("hint") or "") + \
                 (info.get("message") or "") + str(info), \
                 "拒绝时要指路到 target_kind='custom'"
+        finally:
+            ml.close()
+
+
+# ============================================================ 5. 实测反馈（第二轮）
+def test_build_receives_payload_shapes_and_old_signature_still_works():
+    """⭐ `build` 拿得到**负载形状**（反馈 §2-缺口1）——不再靠猜维度。
+
+    他的原话："后果**不是报错，而是换一份数据（换个 N、加一维特征）时静默跑偏**。"
+    ⇒ 判据必须证明**换一份 d 不同的数据时模型跟着变**（写死维度的实现会红）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    code = '''
+class Net(nn.Module):
+    def __init__(self, d_node):
+        super().__init__()
+        self.lin = nn.Linear(d_node, 4)
+
+    def forward(self, x):
+        return self.lin(x).mean(1)
+
+
+class Network:
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        assert ctx is not None, "build 没拿到 ctx"
+        return Net(int(ctx["payload_shapes"]["xr"][-1]))     # ← (R,L,d) → d
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        out = model(ctx["payload"]["xr"])                     # (B,L,d) → (B,)
+        return out, out.detach()
+'''
+    with tempfile.TemporaryDirectory(prefix="nqs-buildctx-") as td:
+        ml = _ml(td)
+        try:
+            for d in (3, 7):                     # ⭐ 换一维特征 ⇒ 模型必须跟着变
+                R, L = 10, 4
+                rng = np.random.RandomState(d)
+                meta = pd.DataFrame({"m": rng.randn(R)})
+                xr = rng.randn(R, L, d)
+                got = ml.tools.execute("prepare_dataset", {
+                    "source": {"kind": "frame", "frame": meta}, "name": f"bc{d}",
+                    "target_kind": "custom",
+                    "payload": {"arrays": {"xr": xr}},
+                    "pipeline": {"steps": [{"key": "scale"}]}})
+                assert got["is_error"] is False, got
+                out = ml.tools.execute("run_custom", {"device": _DEV, 
+                    "code": code, "dataset_id": got["value"]["dataset_id"],
+                    "name": f"bc{d}", "overrides": {"epochs": 2, "batch": 4}})
+                assert out["is_error"] is False, out
+                assert out["value"]["ok"] is True, out["value"]
+
+            # ⚠ **老签名照样能跑**（不逼既有代码改）
+            OLD = '''
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        return nn.Linear(n_in, 1)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        out = model(x).squeeze(-1)
+        return out, out.detach()
+'''
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame", "frame": pd.DataFrame({"m": [1.0] * 8})},
+                "name": "old", "target_kind": "custom",
+                "payload": {"arrays": {"xr": np.zeros((8, 2, 3))}},
+                "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+            old = ml.tools.execute("run_custom", {"device": _DEV, 
+                "code": OLD, "dataset_id": ds, "overrides": {"epochs": 2}})
+            assert old["is_error"] is False, old
+        finally:
+            ml.close()
+
+
+def test_custom_task_needs_no_forward_when_forward_step_exists():
+    """⭐ **只有 `forward_step`、没有 `forward` 也能跑完**（反馈 §2-缺口3）。
+
+    ⚠ 反馈把它定位成"验证轮调了 `model(Xva)`"；实测**真正炸的是 recorder 的探针**
+    （`recorder._collect_probe` 默认调 `model(self._probe)`）—— 验证轮的 `elif` 我
+    是写对了的。两处都要求"同一条入口"。
+    ⇒ 判据里 `forward` 明确**抛异常**：谁再回到 `model(x)`，这条立刻红。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    code = '''
+class Net(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, 3)
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        raise RuntimeError("SHOULD-NOT-BE-CALLED: 这条路上不该有 forward")
+
+
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        out = model.act(model.lin(x))
+        if ctx["kind"] == "val":
+            # ⭐ **验证轮的损失必须来自这里**（不是某个假 forward）。
+            #   返回 (0.5, 0.0) ⇒ MSE = 0.25，是一个**可辨认的常数**：
+            #   只要 val_loss 不等于它，就说明验证走了别的路（或压根没跑）。
+            z = out * 0.0
+            return z + 0.5, z
+        return out, out.detach()
+'''
+    with tempfile.TemporaryDirectory(prefix="nqs-nofwd-") as td:
+        ml = _ml(td)
+        try:
+            R = 12
+            meta = pd.DataFrame({"m": np.arange(R, dtype=float)})
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame", "frame": meta}, "name": "nf",
+                "target_kind": "custom",
+                "payload": {"arrays": {"xr": np.zeros((R, 2, 3))}},
+                "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+            out = ml.tools.execute("run_custom", {"device": _DEV, 
+                "code": code, "dataset_id": ds, "name": "no_forward", "diag": True,
+                "overrides": {"epochs": 3, "batch": 4, "val_split": 0.25}})
+            assert out["is_error"] is False, out
+            rid = out["value"]["run_id"]
+            tr = ml.tools.execute("describe_training",
+                                  {"run_id": rid, "include_series": True})["value"]
+            tags = tr["tags"]
+            # ① 探针跑成功了 ⇒ dead_relu 与逐层梯度都在（探针被跳过时它们会缺）
+            assert "dead_relu" in tags, tags
+            assert any(t.startswith("grad/") for t in tags), tags
+            # ② **验证真的跑了，而且损失来自 forward_step**（可辨认的常数 0.25）。
+            #   ⚠ 这一条是红验证逼出来的：把验证分支弄坏**不会崩**（`vl` 变成 None
+            #   ⇒ 验证被静默跳过 ⇒ `best_epoch` 悄悄改用训练损失）—— 那正是"假事实"。
+            vl = ((tr.get("series") or {}).get("val_loss") or {}).get("values") or []
+            assert vl, "验证损失整条没了（验证被静默跳过）"
+            assert all(abs(v - 0.25) < 1e-6 for v in vl), \
+                f"验证损失不是 forward_step 给的 0.25：{vl}"
+        finally:
+            ml.close()
+
+
+def test_bare_tensor_in_user_hook_lands_on_the_training_device():
+    """⭐ 用户钩子里**随手建的张量**落在训练设备上（反馈 §3.1）。
+
+    他的最小复现是 `torch.tensor([0., 1.])`：模型在显卡、这个在 CPU ⇒ 报出来的却是
+    `Sizes of tensors must match except in dimension 2` 这种**伪装成维度错**的消息。
+    ⇒ 我们在他的代码执行期间把默认设备摆正；⚠ 同时必须**证明没渗出去**。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import torch
+    from ml_toolbox.methods.neural.trainer import hook_device
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    with hook_device(torch, dev):
+        inside = torch.tensor([0.0, 1.0])
+    after = torch.tensor([0.0, 1.0])
+    assert str(inside.device) == str(dev), (inside.device, dev)
+    assert str(after.device) == "cpu", \
+        f"默认设备没复原：{after.device}（会渗到我们自己的代码与下一个方法）"
+
+    # 端到端：forward_step 里建裸张量 —— 上卡时必须能跑
+    code = '''
+class Net(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, 3)
+
+
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        out = model.lin(x)
+        # ⚠ **裸张量**（不带 device）—— 这正是他中招的那一行
+        oh = out.unsqueeze(-1) * torch.tensor([0.0, 1.0, 0.0])
+        return oh.mean(-1), oh.mean(-1).detach()
+'''
+    with tempfile.TemporaryDirectory(prefix="nqs-dev-") as td:
+        ml = _ml(td)
+        try:
+            R = 10
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame",
+                           "frame": pd.DataFrame({"m": np.arange(R, dtype=float)})},
+                "name": "dev", "target_kind": "custom",
+                "payload": {"arrays": {"xr": np.zeros((R, 2, 3))}},
+                "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+            out = ml.tools.execute("run_custom", {
+                "code": code, "dataset_id": ds, "name": "bare_tensor",
+                "device": "auto", "overrides": {"epochs": 2, "batch": 4}})
+            assert out["is_error"] is False, (
+                f"裸张量把训练搞炸了（设备纪律失效）：{out.get('error')}")
+        finally:
+            ml.close()
+
+
+def test_eval_custom_accepts_dataset_id_and_teaches_missing_payload():
+    """⭐ `eval_custom(dataset_id=…)` 走不通是个**确定性 bug**（反馈 §2-缺口2）。
+
+    ⚠ 我上一轮的判据**只走了 `payload` 那条路** ⇒ 文档推荐的 `dataset_id` 用法
+    从没被跑过（典型的假绿）。这条补齐，并钉住"没给数据时要明说"。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="nqs-ev2-") as td:
+        ml = _ml(td)
+        try:
+            meta, bits, amps = _nqs_payload(rows=12, n_atoms=6)
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame", "frame": meta}, "name": "ev2",
+                "target_kind": "custom",
+                "payload": {"arrays": {"bits": bits["values"],
+                                       "bit_mask": bits["mask"],
+                                       "amps": amps["values"]}},
+                "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+            rid = ml.tools.execute("run_custom", {"device": _DEV, 
+                "code": _NET, "dataset_id": ds, "name": "ev2",
+                "overrides": {"epochs": 3, "batch": 4}})["value"]["run_id"]
+            EVAL = ('def evaluate(model, ctx):\n'
+                    '    return {"n": float(len(ctx["payload"]["bits"])),'
+                    ' "has_amps": float("amps" in ctx["payload"])}\n')
+            # ① dataset_id 这条路（文档推荐的用法）
+            got = ml.tools.execute("eval_custom", {
+                "run_id": rid, "code": EVAL, "dataset_id": ds})
+            assert got["is_error"] is False, got
+            v = got["value"]
+            assert v["metrics"]["n"] == 12.0, v["metrics"]
+            assert v["metrics"]["has_amps"] == 1.0, v["metrics"]
+            assert v["n_payload_arrays"] == 3, v          # "拿到几份负载"要看得见
+
+            # ② 没给数据：**回执明说**（不是等代码里 KeyError）
+            quiet = ml.tools.execute("eval_custom", {
+                "run_id": rid,
+                "code": "def evaluate(model, ctx):\n    return {'ok': 1.0}"})
+            assert quiet["is_error"] is False, quiet
+            assert quiet["value"]["n_payload_arrays"] == 0
+            assert any("没有负载" in w for w in quiet["value"]["warnings"]), \
+                quiet["value"]["warnings"]
+
+            # ③ 代码里去取不存在的负载 ⇒ **可教学**（不是裸 KeyError: 'xr'）
+            boom = ml.tools.execute("eval_custom", {
+                "run_id": rid,
+                "code": 'def evaluate(model, ctx):\n'
+                        '    return {"x": float(ctx["payload"]["xr"].sum())}'})
+            assert boom["is_error"] is True, boom
+            msg = ((boom.get("error") or {}).get("message") or "")
+            assert "dataset_id" in msg and "payload" in msg, msg
+            assert "不随 checkpoint 走" in msg, msg
+        finally:
+            ml.close()
+
+
+def test_metrics_runs_in_eval_no_grad_and_can_be_throttled():
+    """⭐ `metrics` 必须在 **eval + no_grad** 下调用，且贵指标能降频（反馈 §2-缺口5）。"""
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    code = '''
+class Net(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, 3)
+
+
+class Network:
+    metrics_every = 2                      # 降频：每 2 轮算一次
+
+    def build(self, n_in, n_out, *, nn):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def metrics(self, model, ctx):
+        return {"probe/training": float(model.training),
+                "probe_grad": float(ctx["payload"]["xr"].requires_grad)}
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        out = model.lin(x)
+        return out, out.detach()
+'''
+    with tempfile.TemporaryDirectory(prefix="nqs-metrics-") as td:
+        ml = _ml(td)
+        try:
+            R = 10
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame",
+                           "frame": pd.DataFrame({"m": np.arange(R, dtype=float)})},
+                "name": "me", "target_kind": "custom",
+                "payload": {"arrays": {"xr": np.zeros((R, 2, 3))}},
+                "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+            out = ml.tools.execute("run_custom", {"device": _DEV, 
+                "code": code, "dataset_id": ds, "name": "metrics_state",
+                "overrides": {"epochs": 5, "batch": 4}})["value"]
+            assert out["ok"] is True, out
+            m = out["metrics"]
+            assert m["probe/training"] == 0.0, f"metrics 不是在 eval 态调的：{m}"
+            assert m["probe_grad"] == 0.0, f"metrics 没在 no_grad 下跑：{m}"
+            # 降频生效：5 轮 → 0,2,4 三个点（末轮**一定**算，终值不能是旧的）
+            # ⚠ 不用 `pick`：它的返回以**整条路径为键**（`"series.…values"`），
+            #   本判据要看的是"点数"，直接读 `series` 更清楚。
+            tr = ml.tools.execute("describe_training", {
+                "run_id": out["run_id"], "include_series": True})["value"]
+            vals = ((tr.get("series") or {}).get("probe/training") or {}).get("values") or []
+            steps = ((tr.get("series") or {}).get("probe/training") or {}).get("steps") or []
+            assert len(vals) == 3, f"降频没生效（{len(vals)} 个点 / 5 轮）"
+            assert steps == [0, 2, 4], steps
+        finally:
+            ml.close()
+
+
+def test_payload_facts_disclose_per_row_shape():
+    """⭐ 回执要说清"一行之内是什么"（反馈 §2-缺口4，他为此烧了十几次往返）。"""
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="nqs-facts-") as td:
+        ml = _ml(td)
+        try:
+            R = 8
+            got = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame",
+                           "frame": pd.DataFrame({"m": np.arange(R, dtype=float)})},
+                "name": "facts", "target_kind": "custom",
+                "payload": {"arrays": {"seq": np.zeros((R, 4, 5)),   # 一行 4×5
+                                       "flat": np.zeros((R, 5)),      # 一行就 5 个数
+                                       "scalar": np.zeros(R)}},       # 一行一个标量
+                "pipeline": {"steps": [{"key": "scale"}]}})
+            assert got["is_error"] is False, got
+            f = got["value"]["payload"]
+            assert f["seq"]["per_row_shape"] == [4, 5], f["seq"]
+            assert f["flat"]["per_row_shape"] == [5], f["flat"]
+            assert "R, L, d" in (f["flat"]["note"] or ""), f["flat"]   # 指路
+            assert "一列" in (f["scalar"]["note"] or ""), f["scalar"]
+            assert "R" in f["_semantics"], f["_semantics"]
         finally:
             ml.close()
 
@@ -603,6 +968,13 @@ _TESTS = [
     test_group_split_holds_out_whole_groups,
     test_multi_component_edge_attr_reaches_the_network,
     test_payload_rows_are_sliced_per_batch,
+    # ---- 第二轮：使用者实跑后的反馈（docs/反馈-NQS路径实测缺口.md）----
+    test_build_receives_payload_shapes_and_old_signature_still_works,
+    test_custom_task_needs_no_forward_when_forward_step_exists,
+    test_bare_tensor_in_user_hook_lands_on_the_training_device,
+    test_eval_custom_accepts_dataset_id_and_teaches_missing_payload,
+    test_metrics_runs_in_eval_no_grad_and_can_be_throttled,
+    test_payload_facts_disclose_per_row_shape,
 ]
 
 

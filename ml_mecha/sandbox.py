@@ -120,16 +120,47 @@ def compile_network(code: str, *, extra_names: dict | None = None) -> CompiledNe
     return CompiledNetwork(instance=instance, source=src, namespace=ns)
 
 
-def call_network_build(net: Any, n_in: int, n_out: int, nn: Any):
-    """调 `Network.build`，失败归一化成 :class:`SandboxError`。"""
-    try:
-        model = net.build(int(n_in), int(n_out), nn=nn)
-    except Exception as exc:                                   # noqa: BLE001
-        raise SandboxError(
+def call_network_build(net: Any, n_in: int, n_out: int, nn: Any,
+                       ctx: Any = None):
+    """调 `Network.build`，失败归一化成 :class:`SandboxError`。
+
+    ## `ctx`：让 `build` 拿得到**负载的形状**（不再靠猜维度）
+
+    实测缺口（NQS 使用者的反馈 §2-缺口1）：`build(n_in, n_out)` 只给得出**特征表列数**，
+    而真实输入维度常在**逐行负载**里（几个原子、每原子几维、几个采样）⇒ 作者只能
+    **写死维度**，后果是"换一份数据（换个 N、加一维特征）时**静默跑偏**"，
+    而那正是本仓最忌的形态（假绿）。
+
+    ⇒ `build` 可以多收一个关键字参数 `ctx`，里面是**形状事实**（不含数据）：
+
+    ```python
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        d_node = ctx["payload_shapes"]["xr"][-1]      # (R, L, d) → d
+        return GNN(d_node=d_node)
+    ```
+
+    ⚠ **老签名照样能跑**：只写 `(n_in, n_out, *, nn)` 时 `TypeError` 落到旧调用
+    —— 与 `on_progress` 同一个做法（"新签名优先、老签名也认"，不逼既有代码改）。
+    """
+    def _bad(exc: BaseException):
+        return SandboxError(
             f"`Network.build` 抛了：{type(exc).__name__}: {exc}",
             kind="build_error",
-            detail="build 必须返回一个 `nn.Module`；参数是 (n_in, n_out, *, nn)",
-        ) from exc
+            detail="build 必须返回一个 `nn.Module`；"
+                   "参数是 (n_in, n_out, *, nn, ctx=None)",
+        )
+
+    try:
+        model = net.build(int(n_in), int(n_out), nn=nn, ctx=ctx)
+    except TypeError as exc:
+        if "ctx" not in str(exc):
+            raise _bad(exc) from exc
+        try:                                        # 老签名：不认 ctx
+            model = net.build(int(n_in), int(n_out), nn=nn)
+        except Exception as exc2:                   # noqa: BLE001
+            raise _bad(exc2) from exc2
+    except Exception as exc:                                   # noqa: BLE001
+        raise _bad(exc) from exc
     if not isinstance(model, nn.Module):
         raise SandboxError(
             f"`Network.build` 返回的不是 nn.Module（是 {type(model).__name__}）",

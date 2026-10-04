@@ -295,6 +295,10 @@ def _eval_custom(engine: MLEngine, wrap,
                 "which": receipt.get("which", ""),
                 "metrics": dict(receipt.get("metrics") or {}),
                 "extra_keys": list(receipt.get("extra_keys") or []),
+                # 这次评估实际拿到几份负载 —— 反馈 §2-缺口2 的教训：让"没给数据"
+                # **看得见**，而不是等代码里 KeyError 才发现
+                "n_payload_arrays": int(receipt.get("n_payload_arrays") or 0),
+                "payload_keys": list(receipt.get("payload_keys") or []),
                 "note": receipt.get("note", ""),
                 "warnings": list(receipt.get("warnings") or []),
                 "error": receipt.get("error", "")}
@@ -324,7 +328,8 @@ def _eval_custom(engine: MLEngine, wrap,
         },
         output_schema={"type": "object",
                        "required": ["ok", "run_id", "which", "metrics",
-                                    "extra_keys", "note", "warnings", "error"]},
+                                    "extra_keys", "n_payload_arrays",
+                                    "payload_keys", "note", "warnings", "error"]},
         execute=wrap(execute),
         banned_words=banned_words,
     )

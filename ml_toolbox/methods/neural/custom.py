@@ -182,7 +182,12 @@ class CustomNNMethod(MLMethod):
 
         # 结构由 AI 写（沙箱编译已保证 build 存在且返回 nn.Module）
         from ml_mecha.sandbox import call_network_build
-        model = call_network_build(net, n_in, n_out, torch.nn)
+        # ⭐ **`build` 拿得到负载形状**（反馈 §2-缺口1）：只在 `build` 里"猜维度"，
+        #   换个 N / 加一维特征就会**静默跑偏**（那是本仓最忌的假绿）。
+        model = call_network_build(
+            net, n_in, n_out, torch.nn,
+            ctx=_build_ctx(payload, n_rows=int(len(prep.Xs)), n_features=n_in,
+                           n_out=n_out, target_kind=kind, device=str(dev)))
 
         # 损失/优化器：有钩子用钩子，否则给与 torch_mlp 一致的默认
         if callable(getattr(net, "loss", None)):
@@ -205,13 +210,37 @@ class CustomNNMethod(MLMethod):
         # ⚠ `prep.yv` 在**自定义任务**里是 None（没有标准标签）⇒ 不能直接下标。
         #   探针的 labels 只用于 latent 帧的着色，没有标签就传 None（如实）。
         probe_labels = None if prep.yv is None else prep.yv[probe_rows]
+        # ⭐⭐ **探针前向也必须走同一条入口**（反馈 §2-缺口3 的**真正现场**）。
+        #   探针是"跑一次前向、用 hook 收集激活"（见 recorder._collect_probe），
+        #   它默认调 `model(self._probe)` —— 而"只有 forward_step、没有可用 forward"
+        #   的模型（NQS 的自回归头就是）会炸
+        #   `NotImplementedError: Module [Net] is missing the required "forward" function`。
+        #   ⚠ 反馈把它当成"验证轮调了 model(Xva)"；验证轮其实是对的（走 forward_step），
+        #   **炸的是探针** —— 这也是为什么红验证要"看红的理由对不对"（A13）。
+        probe_fn = None
+        if callable(getattr(net, "forward_step", None)):
+            probe_payload = {k: v[probe_rows] for k, v in (payload or {}).items()}
+
+            def probe_fn():                               # noqa: F811
+                pctx = {"torch": torch, "nn": torch.nn, "device": str(dev),
+                        "step": 0, "kind": "probe", "n_rows": int(len(prep.Xs)),
+                        "payload": {k: _trainer._as_tensor(v, torch, dev)
+                                    for k, v in probe_payload.items()}}
+                with _trainer.hook_device(torch, dev):
+                    out, _tgt = net.forward_step(
+                        model, (torch.tensor(prep.Xs[probe_rows],
+                                             dtype=torch.float32, device=dev), None),
+                        pctx)
+                return out
+
         rec.set_probe(torch.tensor(prep.Xs[probe_rows], dtype=torch.float32,
                                    device=dev),
-                      labels=probe_labels, probe_idx=probe_rows)
+                      labels=probe_labels, probe_idx=probe_rows, probe_fn=probe_fn)
         self._probe_idx = probe_rows
 
         res = self._new_result(target_kind=kind, params={"lr": lr})
         res._torch = torch
+        res._net = net                       # `predict` 要用它探测 `forward_step`
         res._dev = dev                      # ⭐ 如实记：审计说 cuda 就得真是 cuda
         res._mu, res._sd = prep.mu, prep.sd
         res.classes_ = (prep.label_encoder.classes_
@@ -233,6 +262,9 @@ class CustomNNMethod(MLMethod):
                 #   负载给了数据，forward_step 才有地方消费。
                 forward_step=_hook(net, "forward_step"),
                 on_step=_hook(net, "on_step"), metrics=_hook(net, "metrics"),
+                # 贵的指标（如在全量支撑上算保真度）用 `metrics_every` 降频；
+                # 末轮一定算（保证回执/回看的终值不是旧的 —— 否则又是一个假事实）
+                metrics_every=int(getattr(net, "metrics_every", 1) or 1),
                 keep_best=True)
         except Exception as exc:                             # noqa: BLE001
             import traceback
@@ -369,7 +401,10 @@ class CustomNNMethod(MLMethod):
         problem.spec.y = pd.Series(yv)
 
         from ml_mecha.sandbox import call_network_build
-        model = call_network_build(net, n_in, n_out, torch.nn)
+        model = call_network_build(
+            net, n_in, n_out, torch.nn,
+            ctx=_build_ctx(None, n_rows=int(len(problem.X)), n_features=n_in,
+                           n_out=n_out, target_kind=kind, device=str(dev)))
 
         if callable(getattr(net, "loss", None)):
             lossf = net.loss(nn=torch.nn, n_out=n_out)
@@ -516,8 +551,21 @@ class CustomNNMethod(MLMethod):
         #   而且只有真上卡时才暴露 —— 这是"设备真透传"这条路上容易漏的尾巴）。
         t = torch.tensor(Xs, dtype=torch.float32, device=result._dev)
         result.est.eval()
+        # ⭐ **有 `forward_step` 就用它**（与训练/验证同一条入口）：只实现
+        #   `forward_step` 的模型，`model(t)` 会直接炸
+        #   `missing the required "forward" function`。这里没有负载（预测的是新行），
+        #   所以给一个空负载 + 明确说明：真要"带负载预测"，走 `eval_custom`。
+        fs = _hook(getattr(result, "_net", None), "forward_step")
         with torch.no_grad():
-            out = result.est(t)
+            if fs is not None:
+                ctx = {"torch": torch, "nn": torch.nn, "device": str(result._dev),
+                       "step": 0, "kind": "predict", "n_rows": int(len(Xs)),
+                       "payload": {},
+                       "hint": "预测新行时没有逐行负载；要带负载评估请用 eval_custom"}
+                with _trainer.hook_device(torch, result._dev):
+                    out, _tgt = fs(result.est, (t, None), ctx)
+            else:
+                out = result.est(t)
         if result.target_kind == "classification":
             pred = out.argmax(1).cpu().numpy()
             classes = getattr(result, "classes_", None)
@@ -648,6 +696,22 @@ def describe_checkpoint(run_id: str) -> dict:
                     "`eval_custom(run_id=…, code=…)` 由系统装载后交给你的代码。"}
 
 
+class _PayloadMap(dict):
+    """评估用的负载映射：**取不到键时给可教学的话**（不甩一个裸 `KeyError: 'xr'`）。
+
+    反馈原文："技能里'换一个没见过的 N 评估'的示例写法会直接 `KeyError: 'xr'`。"
+    —— 裸 KeyError 只说"没有这个键"，不说"你该给数据"。这里把**怎么办**写进消息
+    （以及"训练时的负载不随 checkpoint 走"这条事实）。
+    """
+
+    def __missing__(self, key):
+        raise KeyError(
+            f"评估负载里没有 {key!r}（本次可用：{sorted(self) or '（空）'}）。"
+            "评估用的数据要**显式**给：`dataset_id=…`（复用会话里某份数据集）"
+            "或 `payload=…`（现场给新数据，例如换个没见过的 N）。"
+            "⚠ 训练时的负载**不随 checkpoint 走**（刻意如此：评估该用没见过数据）。")
+
+
 def run_eval_code(run_id: str, code: str, *, which: str = "best",
                   payload: Any = None, dataset_id: str = "") -> dict:
     """**把训练好的模型交给调用方的代码**（NQS 需求：一个"能调用外部函数的口子"）。
@@ -686,8 +750,9 @@ def run_eval_code(run_id: str, code: str, *, which: str = "best",
                 "error_kind": "no_checkpoint",
                 "hint": "先跑一次 `run_custom`（它会写 checkpoint）；"
                         "只有自定义网络有 checkpoint"}
-    ctx = {"payload": {str(k): _trainer._as_tensor(v, torch, torch.device("cpu"))
-                       for k, v in dict(payload or {}).items()},
+    ctx = {"payload": _PayloadMap(
+               {str(k): _trainer._as_tensor(v, torch, torch.device("cpu"))
+                for k, v in dict(payload or {}).items()}),
            "torch": torch, "nn": torch.nn,
            "device": "cpu", "run_id": str(run_id), "which": str(which),
            "meta": {k: ck.get(k) for k in
@@ -746,6 +811,37 @@ def _hook(net, name: str):
     """取 `Network` 上的一个可选钩子；没有就回 `None`（**不假装**有）。"""
     fn = getattr(net, name, None)
     return fn if callable(fn) else None
+
+
+def _build_ctx(payload, *, n_rows: int, n_features: int, n_out: int,
+               target_kind: str, device: str) -> dict:
+    """交给 `Network.build(..., ctx=…)` 的**形状事实**（反馈 §2-缺口1）。
+
+    为什么需要（他的原话）："`build` 只拿得到**特征表列数**，而 NQS 的输入维度在
+    **负载**里（节点特征几维、每条配置几个原子、几个采样构型）……于是只能写死维度。
+    后果**不是报错，而是换一份数据时静默跑偏**。"
+
+    ⇒ 这里给的是**事实**（形状/dtype/行数），**不含数据**（build 不该需要数据）。
+    形状的含义（缺口4 的同一条）：`(R, L, d)` 里 **`R` 是行数，`(L, d)` 是"一行之内"的
+    完整结构** —— 所以 `shape[1:]` 才是作者要的那一维。
+    """
+    shapes, dtypes = {}, {}
+    for k, v in (payload or {}).items():
+        try:
+            import numpy as _np
+            a = _np.asarray(v)
+            shapes[str(k)] = list(a.shape)
+            dtypes[str(k)] = str(a.dtype)
+        except Exception:                                      # noqa: BLE001
+            shapes[str(k)] = None
+            dtypes[str(k)] = None
+    return {"payload_shapes": shapes, "payload_dtypes": dtypes,
+            "payload_keys": sorted(shapes),
+            "n_rows": int(n_rows), "n_features": int(n_features),
+            "n_out": int(n_out), "target_kind": str(target_kind),
+            "device": str(device),
+            "hint": "数组形状是 (R, …)：**R 是行数，… 是「一行之内」的完整结构**；"
+                    "若一行是长度为 L 的向量序列，要给 (R, L, d) 而不是 (R, d)"}
 
 
 def _payload_of(problem):

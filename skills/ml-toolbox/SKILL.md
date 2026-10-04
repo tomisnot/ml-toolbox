@@ -171,6 +171,9 @@ class Network:
 三条硬约定（**违反就当场报错，不静默**）：
 
 1. **每个数组第 0 维 = 行数**（"切一批行"就等于"切每个数组的前几维"）；
+   👉 回执里的 **`per_row_shape`** 就是"**一行之内**是什么"：给 `(R, L, d)` 才对
+   （一行是 L 个 d 维向量）；给 `(R, d)` 会切出 `(B, d)`，而报错会是
+   `mat1 and mat2 shapes cannot be multiplied` 这种**离根因很远**的话。
 2. **dtype 原样保留**：复数就是复数、位串是整数、mask 是 bool —— 绝不 float 强转；
 3. **变长的维先 pad 再配 mask**（`core.paddings.pad_rows` 是助手；`mask=True` 表示
    "这个位置是真的"）。⚠ 没有 mask 就分不出"填充"与"真数据 0"。
@@ -214,6 +217,11 @@ def evaluate(model, ctx):
 
 - `which`：`best`（默认，验证损失最好的那轮）/ `last`。
 - 存档里的张量**一律在 CPU**（不绑设备）；装载方自己 `.to(device)`。
+- ⚠ **评估用的数据要显式给**：`dataset_id=…`（复用会话里某份数据集）或
+  `payload=…`（现场给新数据，例如换个没见过的 N）。回执里的 `n_payload_arrays` /
+  `payload_keys` 告诉你**这次拿到几份负载**。
+  **训练时的负载不随 checkpoint 走**（刻意如此：评估该用没见过数据）；
+  没给数据时回执会 `warnings` 明说，代码里取负载会得到一句**可教学的 KeyError**。
 - ⚠ 它在**权威进程**里执行你的代码（与 `run_custom` 同一口径）。要 import 你自己的
   物理引擎，把路径加进 `sys.path`（启动时用 `MLTB_EXTRA_PATHS`）。
 
@@ -224,17 +232,66 @@ def evaluate(model, ctx):
 ```python
 class Network:
     primary_metric = "fid/mean"                    # 可选：主指标叫什么
-    def build(self, n_in, n_out, *, nn): ...        # 必需：返回 nn.Module
+    metrics_every = 2                              # 可选：自定义指标降频（贵的才需要）
+    def build(self, n_in, n_out, *, nn, ctx=None): ...  # 必需；`ctx` 给**负载形状**
     def loss(self, *, nn, n_out): ...               # 可选：默认按任务给 CE/MSE
     def configure(self, model, *, torch, lr, weight_decay): ...   # 可选：自定优化器
-    def forward_step(self, model, batch, ctx): ...  # 可选：特殊批次（负载就从这拿）
+    def forward_step(self, model, batch, ctx): ...  # 可选：**全程唯一入口**（见下）
     def forward_graph(self, model, ctx): ...        # 可选：图任务的全图前向
-    def on_step(self, model, step, ctx): ...        # 可选：**每一步**后（预热："前 N 步先只训模长"）
+    def on_step(self, model, step, ctx): ...        # 可选：**每一步**后（预热）
     def metrics(self, model, ctx): ...              # 可选：**每一轮**上报自定义指标
+```
+
+**① `build` 拿得到负载形状**（别写死维度）：
+
+```python
+def build(self, n_in, n_out, *, nn, ctx=None):
+    d_node = ctx["payload_shapes"]["xr"][-1]   # (R, L, d) → d
+    return GNN(d_node=d_node)                  # ⚠ 写死 d：换数据会**静默跑偏**
+```
+
+`ctx` 里是**形状事实**（不含数据）：`payload_shapes` / `payload_dtypes` /
+`payload_keys` / `n_rows` / `n_features` / `n_out` / `target_kind` / `device`。
+只写 `(n_in, n_out, *, nn)` 的老签名**照样能跑**。
+
+**② 写了 `forward_step`，它就是全程唯一入口**（训练 / 验证 / 探针 / 预测都走它）：
+
+```python
+def forward_step(self, model, batch, ctx):
+    x, y = batch                     # y 在自定义任务里是 None
+    out = model(...)                 # 用 ctx["payload"] 里的负载
+    return out, target               # 两者都给：损失 = loss_fn(out, target)
+```
+
+- ⚠ **不要**为了让验证别炸而写一个与损失无关的假 `forward` —— 不再需要了。
+- 用 **`ctx["kind"]`** 分辨场合：`"train"` / `"val"` / `"probe"` / `"metrics"` / `"predict"`。
+- 验证损失也来自这个钩子，而 **`best_epoch` 是按验证损失选的** ⇒ 你的返回值要有语义。
+
+**③ 建张量**：框架在**你的钩子执行期间**把默认设备摆成训练设备
+（`torch.tensor([0., 1.])` 会自动落到显卡）。跨设备运算仍建议显式写 `device=`。
+⚠ **设备不一致的报错常常伪装成维度错**（`Sizes of tensors must match…`、
+`not enough values to unpack`）—— 见到这类消息**先怀疑设备**。
+
+**④ 自回归的形状语义（`(R, K, N)`）**：
+
+```python
+# bits (R, K, N)：R = 配置数（行）、K = 每行采几个构型、N = 原子数（自回归序列长度）
+# amps (R, K) complex：这 K 个构型的精确振幅
+# ⚠ K **不是**序列长度；把 K 当序列长度会引发一连串形状错。
+def forward_step(self, model, batch, ctx):
+    x, _ = batch
+    bits = ctx["payload"]["bits"].float()      # (B, K, N)
+    mask = ctx["payload"]["bit_mask"]          # (B, K) bool
+    amps = ctx["payload"]["amps"]              # (B, K) complex
+    h = model.encode(x)                        # (B, H)
+    logits = model.decode(h, bits)             # (B, K, N, 2) 实/虚两支
+    return logits[mask], amps[mask]
 ```
 
 - 代码**只写结构**：不许自己写盘、不许碰 GUI（观测与存档由系统统一负责）。
 - `n_out` 在**自定义任务**里是 `0`（真实输出形状由你决定，我们**不猜**）。
+- `metrics` 在 **eval + no_grad** 下被调用（每 `metrics_every` 轮一次，末轮一定算）；
+  ⚠ 它拿的是**全量负载** ⇒ 别在里面做全量重活（贵的指标就降频）。
 - **按名字复用**：`run_custom(name="resnet18", persist=true)` 存下来之后，
   `describe_networks` 列表、`describe_network(name=…)` 取回源码改一版再跑 ⇒ **别重贴代码**。
 - `device`：`auto`（默认，有卡就上卡）/ `cpu` / `cuda:0`；**要求 cuda 而没卡会报错**，

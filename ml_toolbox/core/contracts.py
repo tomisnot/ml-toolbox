@@ -340,7 +340,16 @@ class Problem:
         return dict(self.aux.get(AUX_PAYLOAD) or {})
 
     def payload_facts(self) -> dict:
-        """负载的形状摘要（进 diag / 工具回执；没有就回空 dict）。"""
+        """负载的形状摘要（进 diag / 工具回执；没有就回空 dict）。
+
+        ⭐ **`per_row_shape` 是这条回执最要紧的一列**（实测缺口，反馈 §2-缺口4）：
+        使用者的原话——"我把逐配置特征写成 `(R, 5)`，`prepare_dataset` 收下了、回执
+        看着完全正常，但切批后是 `(B, 5)` 而网络期待 `(B, L, 5)` ⇒ 报出来的是
+        `mat1 and mat2 shapes cannot be multiplied` 这种**离根因很远**的错"。
+        他为此"手工实验出要多带一维"，烧了十几次往返。
+
+        ⇒ 回执直接说清语义：**第 0 维是行数，`shape[1:]` 就是"一行之内"的完整结构**。
+        """
         pay = self.payload()
         if not pay:
             return {}
@@ -349,9 +358,21 @@ class Problem:
             try:
                 import numpy as _np
                 a = _np.asarray(v)
-                out[str(k)] = {"shape": list(a.shape), "dtype": str(a.dtype)}
+                per_row = list(a.shape[1:])
+                if a.ndim == 1:
+                    note = "每行只有一个标量 ⇒ 它更像**一列**（放数据表里更合适）"
+                elif a.ndim == 2:
+                    note = (f"每行是长度 {a.shape[1]} 的向量；若一行本该是**序列**"
+                            f"（L 个位置 × d 维），要给 (R, L, d) 而不是 (R, d)")
+                else:
+                    note = ""
+                out[str(k)] = {"shape": list(a.shape), "dtype": str(a.dtype),
+                               "per_row_shape": per_row, "note": note}
             except Exception:                                  # noqa: BLE001
-                out[str(k)] = {"shape": None, "dtype": None}
+                out[str(k)] = {"shape": None, "dtype": None,
+                               "per_row_shape": None, "note": ""}
+        out["_semantics"] = ("数组形状是 (R, …)：**R = 行数**（切一批行 = 切前几维），"
+                             "「…」就是**一行之内**的完整结构")
         return out
 
     # ------------------------------------------------------------ 能力声明

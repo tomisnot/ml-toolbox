@@ -24,11 +24,57 @@ grad_norm / dead_relu / 逐层梯度 / 权重直方图 / latent 帧，一个不�
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+@contextlib.contextmanager
+def hook_device(torch: Any, dev: Any):
+    """在**调用用户钩子**期间把 torch 默认设备设成训练设备，退出时复原。
+
+    ## 为什么必须有它（实测：反馈 §3.1 烧了十几次往返）
+
+    用户代码里随手建的张量**落在 CPU**，而模型在显卡上 ⇒ 报出来的**不是**
+    "设备不一致"，而是 `Sizes of tensors must match except in dimension 2`、
+    `not enough values to unpack`、`mat1 and mat2 shapes cannot be multiplied`
+    —— **全部伪装成维度错**，把人往完全错误的方向引（他的最小复现是一个
+    `torch.tensor([0., 1.])` 常数张量）。
+
+    ⇒ 与其要求每处都写 `device=…`（漏一处就中招），不如在**用户的钩子执行期间**
+    把默认设备摆正：`torch.tensor([0., 1.])` 自动落到训练设备。
+    - 作用域**只在用户代码那一次调用内**（`with` 包住），我们自己的代码不受影响；
+    - 想要 CPU 张量照样可以：`torch.tensor(..., device="cpu")`。
+
+    ⚠ `set_default_device` 是**进程级**设置 ⇒ 必须 try/finally 复原，
+    否则会渗到我们自己的代码与下一个方法（那才是真的难查）。
+    """
+    setter = getattr(torch, "set_default_device", None)
+    if setter is None or dev is None or str(dev) == "cpu":
+        yield                                    # 老 torch 或 CPU：静默退化（不假装做到）
+        return
+    prev = None
+    try:
+        prev = torch.get_default_device()
+    except Exception:                                      # noqa: BLE001
+        prev = None
+    ok = False
+    try:
+        setter(dev)
+        ok = True
+    except Exception:                                      # noqa: BLE001
+        ok = False
+    try:
+        yield
+    finally:
+        if ok:
+            try:
+                setter(prev if prev is not None else "cpu")
+            except Exception:                              # noqa: BLE001
+                pass
 
 
 @dataclass
@@ -309,7 +355,7 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
           optimizer=None, scheduler=None, grad_clip: float = 0.0,
           early_stop: bool = False, patience: int = 10,
           on_progress=None, forward_step=None, device=None,
-          payload=None, on_step=None, metrics=None,
+          payload=None, on_step=None, metrics=None, metrics_every: int = 1,
           keep_best: bool = False) -> dict:
     """跑训练循环，**托管全部观测**。
 
@@ -406,7 +452,10 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                 optimizer.zero_grad()
                 ctx = _ctx(ib, gstep)
                 if forward_step is not None:
-                    out, target = forward_step(model, (xb, yb), ctx)
+                    # ⚠ 用户钩子期间默认设备 = 训练设备（否则随手建的张量落 CPU，
+                    #   报出来的是"维度错"，见 `hook_device` 的说明）
+                    with hook_device(torch, dev):
+                        out, target = forward_step(model, (xb, yb), ctx)
                     loss = loss_fn(out, target)
                 else:
                     out = model(xb)
@@ -420,7 +469,8 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                 # ⭐ **步钩子**：预热（"前 N 步先只训模长"）需要一个"步"的概念。
                 if on_step is not None:
                     try:
-                        on_step(model, gstep, ctx)
+                        with hook_device(torch, dev):
+                            on_step(model, gstep, ctx)
                     except Exception:                          # noqa: BLE001
                         on_step = None        # 观测/调度失败不拖垮训练（与进度钩子同纪律）
                 gstep += 1
@@ -428,33 +478,51 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
             if Xva is not None:
                 model.eval()
                 with torch.no_grad():
-                    if has_y:
+                    if forward_step is not None:
+                        # ⭐ **有这个钩子就全程走它**（训练/验证/探针同一条入口）：
+                        #   反馈 §2-缺口3 的教训是"别停在中间"—— 验证走 `model(Xva)`
+                        #   会逼作者写一个**与损失无关的假 forward**（就为了让验证别炸）。
+                        vi = torch.tensor(np.asarray(va, dtype=np.int64),
+                                          dtype=torch.long)
+                        with hook_device(torch, dev):
+                            vo, vt = forward_step(model, (Xva, yva if has_y else None),
+                                                  _ctx(vi, ep, kind="val"))
+                        vl = float(loss_fn(vo, vt))
+                    elif has_y:
                         o = model(Xva)
                         vl = float(loss_fn(o.squeeze(-1)
                                            if prep.kind != "classification" else o,
                                            yva))
-                    elif forward_step is not None:
-                        # 自定义任务：验证损失也得由网络的 forward_step 算
-                        # （没有标准标签可比 ⇒ 我们不能替它算）
-                        vi = torch.tensor(np.asarray(va, dtype=np.int64),
-                                          dtype=torch.long)
-                        vo, vt = forward_step(model, (Xva, None),
-                                              _ctx(vi, ep, kind="val"))
-                        vl = float(loss_fn(vo, vt))
                 model.train()
             train_loss = float(tot) / max(len(tr), 1)
             cur_lr = float(optimizer.param_groups[0]["lr"])
-            # ⭐ **方法自己上报的指标**：每轮调一次，写进 TB ⇒ AI 通过
-            #   `describe_training` 直接读到（查询面不用改）。
+            # ⭐ **方法自己上报的指标**：写进 TB ⇒ AI 通过 `describe_training` 直接读到。
+            #
+            # ⚠ 三条实测出来的纪律（反馈 §2-缺口5）：
+            #   1. **必须在 `model.eval()` + `no_grad()` 下调用**：观测没有梯度语义，
+            #      否则作者算一次保真度就建一整张图（吃显存）；我为此得自己写 no_grad。
+            #   2. **它在每轮之后被调用一次、拿全量负载** ⇒ 别在里面做全量重活。
+            #      贵的指标用 `Network.metrics_every = N` 降频（末轮一定算，保证终值不假）。
+            #   3. 上报失败只关掉它自己，**不拖垮训练**（观测是附加的）。
             extra = None
-            if metrics is not None:
+            if metrics is not None and (
+                    int(ep) % max(1, metrics_every) == 0 or ep == total - 1):
                 try:
-                    got = metrics(model, _ctx(None, ep, kind="metrics"))
+                    was_training = bool(model.training)
+                    model.eval()
+                    with torch.no_grad(), hook_device(torch, dev):
+                        got = metrics(model, _ctx(None, ep, kind="metrics"))
+                    if was_training:
+                        model.train()
                     if isinstance(got, dict) and got:
                         extra = got
                         last_extra = dict(got)
                 except Exception:                              # noqa: BLE001
                     metrics = None            # 上报失败不拖垮训练（观测是附加的）
+                    try:
+                        model.train()
+                    except Exception:                          # noqa: BLE001
+                        pass
             recorder.epoch(ep, train_loss, vl, cur_lr, extra=extra)
             if scheduler is not None:
                 scheduler.step()
