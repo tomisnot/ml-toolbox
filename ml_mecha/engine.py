@@ -697,7 +697,8 @@ class MLEngine(Engine):
 
     def _query_training_detail(self, *, run_id: str = "",
                                include_series: bool = False,
-                               limit: int = 200) -> dict[str, Any]:
+                               limit: int = 200,
+                               grad_layers: str = "summary") -> dict[str, Any]:
         """训练的**逐 epoch 观测数值**（只读；数据源 = TensorBoard 事件文件）。
 
         ## 为什么必须是只读查询 + 不走会话内存
@@ -736,7 +737,7 @@ class MLEngine(Engine):
             "run_id": resolved,
             "available": bool(payload.get("available")),
             "reason": str(payload.get("reason") or ""),
-            "latest": tb_series.latest_of(payload),
+            "latest": tb_series.latest_of(payload, grad_layers=grad_layers),
             "tags": sorted((payload.get("scalars") or {}).keys()),
             "histograms": sorted((payload.get("histograms") or {}) or []),
             "images": sorted((payload.get("images") or {}) or []),
@@ -1285,6 +1286,7 @@ class MLEngine(Engine):
             net=net, problem=problem, params=params, torch=torch,
             device=str(dev_state), payload=payload,
             batch_probes=spec.get("batch_probes"),
+            warmup_steps=int(spec.get("warmup_steps") or 0),
             # ⭐ 回执大小可调（反馈 §2.3）：他 65 个模块 × 3 档批量 ⇒ 顶层 `shapes`
             #   与 `runs[].shapes` 各来一份，同一批数据重复两遍。
             verbosity=str(spec.get("shapes_verbosity") or "trace"))
@@ -1294,6 +1296,7 @@ class MLEngine(Engine):
                     "code_path": code_path, "code_source": code_source,
                     "code_lines": len(code.splitlines()),
                     "shapes_verbosity": str(spec.get("shapes_verbosity") or "trace"),
+                    "warmup_steps": int(spec.get("warmup_steps") or 0),
                     "elapsed_s": round(time.time() - t0, 3)})
         if out.get("ok"):
             out["warnings"] = [] if out.get("loss_first_batch") is not None else [
@@ -2583,6 +2586,18 @@ def _summarize_record(record: Any, dataset_id: str,
         suggest = str(getattr(result, "error_suggest", "") or "")
     elif not metrics:
         warning = "运行成功但没有产出可比较的数值指标"
+    # ⭐⭐ **CUDA 上下文被断言毒化**：一次 `device-side assert` 之后，**本进程内**所有
+    #   后续 CUDA 运行都会在**第一次与显卡同步**处报同一个错（实测：栈指向
+    #   `custom._fit_table` 的 `rec.set_probe(...)`，而那位置是**假的**）。
+    #   ⇒ 记下**第一次**那次（它才是有信息量的），之后每次都在 hint 里点明"这是回声"，
+    #   否则使用者会去修一个不存在的问题（实测烧掉一小时）。
+    if not result.ok:
+        # ⚠ 传**完整** error，不只 `warning`：`warning` 只取**最后一行**，而 CUDA 断言的
+        #   关键字在第一行（`device-side assert triggered`）⇒ 只看最后一行认不出来
+        #   （实测：判据当场红，`error_kind` 还是空串）。
+        kind, hint = _cuda_poison_note(
+            kind, hint, f"{getattr(result, 'error', '') or ''}\n{warning}",
+            record.run_id)
     return RunSummary(
         run_id=record.run_id, method=record.method, dataset_id=dataset_id,
         pipeline_id=record.pipeline_id, ok=bool(result.ok),
@@ -2592,6 +2607,52 @@ def _summarize_record(record: Any, dataset_id: str,
         warning=warning,
         error_kind=kind, error_hint=hint, error_suggest=suggest,
     )
+
+
+#: 本进程**首次** `device-side assert` 的留痕：`{"run_id", "at"}`（空 = 还没被毒化）。
+#: ⚠ **进程级**：CUDA 上下文一旦被毒化就无法在本进程内恢复 ⇒ 这个事实必须跟着进程走，
+#: 而不是跟着某一次运行（典型的"一次事故、之后全是回声"）。
+_CUDA_POISON: dict[str, Any] = {}
+
+
+def _cuda_poison_note(kind: str, hint: str, warning: str,
+                      run_id: str) -> tuple[str, str]:
+    """识别 CUDA 断言并**区分"第一次"与"回声"**，回 ``(kind, hint)``。
+
+    ## 为什么值得单列（实测代价：一小时）
+
+    使用者遇到的现象：通过工具箱提交必在 `custom.py:238` 的 `rec.set_probe(...)`
+    报 `CUDA error: device-side assert triggered` ⇒ 他把怀疑对象定成"探针路径与
+    多组数组负载的交互"，并写了一份分析。**实测复核**：那一行只是**第一次与显卡同步**
+    的位置（`torch.tensor(..., device=dev)` 会同步）；真正的断言发生在它**之前**
+    （很可能在上一次运行里），而上下文一旦被毒化，**之后每次运行都在这里报同一个错**。
+
+    ⇒ 本函数把这件事挑明：
+    - **第一次**：记为"毒化起点"，并给"要看真位置就 `CUDA_LAUNCH_BLOCKING=1`"的指引；
+    - **之后每次**：明确说"这是**上一次断言的回声**、位置是假的、**重启进程**才恢复"。
+    """
+    blob = f"{warning}\n{hint}".lower()
+    if not any(s in blob for s in ("device-side assert", "cuda error",
+                                   "cuda kernel error", "cuda_launch_blocking",
+                                   "cuda_launch_blocking=1")):
+        return kind, hint
+    if not _CUDA_POISON:
+        _CUDA_POISON.update({"run_id": str(run_id), "at": time.time()})
+        note = (
+            "⚠ 这是一次 **CUDA 断言（device-side assert）**：报错位置**不一定**是真的出错点"
+            "（CUDA 内核错误是**异步**上报的，栈会指向**下一次与显卡同步**的地方）。"
+            "⇒ 真位置：设 `CUDA_LAUNCH_BLOCKING=1` 后**重启**再重跑；排查期也可先用 "
+            "`device='cpu'` 确认逻辑。⚠ 本进程的 CUDA 上下文**已被毒化**：重启之前"
+            "**所有** CUDA 运行都会在第一次同步处报同一个错（那个位置是假的）。")
+        return (kind or "cuda_device_assert"), (hint + "；" if hint else "") + note
+    prev = str(_CUDA_POISON.get("run_id") or "?")
+    note = (
+        f"⚠⚠ **这是回声，不是新故障**：本进程的 CUDA 上下文早在 run `{prev}` 就已被一次 "
+        f"`device-side assert` 毒化 ⇒ 当前报错的位置（例如 `custom._fit_table` 里的 "
+        f"`rec.set_probe(...)`）**是假的**——它只是下一次与显卡同步的地方。"
+        f"⇒ ① 立刻**重启权威/看门人**；② 要看真位置就先设 `CUDA_LAUNCH_BLOCKING=1` 再重启；"
+        f"③ **别在这里改代码**（那是在修一个不存在的问题）。")
+    return (kind or "cuda_context_poisoned"), (hint + "；" if hint else "") + note
 
 
 def _pick_winner(rows: Sequence[Mapping[str, Any]], primary: str) -> dict[str, Any]:

@@ -156,14 +156,24 @@ def dry_run_network(*, net, problem, params: dict, torch, device,
                     payload: dict | None = None,
                     batch_probes: Any = None,
                     max_trace: int = 80,
-                    verbosity: str = "trace") -> dict:
-    """对一段网络代码**试跑**：编译 → 建模型 → 真实负载上跑几次前向。
+                    verbosity: str = "trace",
+                    warmup_steps: int = 0,
+                    optimizer_factory=None) -> dict:
+    """对一段网络代码**试跑**：编译 → 建模型 → 真实负载上跑几次前向
+    （可选：再**真反传**几步，抓"训练动态"类错误）。
 
     @param verbosity ``trace``（默认：每档批量的完整轨迹）或 ``summary``
         （只回**逐模块唯一的形状对**）—— Transformer 栈那种"65 个模块 × 3 档批量"
         的网络用它能省掉大半回执（反馈 §2.3）。
+    @param warmup_steps 真**反传**多少步（默认 0 = 只验前向）。
+        ⚠ 为什么需要（缺口 C，实测）：`dry_run` 只验前向 ⇒ **抓不到训练动态类错误**，
+        而那是长训练里最贵的：他这轮三次长训练全部分散/发散（step 120 处 loss 从
+        0.009 → 113；以及 `nll → 0` 的退化解），每次代价是上千 epoch + 一次取消。
+        ⇒ 反传几十步就能回答"**权重尺度是否病态 / loss 是否几十步内爆掉**"。
+        边界不变：**不落盘、不计入实验记录**。
     @returns ``{"ok", "batch_sizes_checked", "runs", "shapes", "n_params",
-                "modules", "error", "error_kind", "error_hint", ...}``
+                "modules", "loss_curve", "grad_norm_curve", "params_changed",
+                "any_nonfinite", "verdict", "error", "error_kind", ...}``
 
     ⚠ 顶层 `shapes` 与 `runs[].shapes` **不再各来一份**：顶层只给**失败那一档**
     （没有失败就给**训练批大小那一档**）—— 同一批数据重复两遍纯属浪费上下文。
@@ -296,4 +306,115 @@ def dry_run_network(*, net, problem, params: dict, torch, device,
     losses = [r["loss"] for r in out["runs"] if r["loss"] is not None]
     if losses:
         out["loss_first_batch"] = losses[0]
+    # ⭐ **可选：真反传几步**（缺口 C）——只验前向抓不到"训练动态"类错误。
+    if int(warmup_steps or 0) > 0:
+        out.update(_warmup(
+            model=model, net=net, prep=prep, params=params, torch=torch,
+            dev=dev, fs=fs, lossf=lossf, kind=kind,
+            payload=payload, steps=int(warmup_steps),
+            optimizer_factory=optimizer_factory))
     return out
+
+
+def _warmup(*, model, net, prep, params: dict, torch, dev, fs, lossf, kind,
+            payload, steps: int, optimizer_factory=None) -> dict:
+    """真反传 `steps` 步，回 loss / 梯度范数曲线与"会不会发散"的判读。
+
+    ## 判读规则（写在这里，因为它是本功能的**结论**，不是附带信息）
+
+    - `any_nonfinite`（loss/梯度出 NaN/Inf）⇒ **这个配置会发散**；
+    - 末步 loss > 首步 loss × 10 ⇒ **涨了一个数量级**，按实测经验就是"会分散/发散"；
+    两者都是"**你的配置**"的问题，不是框架坏了 —— 所以 `verdict` 要直说，
+    且**不要**抛错（试跑失败也是一个答案，同 A27）。
+    """
+    from . import trainer as _trainer
+
+    n = int(params.get("batch", 8) or 8)
+    tr = np.asarray(prep.tr_idx, dtype=np.int64)
+    rows = tr[:max(1, min(n, len(tr)))]
+    ctx = {"torch": torch, "nn": torch.nn, "device": str(dev), "step": 0,
+           "kind": "warmup", "n_rows": int(len(prep.Xs)), "row_idx": rows}
+    if payload:
+        ctx["payload"] = {k: _trainer._as_tensor(np.asarray(v)[rows], torch, dev)
+                          for k, v in payload.items()}
+    xb = torch.tensor(prep.Xs[rows], dtype=torch.float32, device=dev)
+    yb = (torch.tensor(prep.yv[rows],
+                       dtype=torch.long if kind == "classification"
+                       else torch.float32, device=dev)
+          if prep.yv is not None else None)
+    before = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    try:
+        if optimizer_factory is not None:
+            opt = optimizer_factory(model)
+        elif callable(getattr(net, "configure", None)):
+            # 用**网络自己**的优化器（否则试跑验的不是它真正会用的那个）
+            opt = net.configure(model, torch=torch,
+                                lr=float(params.get("lr", 1e-3)),
+                                weight_decay=float(params.get("weight_decay", 0.0)))
+        else:
+            opt = torch.optim.Adam(model.parameters(),
+                                   lr=float(params.get("lr", 1e-3)))
+    except Exception as exc:                                   # noqa: BLE001
+        return {"warmup_steps": 0, "warmup_error": f"建优化器失败：{exc}"}
+
+    curve, gnorm, any_nonfinite = [], [], False
+    model.train()
+    for i in range(int(steps)):
+        try:
+            opt.zero_grad()
+            with _trainer.hook_device(torch, dev):
+                if fs is not None:
+                    o, t = fs(model, (xb, yb), {**ctx, "step": i, "kind": "train"})
+                else:
+                    o, t = model(xb), yb
+                loss = lossf(o, t) if lossf is not None else None
+            if loss is None:
+                return {"warmup_steps": 0,
+                        "warmup_error": "没有损失函数（自定义任务需要 `Network.loss`）"}
+            if not bool(torch.isfinite(loss)):
+                any_nonfinite = True
+                curve.append(float("nan"))
+                break
+            loss.backward()
+            total = 0.0
+            for prm in model.parameters():
+                if prm.grad is not None:
+                    total += float(prm.grad.detach().norm()) ** 2
+            g = float(total ** 0.5)
+            if not np.isfinite(g):
+                any_nonfinite = True
+            gnorm.append(g)
+            curve.append(float(loss.detach()))
+            opt.step()
+        except Exception as exc:                               # noqa: BLE001
+            return {"warmup_steps": i, "loss_curve": curve,
+                    "grad_norm_curve": gnorm,
+                    "warmup_error": f"{type(exc).__name__}: {exc}",
+                    "any_nonfinite": any_nonfinite}
+    changed = any(not torch.equal(before[k], v.detach())
+                  for k, v in model.state_dict().items() if k in before)
+    verdict = ""
+    if any_nonfinite:
+        verdict = "⛔ 出 NaN/Inf ⇒ **这个配置会发散**（不是框架坏了）"
+    elif len(curve) >= 2 and curve[-1] > curve[0] * 10 and curve[0] > 0:
+        verdict = (f"⛔ loss 从 {curve[0]:.4g} 涨到 {curve[-1]:.4g}（一个数量级以上）"
+                   f"⇒ **这个配置会分散/发散**（不是框架坏了）")
+    elif (len(gnorm) >= 2 and gnorm[-1] > gnorm[0] * 10 and gnorm[0] > 0):
+        # ⚠ 这条是**实测补的**：病态配置（例如输出放大 1e6）在 Adam 下 loss 仍会
+        #   "在下降"（Adam 归一化梯度尺度）⇒ 只看 loss 会漏判。梯度范数上涨是
+        #   更早、更硬的发散信号。
+        verdict = (f"⚠ 梯度范数从 {gnorm[0]:.4g} 涨到 {gnorm[-1]:.4g}"
+                   f"（一个数量级以上）⇒ 这个配置很可能发散，别急着开长训练")
+    elif (len(curve) >= 2 and curve[0] > 0 and curve[-1] < curve[0] * 0.1
+          and gnorm and gnorm[-1] < 1e-6):
+        # ⚠ 也是实测补的（他的第三种失败）：`nll → 0.0000`、最大概率恒 1.0
+        #   —— loss 塌到 0 且**梯度消失**，那通常不是"学得好"，而是**退化解**。
+        verdict = (f"⚠ loss 塌到 {curve[-1]:.3g} 且梯度≈0 ⇒ 可能是**退化解**"
+                   f"（模型恒输出同一个分布）；检查目标函数/归一化，别当成功")
+    elif len(curve) >= 2 and curve[-1] < curve[0]:
+        verdict = f"✅ {len(curve)} 步内在下降（{curve[0]:.4g} → {curve[-1]:.4g}）"
+    return {"warmup_steps": len(curve), "loss_curve": curve,
+            "grad_norm_curve": gnorm, "params_changed": bool(changed),
+            "any_nonfinite": bool(any_nonfinite), "verdict": verdict,
+            "warmup_note": "这几十步是**真反传**（用了网络自己的优化器）；"
+                           "仍然不落盘、不计入实验记录"}

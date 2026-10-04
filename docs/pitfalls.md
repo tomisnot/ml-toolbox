@@ -777,3 +777,74 @@
 - **判据**：`test_ai_efficiency.py::test_eval_custom_says_why_the_payload_source_is_what_it_is`
   （**真的把声明从存档里抹掉**再查，而不是构造一个假的返回）。
 
+### A33. 观测面**默认给全量** ⇒ AI 放弃推荐姿势（"预算"不是"token 洁癖"）
+- **症状**（反馈 §2/§3 实测）：`read_job` 的 `progress`/`epochs` 是**必填键**却装全量历史
+  （一次 1200 条 ⇒ 几百 KB）；`describe_training` 的 `latest`（**必填**）里带 30 个
+  `grad_by_layer`。当事人的反应不是抱怨，而是**改行为**：
+  "`read_job` 的 `progress` 数组太长……后面我不再直接轮询它了。"
+  ⇒ **AI 主动放弃官方推荐的长训练姿势**，这是最硬的证据（比任何 token 统计都硬）。
+- **根因**：把"**最新状态**"与"**全量历史**"绑在同一个键上 —— 两个不同的需求共用一个出口。
+  而 `pick` 只能删**整个键**，删不掉必填键**内部**的大块（必填键必须始终在）。
+- **修法**（统一取向：**默认摘要，要全量显式要**）：
+  `read_job` 默认 = `progress_latest` + 最近 `tail`(8) 条 + 真实条数/`truncated`，
+  `detail="full"` 才给全量；`describe_training` 的逐层梯度默认"前 3 + 后 3 + 总数"，
+  `grad_layers="full"` 才给全。
+- ⚠ 键名**保持不变**（仍在 `required` 里）⇒ 既有消费者不断；变的只是**内容默认有界**，
+  而真实条数由 `n_progress`/`n_epochs`/`truncated`/`grad_by_layer_n` **说出来**
+  （"截断了"必须可见，否则就成了新的静默）。
+- **判据**：`test_ai_efficiency.py::test_read_job_defaults_to_a_summary_not_the_whole_history`
+  与 `::test_describe_training_summarizes_grad_by_layer`。
+
+### A34. `dry_run` 只验前向 ⇒ **看不见"训练动态"**（长训练里最贵的那类）
+- **症状**（反馈 §4）：这一轮三次长训练**全部分散/发散**（step 120 处 loss 0.009 → 113；
+  以及 `nll → 0` 的退化解），而 `dry_run` 在形状/vtable 层很准却**一个都抓不到**：
+  权重尺度是否病态、loss 是否几十步内爆掉、目标是否退化 —— 全在它的盲区。
+- **修法**：`warmup_steps=N` **真反传 N 步**（用它自己的优化器），回
+  `loss_curve`/`grad_norm_curve`/`params_changed`/`any_nonfinite` + **verdict**。
+  边界不变（不落盘、不计记录），成本是几十步而不是上千步。
+- **三条判读规则**（第二条是实测补的）：loss 涨一个数量级 / **梯度范数涨一个数量级**
+  （Adam 会归一化梯度尺度 ⇒ 病态配置下 loss 仍"在下降"，只看 loss 会漏判）/
+  **loss 塌到 0 且梯度≈0 = 可能是退化解**（"学得好"的假象）。
+- **判据**：`test_ai_efficiency.py::test_dry_run_warmup_steps_catches_dynamics_errors`。
+
+### A35. 差点去修一个**不存在的 bug**：`progress` 整场为 0 其实是"启动耗时"
+- **我看到的**：用 `read_job(wait_s=0)` 每 1.5s 轮询一个 60 epoch 的 job，**整场
+  `progress` 都是 0**，结束的一瞬间跳到 60 ⇒ 看着像"进度根本没边跑边报"。
+- **差点做的**：去改引擎/框架的进度推送（框架还是只读仓，改了也没用）。
+- **实测真相**：那套东西的耗时**几乎全在启动**（torch 导入 + 建模型 ~9s），而 60 epoch
+  不到 0.2s 就跑完 ⇒ 我的采样点**恰好全落在启动阶段**。换个 30 epoch 的 job 用
+  `wait(120)` 再看，`progress` 30 条一条不少。
+- **教训**：**"观测为空"先问"我是不是采样在了一个没有观测的阶段"**，再问"功能坏了吗"。
+  顺带：判据**不该依赖"正好采样在中途"**（那是时序赌博）⇒ 那条判据改成"等到终态再断言
+  回执的默认口径"（与何时读无关）。
+
+### A36. **一次 CUDA 断言，之后全是回声**：栈指向的位置是假的（代价：一小时）
+- **症状**：使用者报告 —— 通过工具箱提交必在 `custom.py:238` 的 `rec.set_probe(...)`
+  报 `CUDA error: device-side assert triggered`，**每次都一样**。他据此写了一份分析，
+  把怀疑对象定成"**探针路径与多组数组负载的交互**"，并请开发者去看
+  `probe_fn`/`set_probe` 在 `(R,K,L)` 负载下的行为。
+- **实测复核（三步，全部有据）**：
+  1. **那一行不是现场**：`set_probe` 里的 `torch.tensor(..., device=dev)` 是那次运行
+     **第一次与显卡同步**；CUDA 内核错误**异步上报** ⇒ 栈指向"下一次同步"而不是出错点
+     （错误文本自己就写了这句话，但没人会去信它）。
+  2. **第一次断言不是多 N**：按时间列出他们的 run 错误序列，**首次**出现在
+     `custom_network-3384947-211`（22:19:59，dataset = **N6 的相位头消融**）；
+     此后每一次（含所有多 N 的）都是**同一个进程里的回声**。
+  3. **两条候选都复现不出来**：用**那次失败的原代码**（从 `record.json` 的
+     `extras.custom_network_code` 取出）+ **真数据**（`runtime/ml_n6/payload.h5`）+
+     **原参数**，以及多 N 的（`ml_multi_10f/payload.h5`，186×256×10）+ 他们的多 N 网络，
+     都在 `CUDA_LAUNCH_BLOCKING=1` 的**新进程**里**跑通**（指标正常）。
+     ⇒ 触发条件不是负载/探针交互，而是**长命进程的状态**（上下文被毒化）。
+- **教训**：**CUDA 断言是"进程级一次性"的**：一旦发生，本进程内**所有**后续 CUDA 运行
+  都会在"第一次同步"处报同一个错 ⇒ 报错位置与真实原因**无关**。
+  遇到它的正确动作：① **重启进程**；② 要真位置就 `CUDA_LAUNCH_BLOCKING=1` 再跑；
+  ③ **不要在那个栈上改代码**。
+- **修法**：`_summarize_record` 现在区分"**第一次**"与"**回声**"：
+  首次 ⇒ `kind=cuda_device_assert` + 指导（`CUDA_LAUNCH_BLOCKING` / 先跑 CPU /
+  本进程上下文已毒化）；之后每次 ⇒ `kind=cuda_context_poisoned` + "这是 `run-X` 的
+  **回声**、位置是假的、**重启**才恢复、别在这里改代码"。
+  ⚠ 检测要匹配**完整** error：`warning` 只取**最后一行**，而关键字在第一行
+  （判据当场抓到这个失误）。
+- **判据**：`test_ai_efficiency.py::test_cuda_device_assert_is_told_apart_from_its_echo`
+  （走真实入口 `_summarize_record`，并钉"无关错误不受影响"）。
+

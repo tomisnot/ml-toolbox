@@ -229,14 +229,21 @@ COMMANDS: tuple[CommandSpec, ...] = (
             CommandParam("reason", "string", False,
                          "这次操作的**原因/意图**（写进审计，显示在监控面板的飞行记录仪上；"
                          "省略则由系统按动作补一句）", ""),
-            CommandParam("code", "string", True,
+            # ⚠ `code` 与 `code_path` **二选一**（引擎在 `engine.py:1113-1126` 强制：
+            #   同时给报 `bad_code_source`，都不给报 `missing_code`）。
+            #   两者都声明为**非必填**：JSON-schema 的 required 只能表达"必须有"，
+            #   表达不了"二选一"。以前把 `code` 声明成 True（必填）导致
+            #   `code_path`-only 的调用**在参数校验层就被拒**（实测：
+            #   `1 validation error … code Field required`），
+            #   而注释里却写着"也可用 code_path（二选一）"—— 自相矛盾。
+            CommandParam("code", "string", False,
                          "定义 `class Network` 的 Python 代码；只需实现 "
                          "build(n_in, n_out, *, nn)，可选 loss/configure/forward_step。"
-                         "⚠ 也可用 `code_path` 从文件读（二选一）"),
+                         "⚠ 与 `code_path` **二选一**（都声明为非必填，引擎层校验）"),
             CommandParam("code_path", "string", False,
                          "从**文件**读网络代码（受已有数据根授权管辖）。"
                          "调参跑多个组合时不必把同一份代码发 N 遍；"
-                         "回执会带上这个路径，便于与文件版本对齐", ""),
+                         "回执会带上这个路径与 `code_source`，便于与文件版本对齐", ""),
             CommandParam("dry_run", "boolean", False,
                          "**试跑**：编译 + 建模型 + 用**真实负载**跑几次一次前向，"
                          "回逐模块形状轨迹与结构化归因；**不反传、不落盘、不计入"
@@ -250,6 +257,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "试跑回执的形状详细度：trace（默认，逐档完整轨迹）/ "
                          "summary（只回逐模块唯一形状对；几十模块 × 3 档的网络用它能"
                          "省掉大半回执）", "trace"),
+            CommandParam("warmup_steps", "integer", False,
+                         "试跑时**真反传**几步（默认 0 = 只验前向）。前向试跑抓不到"
+                         "「训练动态」类错误（loss 几十步内爆掉/退化）—— 那恰是长训练里"
+                         "最贵的；几十步就能判（回执给 loss/梯度曲线与 verdict）", 0),
             CommandParam("dataset_id", "string", False,
                          "数据集引用；留空用最近准备的一份", ""),
             CommandParam("overrides", "object", False,

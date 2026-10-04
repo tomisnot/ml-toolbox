@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -41,19 +42,26 @@ def _ml(tmp: str, *, roots=None):
     return ml
 
 
-def _payload_ds(ml, rows=16, L=6, K=4, d=5):
-    """一份 NQS 形状的数据：逐行负载 + `target_kind=custom`。"""
+def _payload_ds(ml, rows=16, L=6, K=4, d=5, with_target=False):
+    """一份 NQS 形状的数据：逐行负载 + `target_kind=custom`。
+
+    ``with_target=True`` 再放一份**真目标** `tgt`：凡是要验"损失/梯度真在动"的判据
+    都必须用它 —— 用"自为目标"（`return o, o.detach()`）会让 loss 恒等于 0，
+    于是"反传验证"看起来过了其实什么都没验（实测踩过）。
+    """
     rng = np.random.RandomState(0)
     meta = pd.DataFrame({"m": rng.randn(rows)})
     xr = rng.randn(rows, L, d)
     bits = rng.randint(0, 2, size=(rows, K, L)).astype(np.int8)
     mask = np.ones((rows, K), dtype=bool)
     amps = rng.randn(rows, K) + 1j * rng.randn(rows, K)
+    arrays = {"xr": xr, "bits": bits, "bit_mask": mask, "amps": amps}
+    if with_target:
+        arrays["tgt"] = rng.randn(rows, 2)
     got = ml.tools.execute("prepare_dataset", {
         "source": {"kind": "frame", "frame": meta}, "name": "eff",
         "target_kind": "custom",
-        "payload": {"arrays": {"xr": xr, "bits": bits, "bit_mask": mask,
-                               "amps": amps}},
+        "payload": {"arrays": arrays},
         "pipeline": {"steps": [{"key": "scale"}]}})
     assert got["is_error"] is False, got
     return got["value"]["dataset_id"]
@@ -494,6 +502,258 @@ def test_eval_custom_says_why_the_payload_source_is_what_it_is():
             ml.close()
 
 
+#: 用**真目标**的网络（损失与梯度真在动）——验"反传"类判据必须用它
+TGT_NET = '''
+class Net(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.enc = nn.Linear(d, 8)
+        self.head = nn.Linear(8, 2)
+
+    def forward(self, x):
+        return self.head(torch.tanh(self.enc(x)).mean(1))
+
+
+class Network:
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(int(ctx["payload_shapes"]["xr"][-1]))
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(ctx["payload"]["xr"]), ctx["payload"]["tgt"]
+'''
+
+#: 12 个 Linear ⇒ `grad_by_layer` 超过摘要阈值（证明"默认摘要"真的省了东西）
+MANY_LAYER_NET = '''
+class Net(nn.Module):
+    def __init__(self, d, n=12):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(d if i == 0 else 6, 6)
+                                     for i in range(n)])
+        self.out = nn.Linear(6, 2)
+
+    def forward(self, x):
+        h = x.mean(1)
+        for lay in self.layers:
+            h = torch.relu(lay(h))
+        return self.out(h)
+
+
+class Network:
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(int(ctx["payload_shapes"]["xr"][-1]))
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(ctx["payload"]["xr"]), ctx["payload"]["tgt"]
+'''
+
+
+def test_read_job_defaults_to_a_summary_not_the_whole_history():
+    """⭐ `read_job` **默认只回摘要**（缺口 A）。
+
+    他因为 `progress` 太长**放弃了官方轮询姿势**（原话"后面我不再直接轮询它了"）
+    —— AI 主动放弃推荐姿势，是这条缺口最硬的证据。
+    要钉三件：默认有界、**真实条数看得见**、要全量能要到。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-job-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=16, with_target=True)
+            job = ml.tools.execute("submit_run", {
+                "code": TGT_NET, "dataset_id": ds, "name": "obs", "device": _DEV,
+                "overrides": {"epochs": 150, "batch": 4}})
+            assert job["is_error"] is False, job
+            jid = job["value"]["job_id"]
+            # ⚠ **等它跑完再断言**：不依赖"正好采样在中途" —— 实测这套东西的耗时
+            #   几乎全在启动（torch 导入/建模型 ~9s，而 60 epoch 不到 0.2s 就跑完），
+            #   所以"中途采样"是**时序赌博**。要钉的是**回执的默认口径**，那与何时读无关。
+            st = {}
+            for _ in range(30):
+                st = ml.tools.execute("read_job", {
+                    "job_id": jid, "wait_s": 2})["value"]
+                if st["state"] in ("done", "failed", "cancelled") and st["n_progress"]:
+                    break
+            assert st["n_progress"] > 8, f"进度点不足（{st['n_progress']}）：{st}"
+            # ① 默认有界，且**真实条数/被截断**都说得明明白白
+            assert len(st["progress"]) <= 8, len(st["progress"])
+            assert st["truncated"] is True, st
+            assert st["detail"] == "summary" and st["tail"] == 8, st
+            latest = st["progress_latest"]
+            assert latest.get("stage"), latest
+            assert latest.get("loss") is not None, latest   # 够判断"该不该早停"
+            # ② 要全量能要到
+            full = ml.tools.execute("read_job", {
+                "job_id": jid, "detail": "full"})["value"]
+            assert len(full["progress"]) == full["n_progress"], full
+            assert full["truncated"] is False, full
+            # ③ tail 可自定
+            t3 = ml.tools.execute("read_job", {"job_id": jid, "tail": 3})["value"]
+            assert len(t3["progress"]) == min(3, t3["n_progress"]), t3
+        finally:
+            ml.close()
+
+
+def test_unknown_job_gives_on_disk_clues():
+    """⭐ 会话里没有的 job ⇒ 给**盘上的线索**（缺口 D）。
+
+    文档承诺"跑完自动落盘 ⇒ 丢了 job_id 结果还在"，但重启后 `read_job` 只说"不存在"
+    ⇒ 用户会以为**结果丢了**。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-unk-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=12)
+            rid = ml.tools.execute("run_custom", {
+                "code": GOOD, "dataset_id": ds, "name": "clue",
+                "overrides": {"epochs": 2, "batch": 4}, "device": _DEV}
+            )["value"]["run_id"]
+            got = ml.tools.execute("read_job", {"job_id": "job-nope"})
+            assert got["is_error"] is True, got
+            info = (got.get("error") or {}).get("info") or {}
+            assert info.get("kind") == "unknown_job", info
+            hint = info.get("hint") or ""
+            assert "只活在会话里" in hint and "describe_run" in hint, hint
+            # ⭐ 线索要**真的指到盘上的 run**（不是一句"你去查吧"）
+            assert rid in hint, f"线索里没有刚跑完的那个 run：{hint}"
+            assert "describe_run" in (info.get("suggest") or ""), info
+        finally:
+            ml.close()
+
+
+def test_dry_run_warmup_steps_catches_dynamics_errors():
+    """⭐ `warmup_steps`：**真反传**几十步，抓 `dry_run` 的盲区（缺口 C）。
+
+    他这轮三次长训练全部分散/发散（step 120 处 loss 0.009 → 113；`nll → 0` 的退化解），
+    而只验前向的 `dry_run` **一个都抓不到**。边界不变：不落盘、不计入记录。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-warm-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=16, with_target=True)
+            base = {"dataset_id": ds, "dry_run": True, "device": _DEV}
+            # ① 正常网络：真反传过、参数真的动了、loss 在降
+            ok = ml.tools.execute("run_custom", {
+                **base, "code": TGT_NET, "warmup_steps": 12})["value"]
+            assert ok["warmup_steps"] == 12, ok
+            assert ok["params_changed"] is True, ok
+            assert len(ok["loss_curve"]) == 12 and len(ok["grad_norm_curve"]) == 12, ok
+            assert ok["verdict"].startswith("✅"), ok["verdict"]
+            # ② **会发散**的配置（学习率过大）：判读要**直说**，且**不抛错**
+            boom = ml.tools.execute("run_custom", {
+                **base, "code": TGT_NET, "warmup_steps": 15,
+                "overrides": {"lr": 1e3}})["value"]
+            assert boom["warmup_steps"] >= 1, boom
+            v = boom.get("verdict") or ""
+            assert v.startswith(("⛔", "⚠")), (
+                f"学习率 1e3 会发散，判读却没说：{v!r}（曲线 "
+                f"{[round(x, 4) for x in (boom.get('loss_curve') or [])[:5]]}）")
+            # ③ 不落盘/不入账
+            runs_dir = Path(td) / "runs"
+            before = sorted(p.name for p in runs_dir.iterdir()) if runs_dir.is_dir() else []
+            n_hist = len(ml.engine.session.history())
+            again = ml.tools.execute("run_custom", {
+                **base, "code": TGT_NET, "warmup_steps": 5})["value"]
+            after = sorted(p.name for p in runs_dir.iterdir()) if runs_dir.is_dir() else []
+            assert after == before, "warmup 试跑往 runs/ 里写了东西"
+            assert len(ml.engine.session.history()) == n_hist, "warmup 试跑进了会话历史"
+            assert again["run_id"] == "", again
+        finally:
+            ml.close()
+
+
+def test_describe_training_summarizes_grad_by_layer():
+    """⭐ 逐层梯度**默认摘要**（缺口 B）：`pick` 删不掉**必填键内部**的大块。
+
+    他实测：只想看 4 个指标，而 `latest`（必填）里带着 30 个 `grad_by_layer`
+    ⇒ "只看 4 个数"要付 30 个梯度的钱。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-grad-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=16, with_target=True)
+            rid = ml.tools.execute("run_custom", {
+                "code": MANY_LAYER_NET, "dataset_id": ds, "name": "many",
+                "overrides": {"epochs": 3, "batch": 4}, "device": _DEV}
+            )["value"]["run_id"]
+            latest = ml.tools.execute(
+                "describe_training", {"run_id": rid})["value"]["latest"]
+            n_all = int(latest.get("grad_by_layer_n") or 0)
+            assert n_all >= 10, (
+                f"层数不够多（{n_all}）—— 这条判据要证明摘要，需要 >8 层")
+            assert len(latest["grad_by_layer"]) <= 6, latest["grad_by_layer"]
+            assert "grad_layers" in (latest.get("grad_by_layer_note") or ""), latest
+            # 要全量能要到
+            full = ml.tools.execute("describe_training", {
+                "run_id": rid, "grad_layers": "full"})["value"]
+            assert len(full["latest"]["grad_by_layer"]) == n_all, full["latest"]
+        finally:
+            ml.close()
+
+
+def test_cuda_device_assert_is_told_apart_from_its_echo():
+    """⭐ **CUDA 断言之后每一次报错都是回声** —— 必须说清，否则会去修一个不存在的问题。
+
+    实测代价一小时（`nqs_docs/多N合并-进展与阻塞.md`）：使用者把 `custom.py:238` 的
+    `rec.set_probe(...)` 当成现场，写了一份"探针路径与多组数组负载的交互"分析；
+    实测复核那一行只是**第一次与显卡同步**的位置（`torch.tensor(..., device=dev)`），
+    真正的断言在它之前，而上下文被毒化后**每次**都在这里报同一个错。
+
+    本判据走**真实入口**（`_summarize_record`），不只测那个纯函数。
+    """
+    from types import SimpleNamespace
+
+    from ml_mecha.engine import _CUDA_POISON, _summarize_record
+
+    def _fake_record(run_id, err):
+        res = SimpleNamespace(ok=False, error=err, metrics={}, primary_metric="",
+                              error_kind="", error_hint="", error_suggest="",
+                              elapsed=0.0)
+        return SimpleNamespace(run_id=run_id, method="custom_network",
+                               dataset_id="ds-1", pipeline_id="p-1", result=res)
+
+    _CUDA_POISON.clear()
+    assert_text = ("RuntimeError: CUDA error: device-side assert triggered\n"
+                   "CUDA kernel errors might be asynchronously reported …")
+    first = _summarize_record(_fake_record("run-A", assert_text), "ds-1",
+                              SimpleNamespace())
+    assert first.error_kind == "cuda_device_assert", first.error_kind
+    assert "CUDA_LAUNCH_BLOCKING" in first.error_hint, first.error_hint
+    assert "异步" in first.error_hint, first.error_hint
+
+    echo = _summarize_record(_fake_record("run-B", assert_text), "ds-1",
+                             SimpleNamespace())
+    assert echo.error_kind == "cuda_context_poisoned", echo.error_kind
+    assert "回声" in echo.error_hint and "run-A" in echo.error_hint, echo.error_hint
+    assert "重启" in echo.error_hint, echo.error_hint
+    assert "别在这里改代码" in echo.error_hint, echo.error_hint
+
+    # ⚠ **无关失败不受影响**（别把普通错误也说成 CUDA 回声）
+    plain = _summarize_record(_fake_record("run-C", "ValueError: 参数写错了"),
+                              "ds-1", SimpleNamespace())
+    assert plain.error_kind == "" and plain.error_hint == "", (
+        plain.error_kind, plain.error_hint)
+    _CUDA_POISON.clear()
+
+
 _TESTS = [
     test_dry_run_catches_a_shape_error_in_one_round_trip,
     test_dry_run_passes_on_a_correct_net_and_reports_the_trace,
@@ -506,6 +766,13 @@ _TESTS = [
     test_code_path_is_exclusive_and_says_which_source_was_used,
     test_dry_run_shapes_verbosity_is_smaller,
     test_eval_custom_says_why_the_payload_source_is_what_it_is,
+    # ---- 第三轮反馈（docs/反馈-观测面默认全量与AI调用预算.md）----
+    test_read_job_defaults_to_a_summary_not_the_whole_history,
+    test_unknown_job_gives_on_disk_clues,
+    test_dry_run_warmup_steps_catches_dynamics_errors,
+    test_describe_training_summarizes_grad_by_layer,
+    # ---- CUDA 断言与它的回声（多N合并-进展与阻塞.md 的实测代价）----
+    test_cuda_device_assert_is_told_apart_from_its_echo,
 ]
 
 

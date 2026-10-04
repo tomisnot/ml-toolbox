@@ -49,7 +49,7 @@ whenToUse: >-
 | `describe_method` | 某个方法的可调参数与取值范围 | 参数表 |
 | `describe_dataset` | 已准备数据的规模/指纹/预处理链逐步参数/实际划分口径；**带负载时报每个负载的形状与 dtype** | 摘要，不内联数据 |
 | `describe_run` | 按 `run_id` 回看一次运行 | 指标 + 产物类别名（数值不内联） |
-| `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + 逐层梯度 + **网络自己上报的自定义 tag** | 默认只给**最新一轮**；`include_series` 才给序列；可用 `pick` 只取几条 |
+| `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + **逐层梯度**（默认只给**前 3 + 后 3** 与总数）+ **网络自己上报的自定义 tag** | 默认只给**最新一轮**；`include_series` 才给序列；逐层要全量写 `grad_layers="full"`；可用 `pick` 只取几条 |
 | `describe_networks` | 列出自定义网络（名字/指标/源码行数/用过几次） | 清单，不含源码 |
 | `describe_network` | 按名字取回网络**源码**（改一版再跑，免重贴） | 源码 + 来源 run |
 | `checkpoint_detail` | 某次运行**存下来的模型**在不在、多少张量/参数、含不含偏置、在哪块设备上训的 | **权重不内联**；真要用模型走 `eval_custom` |
@@ -60,7 +60,7 @@ whenToUse: >-
 | `compare_methods` | 多方法对比 | 对比表 + 最优（**要比多个就用它**，别逐个拉） |
 | `run_custom` | 跑一段**自定义网络代码**（AI 写结构，系统管训练与观测）；可给 `device`；**`dry_run=true` 先试跑**（回形状轨迹，不落盘）；也可 `code_path` 从文件读 | `run_id` + 指标（自定义任务时是网络上报的） |
 | `submit_run` | 把一次运行提交为**后台任务**（给 `method` 或 `code`）——**长训练就走这条** | `job_id`（立刻返回） |
-| `read_job` | 查后台任务进度/结果 | 状态 + **逐代 loss/val_loss** + **中途就能拿到的 `run_id`** |
+| `read_job` | 查后台任务进度/结果。⚠ **默认只回摘要**：`progress_latest`（含 loss/val_loss）+ 最近 `tail`（默认 8）条 + 真实条数 `n_progress`/`n_epochs`/`truncated` | 要全量历史写 `detail="full"`；要更多条写 `tail=N` |
 | `cancel_run` | 请求取消后台任务 | 明确回"已请求"（在 epoch 边界生效，不谎报"已取消"） |
 | `run_queries` | **一次往返跑一串只读查询**（列方法→看参数→查数据集→看训练） | 每步自带结果与短摘要 |
 | `clear_current_state` | 把配置台面清零（数据集引用/方法/覆写/种子/设备） | 逐键"清空前值 + 清空后读回值" |
@@ -85,6 +85,20 @@ whenToUse: >-
   **它进去了没出来** ⇒ 失败就在它里面）；
 - `error_kind` / `error_hint`：结构化归因，**指认那个"进去了没出来"的模块**；
 - `n_params` / `loss_first_batch` / `batch_sizes_checked`。
+
+⭐ **再加 `warmup_steps=N`：真反传 N 步**（默认 0 = 只验前向）。前向试跑**抓不到
+"训练动态"类错误** —— 而那是长训练里最贵的（实测：loss 在 step 120 处从 0.009 涨到
+113；或 `nll → 0` 的退化解，每次代价是上千 epoch + 一次取消）。回执照给
+`loss_curve` / `grad_norm_curve` / `params_changed` / `any_nonfinite` 与 **`verdict`**：
+
+| verdict | 含义 |
+|---|---|
+| `⛔ …会发散` | loss 涨一个数量级，或出 NaN/Inf |
+| `⚠ 梯度范数涨一个数量级` | Adam 会掩盖 loss 上涨 ⇒ 梯度是更早的信号 |
+| `⚠ loss 塌到 ~0 且梯度≈0` | 可能是**退化解**（模型恒输出同一分布），别当成功 |
+| `✅ N 步内在下降` | 这一步可以放心开长训练 |
+
+⚠ 边界不变：**不反传之外的写入一概没有**（不落盘、不计入实验记录）。
 
 ⚠ 三条边界：**不反传、不落盘、不计入实验记录**（不会污染 `runs/` 与对比）。
 ⚠ 试跑 `ok=false` **不是命令失败**，而是"你的代码跑不起来"这个**问题的答案**——
@@ -150,13 +164,17 @@ LLM 的一次工具调用本质是 HTTP 请求，**客户端必须有超时**（
 ⇒ "同步等训练跑完"对长训练**天生不成立**。正确姿势：
 
 ```
-submit_run(method=… 或 code=…)  → job_id      # 发完就走，不等
-read_job(job_id)                → state + 逐代 loss/val_loss + run_id
+submit_run(method=… 或 code=… 或 code_path=…)  → job_id   # 发完就走，不等
+read_job(job_id)                → state + progress_latest(含 loss/val_loss) + run_id
+                                  （**默认只回摘要** ⇒ 轮询不再拿几百 KB）
+read_job(job_id, detail="full") → 才给全量逐代历史
 describe_training(run_id)       → 想查哪一代/哪个指标都行
 cancel_run(job_id)              → 在 epoch 边界停下（协作式）
 ```
 
-- 后台任务**终态自动落盘** ⇒ 就算后来丢了 `job_id`，结果还在 `runs/<run_id>/`。
+- 后台任务**终态自动落盘** ⇒ 就算后来丢了 `job_id`，结果还在 `runs/<run_id>/`；
+  **重启后 `job_id` 会失效**（作业表只活在会话里）⇒ 那时 `read_job` 会回一句
+  "盘上最近的 run 是 …"，用 `describe_run(run_id=…)` 接着查。
 - **并发上限是 4**（超额会回 `too_many_jobs`，不排队）：要跑更多先等前一批结束。
 - 提交前会**同步预检写权**：LOCKED 下当场拒（不会"提交成功再发现失败"）。
 

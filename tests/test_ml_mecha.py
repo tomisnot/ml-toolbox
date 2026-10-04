@@ -2236,7 +2236,12 @@ def test_core_command_specs_declare_explicit_required(app):
     """
     from ml_mecha.commands import COMMANDS
     #: 语义上无参数、故 required 恒为空的命令（**显式豁免，理由见 docstring**）
-    NO_PARAM_COMMANDS = {"clear_current_state"}
+    #:
+    #: ⚠ `run_custom` 在 2026-10-04 之后也在这里：它的真实约束是"**`code` 与 `code_path`
+    #: 二选一**"（至少给一个），而**平面 schema 表达不了"至少一个"** ⇒ 两个都声明成
+    #: 可选。少给会被入口用**可教学**的 `missing_code` 拒；两个同时给会被
+    #: `bad_code_source` 拒（见 pitfalls A31：同时给时静默取一个会骗人）。
+    NO_PARAM_COMMANDS = {"clear_current_state", "run_custom"}
     commands = app.software.commands
     checked = []
     for host in COMMANDS:

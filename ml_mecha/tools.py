@@ -340,6 +340,10 @@ def _eval_custom(engine: MLEngine, wrap,
     )
 
 
+#: `read_job` 摘要档默认回多少条历史（缺口 A：默认别给全量）。
+#: 为什么是 8：够看"最近几步在涨还是在掉"，又不至于让一次轮询变成几百 KB。
+READ_JOB_TAIL = 8
+
 #: 一段编排最多多少步。**项目要自己想上限**（指导意见 §3：框架给机制，
 #: "上限"是项目策略）：不封顶的话一段动作可以把整个能力面扫一遍，
 #: 上下文与 CPU 都会被打满，而模型自己毫无察觉。
@@ -694,10 +698,11 @@ def _describe_training(engine: MLEngine,
     """
 
     def execute(*, run_id: str = "", include_series: bool = False,
-                limit: int = 200, pick: Any = None) -> Mapping[str, Any]:
+                limit: int = 200, pick: Any = None,
+                grad_layers: str = "summary") -> Mapping[str, Any]:
         detail = engine.query("training_detail", run_id=run_id,
                               include_series=bool(include_series),
-                              limit=int(limit))
+                              limit=int(limit), grad_layers=str(grad_layers))
         out = {"ok": True, **detail, "error": ""}
         # ⚠ `pick` 的**边界**（实测踩过，别想当然）：回执里声明的**必填键**
         #   （`output_schema.required`）必须始终在 ⇒ 工具面会校验、缺了直接
@@ -736,6 +741,10 @@ def _describe_training(engine: MLEngine,
             "limit": {"type": "integer",
                       "description": "每个 tag 最多回多少点（只对 include_series 生效）",
                       "default": 200},
+            "grad_layers": {"type": "string",
+                            "description": "逐层梯度的详细度：summary（默认，前 3 + 后 3 + "
+                                           "总数；几十层的网络能省一大截）/ full（全部）",
+                            "default": "summary"},
             "pick": PICK_PARAM,
         },
         output_schema={"type": "object",
@@ -819,7 +828,7 @@ def _run_custom(engine: MLEngine, wrap,
                 resource_guard: Mapping[str, Any] | None = None,
                 device: str = "", dry_run: bool = False,
                 batch_probes: Any = None, code_path: str = "",
-                shapes_verbosity: str = ""
+                shapes_verbosity: str = "", warmup_steps: int = 0
                 ) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "run_custom", "code": str(code),
                                 "diag": bool(diag), "persist": bool(persist)}
@@ -843,6 +852,8 @@ def _run_custom(engine: MLEngine, wrap,
             spec["code_path"] = str(code_path)
         if shapes_verbosity:
             spec["shapes_verbosity"] = str(shapes_verbosity)
+        if warmup_steps:
+            spec["warmup_steps"] = int(warmup_steps)
         receipt = engine.run(spec, context=_local_context())
         # ⭐ 试跑的回执与真跑**不同形**：多给形状轨迹、少给 run_id（它没有 run）
         #
@@ -865,6 +876,12 @@ def _run_custom(engine: MLEngine, wrap,
                     "code_source": receipt.get("code_source", ""),
                     "code_lines": int(receipt.get("code_lines") or 0),
                     "shapes_verbosity": receipt.get("shapes_verbosity", "trace"),
+                    "warmup_steps": int(receipt.get("warmup_steps") or 0),
+                    "loss_curve": list(receipt.get("loss_curve") or []),
+                    "grad_norm_curve": list(receipt.get("grad_norm_curve") or []),
+                    "params_changed": receipt.get("params_changed"),
+                    "any_nonfinite": receipt.get("any_nonfinite"),
+                    "verdict": receipt.get("verdict", ""),
                     "elapsed_s": receipt.get("elapsed_s", 0.0),
                     "warnings": list(receipt.get("warnings", [])),
                     "error": receipt.get("error", ""),
@@ -914,6 +931,12 @@ def _run_custom(engine: MLEngine, wrap,
                                                 "完整轨迹）/ summary（只回逐模块唯一形状对"
                                                 "—— 几十模块 × 3 档的网络能省掉大半回执）",
                                  "default": "trace"},
+            "warmup_steps": {"type": "integer",
+                             "description": "试跑时**真反传**几步（默认 0 = 只验前向）。"
+                                            "前向试跑抓不到「训练动态」类错误（loss 在"
+                                            "几十步内爆掉/退化成均匀分布）；几十步就能判"
+                                            "（回执给 loss/梯度曲线与 verdict）",
+                             "default": 0},
             "dataset_id": {"type": "string",
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},
@@ -1241,7 +1264,8 @@ def _submit_run(host: Any, side: str,
                 seed: int | None = None,
                 device: str = "",
                 persist: bool = False, diag: bool = False,
-                code: str = "", name: str = "") -> Mapping[str, Any]:
+                code: str = "", code_path: str = "",
+                name: str = "") -> Mapping[str, Any]:
         ml = _require_job_host(host)
         # ⭐ **长训练的正确形态**（用户裁决）：只发一个"开始"信号就走，
         #   之后靠 read_job 主动轮询。这是唯一可行的模式——LLM 的一次工具调用
@@ -1252,19 +1276,33 @@ def _submit_run(host: Any, side: str,
         # ⚠ 这条以前**不存在**：`submit_run` 把命令**写死**成 run_method ⇒
         #   自定义网络只能同步跑，也就等于长训练跑不了（10 分钟超时后 AI
         #   连 run_id 都拿不到）。宿主层本来就支持任意命令，缺的只是这里透传。
-        if not code and not method:
+        if not (code or code_path) and not method:
             raise MechaError(
-                "submit_run 需要 method（内置方法名）或 code（自定义网络代码）",
+                "submit_run 需要 method（内置方法名）或 code / code_path（自定义网络代码）",
                 kind="missing_arguments",
-                hint="二选一：内置方法给 method=；AI 写的网络给 code=（可配 name=）",
+                hint="三选一：内置方法给 method=；AI 写的网络给 code= 或 code_path=；"
+                     "⚠ code 与 code_path 只能给一个",
                 suggest='submit_run(method="torch_mlp", ...) 或 '
+                        'submit_run(code_path="net.py", name="resnet_v1") 或 '
                         'submit_run(code="class Network: ...", name="resnet_v1")',
             )
-        command = "run_custom" if code else "run_method"
+        if code and code_path:
+            raise MechaError(
+                "`code` 与 `code_path` **只能给一个**（同时给时无法判断你想跑哪一份）",
+                kind="bad_code_source",
+                hint="要跑文件里那份：只给 `code_path`；要跑内联那段：只给 `code`。",
+                suggest='submit_run(code_path="net.py", dataset_id=…)',
+            )
+        command = "run_custom" if (code or code_path) else "run_method"
         spec: dict[str, Any] = {"command": command,
                                 "persist": bool(persist), "diag": bool(diag)}
-        if code:
-            spec["code"] = str(code)
+        if code or code_path:
+            # ⚠ 两者**分开透传**，让引擎侧做"从文件读"与"同时给要报错"的判定
+            #   （与 run_custom 同一条路：engine.py 读 code_path 并回 code_source）。
+            if code:
+                spec["code"] = str(code)
+            if code_path:
+                spec["code_path"] = str(code_path)
             if name:
                 spec["name"] = str(name)
         else:
@@ -1288,15 +1326,21 @@ def _submit_run(host: Any, side: str,
         name="submit_run",
         description="把一个运行**提交为后台任务**并立刻返回任务编号（长训练就该用这条："
                     "发一个开始信号就走，之后用 read_job 查进度）。"
-                    "给 `method` 跑内置方法；给 `code` 跑自定义网络（AI 写的结构）。"
+                    "给 `method` 跑内置方法；给 `code` 或 `code_path` 跑自定义网络（AI 写的结构）。"
+                    "⚠ `code` 与 `code_path` **二选一**（长训练最该复用代码，所以这里也接 "
+                    "`code_path`）。"
                     "⚠ 后台跑完会**自动落盘**（runs/<run_id>/record.json）——"
                     "所以就算你后来丢了 job_id，结果也还在。",
         parameters={
             "method": {"type": "string",
-                       "description": "内置方法名（与 code 二选一）", "default": ""},
+                       "description": "内置方法名（与 code / code_path 三选一）", "default": ""},
             "code": {"type": "string",
-                     "description": "自定义网络代码（定义 `class Network`；与 method 二选一）",
-                     "default": ""},
+                     "description": "自定义网络代码（定义 `class Network`）；"
+                                    "⚠ 与 `code_path` 二选一", "default": ""},
+            "code_path": {"type": "string",
+                          "description": "从**文件**读网络代码（受已有数据根授权管辖）；"
+                                         "长训练调参不必重发同一份代码。"
+                                         "⚠ 与 `code` 二选一", "default": ""},
             "name": {"type": "string",
                      "description": "自定义网络的名字（存进存档便于复用）", "default": ""},
             "dataset_id": {"type": "string",
@@ -1322,9 +1366,25 @@ def _submit_run(host: Any, side: str,
     )
 
 
+def _recent_run_ids(n: int = 5) -> list:
+    """盘上最近 n 个 run（按目录 mtime 倒序）——"会话没了但结果还在"时的线索。"""
+    try:
+        from pathlib import Path as _P
+        from ml_toolbox.core.persistence import RUNS_DIR
+        root = _P(str(RUNS_DIR))
+        if not root.is_dir():
+            return []
+        dirs = [d for d in root.iterdir() if d.is_dir()]
+        dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        return [d.name for d in dirs[:max(1, int(n))]]
+    except Exception:                                          # noqa: BLE001
+        return []
+
+
 def _read_job(host: Any,
               banned_words: tuple[str, ...] = ()) -> ToolDefinition:
-    def execute(*, job_id: str, wait_s: float = 0.0) -> Mapping[str, Any]:
+    def execute(*, job_id: str, wait_s: float = 0.0,
+                detail: str = "summary", tail: int = 0) -> Mapping[str, Any]:
         ml = _require_job_host(host)
         try:
             timeout = max(0.0, min(float(wait_s or 0.0), READ_JOB_MAX_WAIT_S))
@@ -1334,7 +1394,24 @@ def _read_job(host: Any,
                 kind="bad_wait_s",
                 hint=f"wait_s 是可选阻塞秒数，上限 {READ_JOB_MAX_WAIT_S:g}",
             ) from None
-        status = ml.jobs.wait(job_id, timeout)
+        # ⭐ **未知 job 要给"盘上的线索"**（缺口 D）：重启会清空会话态，而文档承诺
+        #   "后台跑完会自动落盘" ⇒ 那时用户只看到"不存在"会以为**结果丢了**，
+        #   实际它在 `runs/` 里。⇒ 回一句"本会话没有它" + 最近的 run 列表 + 怎么查。
+        try:
+            status = ml.jobs.wait(job_id, timeout)
+        except Exception as exc:                               # noqa: BLE001
+            if "不存在" not in str(exc) and "not exist" not in str(exc).lower() \
+                    and "unknown" not in str(exc).lower():
+                raise
+            recent = _recent_run_ids(5)
+            raise MechaError(
+                f"本会话里没有这个 job：{job_id}",
+                kind="unknown_job",
+                hint="作业表**只活在会话里**（重启即清空），但跑完的运行是**落盘的**"
+                     f"⇒ 用 `describe_run(run_id=…)` 查。盘上最近的 run：{recent or '（无）'}",
+                suggest=(f"describe_run(run_id={recent[0]!r})" if recent
+                         else "先 `describe_networks` 看按名字存下来的网络"),
+            ) from exc
         raw = status.get("progress") or []
         progress = [{"frac": float(p[0]), "stage": str(p[1])}
                     for p in raw if isinstance(p, (list, tuple)) and len(p) == 2]
@@ -1355,13 +1432,30 @@ def _read_job(host: Any,
             extra = {}
         latest = dict(progress[-1]) if progress else {}
         latest.update(extra.get("latest") or {})
+        # ⭐⭐ **默认只回"摘要"**（缺口 A，实测：AI 因为 `progress` 太长**放弃了官方
+        #   轮询姿势**——他原话"后面我不再直接轮询它了"）。"最新状态"与"全量历史"
+        #   是两个需求，之前被绑在同一个必填键里。
+        #   - 默认：`progress_latest`（已有摘要）+ **最近 `tail` 条** + 真实条数；
+        #   - `detail="full"`：才给全量。`tail` 可自定。
+        #   ⚠ 键名保持不变（`progress`/`epochs` 还在 required 里）⇒ 既有消费者不会断，
+        #     变的是**内容默认有界**，而 `n_progress`/`n_epochs`/`truncated` 把真相说出来。
+        full = str(detail or "summary").lower() in ("full", "all")
+        tail_n = max(1, int(tail or READ_JOB_TAIL))
+        all_epochs = list(extra.get("epochs") or [])
+        out_progress = progress if full else progress[-tail_n:]
+        out_epochs = all_epochs if full else all_epochs[-tail_n:]
         return {"ok": True, "job_id": str(status.get("id") or job_id),
                 "state": str(status.get("state") or ""),
                 "cancel_supported": bool(status.get("cancel_supported", False)),
-                "progress": progress,
+                "progress": out_progress,
                 "progress_latest": latest,
                 "run_id": str(extra.get("run_id") or ""),
-                "epochs": list(extra.get("epochs") or []),
+                "epochs": out_epochs,
+                "n_progress": len(progress), "n_epochs": len(all_epochs),
+                "truncated": bool(not full and (len(progress) > tail_n
+                                                or len(all_epochs) > tail_n)),
+                "detail": "full" if full else "summary",
+                "tail": tail_n,
                 "result_ref": dict(status.get("result_ref") or {}),
                 "error": str(status.get("error") or ""),
                 "ref_error": str(status.get("ref_error") or "")}
@@ -1369,20 +1463,31 @@ def _read_job(host: Any,
     return define_tool(
         name="read_job",
         description="按任务编号查一次后台任务的进度与结果：状态、**逐代数值**"
-                    "（`epochs`/`progress_latest` 带 loss/val_loss，够判断该不该早停）、"
+                    "（`progress_latest` 带 loss/val_loss，够判断该不该早停）、"
                     "**训练中途就能拿到的 `run_id`**（拿去 describe_training 查曲线）、"
-                    "结果引用、失败原因；不阻塞（除非给 wait_s）。",
+                    "结果引用、失败原因；不阻塞（除非给 wait_s）。"
+                    "⚠ **默认只回摘要**（`progress_latest` + 最近 `tail` 条 + 真实条数"
+                    "`n_progress`/`n_epochs`）：`progress`/`epochs` 的全量历史在长训练里"
+                    "是几百 KB。要全量显式给 `detail=\"full\"`，要更多条给 `tail=N`。",
         parameters={
             "job_id": {"type": "string", "description": "submit_run 返回的任务编号"},
             "wait_s": {"type": "number",
                        "description": f"可选：最多阻塞多少秒等它推进（上限 "
                                       f"{READ_JOB_MAX_WAIT_S:g}）；默认 0 立即返回",
                        "default": 0},
+            "detail": {"type": "string",
+                       "description": "summary（默认：最新状态 + 最近 tail 条）/ full（全量）",
+                       "default": "summary"},
+            "tail": {"type": "integer",
+                     "description": f"摘要档回多少条历史（默认 {READ_JOB_TAIL}）",
+                     "default": 0},
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "state", "cancel_supported",
                                     "progress", "progress_latest", "run_id",
-                                    "epochs", "result_ref", "error", "ref_error"]},
+                                    "epochs", "n_progress", "n_epochs", "truncated",
+                                    "detail", "tail", "result_ref", "error",
+                                    "ref_error"]},
         execute=execute,
         banned_words=banned_words,
     )

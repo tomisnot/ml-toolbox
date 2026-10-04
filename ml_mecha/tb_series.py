@@ -195,8 +195,16 @@ def read_run(run_id: str, *, root: Path | None = None,
 _LATEST_ORDER = ("loss", "val_loss", "grad_norm", "lr", "dead_relu")
 
 
-def latest_of(payload: dict) -> dict:
-    """从 :func:`read_run` 的结果抽"最新一轮"，按 ``_LATEST_ORDER`` 排；其余归 ``other``。"""
+def latest_of(payload: dict, *, grad_layers: str = "summary") -> dict:
+    """从 :func:`read_run` 的结果抽"最新一轮"，按 ``_LATEST_ORDER`` 排；其余归 ``other``。
+
+    @param grad_layers ``summary``（默认）或 ``full``。
+        ⚠ **默认摘要**（缺口 B，实测）：他想"只看 4 个指标"，而 `latest`（**必填键**）
+        里带着 30 个 `grad_by_layer` —— `pick` 删得掉别的键，却**删不掉必填键内部的大块**
+        ⇒ "只看 4 个数"要付 30 个梯度的钱。
+        ⇒ 默认给"前 3 + 后 3 + 总数"，要全量写 `grad_layers="full"`。
+        （不改成"默认不给"：逐层梯度是排查"某层学不动"的主要证据，全砍掉会逼人再拉一次。）
+    """
     if not payload.get("available"):
         return {"available": False, "reason": payload.get("reason", "")}
     scal = payload.get("scalars") or {}
@@ -215,7 +223,15 @@ def latest_of(payload: dict) -> dict:
                  for t, v in scal.items()
                  if t.startswith("grad/") and v.get("latest")}
     if per_layer:
-        out["grad_by_layer"] = per_layer
+        if str(grad_layers).lower() in ("full", "all") or len(per_layer) <= 8:
+            out["grad_by_layer"] = per_layer
+        else:
+            items = list(per_layer.items())
+            out["grad_by_layer"] = dict(items[:3] + items[-3:])
+            out["grad_by_layer_n"] = len(per_layer)
+            out["grad_by_layer_note"] = (
+                f"共 {len(per_layer)} 层，这里只给**前 3 + 后 3**（省上下文）；"
+                '要全量：describe_training(…, grad_layers="full")')
     other = {t: v["latest"]["value"] for t, v in scal.items()
              if t not in _LATEST_ORDER and not t.startswith("grad/")
              and v.get("latest")}

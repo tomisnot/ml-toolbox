@@ -3,8 +3,12 @@
 
 每条断言都指向"机制真的接上了"，不是形状猜测：
 
-1. ``required`` 来自 ``execute`` 签名（无默认值=必填），且**声明**里的
-   type/description 覆写回了协议层（消"pydantic 派生把声明成果冲掉"）；
+1. ``required`` 的来源是**两条路**：写工具取**命令声明**
+   （``CommandSpec.parameters["required"]``，经 ``mcp_host`` 的必填来源），
+   只读与 job 调度面取 ``execute`` 闭包签名（无默认值=必填）；
+   且**声明**里的 type/description 覆写回了协议层（消"pydantic 派生把声明成果冲掉"）。
+   ⚠ 两条路**可能不一致**（`run_custom` 曾经：闭包签名 `code=""` 是非必填、
+   命令声明却是 `required=True`）—— 本判据正是钉它们一致的地方；
 2. 起服务后 ``list_tools`` 含**全部** 7 个 ML 工具，名字与 ``schemas()`` 逐字相同；
 3. 只读工具经 HTTP 调用返回真值（``method_count > 0``）；
 4. **LOCKED 下写工具 fail closed**：``is_error=True`` +
@@ -103,7 +107,14 @@ EXPECTED_REQUIRED = {
     "describe_training": [],
     "prepare_dataset": ["source"],
     "read_job": ["job_id"],
-    "run_custom": ["code"],
+    # ⚠ `code` **不是**必填（2026-10-04 修）：`code` 与 `code_path` 二选一，
+    #   而 JSON-schema 的 required 表达不了"二选一"⇒ 两者都声明为非必填，
+    #   由引擎在 `engine.py:1113-1126` 校验（都不给报 `missing_code`、
+    #   同时给报 `bad_code_source`）。
+    #   旧行为把 `code` 声明成必填，导致 `code_path`-only 的调用
+    #   **在参数校验层就被拒**（实测 `1 validation error … code Field required`），
+    #   而声明里的注释却写着"也可用 code_path（二选一）"——自相矛盾。
+    "run_custom": [],
     # ⚠ `method` **不是**必填：`submit_run` 允许 `method` / `code` 二选一
     #   （给了 code 就走自定义网络）。必填项由工具自己判并给可读错误。
     "run_method": ["method"],
@@ -507,13 +518,13 @@ EXPECTED_DEFAULTED = {
     "describe_method": [],
     "describe_methods": ["dataset_id", "family"],
     "describe_run": ["run_id"],
-    "describe_training": ["include_series", "limit", "run_id"],
+    "describe_training": ["grad_layers", "include_series", "limit", "run_id"],
     "describe_network": ["limit"],
     "describe_networks": ["limit"],
     # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
     #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
     "prepare_dataset": ["diag", "name", "target", "target_kind", "time_col"],
-    "read_job": ["wait_s"],
+    "read_job": ["detail", "tail", "wait_s"],
     # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
     #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
     # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）；
@@ -521,12 +532,12 @@ EXPECTED_DEFAULTED = {
     # ⚠ `code` 现在**也有**默认（`""`）：为的是 `code_path` 能单独用（二选一）。
     # `shapes_verbosity`（"trace"）同样进表。
     "run_custom": ["code", "code_path", "dataset_id", "device", "diag", "dry_run",
-                   "name", "persist", "shapes_verbosity"],
+                   "name", "persist", "shapes_verbosity", "warmup_steps"],
     "run_method": ["dataset_id", "device", "diag", "persist"],
     "run_method_batch": ["dataset_id"],
     # `method`/`code`/`name` 都声明了 `""` 默认 ⇒ 进这张表（"未给"= 空串）。
-    "submit_run": ["code", "dataset_id", "device", "diag", "method", "name",
-                   "persist"],
+    "submit_run": ["code", "code_path", "dataset_id", "device", "diag",
+                   "method", "name", "persist"],
     # ---- 2026-10-03 新增（AI 调用体验）----
     # `clear_current_state` 无参数（语义就是"全部清零"，不给"清一部分"的语义面）。
     "clear_current_state": [],
@@ -556,6 +567,7 @@ _DEFAULTED_PROBES = (
     ("describe_training", {}, "run_id", "run-null-shim"),
     ("describe_training", {}, "include_series", True),
     ("describe_training", {}, "limit", 50),
+    ("describe_training", {}, "grad_layers", "full"),
     ("describe_networks", {}, "limit", 10),
     ("describe_network", {"name": "n"}, "limit", 10),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "name", "my-ds"),
@@ -585,9 +597,12 @@ _DEFAULTED_PROBES = (
     ("run_custom", {"code": _MIN_NET_CODE}, "dry_run", True),
     ("run_custom", {"code": _MIN_NET_CODE}, "code_path", "net.py"),
     ("run_custom", {"code": _MIN_NET_CODE}, "shapes_verbosity", "summary"),
+    ("run_custom", {"code": _MIN_NET_CODE}, "warmup_steps", 5),
     ("run_method_batch", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("compare_methods", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
+    ("read_job", {"job_id": "job-null-shim"}, "detail", "full"),
+    ("read_job", {"job_id": "job-null-shim"}, "tail", 3),
     ("submit_run", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
     ("submit_run", {"method": "logistic"}, "device", "cpu"),
     ("submit_run", {"method": "logistic"}, "persist", True),
@@ -711,7 +726,7 @@ _MIN_ARGS = {
 #: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
 #: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
-_EXPECTED_OPTIONAL_PARAMS = 61
+_EXPECTED_OPTIONAL_PARAMS = 67
 
 
 def test_null_shim_rule_partitions_every_optional_param():
