@@ -312,6 +312,38 @@ def newest_unfinished(runs: str, prefix: str = "", *, fresh_s: float = 0.0,
 
 
 # --------------------------------------------------------------------- 看门狗主循环
+def _owned_unfinished_run(client: Any, runs: str,
+                          prefix: str = "") -> tuple[str, str] | None:
+    """按**作业归属**找一个还没落盘的 run：回 ``(run_id, job_id)``，找不到回 ``None``。
+
+    数据源是权威的 `jobs` 只读查询（`job_id → result_ref.run_ids`）——
+    这是"反查表"而不是启发式：**能查到说明那次运行确实由某个 job 产出**。
+    ⚠ 运行中途 `run_ids` 还是空的（终态才定稿）⇒ 还要靠 `read_job` 的
+    `progress_latest.run_id`（那条路在 `askable` 分支里）；这里只处理"查询能给出的"。
+    ⚠ 拿不到（权威不可达 / 旧版权威没有这个查询）⇒ 回 `None`，由调用方退回启发式
+    **并如实标注**。
+    """
+    if client is None:
+        return None
+    try:
+        got = client.call_tool("run_queries", {"actions": [{"op": "jobs",
+                                                            "args": {}}]})
+    except McpError:
+        return None
+    steps = (got or {}).get("steps") or []
+    if not steps:
+        return None
+    output = (steps[0] or {}).get("output") or {}
+    if not output.get("available"):
+        return None
+    unfinished = {i["run_id"] for i in scan_runs(runs, prefix) if not i["has_record"]}
+    for row in output.get("jobs") or []:
+        for rid in row.get("run_ids") or []:
+            if str(rid) in unfinished:
+                return str(rid), str(row.get("job_id") or "?")
+    return None
+
+
 def fmt_elapsed(seconds: float) -> str:
     """人话时长（进展行与摘要行共用，**同一事实只算一次**）。"""
     seconds = max(0.0, float(seconds))
@@ -404,30 +436,39 @@ def watch(*, handle: str, url: str = "", runs: str = "", prefix: str = "",
     #   没有过滤就会一头扎进去、永远等一个不会出现的记录（实测踩过，见
     #   `newest_unfinished` 的说明）。
     no_handle = not handle or handle == ":latest"
-    if no_handle:
-        cand = newest_unfinished(runs, prefix, fresh_s=DEFAULT_FRESH_S)
-        if cand:
-            run_id = cand["run_id"]
-            evidence.append("newest_unfinished_run")
-            emit(f"[watch] 无句柄：盯住最近还在写的运行 {run_id}"
-                 f"（若你刚提交的那个还没建目录，会自动跟上；要精确就传 job_id）")
-            # ⚠ **这是启发式，必须说清**（用户实测的纠正，2026-10-05）：盘上的运行目录
-            #   并不都来自 AI 提交的 job —— 启动器自己也会跑探针 run。没有句柄时
-            #   看门狗只能按"最近还在写"猜，**猜错了会盯错对象**。
-            #   ⇒ 如实标注证据链，并指路"要精确就传 job_id"。
-            notes.append(
-                f"`:latest` 是**启发式**：它按「最近还在写、且没有 record.json」挑目录，"
-                f"可能选中**启动器自己的探针 run**（它在盘上长得一样）。"
-                f"要盯准某一个任务就传 `job_id`（或终态后的 `run_id`）。")
-        else:
-            emit("[watch] 无句柄、盘上没有正在写的运行：等它出现")
-
     client: McpClient | None = None
     if url:
         client = McpClient(url)
     else:
         mcp_note = "没有可用的 MCP 地址（--url 与 .mcp-port 都没有）⇒ 只看盘上证据"
         notes.append(mcp_note)
+
+    if no_handle:
+        # ⭐ **先按"归属"找，再退回启发式**（用户实测的纠正，2026-10-05）：
+        #   盘上的运行目录并不都来自 AI 提交的 job —— 启动器自己也会跑探针 run。
+        #   权威的 `jobs` 查询给出 `job_id → run_ids` 的**反查表** ⇒ 有它就不必猜。
+        owned = _owned_unfinished_run(client, runs, prefix) if client is not None else None
+        if owned:
+            run_id, job_id = owned
+            evidence.append(f"owned_by_job:{job_id}")
+            emit(f"[watch] 无句柄：按**作业归属**认出 {job_id} 的 run {run_id}"
+                 f"（不是猜的：来自权威的 `jobs` 查询）")
+        else:
+            cand = newest_unfinished(runs, prefix, fresh_s=DEFAULT_FRESH_S)
+            if cand:
+                run_id = cand["run_id"]
+                evidence.append("newest_unfinished_run")
+                emit(f"[watch] 无句柄：盯住最近还在写的运行 {run_id}"
+                     f"（若你刚提交的那个还没建目录，会自动跟上；要精确就传 job_id）")
+                # ⚠ **这是启发式，必须说清**：没有句柄、也拿不到作业归属时，
+                #   看门狗只能按"最近还在写"猜，**猜错了会盯错对象**。
+                notes.append(
+                    f"`:latest` 是**启发式**（没能从权威的 `jobs` 查询拿到归属）："
+                    f"它按「最近还在写、且没有 record.json」挑目录，可能选中"
+                    f"**启动器自己的探针 run**（它在盘上长得一样）。"
+                    f"要盯准某一个任务就传 `job_id`（或终态后的 `run_id`）。")
+            else:
+                emit("[watch] 无句柄、盘上没有正在写的运行：等它出现")
 
     #: 能不能问权威：要有 MCP 客户端、要有**真句柄**（`:latest`/无句柄都不是 job
     #: 编号，拿去问只会得到 `unknown_job` —— 那会把"还没建目录"误报成"句柄不存在"）。

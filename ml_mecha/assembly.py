@@ -656,6 +656,10 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
             (lambda _name=name, **kwargs: engine._query_direct(_name, **kwargs)),
             called_by="ml_mecha:read_query")
     engine.bind_surface_query(software.surface.query)
+    # ⭐ **作业注册表的只读引用**（2026-10-05）：`jobs` 查询靠它反查
+    #   `job_id → run_id` 的**归属**（进程外看门狗无句柄时不再靠猜）。
+    #   注册表是 mecha 的对象、活在 Software 里 ⇒ 这里注入，不让引擎自己去找。
+    engine.bind_job_registry(software.jobs)
 
     # 引擎的写路径：唯一入口是 Gate（引擎自己无快照、无第二条写口）。
     engine.bind_state_writer(make_state_writer(software.gate))

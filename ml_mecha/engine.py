@@ -369,6 +369,9 @@ class MLEngine(Engine):
         self._fp_index: dict[str, str] = {}
         self._lock = threading.RLock()
         self._surface_query: Callable[..., Any] | None = None
+        #: 作业注册表的只读引用（由装配点 `bind_job_registry` 注入）：
+        #: `_query_jobs` 用它回答"我提交过什么、各产出哪个 run"。
+        self._jobs_registry: Any | None = None
         self._commands: Any | None = None
         self._command_gate: Any | None = None
         #: 审批通道（``Software.approval``）：只有声明 ``approval_required=True`` 的命令会用到；
@@ -470,6 +473,7 @@ class MLEngine(Engine):
             "dataset_detail": self._query_dataset_detail,
             "run_detail": self._query_run_detail,
             "training_detail": self._query_training_detail,
+            "jobs": self._query_jobs,
             "network_catalog": self._query_network_catalog,
             "network_source": self._query_network_source,
             "checkpoint_detail": self._query_checkpoint_detail,
@@ -922,6 +926,53 @@ class MLEngine(Engine):
         out["max_points"] = int(tb_series.MAX_POINTS)
         return out
 
+    def _query_jobs(self, *, state: str = "", limit: int = 20) -> dict[str, Any]:
+        """**作业清单**：我提交过什么、各自产出了哪个 `run_id`（只读）。
+
+        ## 为什么值得单开一条（用户实测的误导）
+
+        进程外的看门狗（`python -m ml_mecha.watch`）**只认句柄**才可靠；没有句柄时
+        它只能按"盘上最近还在写的目录"猜 —— 而启动器自己也会跑探针 run，长得一样。
+        用户实测被 `:latest` 认成一个不属于他的 run（原话："那个 `-42` **不是我的**…
+        建议你按 `job_id` 反查 `run_id` 来判定归属，而不是靠 `:latest` 猜"）。
+        ⇒ 这张表就是"反查表"：每条的 `run_ids` 直接来自 job 的 `result_ref`。
+
+        ⚠ **只活在会话里**（注册表是内存态）：重启后为空 ⇒ 回
+        `available=false` 并说明，而不是假装"你没提交过任何东西"。
+        """
+        reg = self._jobs_registry
+        if reg is None:
+            return {"available": False, "jobs": [], "n": 0, "reason":
+                    "本引擎没接作业注册表（纯库用法或裸引擎）；AI 模式下由装配点接上"}
+        try:
+            rows = list(reg.list())
+        except Exception as exc:                               # noqa: BLE001
+            return {"available": False, "jobs": [], "n": 0,
+                    "reason": f"读作业注册表失败：{type(exc).__name__}: {exc}"}
+        want = str(state or "").strip()
+        out: list[dict] = []
+        for row in rows:
+            ref = row.get("result_ref") or {}
+            if want and str(row.get("state") or "") != want:
+                continue
+            out.append({
+                "job_id": str(row.get("id") or ""),
+                "command": str(row.get("command") or ""),
+                "state": str(row.get("state") or ""),
+                # ⭐ **归属**：这个 job 产出的 run（终态才定稿 ⇒ 中途为空是正常的）
+                "run_ids": [str(r) for r in (ref.get("run_ids") or [])],
+                "cancel_supported": bool(row.get("cancel_supported", False)),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "error": str(row.get("error") or ""),
+            })
+        n = len(out)
+        cap = max(1, int(limit or 20))
+        return {"available": True, "jobs": out[:cap], "n": n, "limit": cap,
+                "filter_state": want,
+                "note": ("只含**本会话**的作业（注册表在内存里）；重启后为空。"
+                         "`run_ids` 来自 job 的 result_ref ⇒ 这是**归属**的反查依据")}
+
     # ------------------------------------------------------------ Engine ABC
     def schema(self) -> Mapping[str, Any]:
         """一处声明：命令面 + 回执契约 + 状态键 + 资源维度。"""
@@ -931,9 +982,7 @@ class MLEngine(Engine):
             "run_output_required": list(RECEIPT_REQUIRED_KEYS),
             "commands": {c.name: c.to_dict() for c in COMMANDS},
             "state_keys": sorted(_state_keys(self._validator)),
-            "queries": ["method_catalog", "method_detail", "dataset_detail",
-                        "run_detail", "training_detail", "network_catalog",
-                        "network_source"],
+            "queries": list(READ_QUERY_NAMES),
             "limits": {
                 "max_batch_methods": self._validator.max_batch_methods,
                 "max_dataset_rows": self._max_dataset_rows,
@@ -2795,6 +2844,15 @@ class MLEngine(Engine):
         """注入 ``Surface.query``：只读查询统一走 mecha 注册项分派。"""
         self._surface_query = query_fn
 
+    def bind_job_registry(self, jobs: Any) -> None:
+        """注入作业注册表（只读）：`jobs` 查询靠它回答"我提交过什么、产出哪个 run"。
+
+        ⚠ 为什么是**注入**而不是引擎自己 new / 从别处取：注册表是 mecha 框架的
+        对象、活在 `Software` 里（`ml_mecha/assembly.py` 才有），而引擎只该消费它。
+        **不接也能跑**：`jobs` 查询会如实回 `available=false` + 原因（纯库用法）。
+        """
+        self._jobs_registry = jobs
+
     def bind_command_registry(self, commands: Any, gate: Any,
                               approval: Any = None) -> None:
         """注入核心 ``CommandRegistry`` + ``Gate`` + ``approval``：受控命令经核心命令面调用。
@@ -2951,6 +3009,12 @@ def _is_cancelled(context: Any) -> bool:
 READ_QUERY_NAMES: tuple[str, ...] = (
     "method_catalog", "method_detail", "dataset_detail", "run_detail",
     "training_detail", "network_catalog", "network_source", "checkpoint_detail",
+    # ⭐ **作业清单**（2026-10-05，R28 的只读半边）：回答"我提交过什么、它们各自
+    #   产出了哪个 run_id"。为什么要它：**进程外的看门狗**在无句柄时只能按盘上
+    #   目录猜（用户实测被启动器的探针 run 误导过）⇒ 有了这张表就能按
+    #   `job_id → result_ref.run_ids` **反查归属**，而不是靠 `:latest` 猜。
+    #   ⚠ 它只活在会话里（注册表是内存态）⇒ 重启后照样是空的，如实说。
+    "jobs",
 )
 
 

@@ -146,7 +146,9 @@ def test_map_covers_commands_queries_tools_exactly(app):
     # ---- 查询：与 READ_QUERIES / Surface 注册项两路交叉 ----
     query_rows = _rows(KIND_QUERY)
     assert [row["declared_name"] for row in query_rows] == list(READ_QUERIES)
-    assert len(query_rows) == 8
+    # ⚠ 2026-10-05（批次4）：`jobs` 只读查询让查询面 8→9（"我提交过什么、各产出
+    #   哪个 run_id"——进程外看门狗按它反查归属，不再靠 :latest 猜）。
+    assert len(query_rows) == 9
     assert {e.name for e in app.software.surface.entries("query")} == set(READ_QUERIES)
     for row in query_rows:
         assert row["side_effect"] is False and row["scope"] == ()
@@ -161,8 +163,8 @@ def test_map_covers_commands_queries_tools_exactly(app):
     #   （等待原语折进了 `read_job`，没有新增工具；调度器旋钮是新能力，没有既有入口）。
     assert len(tool_rows) == 20
 
-    # 19→20 之后总行数：命令 7 + 查询 8 + 工具 20 = 35（原 34）。
-    assert len(rows) == 35
+    # 19→20 之后总行数：命令 7 + 查询 9 + 工具 20 = 36（原 34）。
+    assert len(rows) == 36
 
 
 # ---------------------------------------------------------------- 2. 命令字段
@@ -340,7 +342,8 @@ def test_runtime_role_table_matches_declaration(app):
     assert diff["declared_not_registered"] == []
     assert diff["registered_not_declared"] == []
     assert set(diff["registered"]) == declared
-    assert len(diff["registered"]) == 15             # 7 命令 + 8 查询
+    # 2026-10-05：查询 8→9（新增 `jobs`：作业清单/归属反查）⇒ 7 + 9 = 16
+    assert len(diff["registered"]) == 16             # 7 命令 + 9 查询
 
     # L7 对偶：合成一条运行时没有的声明，必须被抓住（守卫不哑）
     ghost = dict(ml_capability_map()[0])

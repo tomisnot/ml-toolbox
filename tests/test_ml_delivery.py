@@ -2113,6 +2113,70 @@ def test_compare_aligns_multiple_runs_without_interpolating():
     assert set(picked) == {"loss", "fid"}, picked
 
 
+def test_watch_prefers_job_ownership_over_guessing():
+    """⭐ 无句柄时**先按作业归属找**（权威的 `jobs` 查询），找不到才退回启发式。
+
+    用户实测的纠正（2026-10-05）："盘上那个 `-42` **不是我的**，大概是启动器自己的
+    探针 run …… 建议你按 `job_id` 反查 `run_id` 来判定归属，而不是靠 `:latest` 猜。"
+    ⇒ 判据用假 MCP 客户端给出"作业归属表"，断言：
+    ① 选中**归属表里那个** run（哪怕盘上还有更"新鲜"的目录）；
+    ② `evidence` 里是 `owned_by_job:<job_id>`（可追溯），而**不是** `newest_unfinished_run`；
+    ③ 归属表里**没有**在跑的 run 时，才退回启发式并**自称启发式**。
+    """
+    from ml_mecha import watch
+
+    with tempfile.TemporaryDirectory(prefix="ml-watch-own-") as td:
+        runs = os.path.join(td, "runs")
+        mine = os.path.join(runs, "custom_network-111-1")
+        probe = os.path.join(runs, "custom_network-222-2")
+        os.makedirs(mine)
+        os.makedirs(probe)
+        # 让"探针"那个更晚写 ⇒ 纯启发式会挑错（这正是用户踩到的情形）
+        os.utime(mine, (time.time() - 20, time.time() - 20))
+
+        class _FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def call_tool(self, name, args):
+                assert name == "run_queries", name
+                return {"ok": True, "steps": [{"index": 0, "op": "jobs", "ok": True,
+                                               "output": {
+                                                   "available": True, "n": 1,
+                                                   "jobs": [{"job_id": "job-7",
+                                                             "state": "running",
+                                                             "run_ids": ["custom_network-111-1"]}]}}]}
+
+        real = watch.McpClient
+        watch.McpClient = _FakeClient
+        try:
+            got = watch.watch(handle=":latest", url="http://127.0.0.1:1/mcp",
+                              runs=runs, timeout_s=1, poll_s=0.1,
+                              report_every_s=0)
+        finally:
+            watch.McpClient = real
+        assert got["run_id"] == "custom_network-111-1", got["run_id"]
+        assert "owned_by_job:job-7" in got["evidence"], got["evidence"]
+        assert "newest_unfinished_run" not in got["evidence"], got["evidence"]
+        assert "启发式" not in " ".join(got["notes"]), got["notes"]
+
+        # ③ 归属表里没有在跑的 run ⇒ 退回启发式，并且**自称启发式**
+        class _EmptyClient(_FakeClient):
+            def call_tool(self, name, args):
+                return {"ok": True, "steps": [{"index": 0, "op": "jobs", "ok": True,
+                                               "output": {"available": True, "n": 0,
+                                                          "jobs": []}}]}
+
+        watch.McpClient = _EmptyClient
+        try:
+            got2 = watch.watch(handle=":latest", url="http://127.0.0.1:1/mcp",
+                               runs=runs, timeout_s=1, poll_s=0.1, report_every_s=0)
+        finally:
+            watch.McpClient = real
+        assert "newest_unfinished_run" in got2["evidence"], got2["evidence"]
+        assert "启发式" in " ".join(got2["notes"]), got2["notes"]
+
+
 def test_cancel_run_rejects_uncancellable_job():
     """``cancel_run`` 对不可取消的命令**结构化拒**（job_not_cancellable）。
 

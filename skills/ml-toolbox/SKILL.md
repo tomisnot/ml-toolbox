@@ -252,6 +252,9 @@ cancel_run(job_id)              → 在 epoch 边界停下（协作式）
 
 1. **`run_queries`**：一串**只读**查询一次往返跑完（"列方法→看三个方法的参数→查数据集"）。
    ⚠ 它**只读**：写操作（准备数据、跑方法、改配置）仍要单独调用。
+   ⭐ 其中一个 op 是 **`jobs`**：**作业清单**（`job_id` / `command` / `state` /
+   **`run_ids`**）——回答"我提交过什么、各产出哪个 run"。⚠ 只含**本会话**的作业
+   （注册表在内存里，重启后为空，**如实回 `available=false`**）。
 2. **`pick`**：`describe_training(include_series=true, pick=["series.loss.values"])`
    只回关心的那几条（实测省 ~65%）。取不到的键会如实列进 `_missing`（不会静默回 null）。
    ⚠ **回执里声明为必填的键删不掉**（工具面契约），所以别指望 `pick` 把回执变空。
