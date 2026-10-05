@@ -521,10 +521,24 @@ class MLValidator:
             )
         facts = self._facts.dataset_facts(dataset_id)
         if facts is None:
+            # ⭐ **台账补充**（R32，2026-10-05）：重启后 id 认不出时，只说"本会话
+            #   已准备的数据集：（空）"等于让人靠记忆重建（用户实测：一晚上重复
+            #   登记七八次）。⇒ 台账里若有这份数据，就把**出路**一起给出来
+            #   （能不能自动复原 / 怎么一次拿回来）。取不到就退回原文案。
+            #   ⚠ 走 `getattr` 探测而不是写死协议：别的 facts 实现（判据里的桩）
+            #   不必为此改签名。
+            extra = ""
+            hint_fn = getattr(self._facts, "ledger_hint", None)
+            if callable(hint_fn):
+                try:
+                    extra = str(hint_fn(dataset_id) or "")
+                except Exception:                              # noqa: BLE001
+                    extra = ""
             raise MechaError(
                 f"未知 dataset_id {dataset_id!r}",
                 kind="unknown_dataset",
-                hint=f"本会话已准备的数据集：{self._facts.dataset_ids() or '（空）'}",
+                hint=(f"本会话已准备的数据集：{self._facts.dataset_ids() or '（空）'}"
+                      + (f"。{extra}" if extra else "")),
                 suggest="先调 prepare_dataset",
             )
         return facts

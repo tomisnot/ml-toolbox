@@ -31,6 +31,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ...core.chunks import RowChunks
+
+#: 从 `resource_guard` 里读分块预算（MiB）；没给就用 `core.chunks` 的默认。
+#: ⚠ 为什么走 `resource_guard` 而不是新开一个参数：它本来就是"这次运行的资源声明"
+#: （`max_*_mb` 都在里面）⇒ 分块预算是同类事实，不该分裂成第二个旋钮。
+def chunk_budget_from(extras: Any) -> float | None:
+    try:
+        guard = (extras or {}).get("resource_guard") or {}
+        raw = guard.get("chunk_budget_mb")
+        return float(raw) if raw not in (None, "") else None
+    except Exception:                                          # noqa: BLE001
+        return None
+
 
 @contextlib.contextmanager
 def hook_device(torch: Any, dev: Any):
@@ -271,10 +284,24 @@ def train_graph(recorder, *, model, problem, torch, nn,
                         break
     finally:
         recorder.close()
+    #: ⭐ **实测显存峰值**（事后归因）：只在真跑在 CUDA 上时才有值
+    #: —— CPU 回 `None`，**不假装有数字**（用户实测 §3.3：他事前不知道会 OOM，
+    #: 事后也没有任何地方告诉他"这次其实用了多少"）。
+    peak_vram_mb = None
+    try:
+        if getattr(dev, "type", "") == "cuda":
+            peak_vram_mb = round(
+                float(torch.cuda.max_memory_allocated(dev)) / (1024.0 * 1024.0), 1)
+    except Exception:                                          # noqa: BLE001
+        peak_vram_mb = None
     return {"epochs_run": int(stopped_at + 1) if stopped_at is not None else total,
             "stopped_at": stopped_at, "best_val": best, "cancelled": cancelled,
             "best_epoch": best_epoch, "best_watch": best_watch,
             "device": str(dev),
+            "peak_vram_mb": peak_vram_mb,
+            # ⚠ **图任务不给 `chunks`**：分块的单位是"行"，而图任务的行**不是独立
+            #   样本**（整图前向 + 节点掩码）⇒ 按行切会破坏拓扑。这里如实不给，
+            #   也不编一个没人算过的数字。
             "last_state": {k: v.detach().cpu().clone()
                            for k, v in model.state_dict().items()},
             "best_state": best_state if keep_best else None,
@@ -356,7 +383,7 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
           early_stop: bool = False, patience: int = 10,
           on_progress=None, forward_step=None, device=None,
           payload=None, on_step=None, metrics=None, metrics_every: int = 1,
-          keep_best: bool = False) -> dict:
+          keep_best: bool = False, chunk_budget_mb: float | None = None) -> dict:
     """跑训练循环，**托管全部观测**。
 
     @returns ``{"epochs_run": int, "stopped_at": int|None, "best_val": float,
@@ -413,6 +440,13 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
     if payload:
         pay_t = {str(k): _as_tensor(v, torch, dev) for k, v in payload.items()}
 
+    #: ⭐ **整场训练复用的分块器**（`ctx["chunks"]`）：预算可来自
+    #: `resource_guard.chunk_budget_mb`；复用是为了让"这次切了几块"留得下来。
+    chunker = RowChunks(
+        budget_mb=chunk_budget_mb,
+        x_row_bytes=int(getattr(prep.Xs, "nbytes", 0) or 0)
+        // max(1, int(len(prep.Xs))))
+
     def _ctx(row_idx, step, kind="train"):
         """给 `forward_step` / `metrics` 的上下文（**单一构造点**）。
 
@@ -422,7 +456,13 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
         out = {"torch": torch, "nn": nn, "device": str(dev), "step": int(step),
                "kind": kind, "n_rows": int(len(prep.Xs)),
                "train_idx": np.asarray(tr, dtype=np.int64),
-               "val_idx": np.asarray(va, dtype=np.int64)}
+               "val_idx": np.asarray(va, dtype=np.int64),
+               # ⭐ **框架级分块**（2026-10-05，用户实测 §3.3）：用户不必再手写
+               #   "按 R 切块 + 按块加权累加"。`reduce(..., mode="mean")` 里
+               #   权重的算法由框架负责（见 `core.chunks` 的模块说明）。
+               #   ⚠ **同一个 chunker 复用整场训练**（不是每次 `_ctx` 新建一个）：
+               #   那样 `last_plan` 才留得住"这次到底切了几块"，回执才有话可说。
+               "chunks": chunker}
         if pay_t is not None:
             if row_idx is None:
                 out["payload"] = dict(pay_t)                    # 全量（metrics 用）
@@ -577,10 +617,23 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
     finally:
         recorder.close()
     last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    #: ⭐ **实测显存峰值**（事后归因，用户实测 §3.3）：只在真跑在 CUDA 上时才有值
+    #: ⇒ CPU 回 `None`，**不假装有数字**。
+    peak_vram_mb = None
+    try:
+        if getattr(dev, "type", "") == "cuda":
+            peak_vram_mb = round(
+                float(torch.cuda.max_memory_allocated(dev)) / (1024.0 * 1024.0), 1)
+    except Exception:                                          # noqa: BLE001
+        peak_vram_mb = None
     return {"epochs_run": int(stopped_at + 1) if stopped_at is not None else total,
             "stopped_at": stopped_at, "best_val": best, "cancelled": cancelled,
             "best_epoch": best_epoch, "best_watch": best_watch,
             "device": str(dev), "steps": int(gstep),
+            "peak_vram_mb": peak_vram_mb,
+            # ⭐ **框架分块的实际方案**（网络用了 `ctx["chunks"]` 才有）：回执要能说
+            #   "已分 N 块" —— 否则"分块了没有"只能靠猜（用户实测要的就是这句话）。
+            "chunks": chunker.facts(),
             # 最后一轮上报的自定义指标：让它**同时进回执**（TB 那条路给"看曲线"，
             # 这条给 `describe_run`/`compare_methods` 的"看数字"）
             "last_extra": dict(last_extra),

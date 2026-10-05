@@ -41,7 +41,7 @@ whenToUse: >-
 
 ## 工具清单
 
-> 共 **19** 个。表里的名字必须与注册表逐字一致（有判据钉着）。
+> 共 **20** 个。表里的名字必须与注册表逐字一致（有判据钉着）。
 
 | 工具 | 干什么 | 长什么样的大结果 |
 |---|---|---|
@@ -61,7 +61,8 @@ whenToUse: >-
 | `run_custom` | 跑一段**自定义网络代码**（AI 写结构，系统管训练与观测）；可给 `device`；**`dry_run=true` 先试跑**（回形状轨迹，不落盘）；也可 `code_path` 从文件读 | `run_id` + 指标（自定义任务时是网络上报的） |
 | `submit_run` | 把一次运行提交为**后台任务**（给 `method` 或 `code`）——**长训练就走这条** | `job_id`（立刻返回） |
 | `read_job` | 查后台任务进度/结果。⭐ **要等它跑完就给 `wait="terminal"`**（阻塞到终态，上限 540s；超时**不是错误**）；多个任务用 `job_ids=[…]` + `wait="any"`。⚠ **默认只回摘要**：`progress_latest`（含 loss/val_loss）+ 最近 `tail`（默认 8）条 + 真实条数 `n_progress`/`n_epochs`/`truncated` | 要全量历史写 `detail="full"`；要更多条写 `tail=N`；旧名 `wait_s` 等价于 `wait="terminal"`+同秒数 |
-| `cancel_run` | 请求取消后台任务 | 明确回"已请求"（在 epoch 边界生效，不谎报"已取消"） |
+| `cancel_run` | 请求取消后台任务（**排队中的也能取消**：会在开跑前就撤掉） | 明确回"已请求"（在 epoch 边界生效，不谎报"已取消"） |
+| `set_job_limit` | **热改并发名额**（不必重启权威；调大立刻唤醒排队者） | 改动前后上限 + 正在跑/排队数 |
 | `run_queries` | **一次往返跑一串只读查询**（列方法→看参数→查数据集→看训练） | 每步自带结果与短摘要 |
 | `clear_current_state` | 把配置台面清零（数据集引用/方法/覆写/种子/设备） | 逐键"清空前值 + 清空后读回值" |
 
@@ -156,6 +157,16 @@ HDF5 会按原路径重读）；要换新数据就显式给 `payload` / `dataset
 
 **要在干净台面上开始**：先 `clear_current_state`（否则会踩到上一轮留下的数据集/方法/覆写）。
 
+⭐ **`dataset_id` 是内容寻址的（`ds-<fp12>`）—— 幂等**：
+- 同一份数据（**哪怕换个 `name`**）再登记 ⇒ **同一个 id**，回执里 `reused: true`；
+  所以"上一轮用的是哪份数据"永远对得上，**不必靠记忆**。
+- 可读的名字走 `label` / `aliases`（同一份数据用过的**所有**名字），
+  `describe_dataset` 的 `ledger` 里有 `fp` / `label` / `aliases` / `recent_runs`
+  （用过它的运行 + 结果）——这就是"运行清单"：**指纹 → 名字 → 运行 → 结果**。
+- `restorable=true` 的来源（`csv` / `synthetic`）**重启后仍能直接用同一个 id**
+  （框架按台账声明就地重建）：⚠ `frame` / `arrays` 是**进程内**对象，重启后
+  重建不了 ⇒ 回执会说明原因（那时重新 `prepare_dataset` 会得到**同一个 id**）。
+
 ---
 
 ## 长训练：发信号 → **一次等到终态** → 更长的交给看门狗
@@ -197,8 +208,29 @@ cancel_run(job_id)              → 在 epoch 边界停下（协作式）
   `dataset_path_denied`）。看到它就按它说的修，别当成"训练跑完了但没结果"。
   若出现 `silent_terminal`：那是**框架自检失败**（既没 run、也没说清失败），
   请上报并把这次调用原样贴出来。
-- **并发上限是 4**（超额会回 `too_many_jobs`，不排队）：要跑更多先等前一批结束。
+- **并发上限默认 4，但超额不再报错 —— 会入队**（`submit_run` 回执带
+  `queued` / `queue_position`）。⭐ **要改上限就 `set_job_limit(n)`**（**热改**，
+  不用重启）：调大立刻唤醒排队的任务；调小**不打断**已在跑的。
+  ⚠ 排队中的任务 `read_job` 会显示 `queued=true` + `queue_position`，
+  而 `state` 仍是框架给的 `running`（**线程起了 ≠ 命令开跑了**，这两个词问的
+  不是同一件事，`wait_note` 里会说明）。**排队期间可以 `cancel_run`**（会在开跑前取消）。
 - 提交前会**同步预检写权**：LOCKED 下当场拒（不会"提交成功再发现失败"）。
+- **显存（OOM 是能事前避开的）**：给 `resource_guard.max_peak_mb=<MiB>` 声明你预计的
+  峰值 ⇒ 框架**提交前**对照实测可用显存判一次，明显不够就**可读地拒**
+  （`cuda_oom_predicted`，带"要多少/剩多少/总多少"三个数）。⚠ 框架**不猜**你网络的
+  峰值（猜出来会假装精确）；第一次可以照着上一次运行的实测峰值填——回执/存档里有
+  `peak_mb`（只在真跑 CUDA 上时才有，CPU 上**不给**这个数，也不给 0）。
+- **大负载 + 小显存：让框架分块**（别在自己网络里手写）：
+  ```python
+  def metrics(self, model, ctx):
+      return ctx["chunks"].reduce(ctx["payload"],
+                                  lambda blk: {"fid": _fidelity(model, blk)},
+                                  mode="mean", budget_mb=256)   # 或 mode="sum"
+  ```
+  `mode="mean"` ⇒ 框架算 `Σ (块行数/总行数) × 值`（**逐样本量的正确口径**）；
+  `mode="sum"` ⇒ 直接相加。**不要在返回里自己乘权重**（那是权重平方）。
+  预算也可用 `resource_guard.chunk_budget_mb=…` 统一给。分了几块会写进存档
+  （`nn_chunks`），回执/`describe_run` 看得到。
 
 ---
 

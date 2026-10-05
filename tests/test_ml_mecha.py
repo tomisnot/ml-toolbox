@@ -60,7 +60,8 @@ TOOL_NAMES = ("cancel_run", "checkpoint_detail", "clear_current_state",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
               "eval_custom", "prepare_dataset", "read_job", "run_custom",
-              "run_method", "run_method_batch", "run_queries", "submit_run")
+              "run_method", "run_method_batch", "run_queries", "set_job_limit",
+              "submit_run")
 
 
 # ---------------------------------------------------------------- 夹具
@@ -408,13 +409,24 @@ def test_uncancellable_command_cancel_job_is_rejected(app):
         app.cancel_job(job)
     assert exc2.value.kind == "job_not_cancellable", exc2.value
 
-    # 对照片：同一条命令不取消 ⇒ 成功且建出**另一个**数据集（防断言空转）
+    # 对照片：同一条命令不取消 ⇒ 成功（防断言空转）
+    #
+    # ⚠ **契约变更（2026-10-05，L1 台账）**：这里原先断言两次 prepare_dataset 得到
+    #   "**另一个** dataset_id"。那是**旧契约**（会话内计数器 `ds-001-…`），也正是
+    #   用户实测的病根："每次登记返回新 id ⇒ 上一轮用的哪份数据只能靠记忆对齐"
+    #   （《长任务编排与失败可读性》§3.4）。
+    #   ⇒ 新契约：**同内容 ⇒ 同 id**（`ds-<fp12>`，幂等），所以这里改成断言
+    #   **同一个 id 且 `reused: true`**。这不是放宽判据：它换了个更硬的事实
+    #   （旧断言在"id 稳定"的新世界里必然假，留着就会逼实现回退到非幂等）。
     ok_job = app.submit({"command": "prepare_dataset", "name": "nc-control",
                          "source": dict(frame_source)}, side="human")
     ok_status = app.wait_job(ok_job, 30)
     assert ok_status["state"] == "done", ok_status
     assert ok_job.result["ok"] is True, ok_job.result
-    assert ok_job.result["dataset_id"] != job.result["dataset_id"]
+    assert ok_job.result["dataset_id"] == job.result["dataset_id"], (
+        "同内容两次登记必须得到**同一个** id（幂等）；旧契约的'每次新 id'正是"
+        "用户'只能靠记忆对齐'的病根")
+    assert ok_job.result["reused"] is True, ok_job.result
 
 
 def test_cancellable_command_cancel_job_is_not_rejected(app):
@@ -1575,15 +1587,17 @@ def test_run_queries_orchestrates_reads_in_one_round_trip(app):
         == "too_many_actions", too_many
 
 
-def test_submit_prechecks_write_authority_and_caps_concurrency(app):
-    """⭐ 提交前的两道闸（指导意见 §3-1/§3-2）。
+def test_submit_prechecks_write_authority_and_queues_over_cap(app):
+    """⭐ 提交前的两道闸（**2026-10-05 行为变更：第二道从"拒绝"改成"入队"**）。
 
-    这两条框架**只给机制、要项目自己补**：
-    - **写权预检**：不预检的话，LOCKED 下会"提交成功 → 轮询 → 发现失败"
+    框架**只给机制、要项目自己补**这两道：
+    - **写权预检**（不变）：不预检的话，LOCKED 下会"提交成功 → 轮询 → 发现失败"
       （AI 白等一轮，还可能把失败读成实验结论）。预检让它**同步**被拒。
-    - **并发上限**：local job 是"每次 submit 新起线程、不排队、无上限"
-      ⇒ 不兜住的话连续提交 N 个训练会把机器打满。超额要**响亮拒绝**，
-      且名额在任务**真跑完**后释放（放在 submit 之后就等于没限）。
+    - **并发名额**（变更）：旧行为是"满即**响亮拒绝**"（`too_many_jobs`），
+      用户实测的后果是"必须'投一个、等一个、再投一个'"，而他要的是"一次排满
+      24 小时"（《长任务编排与失败可读性》§3.2）。⇒ 现在**超额入队**，
+      回执带 `queued` / `queue_position`；而"名额在任务**真跑完**才释放"这条
+      **没有放松**——判据用"第 cap+1 个仍停在队列里"来证明它（否则上限形同虚设）。
     """
     ml = app
     _prepared(ml)
@@ -1594,36 +1608,46 @@ def test_submit_prechecks_write_authority_and_caps_concurrency(app):
     info = (out.get("error") or {}).get("info") or {}
     assert info.get("kind") == "authority_locked", info
 
-    # ② 并发上限：su 满即拒（用**慢**方法占住名额）
+    # ② 并发名额：超额**入队**（不再报错），位次递增
     ml.switch_ai()
     ml.tools.execute("prepare_dataset", {
         "source": {"kind": "synthetic", "task": "classification",
                    "n_samples": 600},
         "name": "cap", "target": "target"})
-    cap = ml.submit_max_jobs if hasattr(ml, "submit_max_jobs") else None
-    cap = cap or type(ml)._max_jobs if hasattr(type(ml), "_max_jobs") else 4
     cap = getattr(ml, "_max_jobs", 4)
-    accepted, rejected = [], None
+    got = []
     for _ in range(cap + 2):
-        got = ml.tools.execute("submit_run", {
+        item = ml.tools.execute("submit_run", {
             "method": "random_forest",
             "overrides": {"n_estimators": 120}})
-        if got["is_error"]:
-            rejected = (got.get("error") or {}).get("info") or {}
-            break
-        accepted.append(got["value"]["job_id"])
-    assert len(accepted) == cap, (len(accepted), cap)
-    assert rejected.get("kind") == "too_many_jobs", rejected
-    # ③ 跑完后名额释放
-    for job_id in accepted:
-        ml.tools.execute("read_job", {"job_id": job_id, "wait_s": 120})
+        assert item["is_error"] is False, item        # **一个都不许被拒**
+        got.append(item["value"])
+    assert len(got) == cap + 2, got
+    # 前 cap 个直接跑；后两个**排队**（位次递增 ⇒ 顺序对）
+    queued = [g for g in got if g["queued"]]
+    assert len(queued) >= 1, got
+    positions = [g["queue_position"] for g in queued]
+    assert positions == sorted(positions) and min(positions) >= 1, positions
+    assert all(g["queue_note"] for g in queued), queued
+    state = ml.queue_state()
+    assert state["queued"] == len(queued), (state, len(queued))
+    assert state["running"] <= cap, state
+
+    # ③ 全部跑完 ⇒ 名额真的释放、队列清空（用**新的等待原语**一次等到终态）
+    job_ids = [g["job_id"] for g in got]
+    for job_id in job_ids:
+        final = ml.tools.execute("read_job", {"job_id": job_id,
+                                              "wait": "terminal",
+                                              "timeout_s": 240})
+        assert final["is_error"] is False, final
+        assert final["value"]["state"] == "done", final
+    state = ml.queue_state()
+    assert state["queued"] == 0 and state["running"] == 0, state
+    # 释放之后还能再投（上限没有"漏掉名额"）
     after = ml.tools.execute("submit_run", {"method": "logistic"})
     assert after["is_error"] is False, after
-    # ⚠ **最后一个 job 也要等完**：不等的话实例关闭时它还在跑，
-    #   临时目录清理会因句柄未释放而 `WinError 145`（实测踩过 —— 那条错误
-    #   还会掀翻直跑入口的汇总，让"哪条判据红"看不见）。
     ml.tools.execute("read_job", {"job_id": after["value"]["job_id"],
-                                  "wait_s": 120})
+                                  "wait": "terminal", "timeout_s": 120})
 
 
 def test_tool_descriptions_carry_no_implementation_words(app):

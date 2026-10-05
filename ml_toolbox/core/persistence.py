@@ -29,6 +29,10 @@ def save_record(rec: RunRecord) -> str:
         "method": rec.method, "family": rec.family, "task": rec.task,
         "target_kind": rec.target_kind,
         "dataset": rec.dataset, "pipeline_id": rec.pipeline_id,
+        # ⭐ **内容身份**（`ds-<fp12>`）：跨会话/跨重命名唯一能对齐"这次跑的是哪份
+        #   数据"的键（`dataset` 是显示名，会重复也会改）。老档没有这个键 ⇒
+        #   `load_record` 读出来是空，如实。
+        "dataset_id": getattr(rec, "dataset_id", ""),
         "config": rec.config,
         "metrics": {k: (v if isinstance(v, (int, float, str, list)) else str(v))
                     for k, v in rec.result.metrics.items()},
@@ -220,4 +224,5 @@ def load_run_record(run_id: str):
                      target_kind=res.target_kind,
                      dataset=meta.get("dataset", ""),
                      pipeline_id=meta.get("pipeline_id", ""),
+                     dataset_id=meta.get("dataset_id", ""),
                      config=meta.get("config", {}), result=res)

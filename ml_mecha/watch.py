@@ -411,6 +411,14 @@ def watch(*, handle: str, url: str = "", runs: str = "", prefix: str = "",
             evidence.append("newest_unfinished_run")
             emit(f"[watch] 无句柄：盯住最近还在写的运行 {run_id}"
                  f"（若你刚提交的那个还没建目录，会自动跟上；要精确就传 job_id）")
+            # ⚠ **这是启发式，必须说清**（用户实测的纠正，2026-10-05）：盘上的运行目录
+            #   并不都来自 AI 提交的 job —— 启动器自己也会跑探针 run。没有句柄时
+            #   看门狗只能按"最近还在写"猜，**猜错了会盯错对象**。
+            #   ⇒ 如实标注证据链，并指路"要精确就传 job_id"。
+            notes.append(
+                f"`:latest` 是**启发式**：它按「最近还在写、且没有 record.json」挑目录，"
+                f"可能选中**启动器自己的探针 run**（它在盘上长得一样）。"
+                f"要盯准某一个任务就传 `job_id`（或终态后的 `run_id`）。")
         else:
             emit("[watch] 无句柄、盘上没有正在写的运行：等它出现")
 

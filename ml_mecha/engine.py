@@ -33,10 +33,11 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,7 @@ from ml_toolbox.core.resources import (ResourceBudget, ResourceEstimate,
                                        estimate_resources)
 
 from .commands import COMMANDS, command_map
+from .ledger import MAX_DECL_BYTES, Ledger, decl_fits, fingerprint
 from .validator import (DeviceSpec, MLValidator, clean_device, clean_export_root,
                         clean_overrides, clean_resource_guard, clean_seed)
 
@@ -164,6 +166,15 @@ class DatasetEntry:
     diag: bool
     spec: DataSpec = field(repr=False)
     fitted: Any = field(repr=False, default=None)
+    #: ⭐ **内容指纹**（`ds-<fp12>` 里的那 12 位）与它据以计算的**声明指纹**。
+    #: ⚠ 必须排在 `spec` **之后**（dataclass 不许"无默认字段跟在有默认字段后面"）；
+    #: 默认空 ⇒ 既有构造点一行不用改；两条都由 `prepare_dataset` 填。
+    #: `fp_decl` 是"同一份数据"的**去重键**（不含拟合结果），`fp` 才进 id
+    #: （再叠上 `pipeline_id`，这样库升级改了拟合链也会得到新 id，是如实而非漂移）。
+    fp: str = ""
+    fp_decl: str = ""
+    #: 用户给的名字（**只作可读标签**，不进 id——进 id 就会破坏幂等）。
+    label: str = ""
 
     def facts(self) -> dict[str, Any]:
         """给校验器/只读工具用的**紧凑**事实面（无数组、无大对象）。
@@ -175,6 +186,10 @@ class DatasetEntry:
         return {
             "dataset_id": self.dataset_id,
             "name": self.name,
+            # ⭐ 台账三件（2026-10-05）：**机器对齐靠 id（内容寻址），人读靠 label**。
+            "label": self.label or self.name,
+            "fp": self.fp,
+            "fp_decl": self.fp_decl,
             "target": self.target,
             "time_col": self.time_col,
             "source": self.source,
@@ -329,7 +344,8 @@ class MLEngine(Engine):
                  default_pipeline: Pipeline | None = None,
                  max_batch_methods: int = 8,
                  max_dataset_rows: int = DEFAULT_MAX_DATASET_ROWS,
-                 ops_per_sec: float = DEFAULT_OPS_PER_SEC) -> None:
+                 ops_per_sec: float = DEFAULT_OPS_PER_SEC,
+                 ledger_dir: str | Path | None = None) -> None:
         self.session = session or Session(seed=seed)
         self._state_writer = state_writer
         self._dataset_roots = tuple(str(r) for r in (dataset_roots or ()))
@@ -345,7 +361,12 @@ class MLEngine(Engine):
         if self._ops_per_sec <= 0:
             raise ValueError("ops_per_sec 必须是正数")
         self._datasets: dict[str, DatasetEntry] = {}
-        self._dataset_seq = 0
+        #: ⭐ **身份台账**（R32/R38）：内容寻址的 dataset id + 落盘 + 可复原。
+        #: `ledger_dir` 由装配点给（`<工作区>/.ml-mecha/ml_ledger`）；不给 ⇒
+        #: 台账只在内存（纯库用法/单测），**id 仍然是内容寻址的**（幂等不依赖落盘）。
+        self._ledger = Ledger(ledger_dir)
+        #: `fp_decl → dataset_id`（会话内的幂等索引；台账是它的落盘镜像）。
+        self._fp_index: dict[str, str] = {}
         self._lock = threading.RLock()
         self._surface_query: Callable[..., Any] | None = None
         self._commands: Any | None = None
@@ -551,6 +572,12 @@ class MLEngine(Engine):
         chain = entry.spec.meta.get("chain", [])
         return {
             **dict(facts),
+            # ⭐ **台账视图**（R38 的"运行清单"，2026-10-05）：把
+            #   数据（指纹） → 名字（label/aliases） → 用它的运行（run_ids）串起来。
+            #   为什么挂在这里而不是另开一个 `describe_ledger` 工具：工具数每加一个
+            #   都要同步 SKILL/能力表/判据，而"看这份数据的来龙去脉"本来就是
+            #   `describe_dataset` 的语义——**同一件事不开第二个入口**。
+            "ledger": self._dataset_ledger_view(entry),
             "pipeline_chain": [
                 {"step": c.get("step", {}).get("key", "?"),
                  "title": str(c.get("step", {}).get("title", "") or ""),
@@ -575,6 +602,57 @@ class MLEngine(Engine):
                                  or self._default_pipeline._split_policy()),
             "schema_mismatch": bool(entry.spec.meta.get("schema_mismatch", False)),
             "fit_scope": entry.spec.meta.get("fit_scope", ""),
+        }
+
+    def _dataset_ledger_view(self, entry: DatasetEntry) -> dict[str, Any]:
+        """这份数据在台账里的**来龙去脉**（run manifest 的一格）。
+
+        三件事一次给全，回答"上一轮用的哪份数据、跑出了什么"：
+        `fp`（内容身份）/ `label`+`aliases`（人读的名字，含**历史上用过的所有名字**）/
+        `recent_runs`（用过这份数据的运行，新→旧，**有界**）。
+        ⚠ 运行清单**从既有存档读**（`runs/<id>/record.json` 里的 `dataset`），
+        不另建索引——否则就是第二份可以各自漂移的真值。
+        """
+        rec = self._ledger.lookup(entry.fp_decl) or {}
+        runs: list[dict[str, Any]] = []
+        # 匹配口径：**优先按内容身份**（`record.json` 的 `dataset_id`，2026-10-05 起写入）；
+        # 老档没有它 ⇒ 退回到"显示名属于这份数据的别名"，且**只认属于本 fp 的名字**
+        # （名字会重复/会改，所以这条路是兜底而非常规）。
+        names = {entry.label or entry.name, *(rec.get("aliases") or [])}
+        names.discard("")
+        try:
+            from ml_toolbox.core.persistence import list_records
+            for meta in list_records():                       # 已按 saved_at 新→旧
+                rid = str(meta.get("dataset_id") or "")
+                if rid:
+                    if rid != entry.dataset_id:
+                        continue
+                elif str(meta.get("dataset") or "") not in names:
+                    continue
+                primary = str(meta.get("primary_metric") or "")
+                runs.append({
+                    "run_id": str(meta.get("run_id") or ""),
+                    "method": str(meta.get("method") or ""),
+                    "primary_metric": primary,
+                    "score": (meta.get("metrics") or {}).get(primary, ""),
+                    "saved_at": str(meta.get("saved_at") or ""),
+                    "matched_by": "dataset_id" if rid else "alias(老档无 dataset_id)",
+                    "error": meta.get("error") or "",
+                })
+                if len(runs) >= 10:
+                    break
+        except Exception:                                      # noqa: BLE001
+            runs = []
+        return {
+            "fp": entry.fp, "fp_decl": entry.fp_decl,
+            "dataset_id": entry.dataset_id,
+            "label": entry.label or entry.name,
+            "aliases": list(rec.get("aliases") or [entry.label or entry.name]),
+            "first_seen": str(rec.get("first_seen") or ""),
+            "registrations": int(rec.get("registrations") or 1),
+            "restorable": bool(rec.get("restorable")),
+            "restore_note": str(rec.get("restore_note") or ""),
+            "n_runs": len(runs), "recent_runs": runs,
         }
 
     def _query_network_catalog(self, *, name: str = "",
@@ -863,6 +941,14 @@ class MLEngine(Engine):
         command = str(spec.get("command", ""))
         if _is_cancelled(context):
             return self._cancelled_receipt(command)
+        # ⭐ **显存预检**（2026-10-05，L3）：用户声明了预期峰值（`max_peak_mb`）而
+        #   卡上明显装不下 ⇒ **可读地拒**（`cuda_oom_predicted`，带三个数字）。
+        #   放在**命令入口**的理由与别的守卫一致：同步路径（run_method/run_custom）
+        #   与后台路径都在这里汇合 ⇒ 一处生效、两条路同口径；而且它发生在**写域
+        #   状态之前**（不留半拉子状态、不产生 run）。
+        #   ⚠ 它**只认声明**、不猜你网络的峰值（猜出来的数字会假装精确）。
+        from . import vram as _vram
+        _vram.precheck(dict(spec))
         # ⚠ **后台标记必须在任何校验之前摘掉**：它由装配点的 job worker 放进 spec，
         #   而 `validate_spec` 只认**命令声明的参数** ⇒ 留在里面会被判成
         #   "接受了未声明的参数"（实测：job 立刻以 ok=False 结束，看着像瞬间跑完）。
@@ -1029,8 +1115,10 @@ class MLEngine(Engine):
         payload: dict[str, Any] = {}
         ds_id = str(spec.get("dataset_id") or "").strip()
         if ds_id:
-            self._validator.check_dataset_ref(ds_id)      # 先按既有口径校验存在性
-            entry = self.dataset_entry(ds_id)
+            entry = self.ensure_dataset(ds_id)          # 懒复原优先（重启后仍可用）
+            if entry is None:
+                self._validator.check_dataset_ref(ds_id)   # 先按既有口径校验存在性
+                entry = self.dataset_entry(ds_id)
             if entry is not None:
                 payload = dict(getattr(entry.spec, "aux", {}).get("payload") or {})
         decl = spec.get("payload")
@@ -1148,8 +1236,11 @@ class MLEngine(Engine):
                              kind="missing_code",
                              hint="code 是字符串；只需要实现 build(n_in, n_out, *, nn)")
         dataset_id = str(spec.get("dataset_id") or self._last_dataset_id() or "")
-        self._validator.check_dataset_ref(dataset_id)
-        entry = self.dataset_entry(dataset_id)
+        # ⭐ 懒复原（同上）：重启后可复原的 id 就地重建，不必重新登记
+        entry = self.ensure_dataset(dataset_id)
+        if entry is None:
+            self._validator.check_dataset_ref(dataset_id)
+            entry = self.dataset_entry(dataset_id)
         assert entry is not None
         name = str(spec.get("name") or "").strip() or "custom"
         # ⭐⭐ **试跑**（反馈建议 1，他评为最高性价比）：编译 + 建模型 + 用**真实负载**
@@ -1434,6 +1525,30 @@ class MLEngine(Engine):
             dataset.time_col = str(time_col)
         diag = bool(spec.get("diag", False))
         self._validator.check_row_count(int(len(dataset.frame)))
+        # ⭐⭐ **幂等**（R32 的正解，用户实测：每次登记返回新 id ⇒ 只能靠记忆对齐）：
+        #   先把"你给了什么"算成一个**声明指纹**；命中会话索引或台账 ⇒ **直接复用**
+        #   那一份（连管道都不必重新拟合），回执如实标 `reused: true`。
+        fp_decl = self._dataset_fp_decl(spec, dataset, source_desc)
+        hit = self._dataset_by_fp_decl(fp_decl)
+        if hit is not None:
+            aux = self._aux_facts(hit)
+            # ⭐ **复用也要记一笔**：`aliases` 要**累加**（同一份数据用过的所有名字），
+            #   `registrations` 要能看出"这份数据被登记过几次"。不记的话，用户换了名字
+            #   再登记一次，台账里就查不到那个名字——那正是"只能靠记忆对齐"的病根。
+            self._ledger.remember(
+                fp_decl=hit.fp_decl, dataset_id=hit.dataset_id, label=name,
+                facts=self._ledger_facts(hit),
+                restore=self._dataset_restore_decl(spec), at=_now_iso())
+            return self._prepare_receipt(
+                hit, spec, reused=True,
+                restore_note=("这份数据此前登记过（同指纹）⇒ 直接复用同一个 id；"
+                              "没有重新拟合管道"),
+                extra={"pipeline_chain": [{"step": c.get("step", {}).get("key", "?"),
+                                           "enabled": c.get("step", {}).get("enabled", True),
+                                           "skipped": bool(c.get("skipped"))}
+                                          for c in hit.spec.meta.get("chain", [])],
+                       "split_policy": dict(hit.spec.meta.get("split_policy") or {}),
+                       "graph": aux["graph"], "payload": aux["payload"]})
         # ⭐ **数据形态体检**（NQS 需求 §3.3 的正解）：接不住的形态要**当场、可教学**地拒。
         #   ⚠ 实测过的两个失败：
         #   - 复数列：pipeline 里 `to_numpy(float)` **静默丢掉虚部**，回执还说"成功"
@@ -1455,10 +1570,14 @@ class MLEngine(Engine):
         #   与图的区别：图是"行之间怎么连"，负载是"每行自带的东西"
         #   ⇒ 图要节点掩码划分，负载**按行切**就行（保住 row-level 语义）。
         payload_facts = self._attach_payload(fitted.spec, spec, dataset)
-        # ⭐ **自定义任务**（无标准标签，指标由方法自己上报）
+        # ⭐ 自定义任务（无标准标签，指标由方法自己上报）
         self._apply_target_kind(fitted.spec, spec)
-        dataset_id = self._next_dataset_id(dataset.name)
-        entry = self._build_entry(dataset_id, dataset, fitted.spec, source_desc, diag)
+        fp = self._dataset_fp(fp_decl, str(fitted.spec.meta.get("pipeline_id", "")))
+        dataset_id = self._next_dataset_id(fp)
+        # `DatasetEntry` 是 frozen ⇒ 用 `replace` 补三个台账字段（不另造构造点）。
+        entry = replace(
+            self._build_entry(dataset_id, dataset, fitted.spec, source_desc, diag),
+            fp=fp, fp_decl=fp_decl, label=name)
         # 写权门拒绝时**不留半拉子状态**：登记 → 写门 → 失败即回滚（真题试过，
         # 校验器必须在登记之后才认识这个 id；回滚让被拒的请求彻底无痕）。
         self._commit_dataset(entry)
@@ -1473,32 +1592,110 @@ class MLEngine(Engine):
             self._rollback_dataset(dataset_id)
             raise
         warnings = self._dataset_warnings(entry)
+        # ⭐ **台账落盘**：这份数据的身份、可读标签、以及"重启后怎么重建"。
+        #   落盘失败**不吞**（身份错了比没有身份更贵）：让异常照常冒出去。
+        record = self._ledger.remember(
+            fp_decl=entry.fp_decl, dataset_id=entry.dataset_id, label=entry.label,
+            facts=self._ledger_facts(entry),
+            restore=self._dataset_restore_decl(spec),
+            at=_now_iso())
+        return self._prepare_receipt(
+            entry, spec, reused=False,
+            restore_note=("这份数据可跨重启懒复原（来源可重建）" if record["restorable"]
+                          else f"⚠ 重启后无法自动复原：{record['restore_note']}"),
+            extra={"graph": dict(graph_facts or {}),
+                   "payload": dict(payload_facts or {}),
+                   "pipeline_chain": record["chain"],
+                   "split_policy": record["split_policy"]})
+
+    @staticmethod
+    def _ledger_facts(entry: DatasetEntry) -> dict[str, Any]:
+        """进台账的**事实面**（不含代码、不含大数组）。"""
+        return {"n_rows": entry.n_rows, "n_features": entry.n_features,
+                "target": entry.target, "target_kind": entry.target_kind,
+                "pipeline_id": entry.pipeline_id, "source": entry.source,
+                "split_policy": dict(entry.spec.meta.get("split_policy") or {}),
+                "chain": [{"step": c.get("step", {}).get("key", "?"),
+                           "enabled": c.get("step", {}).get("enabled", True),
+                           "skipped": bool(c.get("skipped"))}
+                          for c in entry.spec.meta.get("chain", [])]}
+
+    def _prepare_receipt(self, entry: DatasetEntry, spec: Mapping[str, Any], *,
+                         reused: bool, restore_note: str,
+                         extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """`prepare_dataset` 的回执（**新建与复用共用一份形状**）。
+
+        ⚠ 为什么抽出来：复用那条路跳过拟合，但它必须给出**同样完整**的事实
+        （`split_policy`/`pipeline_chain`/`graph`/`payload`）——只回一个 id 会让
+        "复用"看起来像"少了信息的降级"。形状只有一份 ⇒ 两条路不可能漂移。
+        """
+        extra = dict(extra or {})
+        ledger_rec = self._ledger.lookup(entry.fp_decl) or {}
         return {
             "ok": True,
             "command": "prepare_dataset",
             "run_ids": [],
             "primary_metric": "",
             "metrics": {"n_rows": entry.n_rows, "n_features": entry.n_features},
-            "warnings": warnings,
-            "dataset_id": dataset_id,
+            "warnings": self._dataset_warnings(entry),
+            "dataset_id": entry.dataset_id,
+            # ⭐ 台账三件：**机器对齐靠 id（内容寻址），人读靠 label/aliases**
+            "fp": entry.fp,
+            "fp_decl": entry.fp_decl,
+            "label": entry.label,
+            "reused": bool(reused),
+            "aliases": list(ledger_rec.get("aliases") or [entry.label]),
+            "registrations": int(ledger_rec.get("registrations") or 1),
+            "restorable": bool(ledger_rec.get("restorable")),
+            "restore_note": restore_note,
             "pipeline_id": entry.pipeline_id,
             "dataset": entry.facts(),
             # 回执里带上"这条链长什么样"（不含代码，代码在存档里）：
             # 调用方不用再查一次就知道自己装配的结果，且**划分口径报的是真值**。
-            "pipeline_chain": [{"step": c.get("step", {}).get("key", "?"),
-                                "enabled": c.get("step", {}).get("enabled", True),
-                                "skipped": bool(c.get("skipped"))}
-                               for c in entry.spec.meta.get("chain", [])],
-            "split_policy": dict(entry.spec.meta.get("split_policy") or {}),
+            "pipeline_chain": extra.get("pipeline_chain") or [],
+            "split_policy": dict(extra.get("split_policy")
+                                 or entry.spec.meta.get("split_policy") or {}),
             # 图事实（节点/边/度分布/孤立点）——带了图才有；让人和 AI 一眼看见
             # "这份数据的拓扑长什么样"（图的坑大多在这儿）。
-            "graph": dict(graph_facts or {}),
+            "graph": dict(extra.get("graph") or {}),
             # 逐行负载的形状/dtype（NQS：复振幅、位串、mask）——**别只回键名**，
             # 形状与 dtype 才是"我的复数还在不在"的答案。
-            "payload": dict(payload_facts or {}),
+            "payload": dict(extra.get("payload") or {}),
             "target_kind": str(entry.spec.target_kind or ""),
             "error": "",
         }
+
+    def _aux_facts(self, entry: DatasetEntry) -> dict[str, dict]:
+        """从**已拟合的数据视图**重算图/负载事实（复用那条路要用）。
+
+        ⚠ 为什么可以重算：这两份事实是 `spec.aux` 的**纯函数**
+        （`Problem(..., allowed=…)` 现场算），不依赖拟合时的临时变量
+        ⇒ 复用分支不必再拟合一次，也能给出与新建**同样完整**的事实。
+        """
+        from ml_toolbox.core.contracts import Problem
+
+        out: dict[str, dict] = {"graph": {}, "payload": {}}
+        for key, allowed, field in (("graph", (AUX_GRAPH,), "graph"),
+                                    ("payload", (AUX_PAYLOAD,), "payload")):
+            if key not in (entry.spec.aux or {}):
+                continue
+            try:
+                out[field] = dict(Problem(entry.spec, allowed=allowed)
+                                  .__getattribute__(f"{field}_facts")())
+            except Exception:                                  # noqa: BLE001
+                out[field] = {}
+        return out
+
+    def _dataset_by_fp_decl(self, fp_decl: str) -> DatasetEntry | None:
+        """会话里有没有同一份数据（按**声明指纹**查；这是幂等的判据）。"""
+        with self._lock:
+            dataset_id = self._fp_index.get(str(fp_decl))
+            if dataset_id and dataset_id in self._datasets:
+                return self._datasets[dataset_id]
+            for entry in self._datasets.values():
+                if entry.fp_decl and entry.fp_decl == str(fp_decl):
+                    return entry
+        return None
 
     def _pipeline_from_spec(self, spec: Mapping[str, Any]) -> Pipeline:
         """按 `spec["pipeline"]` 声明装配一条管道；没声明就用引擎默认。
@@ -1798,8 +1995,10 @@ class MLEngine(Engine):
         计算不可中断（方法层无协作式取消点），这里如实写清，不假装可中断。
         """
         dataset_id = str(spec.get("dataset_id") or self._last_dataset_id() or "")
-        self._validator.check_dataset_ref(dataset_id)
-        entry = self.dataset_entry(dataset_id)
+        entry = self.ensure_dataset(dataset_id)         # 懒复原优先（重启后仍可用）
+        if entry is None:
+            self._validator.check_dataset_ref(dataset_id)
+            entry = self.dataset_entry(dataset_id)
         assert entry is not None
         method = str(spec.get("method", ""))
         descriptor = self._validator.check_method_ref(method, dataset_id=dataset_id)
@@ -2064,12 +2263,168 @@ class MLEngine(Engine):
             )
         return candidate
 
-    def _next_dataset_id(self, name: str) -> str:
-        """预分配数据集引用（写权门拒绝时该号不回滚，但**不登记**任何状态）。"""
-        with self._lock:
-            self._dataset_seq += 1
-            slug = "".join(ch if ch.isalnum() else "-" for ch in name)[:24]
-            return f"ds-{self._dataset_seq:03d}-{slug or 'dataset'}"
+    def _next_dataset_id(self, fp: str) -> str:
+        """内容寻址的 dataset id：``ds-<fp12>``（**同一个 fp 必然同一个 id**）。
+
+        ⚠ **不带用户给的名字**：名字进 id 会让"同一份数据换个名字登记"裂成两个 id，
+        而那正是本条要消灭的病（用户实测：每次登记返回新 id ⇒ 只能靠记忆对齐）。
+        可读性由 `label`/`aliases` 承担（随回执与 `describe_dataset` 一起给）。
+        """
+        return f"ds-{str(fp)}"
+
+    def _source_decl(self, spec: Mapping[str, Any]) -> dict[str, Any]:
+        """来源的**可复核声明**：既能算指纹（内容寻址），也能在可复原时照着重建。
+
+        ## 为什么按 kind 分别处理（而不是把 `spec["source"]` 原样哈希）
+
+        - `frame` / `arrays` 是**进程内**的大对象：声明里必须换成**内容哈希**
+          （否则 `default=str` 会把它们变成 `"<DataFrame …>"` ⇒ 两份不同的数据
+          指纹相同 ⇒ **幂等变成了谎**，那是比"id 每次变"更坏的错）。
+        - `csv` 要带 `size`/`mtime`：源文件改了 ⇒ 指纹变 ⇒ **得到新 id**（如实），
+          不假装幂等（设计文档 §3.2）。
+        - `synthetic` 只由参数决定 ⇒ 声明即全部，天然可复原。
+        """
+        source = spec.get("source")
+        if isinstance(source, Dataset):
+            return {"kind": "dataset", "name": source.name,
+                    "rows": int(len(source.frame))}
+        if isinstance(source, pd.DataFrame):
+            return self._frame_decl(source, {"kind": "frame", "inline": True})
+        if not isinstance(source, Mapping):
+            return {"kind": "unknown", "type": type(source).__name__}
+        kind = str(source.get("kind", "")).strip().lower()
+        if kind in ("frame", "dataframe"):
+            frame = source.get("frame")
+            if not isinstance(frame, pd.DataFrame):
+                return {"kind": "frame", "bad": True}
+            return self._frame_decl(frame, {"kind": "frame", "inline": True,
+                                            "target": source.get("target") or ""})
+        if kind == "csv":
+            try:
+                path = self._resolve_data_path(source.get("path"))
+                stat = path.stat()
+                return {"kind": "csv", "path": str(path), "size": int(stat.st_size),
+                        "mtime": int(stat.st_mtime),
+                        "target": source.get("target") or ""}
+            except (MechaError, OSError):
+                # 路径解不出/文件不在 ⇒ 用原始声明兜底（指纹仍然稳定）
+                return {"kind": "csv", "path": str(source.get("path")),
+                        "target": source.get("target") or ""}
+        if kind == "arrays":
+            return {"kind": "arrays", "x_hash": _hash_array(source.get("X")),
+                    "y_hash": _hash_array(source.get("y")),
+                    "name": source.get("name") or ""}
+        if kind == "synthetic":
+            return {"kind": "synthetic",
+                    "task": str(source.get("task", "classification")),
+                    "n_samples": int(source.get("n_samples", 120)),
+                    "n_features": int(source.get("n_features", 4)),
+                    "n_informative": int(source.get("n_informative", 2)),
+                    "noise": float(source.get("noise", 0.1)),
+                    "seed": clean_seed(source.get("seed", self._seed))}
+        return {"kind": kind or "unknown"}
+
+    @staticmethod
+    def _frame_decl(frame: pd.DataFrame, extra: Mapping[str, Any]) -> dict[str, Any]:
+        """DataFrame 的内容声明：**行内容哈希** + 形状 + 列名（顺序敏感）。"""
+        import hashlib as _h
+
+        try:
+            values = pd.util.hash_pandas_object(frame, index=True).values.tobytes()
+            digest = _h.sha1(values).hexdigest()[:16]
+        except Exception:                                     # noqa: BLE001
+            digest = ""            # 哈希不了 ⇒ 空串（**不假装**同一个内容）
+        return {**dict(extra), "hash": digest, "rows": int(len(frame)),
+                "cols": [str(c) for c in frame.columns],
+                "dtypes": [str(d) for d in frame.dtypes]}
+
+    def _payload_fp_input(self, spec: Mapping[str, Any]) -> Any:
+        """把 `spec["payload"]` / `spec["graph"]` 压成**内容敏感**的指纹输入。
+
+        ⚠ 不能直接用 `_jsonable_payload_decl`：它把内联数组压成**只剩形状/dtype**
+        ⇒ 两份"形状相同、数值不同"的负载会得到相同指纹（假幂等）。
+        这里对数组取**内容哈希**，对路径型声明保留路径。
+        """
+        def _walk(node: Any) -> Any:
+            if isinstance(node, Mapping):
+                return {str(k): _walk(v) for k, v in sorted(node.items(),
+                                                            key=lambda kv: str(kv[0]))}
+            if isinstance(node, (list, tuple)):
+                return [_walk(v) for v in node]
+            if isinstance(node, np.ndarray) or hasattr(node, "tobytes"):
+                return {"array_hash": _hash_array(node),
+                        "shape": list(getattr(node, "shape", ()) or []),
+                        "dtype": str(getattr(node, "dtype", ""))}
+            if isinstance(node, (str, int, float, bool)) or node is None:
+                return node
+            return str(node)
+
+        return {"payload": _walk(spec.get("payload")),
+                "graph": _walk(spec.get("graph"))}
+
+    def _dataset_fp_decl(self, spec: Mapping[str, Any], dataset: Any,
+                         source_desc: str) -> str:
+        """**去重键**：只由"你给了什么"决定，不含拟合结果。
+
+        为什么不含 `pipeline_id`：它要靠**拟合**才得到，而幂等的价值恰恰在于
+        "命中就不必再拟合一遍"。拟合结果对 id 的贡献在 `_dataset_fp` 里补上。
+        """
+        pipeline_decl = spec.get("pipeline")
+        return fingerprint({
+            "source": self._source_decl(spec),
+            "source_desc": str(source_desc),
+            "pipeline": pipeline_decl if decl_fits(pipeline_decl) else "too-big",
+            "target": str(spec.get("target") or ""),
+            "time_col": str(spec.get("time_col") or ""),
+            "target_kind": str(spec.get("target_kind") or ""),
+            "rows": int(len(dataset.frame)) if hasattr(dataset, "frame") else 0,
+            "aux": self._payload_fp_input(spec),
+        })
+
+    def _dataset_fp(self, fp_decl: str, pipeline_id: str) -> str:
+        """进 id 的指纹 = 声明指纹 ⊕ 拟合出的管道指纹（库升级改了链 ⇒ 新 id）。"""
+        return fingerprint({"decl": fp_decl, "pipeline": str(pipeline_id)})
+
+    def _dataset_restore_decl(self, spec: Mapping[str, Any]) -> dict[str, Any]:
+        """**照着重建**这份数据集所需要的一切（存进台账，供重启后懒复原）。"""
+        source = spec.get("source")
+        pipeline = spec.get("pipeline")
+        payload = spec.get("payload")
+        graph = spec.get("graph")
+        restorable, note = self._restorable(source)
+        big = [name for name, decl in (("pipeline", pipeline), ("payload", payload),
+                                       ("graph", graph))
+               if decl is not None and not decl_fits(decl)]
+        if big:
+            restorable, note = False, (f"声明过大（{'+'.join(big)} > "
+                                       f"{MAX_DECL_BYTES} 字节）⇒ 没有存全")
+        return {
+            "restorable": bool(restorable), "note": note,
+            "source": _jsonable_decl(source),
+            "pipeline": _jsonable_decl(pipeline),
+            "payload": _jsonable_decl(payload),
+            "graph": _jsonable_decl(graph),
+            "target": spec.get("target") or "",
+            "time_col": spec.get("time_col") or "",
+            "target_kind": spec.get("target_kind") or "",
+            "diag": bool(spec.get("diag", False)),
+        }
+
+    @staticmethod
+    def _restorable(source: Any) -> tuple[bool, str]:
+        """这份来源在**新进程**里能不能按声明重建？（不能就如实说为什么）"""
+        if isinstance(source, Mapping):
+            kind = str(source.get("kind", "")).strip().lower()
+            if kind == "csv":
+                return True, ""
+            if kind == "synthetic":
+                return True, ""
+            if kind in ("frame", "dataframe"):
+                return False, "source.kind='frame' 是**进程内**的 DataFrame（没落盘）⇒ 重启后无法重建；要跨重启用 'csv'"
+            if kind == "arrays":
+                return False, "source.kind='arrays' 是**进程内**的数组（没落盘）⇒ 重启后无法重建；要跨重启用 'csv' 或 hdf5 负载"
+        return False, ("来源是进程内对象（Dataset/DataFrame）⇒ 重启后无法重建；"
+                       "要跨重启用 'csv'")
 
     def _build_entry(self, dataset_id: str, dataset: Dataset, spec: DataSpec,
                      source: str, diag: bool) -> DatasetEntry:
@@ -2086,14 +2441,124 @@ class MLEngine(Engine):
     def _commit_dataset(self, entry: DatasetEntry) -> None:
         with self._lock:
             self._datasets[entry.dataset_id] = entry
+            if entry.fp_decl:
+                # 幂等索引：同一个**声明指纹**永远指回同一个 id（台账是它的落盘镜像）
+                self._fp_index[entry.fp_decl] = entry.dataset_id
 
     def _rollback_dataset(self, dataset_id: str) -> None:
         """写权门/校验拒绝后的回滚：内存里也不留这条数据集。"""
         with self._lock:
-            self._datasets.pop(dataset_id, None)
+            entry = self._datasets.pop(dataset_id, None)
+            if entry is not None and entry.fp_decl:
+                self._fp_index.pop(entry.fp_decl, None)
+
+    def ensure_dataset(self, dataset_id: str) -> DatasetEntry | None:
+        """取一个数据集；**不在会话里就按台账懒复原**（R32 的"重启后自动复原"）。
+
+        ## 为什么值得做（用户实测 §3.4）
+
+        "重启后 `dataset_id` 全失效，必须重新 `prepare_dataset`。本轮我因此重复登记了
+        七八次。"⇒ 台账里存了这份数据的**来源/管道/负载声明**，于是在**可复原**的来源
+        （csv / synthetic）上，重启后第一次引用那个 id 时就地重建，用户**一行不用改**。
+
+        ## 三条纪律
+
+        1. **只复原可复原的**：`frame`/`arrays` 是进程内对象，重启后无从重建
+           ⇒ 回 `None`，由校验器给"为什么不能 + 怎么改"的可教学错误
+           （**不假装复原成功**）；
+        2. **复原是纯内存动作**：不额外写域状态（`current.*` 由本次命令自己写）
+           ⇒ 不会在用户的台面上留下第二次写入；
+        3. **复原失败要说出来**：异常转成 `dataset_restore_failed`（带原始原因），
+           而不是让它变成 `unknown_dataset`（那会让人以为"id 不存在"，而不是
+           "你的源文件不在了"）。
+        """
+        with self._lock:
+            entry = self._datasets.get(str(dataset_id))
+        if entry is not None:
+            return entry
+        wanted = str(dataset_id or "")
+        if not wanted.startswith("ds-"):
+            return None
+        # 台账里按 **id** 找（新进程的 fp_index 是空的 ⇒ 只能按 id 反查）
+        rec = next((r for r in self._ledger.all()
+                    if str(r.get("dataset_id")) == wanted), None)
+        if rec is None:
+            return None
+        if not rec.get("restorable"):
+            return None
+        restore = dict(rec.get("restore") or {})
+        try:
+            spec = {
+                "source": restore.get("source"),
+                "pipeline": restore.get("pipeline"),
+                "payload": restore.get("payload"),
+                "graph": restore.get("graph"),
+                "target": restore.get("target") or None,
+                "time_col": restore.get("time_col") or None,
+                "target_kind": restore.get("target_kind") or None,
+                "name": str(rec.get("label") or ""),
+                "diag": bool(restore.get("diag")),
+            }
+            dataset, source_desc = self._materialize_source(spec)
+            dataset.name = str(rec.get("label") or dataset.name)
+            dataset.target = str(spec["target"]) if spec["target"] else dataset.target
+            time_col = spec.get("time_col")
+            if time_col:
+                dataset.time_col = str(time_col)
+            pipeline = self._pipeline_from_spec(spec)
+            fitted = self.session.prepare_fitted(dataset, pipeline=pipeline,
+                                                diag=bool(spec["diag"]))
+            self._attach_graph(fitted.spec, spec, dataset)
+            self._attach_payload(fitted.spec, spec, dataset)
+            self._apply_target_kind(fitted.spec, spec)
+            entry = replace(
+                self._build_entry(wanted, dataset, fitted.spec, source_desc,
+                                  bool(spec["diag"])),
+                fp=self._dataset_fp(str(rec.get("fp_decl") or ""),
+                                    str(fitted.spec.meta.get("pipeline_id", ""))),
+                fp_decl=str(rec.get("fp_decl") or ""),
+                label=str(rec.get("label") or dataset.name))
+            self._commit_dataset(entry)
+            return entry
+        except MechaError:
+            raise
+        except Exception as exc:                               # noqa: BLE001
+            raise MechaError(
+                f"数据集 {wanted} 的**懒复原**失败：{type(exc).__name__}: {exc}",
+                kind="dataset_restore_failed",
+                hint="台账里有这份数据的声明，但按声明重建失败了（源文件被移动/删除、"
+                     "或依赖变了都在此列）",
+                suggest="重新 prepare_dataset 一次（会得到同一个 id）",
+            ) from exc
+
+    def ledger_hint(self, dataset_id: str) -> str:
+        """台账里关于这个 id 的**出路**（给 `unknown_dataset` 当可教学补充）。
+
+        ⚠ 为什么要它：重启后 id 认不出时，旧回执只说"未知 dataset_id（本会话已准备的
+        数据集：（空））"——用户只能靠记忆重建。现在告诉他：这份数据**台账里有**、
+        能不能自动复原、以及**怎么用一次调用拿回来**。
+        """
+        wanted = str(dataset_id or "")
+        rec = next((r for r in self._ledger.all()
+                    if str(r.get("dataset_id")) == wanted), None)
+        if rec is None:
+            return ""
+        alias = "、".join(rec.get("aliases") or []) or "（无名）"
+        if rec.get("restorable"):
+            return (f"⚠ 这份数据（label={alias}）在**台账里有**且**可自动复原**："
+                    f"下一次在 run_method/run_custom/eval_custom 里引用 {wanted} "
+                    f"时会按声明就地重建。")
+        return (f"⚠ 这份数据（label={alias}）在**台账里有**，但**无法自动复原**："
+                f"{rec.get('restore_note') or '来源不可重建'} ⇒ 请重新 prepare_dataset "
+                f"（同样的声明会得到**同一个 id** {wanted}）")
 
     def _resolve_dataset(self, spec: Mapping[str, Any]) -> DatasetEntry:
         dataset_id = str(spec.get("dataset_id") or self._last_dataset_id() or "")
+        # ⭐ **重启后懒复原**：id 不在会话里但台账里有且可复原 ⇒ 就地重建
+        #   （用户实测：重启后必须重新登记，一晚上重复了七八次）。
+        restored = self.ensure_dataset(dataset_id)
+        if restored is not None:
+            return restored
         self._validator.check_dataset_ref(dataset_id)
         entry = self.dataset_entry(dataset_id)
         assert entry is not None
@@ -2165,9 +2630,13 @@ class MLEngine(Engine):
         ``ExecutionContext`` 是同一个对象 ⇒ `read_job` 读得到。
         ``context`` 形参保留：批量/对比的**方法边界**取消检查用它。
         """
+        # ⭐ **把内容身份写进数据视图的 meta**：`runner` 会把它带进 `RunRecord`
+        #   ⇒ `record.json` 里留下 `dataset_id`（`dataset` 只是显示名，会重复也会改）。
+        #   必须在 `session.run` **之前**（run 一开始就把 meta 读进 RunRecord）。
+        entry.spec.meta = dict(entry.spec.meta or {})
+        entry.spec.meta["dataset_id"] = entry.dataset_id
         record = self.session.run(entry.spec, request)
         return _summarize_record(record, entry.dataset_id, request)
-
     def _execute_isolated(self, entry: DatasetEntry, request: RunRequest,
                           *, call_id: str,
                           context: Any = None) -> RunSummary:
@@ -2684,6 +3153,56 @@ def _summarize_record(record: Any, dataset_id: str,
         warning=warning,
         error_kind=kind, error_hint=hint, error_suggest=suggest,
     )
+
+
+def _now_iso() -> str:
+    """本地时间的 ISO 串（台账里给人看的时间戳；秒级足够）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _hash_array(value: Any) -> str:
+    """数组/序列的**内容哈希**（指纹要认内容，不认形状）。
+
+    ⚠ 形状相同、数值不同的负载**必须**得到不同指纹，否则"幂等"会变成
+    "把两份不同的数据认成同一份"——那比"id 每次都变"更坏（用户会以为在跑 A，
+    实际拿到的是 B 的拟合与划分）。拿不到内容就回空串（**不假装相同**）。
+    """
+    if value is None:
+        return ""
+    try:
+        arr = np.ascontiguousarray(value)
+        if arr.dtype == object or arr.dtype.kind in "US":
+            payload = np.asarray([str(v) for v in arr.ravel()], dtype=object).tobytes()
+        else:
+            payload = arr.tobytes()
+        return hashlib.sha1(payload).hexdigest()[:16]
+    except Exception:                                          # noqa: BLE001
+        try:
+            return hashlib.sha1(repr(value).encode("utf-8")).hexdigest()[:16]
+        except Exception:                                      # noqa: BLE001
+            return ""
+
+
+def _jsonable_decl(value: Any) -> Any:
+    """把声明压成**能进 jsonl** 的形状（数组/DataFrame → 形状+内容哈希）。
+
+    用途只有一处：台账里的 `restore` 声明（重启后照着重建）。
+    ⚠ 内联大数组**不存真值**（会导致台账膨胀），只存形状+哈希 ⇒ 那种来源的
+    `restorable` 由 `_restorable` 判为 false（**如实**，而不是存一份半真的东西）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable_decl(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_decl(v) for v in value]
+    if isinstance(value, np.ndarray) or hasattr(value, "tobytes"):
+        return {"__array__": _hash_array(value),
+                "shape": list(getattr(value, "shape", ()) or []),
+                "dtype": str(getattr(value, "dtype", ""))}
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _is_missing_custom_method(exc: BaseException) -> bool:

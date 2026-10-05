@@ -34,6 +34,13 @@ class RunRecord:
     pipeline_id: str
     config: dict
     result: MLResult
+    #: ⭐ **数据集的内容身份**（`ds-<fp12>`，2026-10-05 L1 台账）。
+    #: ⚠ 为什么与 `dataset` 并存而不是替换它：`dataset` 是**显示名**（人读、GUI 用），
+    #: 名字会重复/会改；`dataset_id` 是**内容寻址**的（同一份数据永远同一个 id）
+    #: ⇒ 只有它能让"这次跑的是哪份数据"在**跨会话/跨重命名**下仍然对得上
+    #: （用户实测：重启后只能靠记忆对齐）。
+    #: 默认空 ⇒ 既有构造点与老档一行不用改（老档读出来就是空，如实）。
+    dataset_id: str = ""
     started_at: float = field(default_factory=time.time)
     # wall-clock 分段耗时（秒）。legacy_elapsed 与 MLResult.elapsed 保持一致；
     # total 包含 evaluate/CV。CV 内会再次 fit，故各阶段不应简单相加。
@@ -132,6 +139,7 @@ def run_one(method: MLMethod, spec: DataSpec,
                              family=method.family, task=method.task,
                              target_kind=spec.target_kind, dataset=spec.meta.get("dataset", ""),
                              pipeline_id=spec.meta.get("pipeline_id", ""),
+                             dataset_id=spec.meta.get("dataset_id", ""),
                              config={"overrides": dict(cfg.overrides), "diag": bool(cfg.diag),
                                      "seed": int(cfg.seed),
                                      "extras": {k: v for k, v in cfg.extras.items()
@@ -268,6 +276,9 @@ def run_one(method: MLMethod, spec: DataSpec,
                      target_kind=res.target_kind or spec.target_kind,
                      dataset=spec.meta.get("dataset", ""),
                      pipeline_id=spec.meta.get("pipeline_id", ""),
+                     # ⭐ 内容身份（见 `RunRecord.dataset_id` 的说明）：由边界层在
+                     #   跑之前放进 `spec.meta`；纯库调用没有它 ⇒ 空串（如实）。
+                     dataset_id=spec.meta.get("dataset_id", ""),
                      config={"overrides": dict(cfg.overrides),
                              "diag": cfg.diag, "seed": cfg.seed,
                              "extras": dict(cfg.extras)},

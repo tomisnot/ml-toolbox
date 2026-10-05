@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,7 @@ from .commands import COMMANDS as HOST_COMMANDS
 from .core_commands import core_command_specs
 from .engine import (JOB_RUN_FLAG, READ_QUERY_NAMES, RUN_COMMANDS, MLEngine,
                      clear_channel, make_state_writer, use_channel)
+from . import vram
 from .summarizer import ml_summarizer
 from .tools import BANNED_WORDS, register_ml_tools
 
@@ -113,6 +115,43 @@ def _max_jobs() -> int:
 #: 人类侧默认通道标签（细标签归因用；side 才定写权）。
 HUMAN_ACTOR = "ml-gui"
 AI_ACTOR = "ml-ai"
+
+#: 排队状态挂在 `ExecutionContext` 上的属性名（与进度 sidecar 同一手法）。
+#:
+#: ⚠ 为什么不改框架的 job 状态：框架的 `running` 表示"**线程已经起了**"，
+#: 那是它的真话；"在排队、还没开始跑命令"是**调度层**的事实。两件事都要看得见，
+#: 但**不能互相冒充**（把框架状态改写成 queued 就是在报假位置）。
+QUEUE_SIDECAR = "ml_queue_extra"
+
+
+def _ctx_cancelled(ctx: Any) -> bool:
+    """这个执行上下文被请求取消了吗？（**两种形状都要认**）
+
+    ⚠ 实测踩过：mecha 的 `ExecutionContext.cancelled` 是 **property**（回 bool），
+    不是方法 ⇒ 直接 `ctx.cancelled()` 会 `TypeError: 'bool' object is not callable`
+    （而且它发生在**排队线程**里，症状是"排队中被取消的任务变成 failed"——
+    看起来像取消没生效）。⇒ 这里两种形状都认。
+    """
+    flag = getattr(ctx, "cancelled", None)
+    if flag is None:
+        return False
+    try:
+        return bool(flag() if callable(flag) else flag)
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def _attach_queue_note(ctx: Any, *, queued: bool, position: int,
+                       waited_s: float) -> None:
+    """把调度层的排队事实挂到执行上下文（`read_job` 从那里读）。"""
+    if ctx is None:
+        return
+    try:
+        setattr(ctx, QUEUE_SIDECAR, {"queued": bool(queued),
+                                     "position": int(position),
+                                     "waited_s": round(float(waited_s), 3)})
+    except Exception:                                          # noqa: BLE001
+        pass
 
 
 def enforce_terminal_invariant(receipt: Any, command: str) -> Any:
@@ -182,8 +221,21 @@ class MLMecha:
         self.scopes = scopes
         self._closed = False
         #: 后台 job 的**并发名额**（§3-1：框架不排队、无上限 ⇒ 项目自己兜）。
+        #: ⚠ 2026-10-05 起语义变了：它不再"超额就拒"，而是"**同时能跑几个**"，
+        #: 超出的**入队**（用户实测：上限 4 时只能"投一个、等一个、再投一个"，
+        #: 而他要的是"一次排满 24 小时"）。⇒ 用条件变量自己管，不用 BoundedSemaphore：
+        #: 后者**不能热改容量**（而"改上限要重启"正是用户点名的代价）。
         self._max_jobs = _max_jobs()
-        self._jobs_sem = threading.BoundedSemaphore(self._max_jobs)
+        self._cond = threading.Condition()
+        self._running_jobs = 0
+        #: 排队表：``ticket → {"at": 入队时刻, "job_id": 提交后回填}``。
+        #: 顺序 = ticket 顺序 = **入队顺序**（`queue_position` 由它算出来）。
+        self._waiting: dict[int, dict] = {}
+        self._ticket_seq = 0
+        #: 提交那一刻的调度事实（`job_id → {queued, position, waited_s}`）。
+        #: 提交到 worker 真正开跑之间有窗口，那期间只有这份初始值是真的。
+        self._queue_info: dict[str, dict] = {}
+        self._queue_info_lock = threading.Lock()
     # ---- 转发（同一实例，不是第二套） ----
     @property
     def gate(self):
@@ -329,20 +381,63 @@ class MLMecha:
         #   "提交成功 → 轮询 → 发现失败"。改为**提交前**当场拒（同样经 Gate 的
         #   判断逻辑，不另造一套）：`authority.gate(side)` 只读 mode 并抛 GateDenied。
         self.software.authority.gate(side)
-        # ⭐ 闸 ②：**并发上限**（超额响亮拒绝；不排队、不静默丢弃）
-        if not self._jobs_sem.acquire(blocking=False):
-            raise MechaError(
-                f"后台任务已达上限（{self._max_jobs} 个在跑）",
-                kind="too_many_jobs",
-                hint="等已提交的任务结束后再提交，或用 read_job 看看它们在干什么；"
-                     "上限可用环境变量 MLTB_MAX_JOBS 调整",
-                suggest="先 read_job 轮询已有任务；要立刻跑就用同步的 run_method",
-            )
+        # ⭐ 闸 ③：**显存预检**（2026-10-05，L3；用户实测 §3.3 的代价是一整晚）。
+        #   这里是**快速失败**（提交前就拒，连 job 都不建）；同一个函数也在
+        #   `MLEngine.run`（命令入口）上兜一次 ⇒ **同步路径与后台路径同口径**。
+        vram.precheck(dict(spec))
+        # ⭐ 闸 ②：**并发名额 → 超额入队**（2026-10-05 行为变更，见类说明）
+        #   旧行为：超额**响亮拒绝**（`too_many_jobs`）⇒ 用户只能"投一个等一个"，
+        #   而"一次排满 24 小时"是刚需。新行为：**照收，排队**，并在回执里给
+        #   `queued` / `queue_position`（AI 立刻知道"前面还有几个"）。
+        #   ⚠ 取消仍然有效：排队的 worker 会轮询框架的取消信号
+        #     （`ExecutionContext.cancelled()`）⇒ **队列里的任务可以取消**
+        #     （用户明确要求：他会投多、然后改主意）。
+        with self._cond:
+            self._ticket_seq += 1
+            ticket = self._ticket_seq
+            queued = self._running_jobs >= self._max_jobs
+            if queued:
+                self._waiting[ticket] = {"at": time.time(), "job_id": ""}
+                queue_position = len(self._waiting)
+            else:
+                self._running_jobs += 1
+                queue_position = 0
 
         def worker(ctx):
             channel_token = use_channel(channel)
             call_token = CURRENT_CALL_ID.set(call_id)
+            held = not queued
             try:
+                if not held:
+                    started_wait = time.time()
+                    _attach_queue_note(ctx, queued=True,
+                                       position=self._queue_position(ticket),
+                                       waited_s=0.0)
+                    while True:
+                        with self._cond:
+                            if self._running_jobs < self._max_jobs:
+                                self._running_jobs += 1
+                                held = True
+                                self._waiting.pop(ticket, None)
+                                break
+                            self._cond.wait(0.2)
+                        if _ctx_cancelled(ctx):
+                            # ⭐ **在队列里就被取消**：连命令都没跑 ⇒ 如实说，
+                            #   不假装"训练被中断"（那会让人以为跑过一段）。
+                            with self._cond:
+                                self._waiting.pop(ticket, None)
+                            return {
+                                "ok": False, "command": command, "run_ids": [],
+                                "primary_metric": "", "metrics": {}, "warnings": [],
+                                "error": "任务在**排队期间**被取消：它还没开始跑，"
+                                         "没有产生任何运行",
+                                "error_kind": "cancelled_in_queue",
+                                "error_hint": "取消发生在等并发名额的阶段；"
+                                              "要跑请重新提交",
+                                "error_suggest": "",
+                            }
+                    _attach_queue_note(ctx, queued=False, position=0,
+                                       waited_s=time.time() - started_wait)
                 # ⭐ **后台任务的终态自动落盘**（用户裁决：别让"意外"白训练）。
                 #   为什么在这里标：`submit` 是**后台 job 的唯一入口** ⇒ 打这个标
                 #   等价于"这次是在后台跑的"。而 job 状态只在**进程内存**里
@@ -363,9 +458,12 @@ class MLMecha:
                 CURRENT_CALL_ID.reset(call_token)
                 clear_channel(channel_token)
                 # ⭐ 释放并发名额：**job 真跑完**（含失败/取消）才放。
-                #   ⚠ 放在这里而不是 `jobs.submit` 之后：那样会在任务还在跑时就放，
-                #   上限形同虚设。
-                self._jobs_sem.release()
+                #   ⚠ `held` 而不是"总是释放"：排队期间被取消的那条**从没拿到名额**
+                #   ⇒ 释放它会把名额凭空变多（上限形同虚设）。
+                if held:
+                    with self._cond:
+                        self._running_jobs = max(0, self._running_jobs - 1)
+                        self._cond.notify_all()
 
         def ref(receipt):
             if not isinstance(receipt, Mapping):
@@ -375,9 +473,92 @@ class MLMecha:
             return {"kind": "ml_command", "command": command,
                     "run_ids": list(receipt.get("run_ids", []))}
 
-        return self.software.jobs.submit(worker, command=command,
-                                         cancel_supported=cancel_supported,
-                                         result_ref_fn=ref)
+        try:
+            job = self.software.jobs.submit(worker, command=command,
+                                            cancel_supported=cancel_supported,
+                                            result_ref_fn=ref)
+        except Exception:
+            # 提交本身失败（框架拒绝/注册表异常）⇒ **把名额还回去**，
+            # 否则这两份账会永久错位（跑着的少了、名额却被占着）。
+            with self._cond:
+                self._waiting.pop(ticket, None)
+                if not queued:
+                    self._running_jobs = max(0, self._running_jobs - 1)
+                self._cond.notify_all()
+            raise
+        with self._cond:
+            if ticket in self._waiting:
+                self._waiting[ticket]["job_id"] = job.id
+        with self._queue_info_lock:
+            self._queue_info[job.id] = {"queued": bool(queued),
+                                        "position": int(queue_position),
+                                        "waited_s": 0.0}
+        return job
+
+    def job_queue_info(self, job_id: str) -> dict:
+        """这个 job 在**调度层**的状态：``{queued, position, waited_s}``。
+
+        优先读**活的** sidecar（worker 会随排队/开跑更新它）；没有就回提交时记下的
+        初始值（提交到线程真正开跑之间有个极小的窗口，那时只有初始值是真的）。
+        """
+        live: dict = {}
+        try:
+            ctx = self.software.jobs.get(job_id).context
+            live = dict(getattr(ctx, QUEUE_SIDECAR, None) or {})
+        except Exception:                                      # noqa: BLE001
+            live = {}
+        if live:
+            return live
+        with self._queue_info_lock:
+            return dict(self._queue_info.get(job_id)
+                        or {"queued": False, "position": 0, "waited_s": 0.0})
+
+    # ---- 调度器（队列/热改上限）------------------------------------------------
+    def _queue_position(self, ticket: int) -> int:
+        """排队位次（1 = 下一个跑）；已不在队列 ⇒ 0。"""
+        with self._cond:
+            if ticket not in self._waiting:
+                return 0
+            return sorted(self._waiting).index(ticket) + 1
+
+    def queue_state(self) -> dict:
+        """调度器的当前账目：``{limit, running, queued, waiting:[job_id,…]}``。
+
+        ⚠ 与框架的 job 状态**是两件事**，都要看得见：框架的 `running` 表示
+        "线程已经起了"，而这里表示"**真的在跑命令**"——排队的那些在线程上也是
+        `running`。两个都真，只是问的不是同一件事（`read_job` 会把两者分开报）。
+        """
+        with self._cond:
+            ordered = sorted(self._waiting)
+            return {"limit": int(self._max_jobs), "running": int(self._running_jobs),
+                    "queued": len(ordered),
+                    "waiting": [str(self._waiting[t].get("job_id") or "") for t in ordered],
+                    "queue_limit_editable": True}
+
+    def set_job_limit(self, limit: int) -> dict:
+        """**热改**并发名额（不必重启权威——用户点名的代价就在这里）。
+
+        - 调**大**：立刻唤醒排队的 job（能上几个上几个）；
+        - 调**小**：**不打断**已在跑的（训练中断不是"改配置"该有的副作用），
+          只是后续不再放新的进去 ⇒ 实际并发会在它们收尾后收敛到新上限。
+        """
+        try:
+            n = int(limit)
+        except (TypeError, ValueError):
+            raise MechaError(
+                f"并发名额需要整数，收到 {limit!r}", kind="bad_job_limit",
+                hint=f"当前 {self._max_jobs}；例如 set_job_limit 8") from None
+        if n < 1:
+            raise MechaError(
+                f"并发名额至少为 1，收到 {n}", kind="bad_job_limit",
+                hint="0 会把所有后台任务永久堵在队列里（那不是「暂停」的语义）",
+            )
+        with self._cond:
+            before = int(self._max_jobs)
+            self._max_jobs = n
+            self._cond.notify_all()
+            after = self.queue_state()
+        return {"before": before, **after}
 
     def wait_job(self, job, timeout: float | None = None) -> dict:
         """等待 job 结束并返回状态（``result_ref`` 在其中）。"""
@@ -450,6 +631,10 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
         seed=seed, device=device, resource_guard=resource_guard,
         export_root=export_root, max_batch_methods=max_batch_methods,
         max_dataset_rows=max_rows,
+        # ⭐ **身份台账落盘位置**（R32/R38）：`<工作区>/.ml-mecha/ml_ledger`。
+        #   与 mecha 自己的操作账本（`journal.jsonl`）**同一个数据目录**：
+        #   都是"这个工作区的事实"，不该分裂成两个根。
+        ledger_dir=root_path / data_dir_name / "ml_ledger",
     )
 
     software = assemble(

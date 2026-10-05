@@ -960,3 +960,78 @@
   （把真实命令处理链里的 `run_method` 换成"回空回执"的桩 ⇒ 必须得到
   `silent_terminal`，且 `read_job` 报失败）。
 
+### A44. 身份用**内容**定，不要用**名字**或**会话计数器**定
+- **症状**（用户实测，出现频率最高）：`dataset_id` 每次登记都变（`ds-001-…` 会话
+  计数器）⇒ "上一轮用的哪份数据"丢失，**只能靠记忆对齐**；重启后全失效，一晚上
+  **重复登记七八次**（《长任务编排与失败可读性》§3.4）。
+- **修法**：`id = ds-<fp12>`，`fp` 由（来源内容 ⊕ 管道声明 ⊕ 目标/类型 ⊕ 图/负载
+  内容 ⊕ 行数）算出 ⇒ **同内容必然同 id**（幂等）；可读含义交给 `label`/`aliases`。
+  台账落盘（`.ml-mecha/ml_ledger/datasets.jsonl`）⇒ 可复原的来源（csv/synthetic）
+  重启后**懒复原**。
+- **两条教训**：
+  1. **名字不能进身份**：名字进 id 就会"换个名字裂成两个 id"。但**纯指纹也不好用**
+     （人读不出来）⇒ 身份与标签**分开**才是正解（"机器对齐靠 id，人读靠 label"）。
+  2. ⚠ **我的第一版判据漏了跨会话那一步**：会话内的幂等索引把"名字掺进 fp"这个
+     变异**掩盖**掉了（第一次登记返回的 id 本来就是它自己算的）⇒ 变异**杀不死**。
+     补上"**跨重启 + 换名字重新登记仍须同 id**"之后才红。**这就是 A13 说的
+     "挑的 mutation 与原实现等价"——等价不是因为变异弱，是因为判据没走到那条路。**
+- **判据**：`test_ml_delivery.py::test_dataset_id_is_content_addressed_and_idempotent`
+  （含跨重启那一步）、`::test_dataset_survives_restart_by_lazy_restore`、
+  `::test_dataset_needs_reprepare_says_why_and_how`。
+
+### A45. "满了就拒"会把编排者逼成人肉调度器
+- **症状**（用户实测 §3.2）：并发上限 4，超额**直接报错** ⇒ "我因此必须'投一个、
+  等一个、再投一个'"，而他要的是"一次排满 24 小时"。
+- **修法**：**入队**（回执给 `queued` / `queue_position`）、`set_job_limit(n)` **热改**
+  （改上限要重启的代价 = 清空会话态，用户已因此重新登记七八次）、
+  **排队中可取消**（"我会投多、然后改主意"）。
+- **两条纪律**：
+  1. **两层的真话分开报**：框架的 `state=running` 说"线程起了"，调度层的
+     `queued=true` 说"命令还没跑"——**别为了好看把框架状态改写成 queued**（那是报假位置）；
+  2. **名额只在真跑完时释放**，而且**排队中被取消的不许释放**（它从没拿到名额）
+     —— 释放错一次，上限就永久虚高。判据用"排队的那个没占名额"钉住它。
+- **判据**：`test_ml_delivery.py::test_queue_admits_over_limit_reports_position_and_is_hot_editable`、
+  `::test_queued_job_is_cancellable_before_it_ever_runs`、
+  `test_ml_mecha.py::test_submit_prechecks_write_authority_and_queues_over_cap`。
+
+### A46. 资源真相：**估算由声明给，框架只对照实测执行**
+- **症状**（用户实测 §3.3，代价一整晚）：6 GB 卡、配置峰值 5.30 GB、运行时只剩
+  3.6 GB ⇒ OOM，而 CUDA 把它报成 `device-side assert`。"**我事前完全不知道会不够。**"
+- **修法**：`resource_guard.max_peak_mb`（用户声明）＋ 实测可用显存 ⇒ 提交前
+  **可读地拒**（`cuda_oom_predicted`，三个数字都给出）；跑完报**实测峰值**。
+  外加**框架级分块** `ctx["chunks"].reduce(..., mode="mean"|"sum")`，权重累加由框架算。
+- **教训**：**别猜任意 PyTorch 网络的显存峰值**——它取决于结构/批次/优化器状态/
+  是否分块……猜出来的数字会**假装精确**，而"假装精确的预算"比没有预算更坏
+  （人会信任一个错的数）。**声明 + 实测 + 可读拒绝**才是诚实的组合。
+  ⚠ 无 CUDA 时回**空**（不返回 0、不返回编造值）：用户会拿这个数去设预算。
+- **判据**：`test_ml_delivery.py::test_vram_precheck_rejects_only_when_the_declared_peak_cannot_fit`
+  （探针**注入** ⇒ 无 GPU 的机器上也确定地跑）、`::test_peak_vram_is_not_faked_on_cpu`、
+  `test_nqs_path.py::test_framework_chunks_match_the_unchunked_result`
+  （小预算下结果与不分块**一致**；把权重去掉 ⇒ 判据红）。
+
+### A47. 分块的**累加口径**是最容易写错的地方（所以由框架承担）
+- **症状**（用户原话 §3.3）："我为了不 OOM，在**自己的网络代码里**手写了
+  `forward_step`/`metrics` 的内部分块（按 R 切块、按块加权累加）。"
+  ⇒ 每个用户各写一遍，而写错的方式就那两种：**只取最后一块**、**重复计数**
+  （或把权重乘两次 = 权重平方）。
+- **修法**：`ctx["chunks"].reduce(payload, fn, mode="mean"|"sum", budget_mb=…)`
+  —— `mean` 由框架算 `Σ (块行数/总行数) × 值`；用户**不许**再乘权重；
+  每块返回的键必须一致（不一致**抛错**，不静默少一个键）。
+- **判据**：`test_nqs_path.py::test_framework_chunks_match_the_unchunked_result`
+  红验证：把 `mode="mean"` 的权重去掉 ⇒ 数值立刻对不上（33.5 vs 0.52）。
+
+### A48. 观测工具**自己的每一句话**都要有出处（看门狗的三个自造假话）
+- **假话 1**：拿到 `run_id` 后就不再问权威、只等盘上记录 ⇒ 进展行把"最后一次读到的
+  阶段"当实时值打（`job-18` 冻在 `epoch 164/250` 整整 5 分钟，**看着像训练卡住**）。
+- **假话 2**：由此出现回执里 `ok:true` + `state:running` 的**自相矛盾**组合。
+- **假话 3**（用户纠正）：`:latest` 按"最近还在写"挑目录 ⇒ 可能选中**启动器自己的
+  探针 run**（盘上长得一样），却一本正经地报"我盯住了 X"。
+- **修法**：每轮都问权威（只读、毫秒级）；终态以权威为准、盘上记录只是**载荷与证据**，
+  并新增 `state_source`（`authority`/`record`）；等不到终态时 `state="unreported"`
+  ——**不替权威下结论**；启发式模式**自称启发式**并指路"要精确就传 job_id"。
+- **教训**：**"最后一次读到的值"不是"现在的值"**。"猜"要标成猜——一个确定的语气
+  比一个错误的数字更能骗人。
+- **判据**：`test_ml_delivery.py::test_watch_timeout_never_fakes_a_state`、
+  `::test_watch_latest_is_labelled_as_a_heuristic`、
+  `::test_watch_flags_terminal_job_without_any_run`。
+

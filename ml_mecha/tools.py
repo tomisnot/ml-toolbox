@@ -257,6 +257,9 @@ def build_ml_tools(engine: MLEngine, *, actor: str = LOCAL_ACTOR,
         _submit_run(host, side, banned_words),
         _read_job(host, banned_words),
         _cancel_run(host, banned_words),
+        # ⭐ 调度器旋钮：热改并发名额（2026-10-05，L2）。它**不是**新的写通道：
+        #   不碰域状态、不经 Gate，只调"同时能跑几个"。
+        _set_job_limit(host, banned_words),
         _clear_current_state(engine, _with_channel, banned_words),
         _run_queries(engine, codeact, banned_words),
         _checkpoint_detail(engine, banned_words),
@@ -641,20 +644,27 @@ def _describe_dataset(engine: MLEngine,
                 #   与链上 `split` 步骤分开给：那个步骤的参数**不决定**划分
                 #   （真源是 Pipeline 本体），见 `engine._chain_summary` 的说明。
                 "split_policy": detail.get("split_policy") or {},
+                # ⭐ **台账视图**（2026-10-05）：fp（内容身份）+ label/aliases
+                #   （人读的名字，含历史用过的所有名字）+ 用过它的运行（新→旧，有界）。
+                "ledger": detail.get("ledger") or {},
                 "schema_mismatch": detail["schema_mismatch"], "error": ""}
 
     return define_tool(
         name="describe_dataset",
         description="说明一份已准备数据视图的行列规模、目标列、**预处理链逐步参数**"
                     "（填充策略/编码模式/缩放方式…）、**实际划分口径**（split_policy）"
-                    "与管道指纹；用于判断数据是否适合某个方法。",
+                    "与管道指纹；用于判断数据是否适合某个方法。"
+                    "⭐ 还带 `ledger`：`fp`（内容身份，`dataset_id` = `ds-<fp12>`）、"
+                    "`label`/`aliases`（**同一份数据用过的所有名字**）、`restorable`"
+                    "（重启后能否自动复原）与 `recent_runs`（用过它的运行）——"
+                    "**上一轮用的是哪份数据、跑出了什么**一次看清。",
         parameters={"dataset_id": {"type": "string",
                                    "description": "数据集引用；留空用最近准备的一份",
                                    "default": ""}},
         output_schema={"type": "object",
                        "required": ["ok", "dataset_id", "n_rows", "n_features",
                                     "pipeline_id", "pipeline_chain",
-                                    "split_policy", "error"]},
+                                    "split_policy", "ledger", "error"]},
         execute=execute,
         banned_words=banned_words,
     )
@@ -1017,6 +1027,16 @@ def _prepare_dataset(engine: MLEngine, wrap,
         dataset = receipt.get("dataset") or {}
         return {"ok": bool(receipt["ok"]),
                 "dataset_id": receipt.get("dataset_id", ""),
+                # ⭐ **台账三件**（2026-10-05）：内容身份 + 可读标签 + 是否复用。
+                #   `reused: true` 是幂等的可见证据（同一份数据再次登记 ⇒ 同 id）。
+                "fp": receipt.get("fp", ""),
+                "fp_decl": receipt.get("fp_decl", ""),
+                "label": receipt.get("label", ""),
+                "reused": bool(receipt.get("reused")),
+                "aliases": list(receipt.get("aliases") or []),
+                "registrations": int(receipt.get("registrations") or 1),
+                "restorable": bool(receipt.get("restorable")),
+                "restore_note": receipt.get("restore_note", ""),
                 "pipeline_id": receipt.get("pipeline_id", ""),
                 "n_rows": dataset.get("n_rows", 0),
                 "n_features": dataset.get("n_features", 0),
@@ -1090,7 +1110,11 @@ def _prepare_dataset(engine: MLEngine, wrap,
         output_schema={"type": "object",
                        "required": ["ok", "dataset_id", "pipeline_id", "n_rows",
                                     "n_features", "pipeline_chain", "split_policy",
-                                    "payload", "target_kind", "warnings", "error"]},
+                                    "payload", "target_kind", "warnings", "error",
+                                    # ⭐ 台账（2026-10-05）：内容身份 + 可读标签 +
+                                    #   是否复用 + 重启后能否自动复原。
+                                    "fp", "fp_decl", "label", "reused", "aliases",
+                                    "registrations", "restorable", "restore_note"]},
         execute=wrap(execute),
         banned_words=banned_words,
     )
@@ -1335,9 +1359,19 @@ def _submit_run(host: Any, side: str,
         # 通道与 call_id 由 MLMecha.submit 带进后台线程（contextvars 不跨线程）；
         # 这里**不**用 _with_channel —— 见模块 docstring「长任务：job 类工具」。
         job = ml.submit(spec, side=side)
+        # ⭐ **调度层事实**（2026-10-05）：超额不再报错而是**入队** ⇒ 回执必须
+        #   立刻告诉 AI"排在第几"（否则它只能靠再查一次）。⚠ 与框架的 `state`
+        #   分开报：框架说"线程起了"（running），调度说"还没轮到跑"（queued=…）。
+        queue = ml.job_queue_info(job.id)
         return {"ok": True, "job_id": job.id, "command": job.command,
                 "cancel_supported": bool(job.cancel_supported),
-                "state": job.state.value, "error": ""}
+                "state": job.state.value, "error": "",
+                "queued": bool(queue.get("queued")),
+                "queue_position": int(queue.get("position") or 0),
+                "queue_note": ("已入队：前面还有 "
+                               f"{max(0, int(queue.get('position') or 0) - 1)} 个在等"
+                               "（超额不再报错，排到就开跑；排队期间可以 cancel_run）"
+                               if queue.get("queued") else "")}
 
     return define_tool(
         name="submit_run",
@@ -1377,7 +1411,9 @@ def _submit_run(host: Any, side: str,
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "command", "cancel_supported",
-                                    "state", "error"]},
+                                    "state", "error",
+                                    # 调度层（队列）：超额入队 ⇒ 立刻知道排第几。
+                                    "queued", "queue_position", "queue_note"]},
         execute=execute,
         banned_words=banned_words,
     )
@@ -1614,6 +1650,19 @@ def _read_job(host: Any,
         out_progress = progress if full else progress[-tail_n:]
         out_epochs = all_epochs if full else all_epochs[-tail_n:]
         final_state = str(status.get("state") or "")
+        # ⭐ **调度层事实**（2026-10-05）：排队中的 job 在框架那边也是 `running`
+        #   （线程已经起了），但那**不代表已经在训练**。⇒ 两个事实分开报，
+        #   并在 `queue_note` 里说清"这两个词问的不是同一件事"。
+        queue = ml.job_queue_info(job_id) if hasattr(ml, "job_queue_info") else {}
+        queued = bool(queue.get("queued"))
+        queue_note = ""
+        if queued:
+            queue_note = (f"⚠ 这个 job 正在**排队**（第 "
+                          f"{int(queue.get('position') or 0)} 位，已等 "
+                          f"{float(queue.get('waited_s') or 0):.0f}s）：它的 "
+                          f"`state` 由框架给出（线程已启动 ⇒ `running`），"
+                          f"但**命令还没开始跑**——`queued=true` 才是调度层的真话。"
+                          f"排队期间可以 `cancel_run`（会在开跑前就取消掉）。")
         # ⭐ `wait` 的**诚实三件套**：等了多久 / 是不是等到超时（**不是失败**）/
         #   上限是多少（客户端决定，见 `READ_JOB_MAX_WAIT_S`）。
         #   ⚠ 超时不抛错：调用方要能**循环调用**它（"还在跑 + 当前进度"是等待的
@@ -1621,6 +1670,8 @@ def _read_job(host: Any,
         timed_out = bool(mode != "none" and budget > 0
                          and final_state not in TERMINAL_JOB_STATES)
         notes = []
+        if queue_note:
+            notes.append(queue_note)
         if wait_clamped:
             notes.append(f"请求等待 {requested:g}s，已夹到上限 {READ_JOB_MAX_WAIT_S:g}s"
                          f"（MCP 客户端单次调用超时 600s）。要等更久用独立进程："
@@ -1649,6 +1700,10 @@ def _read_job(host: Any,
                 "wait_cap_s": READ_JOB_MAX_WAIT_S, "wait_clamped": wait_clamped,
                 "jobs": [{"job_id": h, "state": _job_state(ml, h)[0]}
                          for h in handles],
+                # ---- 调度层（队列）事实：与框架的 state **分开**、各自为真 ----
+                "queued": queued,
+                "queue_position": int(queue.get("position") or 0),
+                "queue_wait_s": round(float(queue.get("waited_s") or 0), 3),
                 "wait_note": "；".join(notes)}
 
     return define_tool(
@@ -1702,7 +1757,9 @@ def _read_job(host: Any,
                                     # 等待原语（2026-10-05）：等了多久 / 是否等到超时 /
                                     # 上限 / 多句柄状态 / 人话说明。
                                     "wait", "waited_s", "timed_out", "wait_cap_s",
-                                    "wait_clamped", "jobs", "wait_note"]},
+                                    "wait_clamped", "jobs", "wait_note",
+                                    # 调度层（队列）：与框架 state 分开报。
+                                    "queued", "queue_position", "queue_wait_s"]},
         execute=execute,
         banned_words=banned_words,
     )
@@ -1739,6 +1796,33 @@ def _cancel_run(host: Any,
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "cancel_requested",
                                     "terminal", "state_before", "error"]},
+        execute=execute,
+        banned_words=banned_words,
+    )
+
+
+def _set_job_limit(host: Any,
+                   banned_words: tuple[str, ...] = ()) -> ToolDefinition:
+    def execute(*, limit: int) -> Mapping[str, Any]:
+        ml = _require_job_host(host)
+        before = ml.queue_state()
+        after = ml.set_job_limit(int(limit))
+        return {"ok": True, "limit": int(after["limit"]),
+                "limit_before": int(before["limit"]),
+                "running": int(after["running"]), "queued": int(after["queued"]),
+                "error": ""}
+
+    return define_tool(
+        name="set_job_limit",
+        description="**热改**后台任务并发名额（不必重启权威——重启会清空会话里的 "
+                    "dataset_id/job_id，代价大）。调大 ⇒ 立刻唤醒排队的任务；"
+                    "调小 ⇒ **不打断**已在跑的，只是不再放新的进去。"
+                    "⚠ 只影响并发度，不影响任何运行的语义与结果。",
+        parameters={"limit": {"type": "integer",
+                              "description": "新的并发名额（≥1）"}},
+        output_schema={"type": "object",
+                       "required": ["ok", "limit", "limit_before", "running",
+                                    "queued", "error"]},
         execute=execute,
         banned_words=banned_words,
     )

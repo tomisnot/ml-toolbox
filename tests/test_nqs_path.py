@@ -1062,6 +1062,87 @@ _RACE_CODE_A = "class Network:\n    def build(self, n_in, n_out, *, nn):\n      
 _RACE_CODE_B = "class Network:  # B\n    def build(self, n_in, n_out, *, nn):\n        return nn.Linear(n_in, n_out)\n"
 
 
+_CHUNK_CODE = '''
+class Net(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, 3)
+
+
+class Network:
+    """metrics **一次算全量** → 换成 `ctx["chunks"]` 分块算，结果必须一致。"""
+    primary_metric = "mean/amp"
+
+    def build(self, n_in, n_out, *, nn):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        out = model.lin(x)
+        return out, out.detach()
+
+    def metrics(self, model, ctx):
+        # ⚠ **框架级分块**：权重由框架负责（`mode="mean"`），我不自己乘
+        #   —— 用户手写时最容易在这里写成"只取最后一块"或"重复计数"。
+        def _block(blk):
+            return {"mean/amp": float(blk["amps"].real.abs().mean())}
+        return ctx["chunks"].reduce(ctx["payload"], _block, mode="mean",
+                                    budget_mb=0.0005)
+'''
+
+
+def test_framework_chunks_match_the_unchunked_result():
+    """⭐ **框架级分块**：小预算下结果与"一次算全量"一致，且回执说得出"分了几块"。
+
+    用户实测（《长任务编排与失败可读性》§3.3）："我为了不 OOM，在**自己的网络代码里**
+    手写了分块（按 R 切块、按块加权累加）。这是通用需求……不该每个用户各写一遍。"
+
+    ⇒ 判据只钉两件事（都是"用户真会踩"的）：
+    ① **数值一致**：`ctx["chunks"].reduce(..., mode="mean")` 的结果与不分块时
+       逐样本均值一致到容差内（加权口径正确 ⇒ 不是"只取最后一块"）；
+    ② **事实可见**：回执/存档里能读到"已分 N 块"（`nn_chunks` 工件）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="nqs-chunk-") as td:
+        ml = _ml(td)
+        try:
+            rows, n_atoms = 64, 6
+            meta, bits, amps = _nqs_payload(rows=rows, n_atoms=n_atoms, seed=3)
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame", "frame": meta}, "name": "chunk",
+                "target_kind": "custom",
+                "payload": {"arrays": {"bits": bits["values"],
+                                       "bit_mask": bits["mask"],
+                                       "amps": amps["values"]}},
+                "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+            out = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _CHUNK_CODE, "dataset_id": ds,
+                "name": "chunked", "persist": True,
+                "overrides": {"epochs": 3, "batch": 8, "val_split": 0.0}})["value"]
+
+            # ① 数值一致：分块算出的均值 == 全量逐样本均值
+            want = float(np.abs(amps["values"].real).mean())
+            got = float(out["metrics"]["mean/amp"])
+            assert abs(got - want) < 1e-5, (got, want)
+
+            # ② 事实可见：存档里留下"已分 N 块"
+            from ml_toolbox.core.persistence import load_run_record
+            rec = load_run_record(out["run_id"])
+            note = rec.result.artifacts.get("nn_chunks")
+            assert note is not None, "没有留下分块事实 ⇒ 回执无法说'已分 N 块'"
+            text = str(note[0] if hasattr(note, "__getitem__") else note)
+            assert "blocks" in text, text
+            n_blocks = int(text.split()[0])
+            assert n_blocks >= 2, f"预算这么小却只切了 {n_blocks} 块：{text}"
+        finally:
+            ml.close()
+
+
 _TESTS = [
     test_unsupported_shapes_are_rejected_teachably,
     test_row_payload_is_accepted_and_keeps_dtypes,
@@ -1083,6 +1164,8 @@ _TESTS = [
     test_payload_facts_disclose_per_row_shape,
     # ---- 长任务编排批次（docs/建议-ML工具长任务编排与失败可读性.md §2.3）----
     test_concurrent_run_custom_does_not_unregister_each_other,
+    # ---- L3 资源：框架级分块（§3.3）----
+    test_framework_chunks_match_the_unchunked_result,
 ]
 
 

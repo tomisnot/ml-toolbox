@@ -299,7 +299,11 @@ class CustomNNMethod(MLMethod):
                 # 贵的指标（如在全量支撑上算保真度）用 `metrics_every` 降频；
                 # 末轮一定算（保证回执/回看的终值不是旧的 —— 否则又是一个假事实）
                 metrics_every=int(getattr(net, "metrics_every", 1) or 1),
-                keep_best=True)
+                keep_best=True,
+                # ⭐ 框架分块的预算（`resource_guard.chunk_budget_mb`）：不给就用
+                #   `core.chunks` 的默认，**不影响既有行为**（默认只影响显式用了
+                #   `ctx["chunks"]` 的网络）。
+                chunk_budget_mb=_trainer.chunk_budget_from(run_extras))
         except Exception as exc:                             # noqa: BLE001
             import traceback
             res = self._new_result(target_kind=kind, params={"lr": lr}).fail(
@@ -357,6 +361,22 @@ class CustomNNMethod(MLMethod):
             lab = rec.last_labels
             if lab is not None:
                 res.artifacts["labels"] = lab
+        # ⭐ **框架分块的事实**（网络用了 `ctx["chunks"]` 才有）：把"已分 N 块"
+        #   留在存档里 ⇒ 回执 / `describe_run` 能说清"这次是真分了块还是在硬算"。
+        #   ⚠ 位置有讲究：必须**在 `rec.finalize()` 之后**（那一步会重排 artifacts，
+        #   字符串数组在那之前会被过滤掉——与 `custom_network_source` 同一处理）。
+        #   ⚠ 存成**字符串数组**（npz 用 `allow_pickle=False`，装不下 dict）。
+        chunk_facts = dict(stats.get("chunks") or {})
+        if chunk_facts.get("n_blocks"):
+            res.artifacts["nn_chunks"] = np.array([
+                f"{int(chunk_facts['n_blocks'])} blocks x "
+                f"{int(chunk_facts.get('rows_per_block') or 0)} rows "
+                f"(budget {float(chunk_facts.get('budget_mb') or 0):g} MiB)"])
+        # ⭐ **实测显存峰值**（事后归因，用户实测 §3.3）：只在真跑在 CUDA 上时才有值
+        #   ⇒ CPU 上**不留这个键**（不假装有数字，也不留一个 0 让人以为"用了 0 MB"）。
+        if stats.get("peak_vram_mb") is not None:
+            res.artifacts["nn_peak_vram_mb"] = np.array(
+                [float(stats["peak_vram_mb"])])
         # ⭐ 代码跟着运行走：跨会话能取回、能按名字复用（**别让 AI 反复重贴**）
         res.artifacts["custom_network_source"] = np.array([str(compiled.source)])
         # ⭐⭐ **真 checkpoint**（NQS 需求的最高优先项："训练完能把模型拿回来"）

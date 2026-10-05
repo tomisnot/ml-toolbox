@@ -87,12 +87,15 @@ from ml_mecha.mcp_host import (McpHost, build_mcp_server,       # noqa: E402
 from mecha.providers.mcp import tool_input_schema               # noqa: E402
 
 #: 工具面全量（``ToolRegistry.schemas()`` 按 name 排序）。
+#: ⚠ 2026-10-05 长任务编排：等待原语**折进 `read_job`**（不新增工具），
+#: 但"热改并发上限"是**新能力**、没有既有入口 ⇒ 加了 `set_job_limit`（19→20）。
 TOOL_NAMES = ("cancel_run", "checkpoint_detail", "clear_current_state",
               "compare_methods", "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
               "eval_custom", "prepare_dataset", "read_job", "run_custom",
-              "run_method", "run_method_batch", "run_queries", "submit_run")
+              "run_method", "run_method_batch", "run_queries", "set_job_limit",
+              "submit_run")
 
 #: 每个工具的必填项（写工具取**命令声明**，只读与 job 调度面取闭包签名）。
 EXPECTED_REQUIRED = {
@@ -112,6 +115,9 @@ EXPECTED_REQUIRED = {
     #   （都不给报 `missing_job_id`、同时给报 `bad_job_selection`）。
     #   这与 `run_custom.code`/`code_path` 是**同一套**做法（见下）。
     "read_job": [],
+    # ⭐ 2026-10-05：`set_job_limit` 的 `limit` 是**必填**（没有"默认上限"可说——
+    #   默认来自环境变量/装配点，不在这里再写一份）。
+    "set_job_limit": ["limit"],
     # ⚠ `code` **不是**必填（2026-10-04 修）：`code` 与 `code_path` 二选一，
     #   而 JSON-schema 的 required 表达不了"二选一"⇒ 两者都声明为非必填，
     #   由引擎在 `engine.py:1113-1126` 校验（都不给报 `missing_code`、
@@ -555,6 +561,9 @@ EXPECTED_DEFAULTED = {
     # `eval_custom` 的 `which` 有 `"best"` 默认、`dataset_id` 有 `""` 默认；
     # `run_id`/`code` 是必填。
     "eval_custom": ["dataset_id", "which"],
+    # ---- 2026-10-05 长任务编排（L2 调度器）----
+    # `set_job_limit` 唯一的参数 `limit` 是**必填**（无默认）⇒ 本表记空列表。
+    "set_job_limit": [],
 }
 
 #: 逐参数行为判据：(工具, 最小必填参数, 参数名, 真值)。
@@ -724,6 +733,9 @@ _MIN_ARGS = {
     # （`summary` 是内置动作、零参数）——判据只关心 null 垫片的传输行为，
     # 但用真动作能顺带证明"编排入口本身可用"。
     "run_queries": {"actions": [{"op": "summary"}]},
+    # `set_job_limit`：最小必填就是一个合法名额（**真的会改上限**——本判据只关心
+    # 传输行为，但顺手用一个合法值不制造额外副作用面）。
+    "set_job_limit": {"limit": 4},
     # ---- 2026-10-03 新增（NQS 路径）----
     # `checkpoint_detail` 只读、`run_id` 有 `""` 默认 ⇒ 最小必填集是空。
     "checkpoint_detail": {},
@@ -743,6 +755,8 @@ _MIN_ARGS = {
 #: 2026-10-05 长任务编排 +4：`read_job` 的 `wait`/`timeout_s`（阻塞到终态）、
 #: `job_ids`（一次等多个/等任意一个）与 `job_id`（二选一 ⇒ 不再是必填）。
 _EXPECTED_OPTIONAL_PARAMS = 71
+# ⚠ `set_job_limit` 的 `limit` 是**必填** ⇒ 不增加这个计数（它统计的是**可选**参数）。
+#    新增可选参数会在这里红，提醒补探针——这是有意的"逼你登记"。
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -1548,6 +1562,413 @@ def test_missing_custom_method_is_teaching_not_internal_error():
 def _is_missing_custom_method_public(exc):
     from ml_mecha.engine import _is_missing_custom_method
     return _is_missing_custom_method(exc)
+
+
+# ============================================================ L1 身份台账（2026-10-05）
+# 依据：`docs/建议-ML工具长任务编排与失败可读性.md` §3.4 / §5（运行清单）。
+def test_dataset_id_is_content_addressed_and_idempotent():
+    """⭐ **同内容 ⇒ 同一个 id**（幂等）——用户"上一轮用的哪份数据只能靠记忆对齐"的正解。
+
+    实测原文（§3.4）："重启后 `dataset_id` 全失效，必须重新 `prepare_dataset`。本轮
+    我因此**重复登记了七八次**。更麻烦的是：每次登记**返回新 id**，于是'上一轮用的
+    哪份数据'在会话里丢失，只能靠**我的记忆**对齐。"
+
+    本判据钉三条：
+    ① 同一份数据（**换个名字**）再登记 ⇒ 同一个 id、`reused: true`；
+    ② `aliases` **累加**（两个名字都查得到）、`registrations` 计数可见；
+    ③ **不同**内容 ⇒ **不同** id（否则"幂等"会退化成"把所有数据认成一份"）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-ledger-idem-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            src = {"kind": "synthetic", "task": "classification", "n_samples": 60}
+            (a_err, a_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(src), "name": "口径对照"})])
+            assert a_err is False, a_txt
+            a = json.loads(a_txt)
+            assert a["dataset_id"].startswith("ds-"), a
+            assert a["reused"] is False, a
+            assert a["fp"] and a["fp"] in a["dataset_id"], a       # id 由指纹承载
+            assert a["label"] == "口径对照", a
+
+            # ① 同内容、**换个名字** ⇒ 同 id + reused
+            (b_err, b_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(src), "name": "改了个名字"})])
+            assert b_err is False, b_txt
+            b = json.loads(b_txt)
+            assert b["dataset_id"] == a["dataset_id"], (a["dataset_id"], b["dataset_id"])
+            assert b["reused"] is True, b
+            # ② 别名累加 + 登记次数（"这份数据被登记过几次"要看得见）
+            assert set(b["aliases"]) >= {"口径对照", "改了个名字"}, b["aliases"]
+            assert b["registrations"] == 2, b
+
+            # ③ 不同内容 ⇒ 不同 id（防"幂等"变成"全都认成一份"）
+            (c_err, c_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": {"kind": "synthetic",
+                                                "task": "classification",
+                                                "n_samples": 61},
+                                     "name": "口径对照"})])
+            assert c_err is False, c_txt
+            c = json.loads(c_txt)
+            assert c["dataset_id"] != a["dataset_id"], c
+
+        # ④ ⭐ **跨重启**再登记（**换个名字**）：仍然必须是同一个 id。
+        #    ⚠ 这一条才是真正钉死"名字不许进 id"的地方：会话内的幂等索引
+        #    （`fp_decl → id`）会把"名字进了 id"这种实现**掩盖**掉（第一次登记返回
+        #    的 id 本来就是它自己算的）——只有跨会话重新计算 id 才暴露它。
+        #    实测教训：我第一版判据漏了这一步，于是"把 name 掺进 fp"这个变异
+        #    **杀不死**（等价变异）。
+        ml2 = assemble_ml_mecha(root=td, seed=13)
+        try:
+            ml2.switch_ai()
+            again = ml2.tools.execute("prepare_dataset", {
+                "source": {"kind": "synthetic", "task": "classification",
+                           "n_samples": 60},
+                "name": "重启后换的名字"})["value"]
+            assert again["dataset_id"] == a["dataset_id"], (
+                "跨重启+换名字之后 id 变了 ⇒ 名字掺进了身份（'上一轮用的哪份数据'"
+                "又会失配）", again["dataset_id"], a["dataset_id"])
+            assert again["reused"] is False, again      # 新会话里是**新建**（不是复用）
+            assert "重启后换的名字" in again["aliases"], again["aliases"]
+        finally:
+            ml2.close()
+
+
+def test_dataset_survives_restart_by_lazy_restore():
+    """⭐ **重启后同一个 id 仍然可用**（按台账声明就地重建，不必重新登记）。
+
+    用户要的正是这条（§3.4 "登记表落盘，重启后按指纹自动复原"）。
+    判据做**真的两次装配**（同一 root = 模拟重启）：第二次装配的会话里**没有**任何
+    数据集，直接拿第一次的 id 跑 `run_method` ⇒ 必须成功，且事后那个 id 出现在会话里。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-ledger-restart-") as td:
+        src = {"kind": "synthetic", "task": "classification", "n_samples": 60}
+
+        def _fresh():
+            """同一 root 的**新装配**（= 模拟"重启权威"）。"""
+            ml = assemble_ml_mecha(root=td, seed=13)
+            ml.switch_ai()
+            return ml
+
+        ml1 = _fresh()
+        try:
+            got = ml1.tools.execute("prepare_dataset",
+                                    {"source": dict(src), "name": "跨重启"})["value"]
+            dataset_id, fp = got["dataset_id"], got["fp"]
+            assert got["restorable"] is True, got        # synthetic 可重建
+        finally:
+            ml1.close()
+
+        # ---- 模拟重启：新装配、空会话，只有盘上的台账 ----
+        ml2 = _fresh()
+        try:
+            assert ml2.engine.dataset_ids() == [], "新装配不该凭空有数据集（前提守卫）"
+            receipt = ml2.tools.execute("run_method", {
+                "method": "logistic", "dataset_id": dataset_id})
+            assert receipt.get("is_error") is not True, receipt
+            assert receipt["value"]["run_id"], receipt
+            back = ml2.engine.dataset_entry(dataset_id)
+            assert back is not None, "懒复原之后这个 id 必须真的在会话里"
+            assert back.fp == fp, (back.fp, fp)          # 复原出来的是**同一份**
+        finally:
+            ml2.close()
+
+
+def test_dataset_ledger_view_links_fingerprint_label_and_runs():
+    """`describe_dataset` 的 `ledger`：**指纹 → 名字 → 用它的运行**串成一条链（R38）。
+
+    用户要的"运行清单"：*"数据集（按指纹） → 负载 → 作业 → run_id → 判据与结果"*。
+    这里钉前两环 + 运行计数：跑一次 `run_method` 之后，`recent_runs` 里必须出现它
+    （说明台账与 `runs/` 存档**对得上**，不是两本各说各话的账）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-ledger-view-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            (p_err, p_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(_SYNTHETIC),
+                                     "name": "清单用"})])
+            assert p_err is False, p_txt
+            dataset_id = json.loads(p_txt)["dataset_id"]
+            (r_err, r_txt), = _call_tools(host.url, [
+                ("run_method", {"method": "logistic", "dataset_id": dataset_id,
+                                "persist": True})])       # 清单要读的是**盘上**的存档
+            assert r_err is False, r_txt
+            run_id = json.loads(r_txt)["run_id"]
+
+            (d_err, d_txt), = _call_tools(host.url, [
+                ("describe_dataset", {"dataset_id": dataset_id})])
+            assert d_err is False, d_txt
+            ledger = json.loads(d_txt)["ledger"]
+            assert ledger["fp"] and ledger["fp"] in ledger["dataset_id"], ledger
+            assert ledger["label"] == "清单用", ledger
+            assert ledger["restorable"] is True, ledger
+            ids = [r["run_id"] for r in ledger["recent_runs"]]
+            assert run_id in ids, (run_id, ids)
+            entry = next(r for r in ledger["recent_runs"] if r["run_id"] == run_id)
+            assert entry["method"] == "logistic", entry
+            assert entry["score"] != "", entry            # 结果也在（不只是 run_id）
+
+
+def test_dataset_needs_reprepare_says_why_and_how():
+    """不可复原的来源：回**可教学**的 `unknown_dataset` + 为什么 + 怎么办。
+
+    ⚠ 这条是"诚实边界"的判据：`frame`/`arrays` 是进程内对象，重启后**真的**重建不了
+    ⇒ 不许假装复原成功；但必须比"未知 dataset_id（本会话已准备的数据集：（空））"
+    多给两句（台账里有它、为什么不能复原、重新登记会得到同一个 id）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-ledger-prep-") as td:
+        frame = _frame(40, 3)
+        ml = assemble_ml_mecha(root=td, seed=13)
+        try:
+            ml.switch_ai()
+            got = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame", "frame": frame, "target": "target"},
+                "name": "进程内"})["value"]
+            assert got["restorable"] is False, got
+            assert "无法自动复原" in got["restore_note"], got["restore_note"]
+            dataset_id = got["dataset_id"]
+        finally:
+            ml.close()
+
+        # 台账里有它，但**新装配**的会话里没有（frame 重建不了）⇒ 可教学地拒
+        ml2 = assemble_ml_mecha(root=td, seed=13)
+        try:
+            ml2.switch_ai()
+            # ⚠ 命令层的失败留在**回执**里（`ok=false` + kind/hint），不抛异常
+            #   ——这是既有契约（`read_job` 就是据此把失败说给人听的）。
+            got = ml2.engine.run({"command": "run_method", "method": "logistic",
+                                  "dataset_id": dataset_id})
+            assert got["ok"] is False, "不可复原的 id 不该静默跑通"
+            assert got["error_kind"] == "unknown_dataset", got
+            hint = got["error_hint"] or ""
+            assert "台账" in hint, hint
+            assert "同一个 id" in hint, hint          # 告诉用户"重登会得到同一个 id"
+        finally:
+            ml2.close()
+
+
+# ============================================================ L2 调度器（队列）（2026-10-05）
+# 依据：`docs/建议-ML工具长任务编排与失败可读性.md` §3.2（上限即报错、无队列）。
+def _slow_handler(seconds: float = 1.2):
+    """把 `run_method` 换成一个**慢但合法**的桩（回执形状仍满足终态不变量）。
+
+    ⚠ 为什么必须慢：队列只在"跑得比提交慢"时才显现。用真的 logistic（~0.1 s）
+    根本排不上队——判据会**假绿**（我第一版探针就是这么被骗的）。
+    """
+    def handler(spec, ctx):
+        time.sleep(seconds)
+        return {"ok": True, "command": "run_method", "run_ids": ["r-slow"],
+                "primary_metric": "m", "metrics": {"m": 1.0}, "warnings": [],
+                "error": ""}
+    return handler
+
+
+def test_queue_admits_over_limit_reports_position_and_is_hot_editable():
+    """⭐ **超上限不再报错，而是入队** + 回执给 `queue_position` + 上限**热改**。
+
+    用户实测（§3.2）："上限 4 个并发。超出直接**报错**，而不是**排队**。我因此必须
+    '投一个、等一个、再投一个'……上限调整**不需要重启**（重启会清空 dataset 与会话态，
+    代价很大）。"
+
+    本判据一次钉三步（都在**工具面**上走，AI 看到的就是这些）：
+    ① 第 2、3 个回执带 `queued: true` 与**递增的 queue_position**（不是报错）；
+    ② `read_job` 把"排队"与"框架 state"**分开报**（排队时框架仍是 running）；
+    ③ `set_job_limit` 调大 ⇒ 立刻放行，最终**三个都跑成**（队列不是"吞任务"）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-queue-") as td:
+        with _authority(td, open_gate=True) as (ml, host):
+            # 先压低上限（热改，不需要重启）：只放 1 个跑
+            err, txt = _call_tools(host.url, [("set_job_limit", {"limit": 1})])[0]
+            assert err is False, txt
+            assert json.loads(txt)["limit"] == 1, txt
+
+            real = ml.engine._handlers()
+            patched = dict(real)
+            patched["run_method"] = _slow_handler(1.2)
+            ml.engine._handlers = lambda: patched
+            try:
+                sub = []
+                for i in range(3):
+                    e, t = _call_tools(host.url, [
+                        ("submit_run", {"method": "logistic",
+                                        "dataset_id": "ds-x"})])[0]
+                    assert e is False, t
+                    sub.append(json.loads(t))
+                # ① 后两个入队（**不是**报错），位次递增
+                assert sub[0]["queued"] is False, sub[0]
+                assert sub[1]["queued"] is True and sub[1]["queue_position"] == 1, sub[1]
+                assert sub[2]["queued"] is True and sub[2]["queue_position"] == 2, sub[2]
+                assert sub[2]["queue_note"], sub[2]
+
+                # ② 排队与框架状态分开报（read_job 一次看清两件事）
+                e, t = _call_tools(host.url, [
+                    ("read_job", {"job_id": sub[2]["job_id"]})])[0]
+                assert e is False, t
+                got = json.loads(t)
+                assert got["queued"] is True, got
+                assert got["queue_position"] >= 1, got
+                assert got["state"] == "running", got          # 框架：线程已起
+                assert "排队" in got["wait_note"], got["wait_note"]
+
+                # ③ 热改上限 ⇒ 排队者被唤醒
+                e, t = _call_tools(host.url, [("set_job_limit", {"limit": 3})])[0]
+                assert e is False, t
+                up = json.loads(t)
+                assert up["limit"] == 3 and up["limit_before"] == 1, up
+            finally:
+                ml.engine._handlers = lambda: real
+
+            # 三个都必须跑成（队列是排队，不是丢任务）
+            for item in sub:
+                status = ml.jobs.wait(item["job_id"], 30)
+                assert status["state"] == "done", (item["job_id"], status)
+            assert ml.queue_state()["queued"] == 0, ml.queue_state()
+
+            # 坏上限：可教学地拒（0 会把任务永久堵在队列里）
+            err, txt = _call_tools(host.url, [("set_job_limit", {"limit": 0})])[0]
+            assert err is True, txt
+            assert json.loads(txt)["error"]["info"]["kind"] == "bad_job_limit", txt
+
+
+def test_queued_job_is_cancellable_before_it_ever_runs():
+    """⭐ **队列里的任务可以取消**（用户明确要求："我会投多、然后改主意"）。
+
+    取消发生在**开跑之前** ⇒ 必须如实说"它还没开始跑、没有产生任何运行"
+    （`cancelled_in_queue`），而不是假装"训练被中断"（那会让人以为跑过一段）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-queue-cancel-") as td:
+        with _authority(td, open_gate=True) as (ml, host):
+            _call_tools(host.url, [("set_job_limit", {"limit": 1})])
+            real = ml.engine._handlers()
+            patched = dict(real)
+            patched["run_method"] = _slow_handler(1.5)
+            ml.engine._handlers = lambda: patched
+            try:
+                first, second = [], []
+                for sink in (first, second):
+                    e, t = _call_tools(host.url, [
+                        ("submit_run", {"method": "logistic",
+                                        "dataset_id": "ds-x"})])[0]
+                    assert e is False, t
+                    sink.append(json.loads(t))
+                assert second[0]["queued"] is True, second[0]   # 前提：它真的在排队
+
+                e, t = _call_tools(host.url, [
+                    ("cancel_run", {"job_id": second[0]["job_id"]})])[0]
+                assert e is False, t
+                assert json.loads(t)["cancel_requested"] is True, t   # 排队中 ⇒ 真的受理
+
+                status = ml.jobs.wait(second[0]["job_id"], 30)
+                # 框架侧如实记成 `cancelled`（取消确实生效了，不是"跑完了"）
+                assert status["state"] == "cancelled", status
+                got = ml.jobs.get(second[0]["job_id"]).result
+                assert got["ok"] is False, got
+                assert got["error_kind"] == "cancelled_in_queue", got
+                assert not got["run_ids"], got            # **没有**产生运行
+                # 取消的那条**没有占用名额**：第一个照常跑完，队列清空
+                assert ml.jobs.wait(first[0]["job_id"], 30)["state"] == "done"
+                state = ml.queue_state()
+                assert state["queued"] == 0 and state["running"] == 0, state
+            finally:
+                ml.engine._handlers = lambda: real
+
+
+# ============================================================ L3 资源真相（2026-10-05）
+# 依据：`docs/建议-ML工具长任务编排与失败可读性.md` §3.3（显存预检 / 框架分块）。
+def test_vram_precheck_rejects_only_when_the_declared_peak_cannot_fit():
+    """⭐ **提交前**显存预检：声明了峰值**且明显装不下** ⇒ 可读拒绝（不是 CUDA 报错）。
+
+    用户实测（§3.3）：6 GB 卡、配置峰值 5.30 GB、运行时只剩 3.6 GB ⇒ OOM，
+    而 CUDA 把它报成 `device-side assert`（栈指向假位置）。他的原话：
+    "**我事前完全不知道会不够。**"
+
+    判据钉四条边界（**都是"诚实"问题**）：
+    ① 声明 > 可用×1.05 ⇒ 拒，kind=`cuda_oom_predicted`，且**三个数字都在话里**；
+    ② 声明 ≤ 可用 ⇒ 放行（不能把正常任务吓回去）；
+    ③ **没声明** ⇒ 不判（框架不猜你网络的峰值——猜出来会假装精确）；
+    ④ `device='cpu'` ⇒ 不判（跑 CPU 不涉及显存）。
+    ⚠ 显存探针被**注入**（`assembly.vram.probe`），所以这条判据在**没有 GPU** 的
+    机器上也确定地跑（否则它只能靠有卡时才能验，等于没判据）。
+    """
+    from ml_mecha import assembly as _asm
+
+    real = _asm.vram.probe
+    _asm.vram.probe = lambda device=None: {"total_mb": 6141.0, "free_mb": 1024.0,
+                                           "used_mb": 5117.0, "device": "cuda:0"}
+    try:
+        with tempfile.TemporaryDirectory(prefix="ml-vram-") as td:
+            ml = assemble_ml_mecha(root=td, seed=13)
+            ml.switch_ai()
+            try:
+                # ① 明显不够 ⇒ 可读拒绝（带三个数字）
+                out = ml.tools.execute("run_method", {
+                    "method": "logistic", "dataset_id": "ds-x",
+                    "resource_guard": {"max_peak_mb": 4096}})
+                assert out["is_error"] is True, out
+                info = out["error"]["info"]
+                assert info["kind"] == "cuda_oom_predicted", info
+                msg = out["error"]["message"]
+                assert "4096" in msg and "1024" in msg and "6141" in msg, msg
+                assert "OOM" in msg or "显存" in msg, msg
+                # 出路必须给全（减 batch / 分块 / 换 cpu）
+                assert "batch" in info["hint"] + info["suggest"], info
+
+                # ② 装得下 ⇒ 不拒（这里只验"没过预检"这一层：方法不存在之类的
+                #    后置失败不算；用 minimize 的办法——直接调内部函数）
+                assert _asm.vram.precheck(
+                    {"resource_guard": {"max_peak_mb": 512}, "device": "cuda:0"})
+                # ③ 没声明 ⇒ 不判
+                assert _asm.vram.precheck({"device": "cuda:0"}) == {}
+                # ④ 明确 CPU ⇒ 不判（即使声明很大）
+                assert _asm.vram.precheck(
+                    {"resource_guard": {"max_peak_mb": 99999},
+                     "device": "cpu"}) == {}
+                # ⑤ 坏声明 ⇒ 可教学拒（不是静默忽略）
+                bad = ml.tools.execute("run_method", {
+                    "method": "logistic", "dataset_id": "ds-x",
+                    "resource_guard": {"max_peak_mb": "很大"}})
+                assert bad["is_error"] is True, bad
+                assert bad["error"]["info"]["kind"] == "bad_peak_mb", bad
+            finally:
+                ml.close()
+    finally:
+        _asm.vram.probe = real
+
+
+def test_peak_vram_is_not_faked_on_cpu():
+    """CPU 上**不许**留"峰值显存"字段（不假装有数字）。
+
+    与上一条配对：**没有 CUDA 就回空**——一个 0 或一个编造的数都会误导决策
+    （用户拿它去设 `max_peak_mb`，编造等于害他再 OOM 一次）。
+    """
+    from ml_mecha import vram
+
+    if vram.probe():
+        print("    （跳过：本机有 CUDA，这条判据只在无 CUDA 时才有意义）")
+        return
+    assert vram.peak_mb() is None, vram.peak_mb()
+    assert vram.probe() == {}, vram.probe()
+
+
+def test_watch_latest_is_labelled_as_a_heuristic():
+    """⭐ 无句柄模式（`:latest`）必须**自称启发式**——它可能选中启动器的探针 run。
+
+    用户实测的纠正（2026-10-05）："那个 `-42` **不是我的**……大概是**启动器自己的
+    探针 run**。你的新鲜度过滤把它认成'在跑'了——建议你按 `job_id` 反查 `run_id`
+    来判定归属，而不是靠 `:latest` 猜。"
+    ⇒ 在没有句柄的时候，看门狗**只能**猜；那就把"这是猜的、以及怎么不猜"说出来
+    （旧版会一本正经地报"盯住 xxx"，读起来像一个确定的事实）。
+    """
+    from ml_mecha import watch
+
+    with tempfile.TemporaryDirectory(prefix="ml-watch-latest-") as td:
+        runs = os.path.join(td, "runs")
+        fresh = os.path.join(runs, "custom_network-9-9")
+        os.makedirs(fresh)                      # 新鲜、未落盘 ⇒ 会被启发式挑中
+        got = watch.watch(handle=":latest", url="", runs=runs,
+                          timeout_s=1, poll_s=0.1)
+        assert "newest_unfinished_run" in got["evidence"], got["evidence"]
+        notes = " ".join(got["notes"])
+        assert "启发式" in notes, got["notes"]
+        assert "job_id" in notes, got["notes"]     # 指路：要精确就传句柄
 
 
 def test_cancel_run_rejects_uncancellable_job():
