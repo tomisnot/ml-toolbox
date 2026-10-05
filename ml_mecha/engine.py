@@ -776,7 +776,10 @@ class MLEngine(Engine):
     def _query_training_detail(self, *, run_id: str = "",
                                include_series: bool = False,
                                limit: int = 200,
-                               grad_layers: str = "summary") -> dict[str, Any]:
+                               grad_layers: str = "summary",
+                               best_by: str = "",
+                               compare: Sequence[str] | None = None,
+                               tags: Sequence[str] | None = None) -> dict[str, Any]:
         """训练的**逐 epoch 观测数值**（只读；数据源 = TensorBoard 事件文件）。
 
         ## 为什么必须是只读查询 + 不走会话内存
@@ -794,7 +797,32 @@ class MLEngine(Engine):
         ⚠ **读不到就说读不到**（`available=false` + `reason`），绝不回空数组假装
         "跑到第 0 个 epoch"——这是本仓反复在守的那条纪律。
         """
+        from . import curve as _curve
         from . import tb_series
+
+        # ⭐⭐ **多 run 曲线对齐**（R40，2026-10-05）：用户实测的误判是"跨 run 在
+        #   固定 epoch 上比**终值**"——他要的是**同一 tag、同一根 step 轴**的两条
+        #   轨迹。⇒ 给 `compare=[run_a, run_b, …]` 就回对齐后的表（缺失处 `null`，
+      #   **绝不插值**：插值会造出一段没算过的曲线）。
+        compare_ids = [str(r) for r in (compare or []) if str(r or "").strip()]
+        if compare_ids:
+            picked = [str(t) for t in (tags or []) if str(t or "").strip()]
+            series: dict[str, Any] = {}
+            for rid in compare_ids:
+                payload_i = tb_series.read_run(rid, limit=max(1, int(limit or 200)))
+                series[rid] = dict(payload_i.get("scalars") or {})
+            if not picked:
+                picked = _curve.default_tags(series)
+            aligned = _curve.align(series, picked, limit=max(1, int(limit or 200)))
+            return {
+                "run_id": compare_ids[0], "available": True, "reason": "",
+                "latest": {}, "tags": picked, "histograms": [], "images": [],
+                "text": [], "duplicate_steps": [],
+                "compare": {"runs": compare_ids, **aligned},
+                "curve": {}, "convergence": [],
+                "best_by": {"tag": "", "best": {}, "by_val_loss": {},
+                            "note": "compare 模式下不做单 run 的 best_by"},
+            }
 
         # ⭐ **留空 = 最近写过训练事件的那次**（实现描述里的承诺）。
         #   ⚠ 曾经的真相：这句话只写在工具描述里，引擎是直接透传空 run_id 的
@@ -808,6 +836,11 @@ class MLEngine(Engine):
                     "reason": "没有任何运行写过训练过程事件（只有神经网络类方法会写）",
                     "latest": {}, "tags": [], "histograms": [], "images": [],
                     "text": [], "duplicate_steps": [], "max_points": 0,
+                    "curve": {}, "convergence": [],
+                    "best_by": {"tag": "", "best": {}, "by_val_loss": {},
+                                "note": "没有可读的运行"},
+                    "compare": {"runs": [], "tags": {},
+                                "note": "没有给 compare（本条只报单 run）"},
                 }
         payload = tb_series.read_run(resolved,
                                      limit=max(1, int(limit or 200)))
@@ -823,6 +856,60 @@ class MLEngine(Engine):
             # 同一 step 写了多个值时的留痕（重跑沿用同一 run_id 会走到这里）
             "duplicate_steps": payload.get("duplicate_steps") or [],
         }
+        # ⭐⭐ **曲线形状 + 收敛判读**（R42/R43，**默认就给**）：用户实测的误判是
+        #   "只读 `latest`（一个点）⇒ 跨 run 比终值 ⇒ 以为饱和了"。形状是**便宜**的
+        #   （每 tag 六个数），所以不该等 `include_series` 才给。
+        scal = payload.get("scalars") or {}
+        shapes: dict[str, Any] = {}
+        notes: list[dict[str, Any]] = []
+        for tag, got in scal.items():
+            sh = _curve.shape(got.get("steps"), got.get("values"),
+                              tail=_curve.TAIL)
+            if sh.get("n"):
+                shapes[str(tag)] = sh
+            note = _curve.convergence_note(str(tag), sh)
+            if note.get("kind"):
+                notes.append({"tag": str(tag), **note})
+        out["curve"] = shapes
+        #: ⚠ 排序：**先报"欠训练/发散"里的欠训练**（那是用户的误判点），
+        #:   但两类都要在 ⇒ 一个词盖住两种病是最坏的做法。
+        notes.sort(key=lambda n: (n.get("kind") != "underfit", str(n.get("tag"))))
+        out["convergence"] = notes
+        # ⭐ **按任意 tag 挑最佳点**（R41）：`best.pt` 是按 `val_loss` 选的，而
+        #   "val_loss 还在抖、fid 早平了"时两者**不是同一个 epoch**（用户实测踩过）。
+        want = str(best_by or "").strip()
+        best: dict[str, Any] = {"tag": want, "best": {}, "by_val_loss": {},
+                                "note": ""}
+        if want:
+            got = scal.get(want)
+            if not got:
+                best["note"] = (f"这个 run 没有 tag {want!r}；有的 tag 见 `tags`"
+                                f"（注意逐层梯度是 `grad/<层名>.weight`）")
+            else:
+                best["best"] = _curve.best_point(got.get("steps"), got.get("values"),
+                                                 tag=want)
+                vl = scal.get("val_loss")
+                if vl:
+                    best["by_val_loss"] = _curve.best_point(
+                        vl.get("steps"), vl.get("values"), tag="val_loss")
+                    b1, b2 = best["best"], best["by_val_loss"]
+                    if b1.get("step") is not None and b2.get("step") is not None \
+                            and b1["step"] != b2["step"]:
+                        best["note"] = (
+                            f"⚠ 按 {want} 的最佳点在 step {b1['step']:.0f}"
+                            f"（{b1['value']:.4g}），而按 val_loss 的最佳点在 step "
+                            f"{b2['step']:.0f} ⇒ **两者不是同一轮**：`best.pt` 是按 "
+                            f"val_loss 选的，用它做 {want} 的口径评估会不一致")
+                    else:
+                        best["note"] = "两者落在同一轮（这个 run 上口径一致）"
+                else:
+                    best["note"] = "这个 run 没写 val_loss（val_split=0？）⇒ 无从对照"
+        out["best_by"] = best
+        #: `compare` 是**必填键**（回执契约）⇒ 单 run 模式下也要在：空表 + 一句说明
+        #: （"没给 compare"与"给了但没数据"是两件事，别混成一个空对象）。
+        out["compare"] = {"runs": [], "tags": {},
+                          "note": "没有给 `compare` ⇒ 本条只报单 run；"
+                                  "要比多条曲线给 compare=[run_a, run_b, …]"}
         if not include_series:
             return out
         scal = payload.get("scalars") or {}

@@ -1035,3 +1035,40 @@
   `::test_watch_latest_is_labelled_as_a_heuristic`、
   `::test_watch_flags_terminal_job_without_any_run`。
 
+### A49. **看曲线要看形状，不能看终值**（实测代价：一轮 1500 epoch 的训练）
+- **症状**（用户自述）："我一直只读 `latest`（一个点），靠'跨 run 在固定 epoch 上比
+  终值'推断曲线已饱和，据此把 epoch 从 900 砍到 250。后来拉了**同一 run 内的曲线**，
+  发现 `fid/sub1` 从 0.367 一路升到 0.682 且**在 epoch 250 时仍在爬** —— 根本没收敛。"
+  ⇒ 补到 1500 epoch：`fid/sub1` 0.6823 → **0.7938**。
+- **根因**：不是缺数据（曲线一直在 TB 里），而是**看形状很贵**（要 `include_series`
+  + 手工在多条曲线间对齐）⇒ 工具让人**很容易看点、很难看形状**。
+- **修法**：`describe_training` **默认**给 `curve`（每 tag 的形状：末段斜率/单调/平台
+  占比/趋势）与 `convergence`（末段还在爬就直说"可能欠训练"）；`best_by=<tag>`
+  按任意 tag 挑最佳轮；`compare=[…]` 多 run 对齐（缺失 `null`，**不插值**）。
+- **两条教训**：
+  1. **抗噪**：真实曲线**不是单调的**——用户的 `fid/sub1` 末 15 点是 0.667→0.689 的
+     爬升，中间有 ±0.005 抖动。我的第一版判据要求"严格单调上升"⇒ 判成 `mixed`，
+     **恰好漏掉它要防的那个警告**（判据在**真实夹具**上当场红）。
+     ⇒ 用"末段前三分位均值 vs 后三分位均值"这种抗噪判据。
+  2. **别用一个词盖住两种病**：`loss` 类在爬是**发散**（配置问题），指标在爬是
+     **欠训练**（再跑几轮）；而 `grad_norm`/`ph/std` 这类**没有好坏方向**的量
+     **不该给诊断**（第一版错误地复用了给"主指标排序"用的 `is_lower_better`，
+     把 `val_loss` 在爬报成了"欠训练"）。
+- **判据**：`test_ml_delivery.py::test_convergence_warns_on_the_real_underfit_run_and_not_on_the_converged_one`
+  （**两条真实 run 做对照**：250 epoch 必须报 `underfit`、1500 epoch 不许报；
+  锚点是仓内夹具，不依赖 `runs/` 目录存亡）、
+  `::test_best_by_any_tag_compares_against_val_loss_choice`、
+  `::test_compare_aligns_multiple_runs_without_interpolating`。
+
+### A50. **必填骨架别写两份**：`pick` 投影与 `output_schema.required` 各写一遍就会漂移
+- **症状**：给 `describe_training` 新增四个必填键（`curve`/`convergence`/`best_by`/
+  `compare`）之后，**不带 `pick` 的调用全绿，带 `pick` 的调用立刻
+  `bad_tool_output: 缺必填键`** —— 因为 `pick` 那条路把骨架写成了**硬编码元组**。
+- **修法**：`_DESCRIBE_TRAINING_REQUIRED` 一处声明，`pick` 骨架与
+  `output_schema.required` **都**从它取。
+- **教训**：**"声明"与"实现"两处各写一份，就等于两处可以各自漂移**（本仓 R8-2a
+  那条纪律的原话）。这次漂移之所以危险：**只有一条调用路径（`pick`）会红**，
+  很容易被"其它判据都绿"糊过去。
+- **判据**：`test_ml_mecha.py::test_pick_projection_is_honest_about_missing_keys`
+  （它同时钉住"投影后必填骨架仍在"）。
+

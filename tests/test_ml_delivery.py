@@ -529,7 +529,7 @@ EXPECTED_DEFAULTED = {
     "describe_method": [],
     "describe_methods": ["dataset_id", "family"],
     "describe_run": ["run_id"],
-    "describe_training": ["grad_layers", "include_series", "limit", "run_id"],
+    "describe_training": ["best_by", "grad_layers", "include_series", "limit", "run_id"],
     "describe_network": ["limit"],
     "describe_networks": ["limit"],
     # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
@@ -582,6 +582,8 @@ _DEFAULTED_PROBES = (
     ("describe_training", {}, "include_series", True),
     ("describe_training", {}, "limit", 50),
     ("describe_training", {}, "grad_layers", "full"),
+    # ---- R41（2026-10-05）：按任意 tag 挑最佳 step ----
+    ("describe_training", {}, "best_by", "fid/sub1"),
     ("describe_networks", {}, "limit", 10),
     ("describe_network", {"name": "n"}, "limit", 10),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "name", "my-ds"),
@@ -652,6 +654,9 @@ _NONE_DEFAULTED_PROBES = (
     # ---- 长任务编排（2026-10-05）：`job_ids` 是**无默认**的可选参数
     #      （None = 用 `job_id`）⇒ 显式 null 必须原样保留（"不指定多个"）。
     ("read_job", {"job_id": "job-null-shim"}, "job_ids", ["job-null-shim"]),
+    # ---- R40（2026-10-05）：多 run 曲线对齐的两个参数（**无默认**）
+    ("describe_training", {}, "compare", ["run-a", "run-b"]),
+    ("describe_training", {}, "tags", ["fid/sub1"]),
 )
 
 
@@ -754,9 +759,10 @@ _MIN_ARGS = {
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
 #: 2026-10-05 长任务编排 +4：`read_job` 的 `wait`/`timeout_s`（阻塞到终态）、
 #: `job_ids`（一次等多个/等任意一个）与 `job_id`（二选一 ⇒ 不再是必填）。
-_EXPECTED_OPTIONAL_PARAMS = 71
-# ⚠ `set_job_limit` 的 `limit` 是**必填** ⇒ 不增加这个计数（它统计的是**可选**参数）。
-#    新增可选参数会在这里红，提醒补探针——这是有意的"逼你登记"。
+#: 2026-10-05 长任务编排 +4：`read_job` 的 `wait`/`timeout_s`（阻塞到终态）、
+#: `job_ids`（一次等多个/等任意一个）与 `job_id`（二选一 ⇒ 不再是必填）。
+#: 同日曲线分析（R40–R43）+3：`describe_training` 的 `best_by` / `compare` / `tags`。
+_EXPECTED_OPTIONAL_PARAMS = 74
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -1969,6 +1975,142 @@ def test_watch_latest_is_labelled_as_a_heuristic():
         notes = " ".join(got["notes"])
         assert "启发式" in notes, got["notes"]
         assert "job_id" in notes, got["notes"]     # 指路：要精确就传句柄
+
+
+# ============================================================ R40–R43 曲线分析（2026-10-05）
+# 依据：用户实测的一次真实误判（代价一轮 1500 epoch 的训练）：
+#   "我一直只读 `latest`（一个点），靠跨 run 比终值推断曲线已饱和，据此把 epoch 从
+#    900 砍到 250。后来拉了同一 run 内的曲线，发现 `fid/sub1` 从 0.367 一路升到 0.682
+#    且**在 epoch 250 时仍在爬** —— 根本没收敛，是严重欠训练。"
+# 锚点：**两条真实 run** 的逐点序列（抽成仓内夹具；判据不依赖 runs/ 目录存亡）。
+_CURVE_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def _curve_fixture(run_id: str, tag: str) -> dict:
+    path = _CURVE_FIXTURE_DIR / f"curve_{run_id}_{tag.replace('/', '_')}.json"
+    assert path.is_file(), f"缺夹具 {path.name}（曲线判据的锚点）"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_convergence_warns_on_the_real_underfit_run_and_not_on_the_converged_one():
+    """⭐ R42：**250 epoch 那条必须报警、1500 epoch 那条不许报**（判别力判据）。
+
+    ⚠ 这条判据的价值全在"**两条真实曲线的差别**"上：
+    - `custom_network-9008175-1002`（250 epoch）：用户据它判断"已饱和"并砍了 epoch
+      ⇒ 当时 `fid/sub1` **末段仍在爬** ⇒ 必须给 `underfit` 警告；
+    - `custom_network-1422969-1010`（1500 epoch）：真的到平台了（末 10 点甚至在下行）
+      ⇒ **不许报欠训练**（否则警告会变成噪声，人就会学会忽略它）。
+
+    ⚠ 如实记录：这两条曲线的判读**没有调过阈值**（`TAIL=15`/`TREND_FRAC=1%` 都是
+    先定的）。第一版判据在**真实曲线上一度红**——因为它要求"严格单调上升"，
+    而真实曲线有 ±0.005 抖动 ⇒ 判成 `mixed`，**恰好漏掉这个警告**。
+    抗噪判据（末段"前三分位均值 vs 后三分位均值"）才是对的。
+    """
+    sys.path.insert(0, str(REPO))
+    from ml_mecha import curve
+
+    under = _curve_fixture("custom_network-9008175-1002", "fid/sub1")
+    conv = _curve_fixture("custom_network-1422969-1010", "fid/sub1")
+    sh_under = curve.shape(under["steps"], under["values"])
+    sh_conv = curve.shape(conv["steps"], conv["values"])
+
+    note_under = curve.convergence_note("fid/sub1", sh_under)
+    assert sh_under["trend"] == "rising", sh_under
+    assert note_under["kind"] == "underfit", note_under
+    assert "欠训练" in note_under["note"], note_under
+    assert "别按终值" in note_under["note"], note_under      # 指路：别按终值判断
+    # 用户的原始观察：0.367 → 0.682（这两个数要能在形状里看到）
+    assert abs(sh_under["first"] - 0.3670) < 5e-3, sh_under
+    assert abs(sh_under["last"] - 0.6823) < 5e-3, sh_under
+
+    note_conv = curve.convergence_note("fid/sub1", sh_conv)
+    assert sh_conv["trend"] == "flat", sh_conv               # 1500 epoch 已到平台
+    assert note_conv["kind"] == "", note_conv                # ⇒ **不许报警**
+
+    # ⭐ **方向也要分对**：同一条 250 epoch run 的 `val_loss` 末段也在爬，但那是
+    #   **发散**不是欠训练（两者的处置相反）——第一版正是把它报成了欠训练。
+    vl = _curve_fixture("custom_network-9008175-1002", "val_loss")
+    note_vl = curve.convergence_note("val_loss",
+                                     curve.shape(vl["steps"], vl["values"]))
+    assert note_vl["kind"] == "diverging", note_vl
+    # 方向未知的量（梯度范数等）**不给诊断**（趋势照给，但不硬凑一句话）
+    assert curve.convergence_note("grad_norm", {"trend": "rising", "tail": 15,
+                                                "first": 1.0, "last": 2.0})["kind"] == ""
+    assert curve.direction("grad_norm") == "unknown"
+    assert curve.direction("val_loss") == "lower"
+    assert curve.direction("fid/sub1") == "higher"
+
+
+def test_best_by_any_tag_compares_against_val_loss_choice():
+    """⭐ R41：按**任意 tag** 挑最佳 step，并与按 `val_loss` 的选择**对照**。
+
+    用户实测（§R41）："`best.pt` 是按 `val_loss` 选的，但我实测同一 run 里
+    `val_loss` 一直在 155–170 抖动，而 `fid` 早就平了 ⇒ **按 val_loss 选出的 best
+    未必是 fid 最好的那轮**。我做 `eval_custom` 时就踩了这个（口径不一致）。"
+    """
+    sys.path.insert(0, str(REPO))
+    from ml_mecha import curve
+
+    fid = _curve_fixture("custom_network-9008175-1002", "fid/sub1")
+    got = curve.best_point(fid["steps"], fid["values"], tag="fid/sub1")
+    assert got["lower_better"] is False, got
+    assert got["step"] is not None and got["value"] is not None, got
+    # fid 仍在爬 ⇒ 最佳点应当在**最末**（这本身就是"欠训练"的另一面）
+    assert got["index"] >= got["n"] - 3, got
+
+    vl = _curve_fixture("custom_network-9008175-1002", "val_loss")
+    b_vl = curve.best_point(vl["steps"], vl["values"], tag="val_loss")
+    assert b_vl["lower_better"] is True, b_vl
+    # 两者的最佳轮**不是同一轮**（这正是用户踩到的口径不一致）
+    assert abs(got["step"] - b_vl["step"]) > 5, (got, b_vl)
+
+
+def test_compare_aligns_multiple_runs_without_interpolating():
+    """⭐ R40：多 run 曲线**对齐**（同一根 step 轴；缺失处 `null`，**不插值**）。
+
+    用户实测（§R40）："我要比'逐对耦合 vs 聚合量'两条轨迹，而不是只比终值。"
+    ⚠ `null` 而不是插值是**硬要求**：插值会造出一段没算过的曲线，而"看起来更整齐"
+    正是它危险的地方。
+    """
+    sys.path.insert(0, str(REPO))
+    from ml_mecha import curve
+
+    a = _curve_fixture("custom_network-9008175-1002", "fid/sub1")
+    b = _curve_fixture("custom_network-1422969-1010", "fid/sub1")
+    series = {
+        "run-250": {"fid/sub1": {"steps": a["steps"], "values": a["values"]}},
+        # 故意截掉前面一段 ⇒ 制造"某个 step 上 A 有、B 没有"的情形
+        "run-1500": {"fid/sub1": {"steps": b["steps"][100:],
+                                  "values": b["values"][100:]}},
+    }
+    got = curve.align(series, ["fid/sub1"], limit=500)["tags"]["fid/sub1"]
+    assert got["n_runs"] == 2, got
+    axis = got["steps"]
+    vals_a = got["runs"]["run-250"]
+    vals_b = got["runs"]["run-1500"]
+    assert len(axis) == len(vals_a) == len(vals_b), (len(axis), len(vals_a))
+    # ① 轴是**并集**且升序
+    assert axis == sorted(axis), axis[:5]
+    # ② 缺失处是 `None`（**不是 0、也不是插值出来的数**）
+    assert any(v is None for v in vals_a) or any(v is None for v in vals_b), \
+        "这条判据需要至少一处缺失（夹具被改动过？）"
+    missing = [i for i, v in enumerate(vals_b) if v is None]
+    assert missing, "run-1500 截掉了前 100 点 ⇒ 那段必须是 None"
+    # ③ 真实点**逐字**保留（对齐不许改数）
+    for i, step in enumerate(axis):
+        if vals_b[i] is not None:
+            idx = b["steps"].index(step)
+            assert vals_b[i] == b["values"][idx], (step, vals_b[i])
+    # ④ 默认 tag 选取要跳过逐层梯度（几十条会把回执灌满）
+    wide = {"r1": {"loss": {"steps": [1], "values": [1.0]},
+                   "grad/x.weight": {"steps": [1], "values": [1.0]},
+                   "fid": {"steps": [1], "values": [1.0]}},
+            "r2": {"loss": {"steps": [1], "values": [2.0]},
+                   "grad/x.weight": {"steps": [1], "values": [2.0]},
+                   "fid": {"steps": [1], "values": [2.0]}}}
+    picked = curve.default_tags(wide)
+    assert "grad/x.weight" not in picked, picked
+    assert set(picked) == {"loss", "fid"}, picked
 
 
 def test_cancel_run_rejects_uncancellable_job():

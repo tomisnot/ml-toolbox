@@ -708,6 +708,16 @@ def _describe_run(engine: MLEngine,
     )
 
 
+#: `describe_training` 的**必填骨架**（回执里必须始终在的键）。
+#: ⚠ **单一真源**：`pick` 投影要保住它们、`output_schema.required` 要声明它们
+#: ——两处各写一份就会漂移（实测踩过：`pick` 那处是硬编码的元组，新增必填键
+#: `curve`/`convergence`/`best_by`/`compare` 之后，**带 `pick` 的调用立刻
+#: `bad_tool_output` 缺键**，而所有不带 pick 的判据都是绿的）。
+_DESCRIBE_TRAINING_REQUIRED = ("ok", "run_id", "available", "latest", "tags",
+                               "error", "curve", "convergence", "best_by",
+                               "compare")
+
+
 def _describe_training(engine: MLEngine,
                        banned_words: tuple[str, ...] = ()) -> ToolDefinition:
     """⭐ 训练过程观测：**逐 epoch 的数值**（只读投影，不经写权门）。
@@ -726,10 +736,14 @@ def _describe_training(engine: MLEngine,
 
     def execute(*, run_id: str = "", include_series: bool = False,
                 limit: int = 200, pick: Any = None,
-                grad_layers: str = "summary") -> Mapping[str, Any]:
+                grad_layers: str = "summary", best_by: str = "",
+                compare: Any = None, tags: Any = None) -> Mapping[str, Any]:
         detail = engine.query("training_detail", run_id=run_id,
                               include_series=bool(include_series),
-                              limit=int(limit), grad_layers=str(grad_layers))
+                              limit=int(limit), grad_layers=str(grad_layers),
+                              best_by=str(best_by or ""),
+                              compare=[str(x) for x in (compare or [])],
+                              tags=[str(x) for x in (tags or [])])
         out = {"ok": True, **detail, "error": ""}
         # ⚠ `pick` 的**边界**（实测踩过，别想当然）：回执里声明的**必填键**
         #   （`output_schema.required`）必须始终在 ⇒ 工具面会校验、缺了直接
@@ -738,8 +752,7 @@ def _describe_training(engine: MLEngine,
         #   —— 那是**非必填**的大负载（`pick=["series.loss.values"]` 时不再回整条
         #   `series`，只回 loss 那几个点）。
         if pick:
-            required = {k: out[k] for k in ("ok", "run_id", "available", "latest",
-                                            "tags", "error") if k in out}
+            required = {k: out[k] for k in _DESCRIBE_TRAINING_REQUIRED if k in out}
             body = {k: v for k, v in out.items() if k not in required}
             merged = _pick(body, pick)
             # 若点了必填键内部的路径（如 `latest.loss`），把它作为**额外**键给出
@@ -752,10 +765,16 @@ def _describe_training(engine: MLEngine,
         name="describe_training",
         description="读一个 run 的**训练过程观测数值**（逐 epoch）：最新一轮的 "
                     "loss / val_loss / grad_norm / lr / dead_relu / 逐层梯度范数，"
-                    "可选整条序列（include_series=true）用于判断趋势"
-                    "（如'梯度是否在多个数量级上快速增大'）。"
-                    "序列较长时用 `pick` 只取关心的那几条（如 "
-                    "['series.loss.values']），别把整条序列灌进上下文。"
+                    "⭐ **默认还给每个 tag 的「曲线形状」**（`curve`：起点/末值/**末段斜率**/"
+                    "是否单调/平台占比/趋势）与 **`convergence` 判读**——"
+                    "**末段还在爬的非 loss 指标会明确警告「可能欠训练」**"
+                    "（实测：只看终值会误判'已饱和'，把 1500 epoch 砍成 250）。"
+                    "⭐ `best_by=\"<tag>\"`：按**任意 tag** 挑最佳 step（`best.pt` 是按 "
+                    "val_loss 选的，两者常常不是同一轮）。"
+                    "⭐ `compare=[run_a, run_b, …]`：**多 run 曲线对齐**（同 tag、同一根 "
+                    "step 轴，缺失处 `null`——不插值）；要哪几条给 `tags=[…]`。"
+                    "可选整条序列（include_series=true）；序列较长时用 `pick` 只取关心的"
+                    "那几条（如 ['series.loss.values']），别把整条序列灌进上下文。"
                     "⚠ 数据来自 TensorBoard 事件文件：**没有事件文件就如实说读不到**"
                     "（训练时未装 tensorboard 时如此）。",
         parameters={
@@ -772,11 +791,21 @@ def _describe_training(engine: MLEngine,
                             "description": "逐层梯度的详细度：summary（默认，前 3 + 后 3 + "
                                            "总数；几十层的网络能省一大截）/ full（全部）",
                             "default": "summary"},
+            "best_by": {"type": "string",
+                        "description": "⭐ 按这个 tag 挑**最佳 step**（如 'fid/sub1'）"
+                                       "并与按 val_loss 的选择对照；留空不挑",
+                        "default": ""},
+            "compare": {"type": "array",
+                        "description": "⭐ 多 run **曲线对齐**（如 "
+                                       "['custom_network-1-1','custom_network-2-2']）；"
+                                       "给它就返回对齐后的逐点表（缺失 null，不插值）"},
+            "tags": {"type": "array",
+                     "description": "`compare` 时要对齐哪些 tag（如 ['fid/sub1']）；"
+                                    "留空取两个 run 都有、且非逐层梯度的前几条"},
             "pick": PICK_PARAM,
         },
         output_schema={"type": "object",
-                       "required": ["ok", "run_id", "available", "latest",
-                                    "tags", "error"]},
+                       "required": list(_DESCRIBE_TRAINING_REQUIRED)},
         execute=execute,
         banned_words=banned_words,
     )

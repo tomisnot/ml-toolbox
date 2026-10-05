@@ -49,7 +49,7 @@ whenToUse: >-
 | `describe_method` | 某个方法的可调参数与取值范围 | 参数表 |
 | `describe_dataset` | 已准备数据的规模/指纹/预处理链逐步参数/实际划分口径；**带负载时报每个负载的形状与 dtype** | 摘要，不内联数据 |
 | `describe_run` | 按 `run_id` 回看一次运行 | 指标 + 产物类别名（数值不内联） |
-| `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + **逐层梯度**（默认只给**前 3 + 后 3** 与总数）+ **网络自己上报的自定义 tag** | 默认只给**最新一轮**；`include_series` 才给序列；逐层要全量写 `grad_layers="full"`；可用 `pick` 只取几条 |
+| `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + **逐层梯度**（默认只给**前 3 + 后 3** 与总数）+ **网络自己上报的自定义 tag**。⭐ 还默认给 **`curve`（每个 tag 的「曲线形状」**：起点/末值/**末段斜率**/是否单调/平台占比/趋势）与 **`convergence`**：**末段还在爬的非 loss 指标会明确警告「可能欠训练——别按终值判断饱和」**；loss 类在爬则说「发散」（两者处置相反）。⭐ `best_by="fid/sub1"` 按**任意 tag**挑最佳 step（并对照 val_loss 的选择——两者常常不是同一轮）；⭐ `compare=[run_a, run_b]` + `tags=[…]` **多 run 曲线对齐**（同 tag、同一根 step 轴；缺失处 `null`，**不插值**） | 默认只给**最新一轮**；`include_series` 才给序列；逐层要全量写 `grad_layers="full"`；可用 `pick` 只取几条 |
 | `describe_networks` | 列出自定义网络（名字/指标/源码行数/用过几次） | 清单，不含源码 |
 | `describe_network` | 按名字取回网络**源码**（改一版再跑，免重贴） | 源码 + 来源 run |
 | `checkpoint_detail` | 某次运行**存下来的模型**在不在、多少张量/参数、含不含偏置、在哪块设备上训的 | **权重不内联**；真要用模型走 `eval_custom` |
@@ -152,6 +152,20 @@ HDF5 会按原路径重读）；要换新数据就显式给 `payload` / `dataset
 ⑤ describe_run(run_id=…)                 # 指标与生效参数
 ⑥ describe_training(run_id=…)            # 过程数值（判断该不该早停/是不是爆了）
 ```
+
+⭐ **判断"够不够训练"要看曲线形状，不要看终值**（实测教训：有人只读 `latest`
+一个点 + 跨 run 比终值，据此把 epoch 从 900 砍到 250 —— 而那条曲线**末段仍在爬**，
+是严重欠训练；补到 1500 epoch 后 `fid/sub1` 从 0.68 涨到 0.79）：
+
+```
+describe_training(run_id=R)                       # 看 curve[tag].trend / convergence 警告
+describe_training(run_id=R, best_by="fid/sub1")   # 按任意 tag 挑最佳轮（别默认 val_loss 那轮）
+describe_training(compare=[R1, R2], tags=["fid/sub1"])   # 两条轨迹对齐着看
+```
+
+- `convergence` 里 `kind="underfit"` ⇒ **延长 epoch 再下结论**（别按终值说"饱和了"）；
+  `kind="diverging"` ⇒ 配置问题（loss 类在爬）；
+  方向未知的量（`grad_norm`/`ph/std`…）**不给诊断**，趋势照给。
 
 **要比多个方法**：直接 `compare_methods`（它给对比表），不要 `describe_run` 拉 N 次再自己对齐。
 
