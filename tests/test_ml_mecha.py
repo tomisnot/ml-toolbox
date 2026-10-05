@@ -946,10 +946,21 @@ def test_custom_network_runs_and_keeps_the_observation_surface(app):
             import shutil
             shutil.rmtree(Path(RUNS_DIR) / rid, ignore_errors=True)
 
-        # ⑤ 临时注册必须撤干净：注册表里不许留下"代码可能已经不对"的空壳
+        # ⑤ **注册项常驻、但类上不带代码**（契约变更 2026-10-05）
+        #
+        # 旧判据要求"跑完撤干净"，理由是"注册表里不许留一个代码可能已经不对的空壳"。
+        # **那个理由的前提已经不存在**：注册项不带代码（代码随 `cfg.extras` 逐请求
+        # 下传），所以常驻不残留任何过期状态；而"跑完撤除"恰恰会造成**并发竞态**
+        # ——先跑完的那次把并发同伴的注册项撤掉，同伴死于"未注册的方法:
+        # custom_network"（用户实测；判据在 `test_nqs_path.py` 的
+        # `test_concurrent_run_custom_does_not_unregister_each_other`）。
+        # ⇒ 这里改为钉**新契约的两条事实**（撤除这条不变量的"反例"仍是明确的：
+        #   若有人把代码绑回类上，第二条断言会红）。
         from ml_toolbox.core import registry
-        assert "custom_network" not in registry.names(), \
-            "run_custom 跑完没撤注册项 ⇒ 注册表里留了一个代码可能过期的壳"
+        cls = registry.get("custom_network")           # 常驻：按名字仍取得到
+        assert not str(getattr(cls, "custom_code", "")), \
+            "注册项上带了代码 ⇒ 并发跑两份不同代码会串（谁后注册谁覆盖）"
+        assert "custom_network" in registry.names()
     finally:
         _clean_nn_probe()
 

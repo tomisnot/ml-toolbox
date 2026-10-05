@@ -968,6 +968,100 @@ def test_payload_facts_disclose_per_row_shape():
             ml.close()
 
 
+def test_concurrent_run_custom_does_not_unregister_each_other():
+    """⭐ 并发的 `run_custom` **不许撤掉彼此的注册项**（用户实测的提交竞态）。
+
+    ## 现象（使用者实测原文）
+
+    "连续 `submit_run` 三个 `run_custom`：第 1 个成功，紧接的第 2、3 个全部
+    `state=done`，error: `invalid request: 未注册的方法: custom_network`"；
+    "取消一个任务后立刻提交，也复现同一错误"。
+
+    ## 根因（本轮定位）
+
+    `engine._cmd_run_custom` 每次提交**临时造一个带代码的子类**注册进方法表
+    （`registry.unregister(name)` + `registry.register(subclass)`），跑完在
+    `finally` 里 `unregister` ⇒ 先跑完的那次会把并发同伴的注册项撤掉，同伴
+    在"解析方法名"那一刻就撞 `未注册的方法`。
+
+    ## 修法（本判据钉的两条不变量）
+
+    1. **注册项在整条命令期间恒在**（收尾也不撤）——收尾撤除正是竞态的根；
+    2. **代码不带在类上**：类上的 `custom_code` 恒为空，代码随
+       `request.extras` 逐请求下传 ⇒ 并发跑**两份不同代码**也不会串。
+
+    ⚠ 这条判据走**真实命令入口**（`run_custom` 命令：注册 → 方法解析 → 收尾），
+    只把"训练那一段"换成受控桩——训练不是被测对象，而注册/解析/收尾正是。
+    """
+    import threading
+
+    from ml_mecha.engine import RunSummary
+    from ml_toolbox.core import registry
+
+    with tempfile.TemporaryDirectory(prefix="nqs-race-") as td:
+        ml = _ml(td)
+        try:
+            ds = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame",
+                           "frame": pd.DataFrame({"x": np.arange(24, dtype=float),
+                                                  "y": np.arange(24, dtype=float)})},
+                "name": "race", "target": "y"})["value"]["dataset_id"]
+
+            codes = {"a": _RACE_CODE_A, "b": _RACE_CODE_B, "c": _RACE_CODE_A}
+            engine = ml.engine
+            real_execute = engine._execute_one
+            resolved, class_codes = [], []
+            gate = threading.Barrier(len(codes), timeout=30)
+
+            def stub(entry, request, call_id="", context=None):
+                # 三份请求**同时**在命令执行中（真实场景就是并发提交）
+                gate.wait()
+                # ↓ 这里就是 runner 真正会 `registry.get(request.method)` 的位置
+                cls = registry.get(request.method)
+                class_codes.append(str(getattr(cls, "custom_code", "")))
+                # 按 `network_name` 对齐"哪份请求拿到了哪段代码"（并发下顺序不定）
+                resolved.append((request.extras.get("network_name"),
+                                 request.extras.get("custom_network_code")))
+                return RunSummary(run_id="race-" + str(len(resolved)),
+                                  method=request.method,
+                                  dataset_id=ds,
+                                  pipeline_id=entry.pipeline_id, ok=True,
+                                  primary_metric="m", metrics={"m": 1.0},
+                                  elapsed_s=0.01)
+
+            engine._execute_one = stub
+            try:
+                jobs = []
+                for tag, code in codes.items():
+                    jobs.append((tag, code, ml.submit(
+                        {"command": "run_custom", "code": code, "dataset_id": ds,
+                         "name": tag})))
+                for tag, code, job in jobs:
+                    status = ml.wait_job(job, 60)
+                    assert status["state"] == "done", (tag, status)
+                    assert job.result and job.result.get("ok") is True, (tag, job.result)
+            finally:
+                engine._execute_one = real_execute
+
+            # ① 三份都**解析到了**方法（并发同伴没被撤除）
+            assert len(resolved) == 3, resolved
+            # ② 代码**逐请求**到达：每份请求拿到的是**自己**那段（按 name 对齐）
+            assert dict(resolved) == codes, dict(resolved)
+            # ③ 代码**不带在类上**（带了就会串：谁后注册谁覆盖）
+            assert class_codes == ["", "", ""], class_codes
+            # ④ 收尾之后注册项**仍在** —— 旧实现（finally 里 unregister）在这里红
+            assert "custom_network" in registry.names(), (
+                "run_custom 收尾把注册项撤了 ⇒ 并发/紧随其后的提交会死在第 1 次同步处"
+                "（未注册的方法: custom_network）")
+        finally:
+            ml.close()
+
+
+#: 提交竞态判据用的两段**不同**的最小网络代码（③ 要求它们各自到达自己的那次请求）。
+_RACE_CODE_A = "class Network:\n    def build(self, n_in, n_out, *, nn):\n        return nn.Linear(n_in, n_out)\n"
+_RACE_CODE_B = "class Network:  # B\n    def build(self, n_in, n_out, *, nn):\n        return nn.Linear(n_in, n_out)\n"
+
+
 _TESTS = [
     test_unsupported_shapes_are_rejected_teachably,
     test_row_payload_is_accepted_and_keeps_dtypes,
@@ -987,6 +1081,8 @@ _TESTS = [
     test_eval_custom_accepts_dataset_id_and_teaches_missing_payload,
     test_metrics_runs_in_eval_no_grad_and_can_be_throttled,
     test_payload_facts_disclose_per_row_shape,
+    # ---- 长任务编排批次（docs/建议-ML工具长任务编排与失败可读性.md §2.3）----
+    test_concurrent_run_custom_does_not_unregister_each_other,
 ]
 
 

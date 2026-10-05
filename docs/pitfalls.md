@@ -883,3 +883,80 @@
 - **判据**：`test_ai_efficiency.py::test_inline_payload_declaration_is_json_safe`
   （声明可 `json.dumps` + 走**后台 job** 真跑一次必须有 run_id）。
 
+### A39. **"注册 → 跑 → 撤"是并发竞态**：后提交的两个会死在"未注册的方法"
+- **症状**（用户实测原文）：连续 `submit_run` 三个 `run_custom` ⇒ **第 1 个成功，
+  后两个**全部 `state=done` + `error: 未注册的方法: custom_network`
+  （可用方法表里躺着 59 个经典方法，**反而误导**：让人以为方法名写错了）；
+  **取消一个任务后立刻提交**也复现。
+- **根因**：`_cmd_run_custom` 每次提交临时造一个**带代码的子类**
+  （`registry.unregister(name)` + `registry.register(subclass)`）、跑完在 `finally`
+  里 `unregister` ⇒ A 的收尾**撤掉了 B 刚注册的项**；两个 `unregister/register`
+  交错时还会撞 `方法名重复`。之所以要"临时注册"，是因为 `registry.get(name)`
+  **无参构造** ⇒ "这一段代码"只能挂在**类**上。
+- **修法**：注册项**常驻且不带代码**（`custom.py::_register_into_registry`），
+  代码随 `cfg.extras[CUSTOM_CODE_KEY]` **逐请求**下传 ⇒ 竞态从根上消失，
+  而且并发跑**两份不同代码**也各自正确（以前会串成"谁后注册谁覆盖"）。
+- **教训**：**"用完就撤"在并发下不是清理，是踩别人**。共享注册表上的
+  可变状态必须问一句"两个同时在跑会怎样"；而"必须挂在一个全局对象上"
+  通常说明**该换成按请求传递**（这里有现成的通道 `extras`）。
+- **判据**：`test_nqs_path.py::test_concurrent_run_custom_does_not_unregister_each_other`
+  （走真实命令入口，桩替换训练那一段；把"收尾撤除"加回去 ⇒ 判据红，且红的正是
+  用户那句 `未注册的方法: custom_network（可用: ['adaboost', …]）`）。
+
+### A40. **等不到终态**会被绕过：等待原语要么一次等到、要么交给独立进程
+- **症状**（用户实测）：`read_job` 的 `wait_s` 上限 30 s ⇒ 为等一个 250 epoch 的
+  训练**十几次轮询**，最后**绕过整套工具**用本地 `pwsh` 睡 9.5 分钟再查目录。
+  **绕过工具 = 缺能力最硬的证据。**
+- **事实（别猜）**：本实例的 MCP 客户端单次调用超时是
+  `launcher.py:98 TOOL_CALL_TIMEOUT_MS = 600000`（**10 分钟**，不是 SDK 默认的 60 s）
+  ⇒ **540 s 阻塞是安全的**，再长就会撞客户端超时（那时"等待"会被读成"工具失败"）。
+- **修法**：① `read_job(wait="terminal"/"any", timeout_s≤540)`：**一次**调用等到终态，
+  超时**不报错**（回 `timed_out=true` + 进度 + "可以再调一次"）；
+  ② 更长的等待交给**独立进程** `python -m ml_mecha.watch <job_id>`——
+  它经 MCP 读**权威的真状态**、到终态才退出，配 `pwsh run_in_background`
+  ⇒ harness 在它退出时**注入一条完成通知**（这就是"完成事件"的今天可用形态）。
+- **教训**：把"等"做成**会自己结束的进程**，比在协议层造推送便宜得多；
+  而上限这个数字**必须去客户端配置里查**（本仓 600 s 与 SDK 默认 60 s 差 10 倍，
+  猜错的代价是"等待"变成"假失败"）。
+
+### A41. 看门狗自己的两个**假话**：陈旧的进度、以及 `ok:true` + `state:running`
+- **症状**（我自己造的第一个 bug，实测 5 分钟）：`job-18` 盯了 5 分钟，进展行一直
+  打 `epoch 164/250` 不动 —— 看着像**训练卡住了**。其实是我"拿到 `run_id` 之后
+  就不再问权威、只等盘上记录"，于是把**最后一次读到的阶段当实时值**打。
+  由此还出现过回执里 `ok:true` + `state:running` 这种**自相矛盾**的组合。
+- **修法**：每轮都问一次 `read_job`（只读、毫秒级，不打扰训练）；终态以**权威**
+  为准，盘上 `record.json` 只是**载荷与证据**，并新增 `state_source`
+  （`authority` / `record`）如实标注结论来源；等不到终态时 `state="unreported"`
+  ——**不替权威下结论**。
+- **另一个**：盘上会有"没有 `record.json` 的**残骸目录**"（跑一半被 kill）。
+  本仓 `runs/` 里真有一个 **22 小时前**的。没有新鲜度过滤时 `:latest` 会一头扎进去、
+  永远等一个不会出现的记录 ⇒ 加 `DEFAULT_FRESH_S=300`（运行中的目录 mtime 会随
+  TB/checkpoint 持续刷新）。
+- **教训**：**观测工具自己的每一句话都要有出处**。"最后一次读到的值"不是"现在的值"；
+  两个来源（权威状态 / 盘上记录）交叉验证时要**说出用了哪一条**。
+
+### A42. CLI 输出里的 emoji/⇒ 会在 GBK 控制台上**崩在打印这一步**
+- **症状**：看门狗**已经拿到终态**，却
+  `UnicodeEncodeError: 'gbk' codec can't encode character '\u2705'` ⇒ 退出码 1
+  ⇒ 一次**假失败**（而且失败发生在"打印"这行，看起来像工具坏了）。
+- **修法**：机器字段（`state`/`run_id`/指标）与人话摘要**纯 ASCII**；
+  中文解释只放 JSON 的 `notes`，而 JSON 用 `ensure_ascii=True` 转义
+  （任何编码下都能原样解回来）；CLI 另外把 stdout/stderr `reconfigure(utf-8)`。
+- **教训**：本仓的"可教学错误"文化在这里有个反直觉的推论——**给人看的话越花哨，
+  在 Windows 控制台上越容易把成功变成失败**。跨进程边界先保证"能被打印"。
+- **判据**：`test_ml_delivery.py::test_watch_summary_lines_are_pure_ascii`
+  （放回 emoji ⇒ 立刻红）。
+
+### A43. `state=done && error=="" && run_id==""` **这个组合不许存在**
+- **症状**（用户点名的"不该存在"）：一次 job 终态既没有 run、也没有可读的失败
+  ⇒ 它**无法区分"成功但慢"与"从未启动"**（A37 是它的第一种成因）。
+- **修法**：在**后台 job 的唯一入口**（`MLMecha.submit` 的 worker）强制两条蕴含式：
+  `ok=True ⇒ run_ids 非空`；`ok=False ⇒ error 非空且 error_kind 具体`。
+  违反 ⇒ 回执被改写成 `ok=false` + `error_kind="silent_terminal"`
+  （**框架自检失败**，而不是让调用方看到"done 但什么都没有"）。
+- **教训**：**"不许存在的组合"要在唯一入口上强制**，而不是在每个消费者里各判一次
+  ——后者迟早漏一个（`read_job` 漏过、`describe_run` 又漏一次）。
+- **判据**：`test_ml_delivery.py::test_empty_receipt_becomes_silent_terminal_not_done`
+  （把真实命令处理链里的 `run_method` 换成"回空回执"的桩 ⇒ 必须得到
+  `silent_terminal`，且 `read_job` 报失败）。
+

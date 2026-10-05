@@ -106,7 +106,12 @@ EXPECTED_REQUIRED = {
     "describe_run": [],
     "describe_training": [],
     "prepare_dataset": ["source"],
-    "read_job": ["job_id"],
+    # ⚠ `job_id` **不是**必填（2026-10-05 长任务编排）：它与 `job_ids` 二选一
+    #   （"看一个" vs "一次等多个/等任意一个"），而 JSON-schema 的 required
+    #   表达不了"二选一"⇒ 两者都声明为非必填，由 `tools._job_handles` 校验
+    #   （都不给报 `missing_job_id`、同时给报 `bad_job_selection`）。
+    #   这与 `run_custom.code`/`code_path` 是**同一套**做法（见下）。
+    "read_job": [],
     # ⚠ `code` **不是**必填（2026-10-04 修）：`code` 与 `code_path` 二选一，
     #   而 JSON-schema 的 required 表达不了"二选一"⇒ 两者都声明为非必填，
     #   由引擎在 `engine.py:1113-1126` 校验（都不给报 `missing_code`、
@@ -524,7 +529,7 @@ EXPECTED_DEFAULTED = {
     # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
     #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
     "prepare_dataset": ["diag", "name", "target", "target_kind", "time_col"],
-    "read_job": ["detail", "tail", "wait_s"],
+    "read_job": ["detail", "job_id", "tail", "timeout_s", "wait", "wait_s"],
     # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
     #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
     # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）；
@@ -603,6 +608,12 @@ _DEFAULTED_PROBES = (
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
     ("read_job", {"job_id": "job-null-shim"}, "detail", "full"),
     ("read_job", {"job_id": "job-null-shim"}, "tail", 3),
+    # ---- 长任务编排（2026-10-05）：等待原语折进 read_job（不新增工具）----
+    ("read_job", {"job_id": "job-null-shim"}, "wait", "terminal"),
+    ("read_job", {"job_id": "job-null-shim"}, "timeout_s", 5.0),
+    # `job_id` 变成可选（与 `job_ids` 二选一）⇒ 它的默认在同一张表的基准里
+    # 不能再出现，否则探针的 base 与被探参数会撞在一起。
+    ("read_job", {}, "job_id", "job-null-shim"),
     ("submit_run", {"method": "logistic"}, "dataset_id", "ds-null-shim"),
     ("submit_run", {"method": "logistic"}, "device", "cpu"),
     ("submit_run", {"method": "logistic"}, "persist", True),
@@ -629,6 +640,9 @@ _NONE_DEFAULTED_PROBES = (
     ("compare_methods", {"methods": ["logistic"]}, "seed", 7),
     ("submit_run", {"method": "logistic"}, "overrides", {"k": 1}),
     ("submit_run", {"method": "logistic"}, "seed", 7),
+    # ---- 长任务编排（2026-10-05）：`job_ids` 是**无默认**的可选参数
+    #      （None = 用 `job_id`）⇒ 显式 null 必须原样保留（"不指定多个"）。
+    ("read_job", {"job_id": "job-null-shim"}, "job_ids", ["job-null-shim"]),
 )
 
 
@@ -726,7 +740,9 @@ _MIN_ARGS = {
 #: `submit_run` 缺 persist/diag ⇒ 长训练跑完人回 GUI 看不到）再 +3；
 #: 同日 `run_custom`（7 个可选）+ `describe_networks`/`describe_network`（各 1~2 个）
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
-_EXPECTED_OPTIONAL_PARAMS = 67
+#: 2026-10-05 长任务编排 +4：`read_job` 的 `wait`/`timeout_s`（阻塞到终态）、
+#: `job_ids`（一次等多个/等任意一个）与 `job_id`（二选一 ⇒ 不再是必填）。
+_EXPECTED_OPTIONAL_PARAMS = 71
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -1139,6 +1155,399 @@ def test_job_tools_submit_read_and_result_ref():
             err, txt = _call_tools(host.url, [("read_job", {"job_id": "job-9999"})])[0]
             assert err is True, txt
             assert json.loads(txt)["error"]["info"]["kind"] == "unknown_job", txt
+
+
+# ============================================================ 长任务编排（2026-10-05）
+# 依据：`docs/建议-ML工具长任务编排与失败可读性.md` §2.1（等待原语）。
+def test_read_job_wait_terminal_blocks_and_returns_terminal():
+    """⭐ **等待原语**：**一次** `read_job` 就等到终态，不再靠调用方轮询。
+
+    用户实测（建议 §2.1）：`wait_s` 上限 30 s ⇒ 为等一个 250 epoch 的训练反复轮询，
+    最后**绕过工具**用本地 `pwsh` 睡 9.5 分钟。"绕过工具 = 缺能力最硬的证据"。
+    本判据只调一次 `read_job` 就必须拿到终态；若实现退回"立刻返回"，它会红。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-wait-terminal-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            (p_err, p_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(_SYNTHETIC)})])
+            assert p_err is False, p_txt
+            dataset_id = json.loads(p_txt)["dataset_id"]
+
+            err, txt = _call_tools(host.url, [
+                ("submit_run", {"method": "logistic", "dataset_id": dataset_id})])[0]
+            assert err is False, txt
+            job = json.loads(txt)["job_id"]
+
+            # ⭐ **只有这一次** read_job：它必须一直阻塞到终态
+            err, txt = _call_tools(host.url, [
+                ("read_job", {"job_id": job, "wait": "terminal",
+                              "timeout_s": 120})])[0]
+            assert err is False, txt
+            got = json.loads(txt)
+            assert got["state"] == "done", got
+            assert got["timed_out"] is False, got
+            assert got["wait"] == "terminal", got
+            assert got["wait_cap_s"] >= 540, got          # 上限从 30 提到 540
+            assert got["wait_note"] == "", got            # 没夹、没超时 ⇒ 不必解释
+            assert [j["job_id"] for j in got["jobs"]] == [job], got["jobs"]
+            assert got["result_ref"].get("run_ids"), got
+
+
+def test_read_job_wait_timeout_is_a_clean_answer_not_an_error():
+    """⭐ 等到超时**不是错误**：回"仍在跑" + 进度，调用方可以**循环调用**。
+
+    用户明确要求（本轮裁决）："超时必须干净返回'仍在运行 + 当前进度摘要'，
+    **不能报错**——我要能循环调用它。"⇒ 本条用宿主自己的 submit seam 造一个
+    **受控地不结束**的 job，再对一个 1 s 预算调 `wait="terminal"`。
+    """
+    import threading
+
+    with tempfile.TemporaryDirectory(prefix="ml-wait-timeout-") as td:
+        with _authority(td, open_gate=True) as (ml, host):
+            gate = threading.Event()
+            sleepy = ml.jobs.submit(lambda _ctx: gate.wait(20), command="sleepy",
+                                    cancel_supported=True)
+            try:
+                err, txt = _call_tools(host.url, [
+                    ("read_job", {"job_id": sleepy.id, "wait": "terminal",
+                                  "timeout_s": 1})])[0]
+                # ① **不是错误**（is_error=False）
+                assert err is False, txt
+                got = json.loads(txt)
+                # ② 如实说"还在跑"，且 timed_out 为真（这是等待的正常终点）
+                assert got["timed_out"] is True, got
+                assert got["state"] not in ("done", "failed", "cancelled"), got
+                assert got["waited_s"] >= 1, got
+                # ③ 必须**告诉调用方下一步**（能循环调用 / 或用 watcher 等更久）
+                assert "watch" in got["wait_note"], got["wait_note"]
+            finally:
+                gate.set()
+
+
+def test_read_job_wait_any_reports_whichever_finished_first():
+    """⭐ `job_ids` + `wait="any"`：**谁先完先报谁**（不是"报第一个句柄"）。
+
+    顺序刻意把"不会结束的"放**前面**：若实现只是取第一个句柄，这条会红。
+    """
+    import threading
+
+    with tempfile.TemporaryDirectory(prefix="ml-wait-any-") as td:
+        with _authority(td, open_gate=True) as (ml, host):
+            (p_err, p_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(_SYNTHETIC)})])
+            assert p_err is False, p_txt
+            dataset_id = json.loads(p_txt)["dataset_id"]
+            err, txt = _call_tools(host.url, [
+                ("submit_run", {"method": "logistic", "dataset_id": dataset_id})])[0]
+            assert err is False, txt
+            fast = json.loads(txt)["job_id"]
+
+            gate = threading.Event()
+            sleepy = ml.jobs.submit(lambda _ctx: gate.wait(20), command="sleepy",
+                                    cancel_supported=True)
+            try:
+                err, txt = _call_tools(host.url, [
+                    ("read_job", {"job_ids": [sleepy.id, fast], "wait": "any",
+                                  "timeout_s": 120})])[0]
+                assert err is False, txt
+                got = json.loads(txt)
+                assert got["job_id"] == fast, got          # ← 先完的那个，不是第一个
+                assert got["state"] == "done", got
+                assert got["timed_out"] is False, got
+                # 两个句柄的状态都要能看见（不是只看主角）
+                states = {j["job_id"]: j["state"] for j in got["jobs"]}
+                assert set(states) == {sleepy.id, fast}, states
+                assert states[sleepy.id] not in ("done", "failed", "cancelled"), states
+            finally:
+                gate.set()
+
+
+def test_read_job_wait_clamps_to_cap_and_says_so():
+    """⭐ 超上限**不静默**：夹到上限并在 `wait_note` 里明说，且给出更长的替代。
+
+    "静默夹住"是旧实现的行为（要 3600 得 30）——那让人以为"等够了"。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-wait-clamp-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            (p_err, p_txt), = _call_tools(host.url, [
+                ("prepare_dataset", {"source": dict(_SYNTHETIC)})])
+            assert p_err is False, p_txt
+            dataset_id = json.loads(p_txt)["dataset_id"]
+            err, txt = _call_tools(host.url, [
+                ("submit_run", {"method": "logistic", "dataset_id": dataset_id})])[0]
+            assert err is False, txt
+            job = json.loads(txt)["job_id"]
+
+            err, txt = _call_tools(host.url, [
+                ("read_job", {"job_id": job, "wait": "terminal",
+                              "timeout_s": 99999})])[0]
+            assert err is False, txt
+            got = json.loads(txt)
+            assert got["wait_clamped"] is True, got
+            assert f"{got['wait_cap_s']:g}" in got["wait_note"], got["wait_note"]
+            assert "watch" in got["wait_note"], got["wait_note"]
+            assert got["state"] == "done", got            # 夹的是等待，不是结论
+
+
+def test_read_job_wait_selection_rejects_bad_input_teachably():
+    """句柄给法冲突 / `wait` 写错 ⇒ **可教学**拒（不是猜一个用）。"""
+    with tempfile.TemporaryDirectory(prefix="ml-wait-bad-") as td:
+        with _authority(td, open_gate=True) as (_ml, host):
+            err, txt = _call_tools(host.url, [
+                ("read_job", {"job_id": "job-1", "job_ids": ["job-1"]})])[0]
+            assert err is True, txt
+            assert json.loads(txt)["error"]["info"]["kind"] == "bad_job_selection", txt
+
+            err, txt = _call_tools(host.url, [
+                ("read_job", {"job_id": "job-1", "wait": "someday"})])[0]
+            assert err is True, txt
+            assert json.loads(txt)["error"]["info"]["kind"] == "bad_wait", txt
+
+
+# ============================================================ 看门狗（进程外等待）
+def test_watch_summary_lines_are_pure_ascii():
+    """看门狗的摘要行必须是**纯 ASCII** —— 否则它在 GBK 控制台上**打印就崩**。
+
+    实测（2026-10-05 22:0x）：摘要行里放了 emoji/⇒ ⇒
+    `UnicodeEncodeError: 'gbk' codec can't encode character` ⇒
+    **看门狗拿到了终态却退出码 1**（新一轮"假失败"）。本判据把这条钉死。
+    """
+    from ml_mecha import watch
+
+    cases = [
+        {"timed_out": True, "job_state": "running", "run_id": "", "elapsed_s": 30,
+         "polls": 3},
+        {"ok": False, "evidence": ["handle_unknown"], "error": "no such job",
+         "state": "unknown_handle"},
+        {"ok": False, "evidence": ["record_missing_after_settle"], "state": "done",
+         "run_id": "r1"},
+        {"ok": True, "state": "done", "run_id": "r1", "primary_metric": "m",
+         "metrics": {"m": 1.0}, "elapsed_s": 61, "polls": 5},
+    ]
+    for case in cases:
+        line = watch.summary_line(case)
+        assert line.isascii(), (line, "摘要行必须纯 ASCII（GBK 控制台会崩在打印上）")
+
+
+def test_watch_reports_terminal_from_disk_record_and_ignores_wreck():
+    """看门狗：① 有 `record.json` ⇒ 直接终态（**不需要权威**）；
+    ② 盘上"没有 record.json 的旧残骸目录"**不许**被当成在跑。
+
+    ② 不是假想：本仓 `runs/` 里真的有一个 22 小时前的残骸目录，
+    没有新鲜度过滤时 `:latest` 会一头扎进去、永远等一个不会出现的记录。
+    """
+    from ml_mecha import watch
+
+    with tempfile.TemporaryDirectory(prefix="ml-watch-") as td:
+        runs = os.path.join(td, "runs")
+        os.makedirs(runs)
+        wreck = os.path.join(runs, "custom_network-1-1")
+        os.makedirs(wreck)
+        old = time.time() - 22 * 3600
+        os.utime(wreck, (old, old))
+        assert watch.newest_unfinished(runs, fresh_s=watch.DEFAULT_FRESH_S) is None, \
+            "22 小时没写过的残骸目录不许被当成'在跑'"
+
+        rid = "custom_network-2-2"
+        d = os.path.join(runs, rid)
+        os.makedirs(d)
+        with open(os.path.join(d, "record.json"), "w", encoding="utf-8") as fh:
+            json.dump({"run_id": rid, "method": "custom_network",
+                       "primary_metric": "m", "metrics": {"m": 0.5},
+                       "error": "", "saved_at": "2026-10-05T22:00:00"}, fh)
+
+        got = watch.watch(handle=rid, url="", runs=runs, timeout_s=5, poll_s=0.1)
+        assert got["ok"] is True and got["state"] == "done", got
+        assert got["metrics"] == {"m": 0.5}, got
+        assert "record.json" in got["evidence"], got["evidence"]
+        assert got["record"].endswith("record.json"), got
+        assert got["timed_out"] is False, got
+
+
+def test_watch_timeout_never_fakes_a_state():
+    """等不到终态时不许**替权威下结论**：`state` 是 `unreported`，`timed_out` 为真。"""
+    from ml_mecha import watch
+
+    with tempfile.TemporaryDirectory(prefix="ml-watch-to-") as td:
+        runs = os.path.join(td, "runs")
+        os.makedirs(os.path.join(runs, "custom_network-1-1"))
+        got = watch.watch(handle="custom_network-1-1", url="", runs=runs,
+                          timeout_s=1, poll_s=0.1)
+        assert got["timed_out"] is True and got["ok"] is False, got
+        assert got["state"] == "unreported", got
+        assert "unreported" in watch.summary_line(got), watch.summary_line(got)
+
+
+def test_watch_flags_terminal_job_without_any_run():
+    """⭐ `state=done` + **没有 run_id** 这个组合：看门狗必须**报出来**，不许傻等。
+
+    这正是用户点名的那个"不该存在"的组合（`done && error=="" && run_id==""`）——
+    它无法区分"成功但慢"与"从未启动"。看门狗用假 MCP 客户端注入这个形状。
+    """
+    from ml_mecha import watch
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def call_tool(self, name, args):
+            return {"ok": True, "job_id": args.get("job_id", ""), "state": "done",
+                    "run_id": "", "error": "", "progress_latest": {}}
+
+    with tempfile.TemporaryDirectory(prefix="ml-watch-silent-") as td:
+        runs = os.path.join(td, "runs")
+        os.makedirs(runs)
+        real = watch.McpClient
+        watch.McpClient = _FakeClient
+        try:
+            got = watch.watch(handle="job-7", url="http://127.0.0.1:1/mcp",
+                              runs=runs, timeout_s=5, poll_s=0.1)
+        finally:
+            watch.McpClient = real
+        assert got["ok"] is False, got
+        assert "terminal_without_run" in got["evidence"], got["evidence"]
+        assert got["error"], "静默终态必须带一句人能读的说明"
+
+
+# ============================================================ 失败真因（2026-10-05）
+# 依据：`docs/建议-ML工具长任务编排与失败可读性.md` §2.2（静默死亡 / 假位置）。
+def test_empty_receipt_becomes_silent_terminal_not_done():
+    """⭐ ``state=done`` + 无 run + 无失败原因 这个组合**不许存在**。
+
+    用户原话（§2.2）："`state=done && error=="" && run_id==""` 这个组合**不应该存在**
+    —— 它无法区分'成功但慢'和'从未启动'。"
+
+    做法：把**真实命令处理链**里的 `run_method` 换成一个"回空回执"的桩
+    （走的仍是 `submit → worker → engine.run` 这条真路），断言它被改写成
+    `silent_terminal`，而且 `read_job` 会把它报成**失败**（不是 done）。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-silent-") as td:
+        with _authority(td, open_gate=True) as (ml, host):
+            real = ml.engine._handlers()
+            patched = dict(real)
+            patched["run_method"] = lambda spec, ctx: {"ok": True}     # ← 空回执
+            ml.engine._handlers = lambda: patched
+            try:
+                job = ml.submit({"command": "run_method", "method": "logistic",
+                                 "dataset_id": "ds-x"}, side="ai")
+                ml.wait_job(job, 20)
+            finally:
+                ml.engine._handlers = lambda: real
+
+            assert job.result["ok"] is False, job.result
+            assert job.result["error_kind"] == "silent_terminal", job.result
+            assert "silent_terminal" in job.result["error"], job.result
+            assert job.result["error_hint"], job.result
+
+            # 用户可见的那条路：`read_job` 必须报失败（不是"done 但什么都没有"）
+            err, txt = _call_tools(host.url, [("read_job", {"job_id": job.id})])[0]
+            assert err is True, txt
+            info = json.loads(txt)["error"]["info"]
+            assert info["kind"] == "silent_terminal", info
+
+
+def test_failure_without_a_kind_still_gets_one():
+    """`ok=False` 但没归类 ⇒ 补一个**具体** kind（"不知道哪一类"本身要看得见）。"""
+    from ml_mecha.assembly import enforce_terminal_invariant
+
+    got = enforce_terminal_invariant({"ok": False, "error": "炸了"}, "run_method")
+    assert got["error_kind"] == "job_command_failed", got
+    # 正常形状**原样过**（不变量不许把成功改坏）
+    ok_shape = {"ok": True, "run_ids": ["r1"], "error": ""}
+    assert enforce_terminal_invariant(ok_shape, "run_method") == ok_shape
+    # 不产 run 的命令不受这条不变量约束（prepare_dataset 正常成功就是没有 run_ids）
+    prep = {"ok": True, "dataset_id": "ds-1", "error": ""}
+    assert enforce_terminal_invariant(prep, "prepare_dataset") == prep
+
+
+def test_cuda_oom_and_poison_are_classified_and_pinned_to_first_line():
+    """⭐ 显存不足要**一等化**、CUDA 断言/回声要**置顶**（不许埋在 hint 末尾）。
+
+    两条实测反馈（§2.2 / §3.3）：
+    - 显存不足被 CUDA 报成 `device-side assert`，栈指向 `set_probe` ⇒ "事前完全
+      不知道会不够"；⇒ 认出来 + 把**数字**（要多少/剩多少/总量）摆到首行；
+    - "毒化提示写了，但放在 `hint` 末尾，我读了好几轮才注意到" ⇒ 回声必须**置顶**。
+
+    ⚠ 走的是**真实回执构造入口** `_summarize_record`（那条路上曾经有过
+    "`warning` 只取最后一行 ⇒ 认不出 CUDA 断言"的失误，只测纯函数会漏掉它）。
+    """
+    from ml_mecha import engine as E
+    from ml_toolbox.api import RunRequest
+    from ml_toolbox.core.contracts import MLResult
+    from ml_toolbox.core.runner import RunRecord
+
+    def _receipt(error: str, run_id: str = "r-x"):
+        res = MLResult(method_name="custom_network", task="supervised",
+                       metrics={"m": 1.0}, primary_metric="m",
+                       params={}, elapsed=0.1, error=error)
+        rec = RunRecord(run_id=run_id, method="custom_network", family="neural",
+                        task="supervised", target_kind=None, dataset="ds-1",
+                        pipeline_id="p-1", config={}, result=res)
+        return E._summarize_record(rec, "ds-1", RunRequest(method="custom_network"))
+
+    saved = dict(E._CUDA_POISON)
+    E._CUDA_POISON.clear()
+    try:
+        # ① 显存不足：**一等**错误 + 数字进首行 + 明说"不必重启"
+        oom = _receipt("CUDA out of memory. Tried to allocate 2.00 GiB "
+                       "(GPU 0 has a total capacity of 5.99 GiB of which 1.21 GiB "
+                       "is free)")
+        assert oom.error_kind == "cuda_oom", oom
+        assert oom.warning.startswith("⚠ 显存不足"), oom.warning
+        assert "2.00 GiB" in oom.warning and "1.21 GiB" in oom.warning, oom.warning
+        assert "不必重启" in oom.error_hint, oom.error_hint
+
+        # ② 第一次 device-side assert：置顶 + 首次记号
+        first = _receipt("CUDA error: device-side assert triggered", run_id="r-first")
+        assert first.error_kind == "cuda_device_assert", first
+        assert first.warning.startswith("⚠ CUDA 断言"), first.warning
+        assert "毒化" in first.warning, first.warning
+
+        # ③ 之后的每一次：**回声**必须置顶，并点名那次 run + "别在这里改代码"
+        echo = _receipt("CUDA error: device-side assert triggered", run_id="r-second")
+        assert echo.error_kind == "cuda_context_poisoned", echo
+        assert echo.warning.startswith("⚠⚠"), echo.warning
+        assert "回声" in echo.warning and "r-first" in echo.warning, echo.warning
+        assert "别在这里改代码" in echo.warning, echo.warning
+        assert "别在这里改代码" in echo.error_hint, echo.error_hint
+    finally:
+        E._CUDA_POISON.clear()
+        E._CUDA_POISON.update(saved)
+
+
+def test_missing_custom_method_is_teaching_not_internal_error():
+    """注册表里没有 `custom_network` ⇒ **自解释**，不许报成 `internal_error`。
+
+    用户 §2.3 的兜底要求原话："报错要能自解释 —— '自定义网络方法尚未就绪，请重试'，
+    而不是把 59 个可用方法列一遍（那反而误导，让人以为方法名写错了）"。
+    """
+    with tempfile.TemporaryDirectory(prefix="ml-notready-") as td:
+        with _authority(td, open_gate=True) as (ml, _host):
+            real = ml.engine._handlers()
+            patched = dict(real)
+
+            def _boom(spec, ctx):
+                raise KeyError("未注册的方法: custom_network"
+                               "（可用: ['adaboost', 'logistic', 'ridge']）")
+
+            patched["run_method"] = _boom
+            ml.engine._handlers = lambda: patched
+            try:
+                got = ml.engine.run({"command": "run_method", "method": "logistic",
+                                     "dataset_id": "ds-x"})
+            finally:
+                ml.engine._handlers = lambda: real
+            assert got["ok"] is False, got
+            assert got["error_kind"] == "custom_network_not_ready", got
+            assert "不是你写错了" in got["error"], got
+            # 别的内部错误**不许**被这条兜底吃掉（窄判据）
+            assert not _is_missing_custom_method_public(RuntimeError("boom"))
+            assert not _is_missing_custom_method_public(KeyError("未注册的方法: ridge"))
+
+
+def _is_missing_custom_method_public(exc):
+    from ml_mecha.engine import _is_missing_custom_method
+    return _is_missing_custom_method(exc)
 
 
 def test_cancel_run_rejects_uncancellable_job():

@@ -968,6 +968,22 @@ class MLEngine(Engine):
             return self._failure(command, MechaError(
                 str(exc), kind=exc.kind, hint=exc.hint, suggest=exc.suggest), [])
         except Exception as exc:  # noqa: BLE001 - 内部错误也要进回执，不逃逸
+            # ⚠ **注册表查不到 `custom_network`** 是"方法没就绪"，不是"框架坏了"
+            #   （用户实测 §2.3 的兜底要求原话："报错要能自解释 —— '自定义网络方法
+            #   尚未就绪，请重试'，而不是把 59 个可用方法列一遍（那反而误导，
+            #   让人以为方法名写错了）"）。
+            #   ⚠ 与 `check_method_ref` 的用户输入校验**不是一回事**：走到这里说明
+            #   是我们自己在跑 `custom_network` 时它不在注册表里（导入顺序/旧版竞态）。
+            if _is_missing_custom_method(exc):
+                return self._failure(command, MechaError(
+                    "自定义网络方法（custom_network）在方法表里查不到 ⇒ "
+                    "**这不是你写错了方法名**，是适配器尚未就绪",
+                    kind="custom_network_not_ready",
+                    hint="方法层（ml_toolbox.methods.neural.custom）没能在运行前把"
+                         "适配器注册进方法表：多半是 neural 族尚未 import（需 torch）"
+                         "或旧版的并发注册竞态",
+                    suggest="重试一次；仍失败则确认 ml_toolbox.methods 已加载"
+                            "（描述里列出的 59 个经典方法与本方法无关）"), [])
             return self._failure(command, MechaError(
                 f"{type(exc).__name__}: {exc}", kind="internal_error",
                 hint="栈留在宿主日志；回执只给结构化失败"), [])
@@ -1091,20 +1107,21 @@ class MLEngine(Engine):
 
         ## 形状：它本质就是"跑一个方法"
 
-        收编方式（用户裁决）不是另开一条执行面，而是：**临时注册**一个
-        `CustomNNMethod`（它是一台真正的 `MLMethod`）→ 走与 `run_method`
-        完全相同的执行路径 → 跑完**立刻撤除**注册项。
+        收编方式（用户裁决）不是另开一条执行面，而是：**注册**一台真正的
+        `CustomNNMethod`（装配期常驻）→ 走与 `run_method` 完全相同的执行路径。
 
         ⇒ 白拿的东西：`Session` 的校验/快照、`runner` 的切分与评估、
         `artifacts`、`runs/` 存档、五页检视、`describe_training` 观测面、
         Gate 写权与审计。
 
-        ## ⚠ 为什么必须"跑完就撤"
+        ## ⚠ 为什么**常驻注册**（"跑完就撤"已被证明是错的）
 
-        代码是**逐请求变化**的，而 `Session.run` 只认注册表里的名字
-        （`registry.get(request.method)`）。留着不撤 ⇒ 注册表里恒有一个
-        **代码已经不对**的 `custom_network`，之后谁取到它都会拿到上一次的代码。
-        `finally` 里撤，连失败路径也不留垃圾。
+        旧实现每次跑完在 `finally` 里撤除注册项，理由是"代码逐请求变化，
+        留着会拿到上一次的代码"。**那个理由的前提已经不存在**：代码现在随
+        `request.extras` 逐请求下传，注册项本身**不带代码**（见
+        `_ensure_custom_method` 的竞态复盘）。
+        ⇒ 撤除不再防任何东西，只会**撤掉并发中的另一次运行**：实测"连续提交三个
+        `run_custom`，第 1 个成功、后两个死于 `未注册的方法: custom_network`"。
         """
         code = str(spec.get("code") or "")
         # ⭐ **代码可以从文件读**（反馈建议 3）：调参要跑 N 个组合时，
@@ -1144,45 +1161,44 @@ class MLEngine(Engine):
             return self._cmd_dry_run_custom(spec, entry, code, code_path, name,
                                             context, code_source)
         method_name = _custom_method_name()
-        # ⚠ **先注册再按注册表取 schema**：这样覆写校验用的就是"运行时真正那个方法"
-        #   的声明，而不是另抄一份；且里外只有一个来源。
+        # ⚠ **先确保注册项在**再按注册表取 schema：这样覆写校验用的就是"运行时
+        #   真正那个方法"的声明，而不是另抄一份；且里外只有一个来源。
         #   `method_param_schema` 回的是**dict 形状**（`clean_overrides` 要的形状），
         #   而槽里那份是 `ParamSpec` 对象 ⇒ 直接塞进 `_build_request` 会
         #   `'ParamSpec' object has no attribute 'get'`（实测踩过）。
-        self._register_custom_method(code)
-        try:
-            request, options = self._build_request(
-                {**spec, "method": method_name}, method=method_name,
-                param_schema=self.method_param_schema(method_name))
-            # ⭐ 代码经 extras 下传（字符串 ⇒ JSON 可序列化 ⇒ 能原样进 record.json）
-            request.extras[_custom_code_key()] = code
-            # ⭐ **负载的"声明"也下传**：checkpoint 要把它存起来，`eval_custom` 才能
-            #   默认继承训练时的数据（反馈建议 4）。只存声明（HDF5 路径/小数组），
-            #   大数组留在原处按需读。
-            #   ⚠ 声明来自**登记数据那一步**（`spec.meta`），不在本次 `run_custom`
-            #     的参数里 —— 实测踩过：只看 `spec["payload"]` 会永远是空的。
-            request.extras["payload_decl"] = dict(
-                spec.get("payload") or entry.spec.meta.get("payload_decl") or {})
-            request.extras["code_path"] = code_path
-            request.extras["network_name"] = name
-            _attach_progress(request, context)
-            self._write_state(
-                "ml_mecha:run_custom",
-                # ⚠ `current.method` 必须是**已注册的方法名**（状态校验器按注册表查，
-                #   实测：写用户给的网络名会被拒 "未注册的方法 …"）。运行级那个
-                #   人类可读的名字走回执与 `extras["network_name"]`，不占这个键。
-                {"current.dataset_id": dataset_id,
-                 "current.method": method_name,
-                 "current.overrides": dict(request.overrides),
-                 "current.seed": int(request.seed),
-                 "current.device": clean_device(
-                     options.get("device", spec.get("device", self._device))).to_state()},
-                spec,
-            )
-            summary = self._execute_one(entry, request, call_id=_call_id(),
-                                        context=context)
-        finally:
-            self._unregister_custom_method()
+        # ⚠ **不撤除**（撤除 = 并发竞态的根）：代码随 extras 走，见
+        #   `_ensure_custom_method` 的说明。
+        self._ensure_custom_method()
+        request, options = self._build_request(
+            {**spec, "method": method_name}, method=method_name,
+            param_schema=self.method_param_schema(method_name))
+        # ⭐ 代码经 extras 下传（字符串 ⇒ JSON 可序列化 ⇒ 能原样进 record.json）
+        request.extras[_custom_code_key()] = code
+        # ⭐ **负载的"声明"也下传**：checkpoint 要把它存起来，`eval_custom` 才能
+        #   默认继承训练时的数据（反馈建议 4）。只存声明（HDF5 路径/小数组），
+        #   大数组留在原处按需读。
+        #   ⚠ 声明来自**登记数据那一步**（`spec.meta`），不在本次 `run_custom`
+        #     的参数里 —— 实测踩过：只看 `spec["payload"]` 会永远是空的。
+        request.extras["payload_decl"] = dict(
+            spec.get("payload") or entry.spec.meta.get("payload_decl") or {})
+        request.extras["code_path"] = code_path
+        request.extras["network_name"] = name
+        _attach_progress(request, context)
+        self._write_state(
+            "ml_mecha:run_custom",
+            # ⚠ `current.method` 必须是**已注册的方法名**（状态校验器按注册表查，
+            #   实测：写用户给的网络名会被拒 "未注册的方法 …"）。运行级那个
+            #   人类可读的名字走回执与 `extras["network_name"]`，不占这个键。
+            {"current.dataset_id": dataset_id,
+             "current.method": method_name,
+             "current.overrides": dict(request.overrides),
+             "current.seed": int(request.seed),
+             "current.device": clean_device(
+                 options.get("device", spec.get("device", self._device))).to_state()},
+            spec,
+        )
+        summary = self._execute_one(entry, request, call_id=_call_id(),
+                                    context=context)
         self._append_command_event("ml.run", summary, spec)
         warning = summary.warning
         return {
@@ -1309,16 +1325,35 @@ class MLEngine(Engine):
         return out
 
     @staticmethod
-    def _register_custom_method(code: str = "") -> None:
-        """把适配器临时注册进方法注册表（幂等：先撤再注册）。
+    def _ensure_custom_method() -> None:
+        """确保 `custom_network` 在方法注册表里（**幂等；永不撤除**）。
 
-        ⚠ **代码要绑在类上，不是实例上**：`Session.run` 走的是
-        `registry.get(name)`，而它**无参构造**（`cls()`）⇒ 绑在实例上等于没绑
-        （实测：`SandboxError: 没有拿到网络代码`）。这里造一个**带代码的子类**
-        注册进去，`registry.get` 造出来的每个实例都带着它。
+        ## 为什么不再"注册→跑→撤"（用户实测复现的竞态，2026-10-05）
+
+        旧实现每次 `run_custom` 造一个**带代码的子类**注册进方法注册表，
+        跑完在 `finally` 里 `unregister`。并发提交两次时：
+
+        .. code-block:: text
+
+            A: register(code_a) ────────────► 跑 ──► finally unregister  ← 把 B 的项撤了
+            B:        register(code_b) ──► get(name)  ✗ KeyError 未注册的方法
+
+        ⇒ 使用者实测：连续提交三个 `run_custom`，**第 1 个成功、后两个**全部
+        死于 `未注册的方法: custom_network`；**取消后立刻提交**也复现。
+        这条路还有个更隐蔽的错法：A 撤、B 注册、A 再注册 ⇒ `方法名重复`；
+        更坏的是两份**不同代码**并发时，谁后注册谁覆盖 ⇒ 可能**跑错代码**。
+
+        ⇒ 改为：注册表里恒有一个**不带代码**的适配器（方法层 import 时已常驻
+        注册，见 `methods/neural/custom.py::_register_into_registry`），
+        代码随 `request.extras` 逐请求下传。这里只做**幂等兜底**——
+        覆盖"方法层尚未 import 到"的导入顺序情形（那时注册表里没有它，
+        而 `_CUSTOM_SLOT` 可能有），仍然**不撤除**：撤除正是竞态的根。
         """
         from ml_toolbox.core import registry
 
+        name = _custom_method_name()
+        if name in registry.names():
+            return
         base = _CUSTOM_SLOT.get("cls")
         if base is None:
             raise MechaError(
@@ -1328,16 +1363,9 @@ class MLEngine(Engine):
                      "import 时会调 `register_custom_network`）",
                 suggest="确认 ml_toolbox.methods 已加载，且 neural 族可用（需 torch）",
             )
-        name = _custom_method_name()
-        registry.unregister(name)                     # 上一次的残留先清掉
-        bound = type(name, (base,), {"custom_code": str(code or ""),
-                                     "name": name})
-        registry.register(bound)
-
-    @staticmethod
-    def _unregister_custom_method() -> None:
-        from ml_toolbox.core import registry
-        registry.unregister(_custom_method_name())
+        # 注册**基类本身**（不带代码）：`registry.get(name)` 无参构造出来的实例
+        # 从 `cfg.extras` 取代码 ⇒ 并发安全。
+        registry.register(base)
 
     def _cmd_clear_current_state(self, spec: dict[str, Any],
                           context: Any) -> Mapping[str, Any]:
@@ -2637,9 +2665,16 @@ def _summarize_record(record: Any, dataset_id: str,
         # ⚠ 传**完整** error，不只 `warning`：`warning` 只取**最后一行**，而 CUDA 断言的
         #   关键字在第一行（`device-side assert triggered`）⇒ 只看最后一行认不出来
         #   （实测：判据当场红，`error_kind` 还是空串）。
-        kind, hint = _cuda_poison_note(
+        # ⭐⭐ 返回值多了第三个：**回执首行**。用户的实测反馈是"这条提示写了，但放在
+        #   `hint` 末尾，我读了好几轮才注意到"——假位置/回声这类事实必须**置顶**
+        #   （`warning` 就是回执的 `error`，也是 job 失败时 message 里那句话）。
+        kind, hint, head = _cuda_poison_note(
             kind, hint, f"{getattr(result, 'error', '') or ''}\n{warning}",
             record.run_id)
+        if head:
+            # **结论置顶**（用户的实测反馈：埋在 `hint` 末尾读不到），原文末行保留
+            # ——它是唯一的"机器原文"，两者都不能丢。
+            warning = f"{head} ｜（原始报错末行）{warning}"
     return RunSummary(
         run_id=record.run_id, method=record.method, dataset_id=dataset_id,
         pipeline_id=record.pipeline_id, ok=bool(result.ok),
@@ -2651,15 +2686,57 @@ def _summarize_record(record: Any, dataset_id: str,
     )
 
 
+def _is_missing_custom_method(exc: BaseException) -> bool:
+    """这个异常是不是"注册表里没有 `custom_network`"？
+
+    ⚠ 判据要**窄**：只认"KeyError 且消息里同时提到未注册与自定义网络"
+    （`registry.get` 的 KeyError 文案是 `未注册的方法: <name>（可用: [...]）`）。
+    宽判会把它当万能兜底，反而盖住真正的内部错误——那是另一种"假位置"。
+    """
+    if not isinstance(exc, KeyError):
+        return False
+    text = f"{exc}"
+    return (_custom_method_name() in text
+            and ("未注册" in text or "not registered" in text.lower()))
+
+
 #: 本进程**首次** `device-side assert` 的留痕：`{"run_id", "at"}`（空 = 还没被毒化）。
 #: ⚠ **进程级**：CUDA 上下文一旦被毒化就无法在本进程内恢复 ⇒ 这个事实必须跟着进程走，
 #: 而不是跟着某一次运行（典型的"一次事故、之后全是回声"）。
 _CUDA_POISON: dict[str, Any] = {}
 
+#: 显存不足的判据串（torch/cuBLAS 各版本的措辞都要认）。
+_OOM_MARKERS = ("out of memory", "outofmemoryerror", "cuda oom",
+                "cublas_status_alloc_failed", "cuda_error_out_of_memory")
+
+
+def _oom_headline(blob: str) -> str:
+    """从 OOM 原文里抠出**数字**，拼一句能决策的首行（抠不到就只报类别）。
+
+    ## 为什么必须一等化（用户实测 §3.3）
+
+    6 GB 卡上他的配置峰值 5.30 GB、运行时只剩 3.6 GB 可用 ⇒ OOM，而 CUDA 层把它
+    报成 `device-side assert`（栈指向 `set_probe`）⇒ "我事前完全不知道会不够"，
+    事后也看不出是显存。⇒ 至少要把 OOM **认出来并置顶**，把 torch 里本来就有的
+    数字（要多少 / 剩多少 / 总量）提出来，因为那三个数直接决定"减 batch 还是分块"。
+    """
+    import re
+    want = re.search(r"tried to allocate ([\d.]+)\s*([KMGT]?i?B)", blob, re.I)
+    free = re.search(r"([\d.]+)\s*([KMGT]?i?B)\s*free", blob, re.I)
+    total = re.search(r"total capacity of ([\d.]+)\s*([KMGT]?i?B)", blob, re.I)
+
+    def _fmt(m):
+        return f"{m.group(1)} {m.group(2)}" if m else "?"
+
+    return (f"⚠ 显存不足（CUDA OOM）：本次还要 {_fmt(want)}，"
+            f"而卡上只剩 {_fmt(free)}（总 {_fmt(total)}）"
+            f"⇒ 减 `batch`／开分块／换更小的负载。"
+            f"⚠ 别再调参重试同一个配置（它一定还会 OOM）")
+
 
 def _cuda_poison_note(kind: str, hint: str, warning: str,
-                      run_id: str) -> tuple[str, str]:
-    """识别 CUDA 断言并**区分"第一次"与"回声"**，回 ``(kind, hint)``。
+                      run_id: str) -> tuple[str, str, str]:
+    """识别 CUDA 断言/OOM 并**区分"第一次"与"回声"**，回 ``(kind, hint, headline)``。
 
     ## 为什么值得单列（实测代价：一小时）
 
@@ -2672,12 +2749,26 @@ def _cuda_poison_note(kind: str, hint: str, warning: str,
     ⇒ 本函数把这件事挑明：
     - **第一次**：记为"毒化起点"，并给"要看真位置就 `CUDA_LAUNCH_BLOCKING=1`"的指引；
     - **之后每次**：明确说"这是**上一次断言的回声**、位置是假的、**重启进程**才恢复"。
+
+    ## 第三个返回值 = **首行**（2026-10-05 补，用户实测反馈）
+
+    提示原先只进 `hint`（回执的次要从属字段），而使用者读的是 `error`/message
+    那一行 ⇒ 他"读了好几轮才注意到"。⇒ 现在把**结论**摆到 `headline`
+    （= 回执的 `error` 首行），`hint` 里保留完整解释与操作步骤。
+    ⚠ OOM 优先于断言回声：OOM **不毒化**上下文，把它说成回声会让人去重启
+    （而真正该做的是减 batch）。
     """
     blob = f"{warning}\n{hint}".lower()
+    if any(s in blob for s in _OOM_MARKERS):
+        return ("cuda_oom", (hint + "；" if hint else "") +
+                "显存不足**不会**毒化 CUDA 上下文（不必重启）；"
+                "减 batch 或让网络按块算，然后重跑即可。", _oom_headline(blob))
     if not any(s in blob for s in ("device-side assert", "cuda error",
                                    "cuda kernel error", "cuda_launch_blocking",
                                    "cuda_launch_blocking=1")):
-        return kind, hint
+        # ⚠ 没话说就回**空首行**（不是"原样回 warning"）：调用方据此决定要不要
+        #   拼首行，回原值会让它把同一句话拼两遍。
+        return kind, hint, ""
     if not _CUDA_POISON:
         _CUDA_POISON.update({"run_id": str(run_id), "at": time.time()})
         note = (
@@ -2686,7 +2777,10 @@ def _cuda_poison_note(kind: str, hint: str, warning: str,
             "⇒ 真位置：设 `CUDA_LAUNCH_BLOCKING=1` 后**重启**再重跑；排查期也可先用 "
             "`device='cpu'` 确认逻辑。⚠ 本进程的 CUDA 上下文**已被毒化**：重启之前"
             "**所有** CUDA 运行都会在第一次同步处报同一个错（那个位置是假的）。")
-        return (kind or "cuda_device_assert"), (hint + "；" if hint else "") + note
+        head = ("⚠ CUDA 断言（device-side assert）：报错位置**不一定是真出错点**"
+                "（异步上报，栈指向下一次同步处）；且本进程 CUDA 上下文**已被毒化**，"
+                "重启前所有 CUDA 运行都会在这里报同一个假错")
+        return (kind or "cuda_device_assert"), (hint + "；" if hint else "") + note, head
     prev = str(_CUDA_POISON.get("run_id") or "?")
     note = (
         f"⚠⚠ **这是回声，不是新故障**：本进程的 CUDA 上下文早在 run `{prev}` 就已被一次 "
@@ -2694,7 +2788,11 @@ def _cuda_poison_note(kind: str, hint: str, warning: str,
         f"`rec.set_probe(...)`）**是假的**——它只是下一次与显卡同步的地方。"
         f"⇒ ① 立刻**重启权威/看门人**；② 要看真位置就先设 `CUDA_LAUNCH_BLOCKING=1` 再重启；"
         f"③ **别在这里改代码**（那是在修一个不存在的问题）。")
-    return (kind or "cuda_context_poisoned"), (hint + "；" if hint else "") + note
+    head = (f"⚠⚠ **这是回声，不是新故障**：本进程 CUDA 上下文早在 run `{prev}` 已被 "
+            f"device-side assert 毒化 ⇒ 当前位置是假的（只是下一次同步处）。"
+            f"重启权威才恢复；**别在这里改代码**")
+    return ((kind or "cuda_context_poisoned"),
+            (hint + "；" if hint else "") + note, head)
 
 
 def _pick_winner(rows: Sequence[Mapping[str, Any]], primary: str) -> dict[str, Any]:

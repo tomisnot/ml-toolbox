@@ -20,8 +20,10 @@
   不 import 就等于 `run_custom` 命令永远拿不到适配器；
 - 它**顶层不 import torch**（`nn`/`torch` 都在函数体内取）⇒ 未装 torch 时照样导入得动，
   不拖累其余方法族的注册。
-⚠ 它**不 `@register`**：名字进注册表走"注册→跑→撤"（引擎负责），
-否则注册表里会恒留一个代码不对的空壳。
+⚠ 它**常驻注册**（`custom_network`，见 `custom._register_into_registry`）：
+名字一进注册表就不再撤 —— 代码**不带在类上**，而是随 `cfg.extras` 逐请求下传。
+（2026-10-05 之前是"注册→跑→撤"，那会**撤掉并发中另一次运行的注册**，
+实测"连续提交三个 `run_custom`，后两个死于 `未注册的方法`"。）
 """
 from . import mlp      # noqa: F401  （@register 生效点）
 from . import custom   # noqa: F401  （登记进边界层的槽；见上）

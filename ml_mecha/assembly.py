@@ -115,6 +115,59 @@ HUMAN_ACTOR = "ml-gui"
 AI_ACTOR = "ml-ai"
 
 
+def enforce_terminal_invariant(receipt: Any, command: str) -> Any:
+    """**终态不变量**：终态的 job 必须"要么有 run、要么有可读的失败"。
+
+    用户点名的那个"不该存在"的组合（实测原文）：
+    ``state=done && error=="" && run_id==""``（既无 run、也无日志、也无 run 目录）——
+    它**无法区分"成功但慢"和"从未启动"**。⇒ 在这里把它变成一次**框架自检失败**
+    （``silent_terminal``），而不是让调用方看到"done 但什么都没有"。
+
+    两条蕴含式（**不是严格 XOR**：``error`` 同时是 ``ok=True`` 时的告警通道，
+    见 `RunSummary.warning` —— 所以"恰好一个非空"在这里不可实现，能实现且真正
+    有用的是下面两条）：
+
+    1. ``ok=True``  ⇒ ``run_ids`` 非空（说成功就得说成功在哪个 run 上）；
+    2. ``ok=False`` ⇒ ``error`` 非空**且** ``error_kind`` 具体（说失败就得说哪一类）。
+
+    ⚠ 只对**会产生 run 的命令**（:data:`ml_mecha.engine.RUN_COMMANDS`）成立：
+    ``prepare_dataset`` 本来就不产 run，用同一条不变量会把正常的成功判成失败。
+    ⚠ 违反时**改写回执**（``ok=False`` + ``error_kind="silent_terminal"``）而不是
+    抛异常：抛异常会让 job 变成 ``failed`` + 一句栈，反而丢掉"是哪条命令"的上下文；
+    改写后 `read_job` 会照既有路径把原因说给人听。
+    """
+    if not isinstance(receipt, Mapping) or command not in RUN_COMMANDS:
+        return receipt
+    out = dict(receipt)
+    run_ids = [r for r in (out.get("run_ids") or []) if str(r or "").strip()]
+    ok = bool(out.get("ok"))
+    err = str(out.get("error") or "").strip()
+    kind = str(out.get("error_kind") or "").strip()
+    if ok and run_ids:
+        return out
+    if not ok and err:
+        if kind:
+            return out
+        # 失败但没归类 ⇒ 补一个**具体**的 kind（"不知道哪一类"本身要看得见）
+        out["error_kind"] = "job_command_failed"
+        return out
+    reason = ("命令回了 ok=True 但没有任何 run_id" if ok
+              else "命令没成功，却也没给出一句失败原因")
+    out.update({
+        "ok": False,
+        "run_ids": [],
+        "error": f"silent_terminal：{reason}（命令 {command}）——"
+                 f"既拿不到运行、也拿不到可读的失败，这是**框架自检失败**，"
+                 f"不是「这次实验没结果」",
+        "error_kind": "silent_terminal",
+        "error_hint": "这条不变量存在的理由：`state=done && error=='' && run_id==''` "
+                      "无法区分'成功但慢'与'从未启动'。请把这次调用上报给开发侧；"
+                      "同时看一眼权威日志（`logs/`）与 `runs/` 最近写入时间",
+        "error_suggest": "重跑一次；若重复出现，改用 read_job 看 job 的 progress/epochs",
+    })
+    return out
+
+
 class MLMecha:
     """装配结果句柄：mecha ``Software`` + ML 引擎 + 薄帮助。
 
@@ -300,7 +353,12 @@ class MLMecha:
                 job_spec = dict(spec)
                 if job_spec.get("command") in RUN_COMMANDS:
                     job_spec[JOB_RUN_FLAG] = True
-                return self.engine.run(job_spec, context=ctx)
+                receipt = self.engine.run(job_spec, context=ctx)
+                # ⭐ **终态不变量**（用户点名的那条）：终态必须"要么有 run、
+                #   要么有可读的失败"。挂在这里的原因与落盘兜底**同一个**：
+                #   `submit` 是后台 job 的唯一入口 ⇒ 不变量对所有命令自动生效，
+                #   不需要每加一条命令就记得补一次。
+                return enforce_terminal_invariant(receipt, command)
             finally:
                 CURRENT_CALL_ID.reset(call_token)
                 clear_channel(channel_token)

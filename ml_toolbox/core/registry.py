@@ -71,16 +71,16 @@ def families() -> dict[str, list[str]]:
 def unregister(name: str) -> bool:
     """撤掉一个注册项（回 ``True`` 表示真撤掉了）。
 
-    ## 为什么需要它（唯一的消费者是"自定义网络"）
+    ## ⚠ 2026-10-05 起它**不再有生产消费者**
 
-    自定义网络的代码是**逐请求变化**的，而 `Session.run` 只认注册表里的名字
-    （`registry.get(request.method)`）⇒ 只能"注册 → 跑 → 撤"。
-    没有撤除就会留下垃圾项：注册表里多一个**代码已经不对**的 `custom_network`，
-    之后任何人 `registry.get("custom_network")` 都会拿到上一次的代码——
-    那是最难查的一类"看起来对、其实是旧的"。
+    曾经唯一的消费者是"自定义网络"：代码逐请求变化 ⇒ "注册 → 跑 → 撤"。
+    那条路有一个**实测复现的并发竞态**（A 的收尾 `unregister` 撤掉 B 刚注册的项
+    ⇒ B 死在 `未注册的方法: custom_network`），现在改成**常驻注册 + 代码随
+    `cfg.extras` 逐请求携带**（见 `methods/neural/custom.py::_register_into_registry`），
+    所以 `custom_network` 不再撤除。
 
-    ⚠ 它**只删自己的临时项**：内置方法族在 `load_builtin` 里注册，调用方不该用它
-    去动内置方法（判据里也不这么做）。
+    保留它的理由：只能由"确实知道自己在撤什么"的调用方显式使用（判据/实验代码）。
+    ⚠ 内置方法族在 `load_builtin` 里注册，**不要**用它去动内置方法。
     """
     return _REGISTRY.pop(str(name), None) is not None
 

@@ -60,7 +60,7 @@ whenToUse: >-
 | `compare_methods` | 多方法对比 | 对比表 + 最优（**要比多个就用它**，别逐个拉） |
 | `run_custom` | 跑一段**自定义网络代码**（AI 写结构，系统管训练与观测）；可给 `device`；**`dry_run=true` 先试跑**（回形状轨迹，不落盘）；也可 `code_path` 从文件读 | `run_id` + 指标（自定义任务时是网络上报的） |
 | `submit_run` | 把一次运行提交为**后台任务**（给 `method` 或 `code`）——**长训练就走这条** | `job_id`（立刻返回） |
-| `read_job` | 查后台任务进度/结果。⚠ **默认只回摘要**：`progress_latest`（含 loss/val_loss）+ 最近 `tail`（默认 8）条 + 真实条数 `n_progress`/`n_epochs`/`truncated` | 要全量历史写 `detail="full"`；要更多条写 `tail=N` |
+| `read_job` | 查后台任务进度/结果。⭐ **要等它跑完就给 `wait="terminal"`**（阻塞到终态，上限 540s；超时**不是错误**）；多个任务用 `job_ids=[…]` + `wait="any"`。⚠ **默认只回摘要**：`progress_latest`（含 loss/val_loss）+ 最近 `tail`（默认 8）条 + 真实条数 `n_progress`/`n_epochs`/`truncated` | 要全量历史写 `detail="full"`；要更多条写 `tail=N`；旧名 `wait_s` 等价于 `wait="terminal"`+同秒数 |
 | `cancel_run` | 请求取消后台任务 | 明确回"已请求"（在 epoch 边界生效，不谎报"已取消"） |
 | `run_queries` | **一次往返跑一串只读查询**（列方法→看参数→查数据集→看训练） | 每步自带结果与短摘要 |
 | `clear_current_state` | 把配置台面清零（数据集引用/方法/覆写/种子/设备） | 逐键"清空前值 + 清空后读回值" |
@@ -96,7 +96,7 @@ whenToUse: >-
 | `⛔ …会发散` | loss 涨一个数量级，或出 NaN/Inf |
 | `⚠ 梯度范数涨一个数量级` | Adam 会掩盖 loss 上涨 ⇒ 梯度是更早的信号 |
 | `⚠ loss 塌到 ~0 且梯度≈0` | 可能是**退化解**（模型恒输出同一分布），别当成功 |
-| `✅ N 步内在下降` | 这一步可以放心开长训练 |
+| `✅ 前 N 步在下降` | ⚠ **只是这个窗口内健康**，不代表 N 步之后也健康（实测同类配置在 step 120 才发散）⇒ 要更硬的把握就把 `warmup_steps` 提到覆盖"损失分段切换"那一步，或直接开短训练看曲线 |
 
 ⚠ 边界不变：**不反传之外的写入一概没有**（不落盘、不计入实验记录）。
 
@@ -158,20 +158,35 @@ HDF5 会按原路径重读）；要换新数据就显式给 `payload` / `dataset
 
 ---
 
-## 长训练：只能用"发信号 + 主动查"
+## 长训练：发信号 → **一次等到终态** → 更长的交给看门狗
 
-LLM 的一次工具调用本质是 HTTP 请求，**客户端必须有超时**（本实例 10 分钟）
-⇒ "同步等训练跑完"对长训练**天生不成立**。正确姿势：
+LLM 的一次工具调用本质是 HTTP 请求，**客户端必须有超时**（本实例 **10 分钟**，
+见 `launcher.py` 的 `TOOL_CALL_TIMEOUT_MS=600000`）⇒ "无限等"天生不成立。
+但**不必轮询**：等待原语已经接在 `read_job` 上。
 
 ```
-submit_run(method=… 或 code=… 或 code_path=…)  → job_id   # 发完就走，不等
-read_job(job_id)                → state + progress_latest(含 loss/val_loss) + run_id
-                                  （**默认只回摘要** ⇒ 轮询不再拿几百 KB）
+submit_run(method=… 或 code=… 或 code_path=…)  → job_id   # 发完就走
+read_job(job_id, wait="terminal", timeout_s=540)          # ⭐ 一次阻塞到终态
+    → state=done/failed/cancelled + run_id + result_ref + metrics
+    → 超时**不是错误**：回 timed_out=true + 当前进度，可以再调一次
+read_job(job_ids=["job-3","job-4"], wait="any", timeout_s=540)   # 谁先完先报谁
+read_job(job_id)                → 只想瞄一眼（立刻返回，默认摘要）
 read_job(job_id, detail="full") → 才给全量逐代历史
 describe_training(run_id)       → 想查哪一代/哪个指标都行
 cancel_run(job_id)              → 在 epoch 边界停下（协作式）
 ```
 
+- **上限 540 s**（客户端 600 s 之内留余量）。超了**不报错**：夹到 540 并在
+  `wait_note` 里说明。**绝大多数 250 epoch 的训练（实测 5–8 分钟）一次就等到。**
+- ⭐ **更长的（900 epoch / 一小时级）用看门狗**——它是独立进程，不受工具超时约束：
+  ```
+  pwsh run_in_background: python -m ml_mecha.watch <job_id> --poll 15
+  ```
+  它到终态才退出，**退出时 harness 会自动注入一条完成通知**（这就是"完成事件"的
+  今天可用形态）⇒ 期间你可以去做别的事，**不要轮询**。
+  - 也能传 `run_id`（跨重启稳定）；`--timeout N` 可给上限（默认一直等）。
+  - 退出码：`0` 终态；`3` 超时仍在跑（不是失败）；`2` 句柄查不到（会给你盘上最近的 run）。
+  - 它**只读**：不提交、不取消、不写任何域状态。
 - 后台任务**终态自动落盘** ⇒ 就算后来丢了 `job_id`，结果还在 `runs/<run_id>/`；
   **重启后 `job_id` 会失效**（作业表只活在会话里）⇒ 那时 `read_job` 会回一句
   "盘上最近的 run 是 …"，用 `describe_run(run_id=…)` 接着查。
@@ -180,6 +195,8 @@ cancel_run(job_id)              → 在 epoch 边界停下（协作式）
 - **`read_job` 的语义**：`state=done` 只表示"job 跑完了"，**不等于命令成功** ——
   命令层的失败会以**可教学错误**抛出（kind 是命令自己的，如 `unknown_dataset`、
   `dataset_path_denied`）。看到它就按它说的修，别当成"训练跑完了但没结果"。
+  若出现 `silent_terminal`：那是**框架自检失败**（既没 run、也没说清失败），
+  请上报并把这次调用原样贴出来。
 - **并发上限是 4**（超额会回 `too_many_jobs`，不排队）：要跑更多先等前一批结束。
 - 提交前会**同步预检写权**：LOCKED 下当场拒（不会"提交成功再发现失败"）。
 

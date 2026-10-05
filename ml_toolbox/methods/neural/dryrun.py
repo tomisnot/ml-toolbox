@@ -412,7 +412,13 @@ def _warmup(*, model, net, prep, params: dict, torch, dev, fs, lossf, kind,
         verdict = (f"⚠ loss 塌到 {curve[-1]:.3g} 且梯度≈0 ⇒ 可能是**退化解**"
                    f"（模型恒输出同一个分布）；检查目标函数/归一化，别当成功")
     elif len(curve) >= 2 and curve[-1] < curve[0]:
-        verdict = f"✅ {len(curve)} 步内在下降（{curve[0]:.4g} → {curve[-1]:.4g}）"
+        # ⚠ **窗口措辞**（用户实测 §4.1）：他实测同类发散发生在 **step 120**，
+        #   而这条 verdict 当时只说"✅ 40 步内在下降"，读起来像"这份配置没问题"。
+        #   ⇒ 明写这是**窗口内**的结论，且给"下一步该怎么扩大窗口"。
+        verdict = (f"✅ **前 {len(curve)} 步**在下降（{curve[0]:.4g} → {curve[-1]:.4g}）"
+                   f"——⚠ 这只说明**这个窗口内**健康，**不代表 {len(curve)} 步之后也健康**"
+                   f"（实测同类配置在 step 120 才发散）。要更硬的把握：把 "
+                   f"`warmup_steps` 提到覆盖「损失分段切换」那一步，或直接开短训练看曲线")
     return {"warmup_steps": len(curve), "loss_curve": curve,
             "grad_norm_curve": gnorm, "params_changed": bool(changed),
             "any_nonfinite": bool(any_nonfinite), "verdict": verdict,

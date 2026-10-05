@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -49,9 +50,25 @@ from .engine import MLEngine, clear_channel, use_channel
 #: 本地宿主的默认通道标签（细标签归因用；side 才定写权）。
 LOCAL_ACTOR = "ml-local"
 
-#: ``read_job`` 单次最多阻塞多久（秒）。阻塞是**可选便利**，不是"等到跑完"的
-#: 承诺：MCP 侧单次调用有超时（dsh 默认 60 s），模型应轮询。
-READ_JOB_MAX_WAIT_S = 30.0
+#: ``read_job`` 一次最多阻塞多久（秒）。
+#:
+#: ## 为什么是 540（而不是原来的 30，也不是使用者要的 3600）
+#:
+#: 上限由**客户端**决定，不是我们能选的：dsh 的 MCP 客户端对**每次 `tools/call`**
+#: 有超时（`@deepseek-ai/dsh-mcp-client` 的 ``toolCallTimeoutMs``，默认 60 s），
+#: 而本仓 `launcher.py` 已经把它显式设成 **600000 ms = 10 分钟**
+#: （`TOOL_CALL_TIMEOUT_MS`，注释原话："默认 60 s 会让长训练'假失败'"）。
+#: ⇒ 540 s 在 600 s 之内留了余量：**阻塞到 540 也不会撞客户端超时**。
+#: 更长的等待（900 epoch 那种一小时级）走 `python -m ml_mecha.watch`——它是
+#: **独立进程**，不受工具调用超时约束（见该模块 docstring）。
+#: ⚠ 超了**不报错**：夹到上限并在回执里明说（`wait_note`），免得把"等待"变成失败。
+READ_JOB_MAX_WAIT_S = 540.0
+
+#: job 的终态集合（与 mecha 的 Job 契约同名，不另造一套词）。
+TERMINAL_JOB_STATES = frozenset({"done", "failed", "cancelled"})
+
+#: 服务端 `wait="any"`/多句柄时的短轮询间隔（秒）。见 `_wait_jobs` 的说明。
+_WAIT_POLL_S = 0.15
 
 #: job 工具在宿主未接 job 服务时的结构化失败（不是静默假成功）。
 _NO_JOB_HOST_HINT = ("job 工具需要一个接好 Job 服务的宿主（MLMecha）；"
@@ -1381,28 +1398,138 @@ def _recent_run_ids(n: int = 5) -> list:
         return []
 
 
+def _job_handles(job_id: str, job_ids: Any) -> list:
+    """把 ``job_id`` / ``job_ids`` 两种给法归一成句柄列表（空/冲突都**可教学地拒**）。
+
+    ⚠ 为什么保留单数形式而不换成"只收列表"：`job_id` 是既有调用方的形状
+    （判据、GUI、说明书都按它写），而"一次投多个、谁先完谁先报"是**新增**能力
+    ⇒ 加法而不是改写（既有调用一行不用改）。
+    """
+    if isinstance(job_ids, str):
+        multi = [job_ids]
+    elif job_ids:
+        try:
+            multi = [str(h) for h in job_ids]
+        except TypeError:
+            raise MechaError(
+                f"job_ids 需要字符串列表，收到 {type(job_ids).__name__}",
+                kind="bad_job_ids",
+                hint='形如 job_ids=["job-3", "job-4"]',
+            ) from None
+    else:
+        multi = []
+    if multi and job_id:
+        raise MechaError(
+            "`job_id` 与 `job_ids` 只能给一个（同时给时无法判断你想看哪个）",
+            kind="bad_job_selection",
+            hint="看一个用 `job_id`；一次等多个/等任意一个用 `job_ids=[…]`",
+            suggest='read_job(job_ids=["job-3", "job-4"], wait="any", timeout_s=300)',
+        )
+    handles = [str(h) for h in (multi or [job_id]) if str(h or "").strip()]
+    if not handles:
+        raise MechaError(
+            "read_job 需要 job_id 或 job_ids",
+            kind="missing_job_id",
+            hint="submit_run 会返回 job_id（如 job-3）；想看盘上的运行用 describe_run",
+        )
+    return handles
+
+
+def _job_state(ml: Any, handle: str) -> tuple:
+    """当前状态（**不阻塞**）：回 ``(state, status, exc)``。
+
+    查询失败**不在这里吞掉**：回 ``exc`` 让调用方分类——是"句柄不存在"（要教学）
+    还是"服务出错"（要原样抛）。吞掉就会把后者报成前者，那正是"假位置"。
+    """
+    try:
+        status = ml.jobs.wait(handle, 0.0)
+    except Exception as exc:                                  # noqa: BLE001
+        return "", {}, exc
+    return str((status or {}).get("state") or ""), dict(status or {}), None
+
+
+def _wait_jobs(ml: Any, handles: list, mode: str, budget: float) -> None:
+    """**真等到终态**（"等待"不再是调用方的负担）。
+
+    - 单句柄 + ``terminal``：走 Job 注册表自己的 ``wait(handle, budget)``
+      —— **一次阻塞**，调用方一次工具调用就够（这条对应"等待不靠轮询"）；
+    - 多句柄 / ``any``：注册表**没有**"等任意一个"这个原语 ⇒ 在**服务端**短轮询
+      （``_WAIT_POLL_S``）。对调用方仍然只是一次工具调用；这里如实写清楚，
+      免得下一轮有人以为它是事件驱动的（那是 dsh 侧的注入通道，另一件事）。
+    - **未知句柄不在这里变成异常**：交给回执层给可教学错误（"盘上的线索"）。
+    """
+    deadline = time.time() + max(0.0, float(budget))
+    if mode == "terminal" and len(handles) == 1:
+        try:
+            ml.jobs.wait(handles[0], max(0.0, float(budget)))
+        except Exception:                                     # noqa: BLE001
+            pass
+        return
+    while True:
+        states = [_job_state(ml, h)[0] for h in handles]
+        if mode == "any" and any(s in TERMINAL_JOB_STATES for s in states):
+            return
+        if mode == "terminal" and states and all(s in TERMINAL_JOB_STATES
+                                                 for s in states):
+            return
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(_WAIT_POLL_S, remaining))
+
+
 def _read_job(host: Any,
               banned_words: tuple[str, ...] = ()) -> ToolDefinition:
-    def execute(*, job_id: str, wait_s: float = 0.0,
+    def execute(*, job_id: str = "", job_ids: Any = None, wait: str = "none",
+                timeout_s: float = 0.0, wait_s: float = 0.0,
                 detail: str = "summary", tail: int = 0) -> Mapping[str, Any]:
         ml = _require_job_host(host)
+        handles = _job_handles(job_id, job_ids)
+        mode = str(wait or "none").strip().lower()
+        if mode in ("", "no", "none", "off", "false"):
+            mode = "none"
+        if mode not in ("none", "terminal", "any"):
+            raise MechaError(
+                f"wait 只能是 none / terminal / any，收到 {wait!r}",
+                kind="bad_wait",
+                hint="none=立刻返回（默认）；terminal=阻塞到终态；"
+                     "any=多句柄里谁先到终态就回谁",
+            )
         try:
-            timeout = max(0.0, min(float(wait_s or 0.0), READ_JOB_MAX_WAIT_S))
+            requested = max(float(timeout_s or 0.0), float(wait_s or 0.0))
         except (TypeError, ValueError):
             raise MechaError(
-                f"wait_s 必须是数字，收到 {wait_s!r}",
+                f"timeout_s/wait_s 必须是数字，收到 {timeout_s!r} / {wait_s!r}",
                 kind="bad_wait_s",
-                hint=f"wait_s 是可选阻塞秒数，上限 {READ_JOB_MAX_WAIT_S:g}",
+                hint=f"上限 {READ_JOB_MAX_WAIT_S:g} 秒（超出会夹到上限并明说，不报错）",
             ) from None
+        # ⚠ **旧参数 `wait_s` 兼容**：它的语义本来就是"最多阻塞多少秒等它推进"
+        #   （上限原来是 30 s）⇒ 给了它就等价于 `wait="terminal"`，一次都不用改。
+        if float(wait_s or 0.0) > 0 and mode == "none":
+            mode = "terminal"
+        wait_clamped = requested > READ_JOB_MAX_WAIT_S
+        budget = max(0.0, min(requested, READ_JOB_MAX_WAIT_S))
+        t_start = time.time()
+        if mode != "none" and budget > 0:
+            _wait_jobs(ml, handles, mode, budget)
+        waited = time.time() - t_start
+        # 主角：**已到终态的优先**（any ⇒ 谁先完报谁；terminal ⇒ 全完之后按顺序取）
+        chosen = handles[0]
+        for handle in handles:
+            if _job_state(ml, handle)[0] in TERMINAL_JOB_STATES:
+                chosen = handle
+                break
+        job_id = chosen
         # ⭐ **未知 job 要给"盘上的线索"**（缺口 D）：重启会清空会话态，而文档承诺
         #   "后台跑完会自动落盘" ⇒ 那时用户只看到"不存在"会以为**结果丢了**，
         #   实际它在 `runs/` 里。⇒ 回一句"本会话没有它" + 最近的 run 列表 + 怎么查。
-        try:
-            status = ml.jobs.wait(job_id, timeout)
-        except Exception as exc:                               # noqa: BLE001
-            if "不存在" not in str(exc) and "not exist" not in str(exc).lower() \
-                    and "unknown" not in str(exc).lower():
-                raise
+        #   ⚠ 其余查询错误**原样抛**（不冒充"不存在"——那是假位置）。
+        _, status, query_exc = _job_state(ml, job_id)
+        if query_exc is not None:
+            text = f"{query_exc}"
+            if ("不存在" not in text and "not exist" not in text.lower()
+                    and "unknown" not in text.lower()):
+                raise query_exc
             recent = _recent_run_ids(5)
             raise MechaError(
                 f"本会话里没有这个 job：{job_id}",
@@ -1411,7 +1538,7 @@ def _read_job(host: Any,
                      f"⇒ 用 `describe_run(run_id=…)` 查。盘上最近的 run：{recent or '（无）'}",
                 suggest=(f"describe_run(run_id={recent[0]!r})" if recent
                          else "先 `describe_networks` 看按名字存下来的网络"),
-            ) from exc
+            ) from query_exc
         raw = status.get("progress") or []
         progress = [{"frac": float(p[0]), "stage": str(p[1])}
                     for p in raw if isinstance(p, (list, tuple)) and len(p) == 2]
@@ -1453,20 +1580,22 @@ def _read_job(host: Any,
             #   非取消态下命令回了 `ok=false`。
             if job_error or state == "failed" or (cmd_ok is False
                                                   and state != "cancelled"):
-                detail = (str(result.get("error") or "")
-                          if isinstance(result, Mapping) else "")
+                rid = str(extra.get("run_id") or "")
+                tail_note = (f"⚠ 这次运行**其实跑过了**（run_id={rid}）："
+                             f"去看 `describe_run(run_id={rid!r})`。") if rid else ""
+                # ⚠ 变量名不能叫 `detail`：那是"回多少"的参数（summary/full），
+                #   同名会把它的值覆盖掉（旧实现在这里就覆盖过一次）。
+                fail_detail = (str(result.get("error") or "")
+                               if isinstance(result, Mapping) else "")
                 kind = (str(result.get("error_kind") or "")
                         if isinstance(result, Mapping) else "")
                 hint = (str(result.get("error_hint") or "")
                         if isinstance(result, Mapping) else "")
                 suggest = (str(result.get("error_suggest") or "")
                            if isinstance(result, Mapping) else "")
-                rid = str(extra.get("run_id") or "")
-                tail_note = (f"⚠ 这次运行**其实跑过了**（run_id={rid}）："
-                             f"去看 `describe_run(run_id={rid!r})`。") if rid else ""
                 raise MechaError(
                     f"这个 job 没有产出可用的运行：state={state}；"
-                    f"命令层错误：{detail or job_error or '（空）'}",
+                    f"命令层错误：{fail_detail or job_error or '（空）'}",
                     kind=kind or "job_command_failed",
                     hint=(hint or "命令本身失败了 —— 原因见 message；"
                                   "⚠ 不是'框架坏了'，多半是入参/数据引用/权限问题")
@@ -1484,8 +1613,24 @@ def _read_job(host: Any,
         all_epochs = list(extra.get("epochs") or [])
         out_progress = progress if full else progress[-tail_n:]
         out_epochs = all_epochs if full else all_epochs[-tail_n:]
+        final_state = str(status.get("state") or "")
+        # ⭐ `wait` 的**诚实三件套**：等了多久 / 是不是等到超时（**不是失败**）/
+        #   上限是多少（客户端决定，见 `READ_JOB_MAX_WAIT_S`）。
+        #   ⚠ 超时不抛错：调用方要能**循环调用**它（"还在跑 + 当前进度"是等待的
+        #   正常终点之一，把它做成错误会让 AI 把"没跑完"读成"实验失败"）。
+        timed_out = bool(mode != "none" and budget > 0
+                         and final_state not in TERMINAL_JOB_STATES)
+        notes = []
+        if wait_clamped:
+            notes.append(f"请求等待 {requested:g}s，已夹到上限 {READ_JOB_MAX_WAIT_S:g}s"
+                         f"（MCP 客户端单次调用超时 600s）。要等更久用独立进程："
+                         f"`python -m ml_mecha.watch <job_id>`（退出时 harness 会通知你）")
+        if timed_out:
+            notes.append(f"等满 {waited:.0f}s 仍在跑（state={final_state or '?'}）"
+                         f"—— 这是**等待**的正常终点，不是失败；可以再调一次，"
+                         f"或改用 `python -m ml_mecha.watch {job_id}` 让它到终态时通知你")
         return {"ok": True, "job_id": str(status.get("id") or job_id),
-                "state": str(status.get("state") or ""),
+                "state": final_state,
                 "cancel_supported": bool(status.get("cancel_supported", False)),
                 "progress": out_progress,
                 "progress_latest": latest,
@@ -1498,22 +1643,48 @@ def _read_job(host: Any,
                 "tail": tail_n,
                 "result_ref": dict(status.get("result_ref") or {}),
                 "error": str(status.get("error") or ""),
-                "ref_error": str(status.get("ref_error") or "")}
+                "ref_error": str(status.get("ref_error") or ""),
+                # ---- 等待原语的回执（新增；形状只加不改，既有消费者不受影响）----
+                "wait": mode, "waited_s": round(waited, 3), "timed_out": timed_out,
+                "wait_cap_s": READ_JOB_MAX_WAIT_S, "wait_clamped": wait_clamped,
+                "jobs": [{"job_id": h, "state": _job_state(ml, h)[0]}
+                         for h in handles],
+                "wait_note": "；".join(notes)}
 
     return define_tool(
         name="read_job",
-        description="按任务编号查一次后台任务的进度与结果：状态、**逐代数值**"
+        description="按任务编号查后台任务的进度与结果：状态、**逐代数值**"
                     "（`progress_latest` 带 loss/val_loss，够判断该不该早停）、"
                     "**训练中途就能拿到的 `run_id`**（拿去 describe_training 查曲线）、"
-                    "结果引用、失败原因；不阻塞（除非给 wait_s）。"
+                    "结果引用、失败原因。"
+                    "⭐ **要等它跑完就给 `wait`**：`wait=\"terminal\"` 阻塞到终态"
+                    f"（上限 {READ_JOB_MAX_WAIT_S:g}s = MCP 客户端 600s 超时之内）；"
+                    "多个任务用 `job_ids=[…]` + `wait=\"any\"`（谁先完先报谁）。"
+                    "⚠ 等到超时**不是错误**：回执 `timed_out=true` + 当前进度，可以再调一次；"
+                    "要等**超过 9 分钟**（900 epoch 那种）改用独立进程 "
+                    "`python -m ml_mecha.watch <job_id>`（它到终态才退出，harness 会通知你）。"
+                    "⚠ `wait_s` 是旧名（等价于 `wait=\"terminal\"` + 同秒数），新调用用 `timeout_s`。"
                     "⚠ **默认只回摘要**（`progress_latest` + 最近 `tail` 条 + 真实条数"
                     "`n_progress`/`n_epochs`）：`progress`/`epochs` 的全量历史在长训练里"
                     "是几百 KB。要全量显式给 `detail=\"full\"`，要更多条给 `tail=N`。",
         parameters={
-            "job_id": {"type": "string", "description": "submit_run 返回的任务编号"},
+            "job_id": {"type": "string", "description": "submit_run 返回的任务编号",
+                       "default": ""},
+            "job_ids": {"type": "array",
+                        "description": "一次看/等多个任务（与 `job_id` 二选一）；"
+                                       "配 `wait=\"any\"` 就是「谁先完先报谁」"},
+            "wait": {"type": "string",
+                     "description": "none（默认，立刻返回）/ terminal（阻塞到终态）/ "
+                                    "any（`job_ids` 里第一个到终态的）",
+                     "default": "none"},
+            "timeout_s": {"type": "number",
+                          "description": f"最多阻塞多少秒（上限 "
+                                         f"{READ_JOB_MAX_WAIT_S:g}；超出夹到上限并在 "
+                                         f"`wait_note` 里明说，**不报错**）",
+                          "default": 0},
             "wait_s": {"type": "number",
-                       "description": f"可选：最多阻塞多少秒等它推进（上限 "
-                                      f"{READ_JOB_MAX_WAIT_S:g}）；默认 0 立即返回",
+                       "description": f"⚠ 旧名，等价于 `wait=\"terminal\"` + 同秒数"
+                                      f"（上限 {READ_JOB_MAX_WAIT_S:g}）；新调用用 `timeout_s`",
                        "default": 0},
             "detail": {"type": "string",
                        "description": "summary（默认：最新状态 + 最近 tail 条）/ full（全量）",
@@ -1527,7 +1698,11 @@ def _read_job(host: Any,
                                     "progress", "progress_latest", "run_id",
                                     "epochs", "n_progress", "n_epochs", "truncated",
                                     "detail", "tail", "result_ref", "error",
-                                    "ref_error"]},
+                                    "ref_error",
+                                    # 等待原语（2026-10-05）：等了多久 / 是否等到超时 /
+                                    # 上限 / 多句柄状态 / 人话说明。
+                                    "wait", "waited_s", "timed_out", "wait_cap_s",
+                                    "wait_clamped", "jobs", "wait_note"]},
         execute=execute,
         banned_words=banned_words,
     )

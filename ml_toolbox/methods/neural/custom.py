@@ -24,6 +24,16 @@
 而 `cfg.extras` 本来就是"任务级扩展"的通道（`run_id` / `device` / `on_progress`
 都走它）。代码是**字符串**，所以它还是 JSON 可序列化的 ⇒ 能原样进
 `runs/<id>/record.json` 的 `config.extras`，**复用与审计都白拿**。
+
+## 为什么本类**常驻**注册（不再"注册→跑→撤"）
+
+`Session.run` 只认注册表里的名字，而 `registry.get(name)` **无参构造**
+⇒ 历史上只能"每次提交造一个带代码的子类注册进去、跑完撤掉"。那条路有一个
+**用户实测复现的竞态**：并发提交两次 ⇒ 先跑完的那次 `unregister` 会把另一次
+刚注册的项撤掉，后者死在第 1 次同步处（`未注册的方法: custom_network`）；
+取消任务后立刻提交也复现。⇒ 现在注册项**不带代码**（常驻），代码逐请求
+下传（`cfg.extras[CUSTOM_CODE_KEY]`）⇒ 竞态从根上消失，且并发跑**两份不同
+代码**也各自正确。
 """
 from __future__ import annotations
 
@@ -45,15 +55,17 @@ from .recorder import TrainingRecorder
 #: ⚠ 单一真源：`ml_mecha` 侧从 `ml_toolbox` 读它，不各写一份字面量。
 CUSTOM_CODE_KEY = "custom_network_code"
 
-#: 名字前缀：注册表里的临时方法名（`run_custom` 每次跑完就撤，见 engine）。
+#: 注册表里的方法名（**常驻**：装配期就注册，跑完不撤 —— 见 `_register_into_registry`）。
 CUSTOM_METHOD_NAME = "custom_network"
 
 
 class CustomNNMethod(MLMethod):
     """AI 写的 `Network` 的宿主方法（`fit` 由本类代写）。
 
-    ⚠ 它**按请求临时注册**（名字固定 `custom_network`，跑完即撤）：这样
-    `registry.get(name)` 的既有语义（无参构造）不用改，也不给注册表留垃圾。
+    ⚠ **常驻注册**（名字固定 `custom_network`），代码**按请求携带**（`cfg.extras`）：
+    注册表里这一项从不带代码，所以并发跑多份不同的代码也各自正确，
+    也不存在"跑完撤掉别人的注册"这种竞态（用户实测：并发提交三连，后两个
+    死在 `未注册的方法: custom_network`）。
     """
 
     name = CUSTOM_METHOD_NAME
@@ -102,16 +114,36 @@ class CustomNNMethod(MLMethod):
             return None
 
     # ------------------------------------------------ 代码 → 网络实例
-    def _network(self):
-        """编译 `self.custom_code`（沙箱），返回 `CompiledNetwork`。"""
+    def _network(self, run_extras=None):
+        """编译这段请求带的网络代码（沙箱），返回 `CompiledNetwork`。
+
+        ## 代码从哪来：**按请求携带**（`cfg.extras`），不是类属性
+
+        历史上代码被绑在**每次提交临时造的子类**上（`type(name, (base,), {"custom_code": …})`）
+        再注册进注册表，跑完 `finally: unregister`。那个做法有一个**用户实测复现的竞态**：
+        并发提交两次自定义网络时，A 的收尾 `unregister` 会把 B 刚注册的项撤掉
+        ⇒ B 死在 `未注册的方法: custom_network`。而"注册→跑→撤"之所以被当成必需，
+        是因为 `Session.run` 只认注册表里的名字、且 `registry.get(name)` **无参构造**
+        —— 于是"那一段代码"只能挂在类上。
+
+        ⇒ 现在反过来：**注册表里恒有一个不带代码的适配器**（常驻，见
+        `_register_into_registry`），代码随 `cfg.extras[CUSTOM_CODE_KEY]` 逐请求下传。
+        同一个进程里并发跑**两份不同的代码**因此也各自正确（类上不再有代码可串）。
+
+        ⚠ `self.custom_code` 仍然优先（保留给"直接构造实例"的路径，如
+        `make_custom_instance(code)` 与既有判据）——但引擎那条路不再用它。
+        """
         from ml_mecha.sandbox import SandboxError, compile_network
 
         code = str(getattr(self, "custom_code", "") or "")
+        if not code.strip() and run_extras:
+            code = str(run_extras.get(CUSTOM_CODE_KEY) or "")
         if not code.strip():
             raise SandboxError(
                 "没有拿到网络代码",
                 kind="missing_custom_code",
-                detail=f"引擎应把代码放进 `cfg.extras[{CUSTOM_CODE_KEY!r}]`",
+                detail=f"引擎应把代码放进 `cfg.extras[{CUSTOM_CODE_KEY!r}]`"
+                       "（或直接构造实例时设 `custom_code`）",
             )
         return compile_network(code)
 
@@ -151,7 +183,7 @@ class CustomNNMethod(MLMethod):
         #   （ml_mecha → ml_toolbox.api → methods）。别提到模块顶部。
         from ml_mecha.sandbox import SandboxError
         try:
-            compiled = self._network()
+            compiled = self._network(run_extras)
         except SandboxError as exc:
             # ⭐ **AI 写的代码出错 ⇒ 必须归成"你的代码"，不是"框架坏了"**。
             #   ⚠ 这段原先**没有** try：异常一路逃到 `runner.run_one` 的兜底，
@@ -381,7 +413,7 @@ class CustomNNMethod(MLMethod):
         #   （ml_mecha → ml_toolbox.api → methods）。别提到模块顶部。
         from ml_mecha.sandbox import SandboxError
         try:
-            compiled = self._network()
+            compiled = self._network(run_extras)
         except SandboxError as exc:
             # ⭐ **AI 写的代码出错 ⇒ 必须归成"你的代码"，不是"框架坏了"**。
             #   ⚠ 这段原先**没有** try：异常一路逃到 `runner.run_one` 的兜底，
@@ -1002,6 +1034,26 @@ def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dic
         return None
 
 
+def _register_into_registry() -> None:
+    """把本适配器**常驻**注册进方法注册表（幂等）。
+
+    ## 为什么由本模块自己注册（而不是引擎在跑之前临时注册）
+
+    见模块 docstring：临时注册 + 跑完撤除 = **并发竞态**（A 撤掉 B 的注册）。
+    注册项本身**不带代码**，所以"常驻"不会留下"代码已经不对的空壳"——
+    那个顾虑是旧的类属性做法带来的，代码改走 `cfg.extras` 之后就不存在了。
+
+    ⚠ 幂等：重复 import / 已有同名项 ⇒ 直接返回（不抛、不覆盖别人的同名项）。
+    ⚠ 与"槽注册"（`_register_into_host`）是**两件事**：槽是给 `ml_mecha` 边界层
+    代转参数表的，注册表是给 `Session.run` 按名字取方法的。两者都要有。
+    """
+    from ...core import registry
+
+    if CUSTOM_METHOD_NAME in registry.names():
+        return
+    registry.register(CustomNNMethod)
+
+
 def _register_into_host() -> None:
     """把自己登记进边界层的槽（`ml_mecha.engine`）。
 
@@ -1018,6 +1070,7 @@ def _register_into_host() -> None:
                             cls=CustomNNMethod, param_schema=CustomNNMethod.param_schema)
 
 
+_register_into_registry()
 _register_into_host()
 
 
