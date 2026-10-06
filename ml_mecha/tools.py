@@ -800,8 +800,13 @@ def _describe_training(engine: MLEngine,
                                        "['custom_network-1-1','custom_network-2-2']）；"
                                        "给它就返回对齐后的逐点表（缺失 null，不插值）"},
             "tags": {"type": "array",
-                     "description": "`compare` 时要对齐哪些 tag（如 ['fid/sub1']）；"
-                                    "留空取两个 run 都有、且非逐层梯度的前几条"},
+                     "description": "要对齐哪些 tag。⭐ **单独给它**（不配 `compare`）⇒ "
+                                    "把**同一 run 内多个 tag** 放到同一根 step 轴上"
+                                    "（回答「这几个数能不能放一起比」："
+                                    "`aligned_at_step` 才是公共步——各 tag 的求值步长"
+                                    "可以不同，如 `metrics_every` 降频时 `fid/*` 每 N 轮"
+                                    "才记一次）；配 `compare` 时则是「要对比哪几条 tag」"
+                                    "（留空取两个 run 都有、且非逐层梯度的前几条）"},
             "pick": PICK_PARAM,
         },
         output_schema={"type": "object",

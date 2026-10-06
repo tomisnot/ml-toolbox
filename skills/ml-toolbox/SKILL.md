@@ -161,11 +161,18 @@ HDF5 会按原路径重读）；要换新数据就显式给 `payload` / `dataset
 describe_training(run_id=R)                       # 看 curve[tag].trend / convergence 警告
 describe_training(run_id=R, best_by="fid/sub1")   # 按任意 tag 挑最佳轮（别默认 val_loss 那轮）
 describe_training(compare=[R1, R2], tags=["fid/sub1"])   # 两条轨迹对齐着看
+describe_training(run_id=R, tags=["loss","fid/sub0"])    # ⭐ 同一 run 内多 tag 放同一根轴
 ```
 
 - `convergence` 里 `kind="underfit"` ⇒ **延长 epoch 再下结论**（别按终值说"饱和了"）；
-  `kind="diverging"` ⇒ 配置问题（loss 类在爬）；
-  方向未知的量（`grad_norm`/`ph/std`…）**不给诊断**，趋势照给。
+  `kind="diverging"` ⇒ 配置问题（loss 类在爬）；`kind="noisy_tail"` ⇒ 本窗口在降、
+  末段只是抖动（**不是**发散）；方向未知的量（`grad*`/`ph/std`/`weights_norm/*`）
+  **不给诊断**，趋势照给。
+- ⚠ **`latest` 里的数不一定在同一步**：各 tag 的求值步长可以不同（`metrics_every`
+  降频时 `fid/*` 每 N 轮才记一次）⇒ 每个 tag 的步号在 **`latest_steps`** 里。
+  **要把几个数放一起比，就用 `tags=[…]`**，看 **`aligned_at_step`**（所有 tag 都有
+  值的最后一步）与 **`aligned`**（那一步的值）。**没有公共步时 `aligned_at_step=null`
+  ——那就别把它们并排读**（并排读会把"各自都真"的数读成"互相矛盾"）。
 
 **要比多个方法**：直接 `compare_methods`（它给对比表），不要 `describe_run` 拉 N 次再自己对齐。
 

@@ -2284,6 +2284,70 @@ def test_curve_analysis_uses_the_full_readable_history_not_the_display_limit():
         ml.close()
 
 
+def test_same_run_cross_tag_alignment_exposes_unequal_step_cadence():
+    """⭐ 同一 run 内多 tag 对齐：**不同求值步长不许被并排成"同一时刻"**。
+
+    用户实测（他自己的口径 bug 报告，2026-10-06）：他在一份回执里同时读到
+    `loss=0.018` / `fid/step=0.9965` / `fid/sub0=0.7301`，判断"三者数学上不能
+    同时成立"。而这三个 tag 的**求值步长本来就不同**（`loss`/`fid/step` 逐 epoch，
+    `fid/sub0` 每 3 个 epoch）⇒ `latest` 把"各 tag 各自的最新值"并排放在一起，
+    **看着像同一时刻的三个数**，其实各自在自己那一步都是真的。
+    ⇒ 框架的职责是**把值放到同一根轴上**，并给出"这些数能放一起比"的那一步。
+
+    本判据钉四件事：
+    ① `latest_steps` 每 tag 都给（**没有它，`latest` 就在暗示"同一步"**）；
+    ② 同一 run 内 `tags=[…]` 对齐：轴是并集，`fid/sub0` 在非 3 倍数处必须是 `null`；
+    ③ `aligned_at_step` = 所有 tag 都有的**最后一个** step，`aligned` 取自那一步；
+    ④ 若各 tag 的步长**完全错开**（没有公共 step）⇒ `aligned_at_step is None`
+       且 `aligned == {}`（**不许挑一个"差不多"的步**）。
+    """
+    sys.path.insert(0, str(REPO))
+    import tempfile
+
+    from ml_mecha import curve
+    from ml_mecha.assembly import assemble_ml_mecha
+
+    ml = assemble_ml_mecha(root=tempfile.mkdtemp(prefix="ml-tagalign-"), seed=13)
+    try:
+        got = ml.engine.query("training_detail",
+                              run_id="custom_network-3906151-1101",
+                              tags=["loss", "fid/step", "fid/sub0"])
+        # ① 每个 tag 都有自己的步号（`latest` 不再暗示"同一步"）
+        for tag in ("loss", "fid/step", "fid/sub0", "val_loss"):
+            assert got["latest_steps"].get(tag) is not None, got["latest_steps"]
+        # ② 轴是并集；`fid/sub0` 每 3 个 epoch 才记 ⇒ 非 3 倍数处是 null
+        cmp_ = got["compare"]
+        assert cmp_["mode"].startswith("tags"), cmp_
+        axis = cmp_["steps"]
+        sub0 = cmp_["tags"]["fid/sub0"]
+        assert len(axis) == len(sub0), (len(axis), len(sub0))
+        missed = [i for i, v in enumerate(sub0) if v is None]
+        assert missed, "这条 run 的 fid/sub0 是每 3 轮一次 ⇒ 必须有 null"
+        assert all(axis[i] % 3 != 0 for i in missed[:5]), \
+            [(axis[i], sub0[i]) for i in missed[:5]]
+        # ③ 公共步：所有 tag 都有的最后一步（且那里的值逐字来自原序列）
+        step = cmp_["aligned_at_step"]
+        assert step is not None, cmp_
+        i = axis.index(step)
+        assert all(cmp_["tags"][t][i] is not None for t in cmp_["tags"]), cmp_
+        assert cmp_["aligned"]["loss"] == cmp_["tags"]["loss"][i], cmp_["aligned"]
+
+        # ④ 步长完全错开 ⇒ **不许并排**（`aligned_at_step=None`）
+        odd = {"a": {"steps": [0, 2, 4], "values": [1.0, 2.0, 3.0]},
+               "b": {"steps": [1, 3, 5], "values": [4.0, 5.0, 6.0]}}
+        no_common = curve.align_tags(odd, ["a", "b"])
+        assert no_common["aligned_at_step"] is None, no_common
+        assert no_common["aligned"] == {}, no_common
+        # 而公共步存在时（这里步 2 与 3 各自都有 ⇒ 无公共）换成有交集的轴再验一次
+        overlap = {"a": {"steps": [0, 1, 2], "values": [1.0, 2.0, 3.0]},
+                   "b": {"steps": [1, 2, 3], "values": [4.0, 5.0, 6.0]}}
+        ok = curve.align_tags(overlap, ["a", "b"])
+        assert ok["aligned_at_step"] == 2, ok
+        assert ok["aligned"] == {"a": 3.0, "b": 5.0}, ok
+    finally:
+        ml.close()
+
+
 def test_cancel_run_rejects_uncancellable_job():
     """``cancel_run`` 对不可取消的命令**结构化拒**（job_not_cancellable）。
 

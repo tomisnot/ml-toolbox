@@ -1135,3 +1135,23 @@
   （含 `direction("grad/dec.1.linear2.weight") == "unknown"` 与逐层梯度不得出现在
   `convergence` 里的断言）。红验证：退回子串匹配 ⇒ 红。
 
+### A54. **把不同步的值并排放，等于制造一个假矛盾**（用户自己的口径 bug 由工具"帮忙"放大）
+- **症状**（用户 2026-10-06）：他在一份回执里同时读到 `loss=0.018`、
+  `fid/step=0.9965`、`fid/sub0=0.7301`，判断"**三者数学上不能同时成立**"，
+  一度怀疑自己的度量/损失口径全错。而三个 tag 的**求值步长本来就不同**：
+  `loss`/`fid/step` 逐 epoch，`fid/sub0` 每 3 个 epoch（`metrics_every` 降频）
+  ⇒ "各 tag 各自的最新值"很可能**不在同一个 step 上**，每个数在**它自己那一步**
+  都是真的。**工具把它们并排放着，就是在暗示"同一时刻"。**
+- **修法**：
+  1. `latest_steps`：每个 tag 的**求值步号**随值一起给（不标步号就等于暗示同步）；
+  2. 同一 run 内 `tags=[…]` 对齐（`compare` 的同族）：同一根 step 轴、缺失处 `null`；
+     **`aligned_at_step` = 所有 tag 都有值的最后一步**，`aligned` 取自那一步；
+  3. **没有公共步时 `aligned_at_step=null`**、`aligned={}` —— **不许挑一个"差不多"
+     的步**凑一个看起来完整的表。
+- **教训**：**"并排"是一种断言**。把两个数放在同一行，读者就会认为它们同源同时；
+  工具要么给出共同轴，要么**明说它们不可比**。这与 A52（文案与数字不同源）是同一
+  条纪律的两个面：**引用必须与对象同源；并排必须与时刻同源**。
+- **判据**：`test_ml_delivery.py::test_same_run_cross_tag_alignment_exposes_unequal_step_cadence`
+  （用用户那条 run：`fid/sub0` 在非 3 倍数处必须是 `null`；步长完全错开时
+  `aligned_at_step` 必须是 `None`）。
+

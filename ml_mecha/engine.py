@@ -809,6 +809,7 @@ class MLEngine(Engine):
         #   轨迹。⇒ 给 `compare=[run_a, run_b, …]` 就回对齐后的表（缺失处 `null`，
       #   **绝不插值**：插值会造出一段没算过的曲线）。
         compare_ids = [str(r) for r in (compare or []) if str(r or "").strip()]
+        same_run_tags = [str(t) for t in (tags or []) if str(t or "").strip()]
         if compare_ids:
             picked = [str(t) for t in (tags or []) if str(t or "").strip()]
             series: dict[str, Any] = {}
@@ -881,6 +882,15 @@ class MLEngine(Engine):
             if note.get("kind"):
                 notes.append({"tag": str(tag), **note})
         out["curve"] = shapes
+        #: ⭐ **每个 tag 自己的求值 step**（2026-10-06）：`latest` 是把各 tag 的
+        #:   "最新值"并排放的，而它们的**步长可以不同**（`metrics_every` 降频时
+        #:   `fid/*` 每 N 轮才记一次）⇒ 不标 step 就等于**暗示它们同一步**。
+        #:   用户实测正是踩了这个：三个数并排看着"数学上不能同时成立"，
+        #:   其实各自在不同 step 上都是真的。⇒ 值照给，**步号必须一起给**。
+        out["latest_steps"] = {
+            str(tag): (list(got.get("steps") or [])[-1]
+                       if (got.get("steps") or []) else None)
+            for tag, got in scal.items()}
         #: ⚠ 排序：**先报"欠训练/发散"里的欠训练**（那是用户的误判点），
         #:   但两类都要在 ⇒ 一个词盖住两种病是最坏的做法。
         notes.sort(key=lambda n: (n.get("kind") != "underfit", str(n.get("tag"))))
@@ -915,11 +925,19 @@ class MLEngine(Engine):
                 else:
                     best["note"] = "这个 run 没写 val_loss（val_split=0？）⇒ 无从对照"
         out["best_by"] = best
-        #: `compare` 是**必填键**（回执契约）⇒ 单 run 模式下也要在：空表 + 一句说明
-        #: （"没给 compare"与"给了但没数据"是两件事，别混成一个空对象）。
-        out["compare"] = {"runs": [], "tags": {},
-                          "note": "没有给 `compare` ⇒ 本条只报单 run；"
-                                  "要比多条曲线给 compare=[run_a, run_b, …]"}
+        #: `compare` 是**必填键**（回执契约）⇒ 单 run 模式下也要在：
+        #: - 给了 `tags` ⇒ **同一 run 内多 tag 的对齐**（同一个 step 轴 + `aligned_at_step`）；
+        #: - 没给 ⇒ 空表 + 一句说明（"没给"与"给了但没数据"是两件事）。
+        if same_run_tags:
+            out["compare"] = {"mode": "tags(同 run)", "run_id": resolved,
+                              **_curve.align_tags(scal, same_run_tags,
+                                                  limit=max(1, int(limit or 200)))}
+        else:
+            out["compare"] = {"runs": [], "tags": {},
+                              "note": "没有给 `compare` ⇒ 本条只报单 run；"
+                                      "要比多条曲线给 compare=[run_a, run_b, …]；"
+                                      "要把**同一 run 内多个 tag** 放到同一根轴上，"
+                                      "给 `tags=[…]`"}
         if not include_series:
             return out
         scal = payload.get("scalars") or {}

@@ -294,6 +294,52 @@ def best_point(steps: Sequence[Any], values: Sequence[Any], *,
             "lower_better": d}
 
 
+def align_tags(series: Mapping[str, Mapping[str, Any]], tags: Sequence[str], *,
+               limit: int = 200) -> dict[str, Any]:
+    """**同一个 run 内、多个 tag** 的对齐（R40 的同族，2026-10-06 补）。
+
+    ## 为什么它比 `align`（多 run 同 tag）更紧急
+
+    用户的实测 bug：他在一份回执里同时读到
+    ``loss=0.018``、``fid/step=0.9965``、``fid/sub0=0.7301`` 三个数并判断
+    "数学上不能同时成立"。而**三个数的求值步长本来就不一样**：
+    `loss`/`fid/step` 是**逐 epoch**，`fid/sub0` 是**每 3 个 epoch**（`metrics_every`）。
+    于是"每个 tag 各自的最新值"很可能**不在同一个 step 上** ——
+    把它们并排读，就会得到一个**看着像矛盾的组合**（每个数在它自己那一步都是真的）。
+
+    ⇒ 框架的职责是**把值放到同一根轴上**并如实标出缺失（`None`），
+    而不是把不同步的值并排放着让人自己踩。`aligned_at_step` 给出
+    **所有 tag 都有的最后一个 step**（那才是"可以放一起比"的那一步）。
+    """
+    picked = [str(t) for t in (tags or []) if str(t or "").strip()]
+    per_tag: dict[str, dict[float, float]] = {}
+    for tag in picked:
+        got = (series or {}).get(tag) or {}
+        ys = _floats(got.get("values"))
+        xs = [float(s) for s in _floats(got.get("steps"))] or list(range(len(ys)))
+        n = min(len(ys), len(xs))
+        per_tag[tag] = {xs[i]: ys[i] for i in range(n)}
+    axis = sorted({x for points in per_tag.values() for x in points})
+    if limit and len(axis) > int(limit):
+        axis = axis[-int(limit):]
+    common = [x for x in axis if all(x in points for points in per_tag.values())]
+    last_common = common[-1] if common else None
+    return {
+        "steps": axis,
+        "tags": {tag: [points.get(x) for x in axis]
+                 for tag, points in per_tag.items()},
+        "n_points": {tag: len(points) for tag, points in per_tag.items()},
+        #: **可以放一起比的那一步**（所有 tag 都有值的最后一个 step）；
+        #: `None` ⇒ 没有公共 step（各 tag 的求值步长完全错开）⇒ 别并排读。
+        "aligned_at_step": last_common,
+        "aligned": ({tag: per_tag[tag][last_common] for tag in picked}
+                    if last_common is not None else {}),
+        "note": ("同一根 step 轴；某 tag 在那一步没记就写 null（**不插值**）。"
+                 "⚠ `aligned_at_step` 才是「这些数能放一起比」的那一步——"
+                 "各 tag 的求值步长可以不同（如 fid/* 每 N 轮一次）"),
+    }
+
+
 def align(series: Mapping[str, Mapping[str, Any]], tags: Sequence[str], *,
           limit: int = 200) -> dict[str, Any]:
     """多 run 曲线**对齐**（R40）：同一个 tag、同一根 step 轴、缺失处 `None`。
@@ -345,5 +391,6 @@ def default_tags(series: Mapping[str, Mapping[str, Any]], *,
     return common[:cap]
 
 
-__all__ = ["shape", "convergence_note", "best_point", "align", "default_tags",
-           "TAIL", "REL_TOL", "TREND_FRAC"]
+__all__ = ["shape", "convergence_note", "best_point", "align", "align_tags",
+           "default_tags", "direction", "TAIL", "REL_TOL", "TREND_FRAC",
+           "WHOLE_DROP_FRAC", "BIG_TAIL_FRAC"]
