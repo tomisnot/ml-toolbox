@@ -846,8 +846,14 @@ class MLEngine(Engine):
                     "compare": {"runs": [], "tags": {},
                                 "note": "没有给 compare（本条只报单 run）"},
                 }
-        payload = tb_series.read_run(resolved,
-                                     limit=max(1, int(limit or 200)))
+        # ⚠ **分析窗口与回执序列是两个问题**（实测教训 2026-10-06）：曲线判读
+        #   （`curve`/`convergence`/`best_by`）要**尽量长的历史**才对——"末段回升
+        #   算不算发散"必须看得到全程降幅；而 `series` 是**大负载**，由 `limit` 控。
+        #   ⇒ 读一次（按两者的**较大**值），分析用全量、`series` 再按 `limit` 切片。
+        #   旧版按 `limit` 截断后再判读 ⇒ 用户那条 `val_loss`（全程 6372→1060）
+        #   在只看末 200 点时被误报成"发散"（判读与它手里的证据不一致）。
+        payload = tb_series.read_run(
+            resolved, limit=max(1, int(limit or 200), int(tb_series.MAX_POINTS)))
         out: dict[str, Any] = {
             "run_id": resolved,
             "available": bool(payload.get("available")),
@@ -917,12 +923,14 @@ class MLEngine(Engine):
         if not include_series:
             return out
         scal = payload.get("scalars") or {}
-        # ⚠ 每个 tag **各自**带 steps：tag 可以晚开始（`val_split=0` 时 val_loss
-        #   整条不写），拿全局步轴去对会错位。
+        #: `series` 按调用方的 `limit` 切（大负载受控）；而上面的 `curve`/`convergence`
+        #: 用的是**可读到的全部点**（判读要证据足够）。两者各自说明自己的窗口。
+        cap = max(1, int(limit or 200))
         out["series"] = {
-            tag: {"steps": list((got or {}).get("steps") or []),
-                  "values": list((got or {}).get("values") or [])}
+            tag: {"steps": list((got or {}).get("steps") or [])[-cap:],
+                  "values": list((got or {}).get("values") or [])[-cap:]}
             for tag, got in scal.items()}
+        out["series_limit"] = cap
         out["max_points"] = int(tb_series.MAX_POINTS)
         return out
 

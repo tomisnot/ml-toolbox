@@ -2027,18 +2027,28 @@ def test_convergence_warns_on_the_real_underfit_run_and_not_on_the_converged_one
     assert sh_conv["trend"] == "flat", sh_conv               # 1500 epoch 已到平台
     assert note_conv["kind"] == "", note_conv                # ⇒ **不许报警**
 
-    # ⭐ **方向也要分对**：同一条 250 epoch run 的 `val_loss` 末段也在爬，但那是
-    #   **发散**不是欠训练（两者的处置相反）——第一版正是把它报成了欠训练。
+    # ⭐ **方向也要分对**：同一条 250 epoch run 的 `val_loss` 末段也在爬，但它
+    #   **不能**被报成"欠训练"（两者处置相反）——第一版正是把它报成了欠训练。
+    #   ⚠ 2026-10-06 再修一层：它**也不是 `diverging`**（本窗口 383.9→125.1，
+    #   降 67%）⇒ 正确结论是 **`noisy_tail`**（"不构成发散"）。
+    #   这一条同时钉住"loss 家族 ≠ 欠训练"与"没在发散就别喊发散"。
     vl = _curve_fixture("custom_network-9008175-1002", "val_loss")
     note_vl = curve.convergence_note("val_loss",
                                      curve.shape(vl["steps"], vl["values"]))
-    assert note_vl["kind"] == "diverging", note_vl
-    # 方向未知的量（梯度范数等）**不给诊断**（趋势照给，但不硬凑一句话）
+    assert note_vl["kind"] == "noisy_tail", note_vl
+    assert "不构成发散" in note_vl["note"], note_vl
+    # 方向未知的量（梯度范数/逐层梯度）**不给诊断**（趋势照给，但不硬凑一句话）
     assert curve.convergence_note("grad_norm", {"trend": "rising", "tail": 15,
-                                                "first": 1.0, "last": 2.0})["kind"] == ""
-    assert curve.direction("grad_norm") == "unknown"
-    assert curve.direction("val_loss") == "lower"
-    assert curve.direction("fid/sub1") == "higher"
+                                                "tail_first": 1.0,
+                                                "tail_last": 2.0})["kind"] == ""
+    for tag, want in (("grad_norm", "unknown"), ("val_loss", "lower"),
+                      ("fid/sub1", "higher"), ("ph/std", "unknown"),
+                      ("weights_norm/first", "unknown"),
+                      # ⚠ **词元级匹配**（实测 bug）：`linear2` 曾经命中子串 `r2`
+                      #   ⇒ 一个逐层梯度被当成"越大越好的质量指标"⇒ 误报欠训练。
+                      ("grad/dec.1.linear2.weight", "unknown"),
+                      ("grad/enc.0.linear1.weight", "unknown")):
+        assert curve.direction(tag) == want, (tag, curve.direction(tag))
 
 
 def test_best_by_any_tag_compares_against_val_loss_choice():
@@ -2175,6 +2185,103 @@ def test_watch_prefers_job_ownership_over_guessing():
             watch.McpClient = real
         assert "newest_unfinished_run" in got2["evidence"], got2["evidence"]
         assert "启发式" in " ".join(got2["notes"]), got2["notes"]
+
+
+def test_noisy_tail_of_a_converging_loss_is_not_reported_as_divergence():
+    """⭐ **末段噪声回升 ≠ 发散**（用户 2026-10-06 的 bug 报告，带真实 run 当证据）。
+
+    他看到的回执原文：
+    ```
+    {"tag": "loss", "kind": "diverging",
+     "note": "⚠ loss 在末 15 个评估点仍在**上升**（136→29.86）⇒ 这个配置**可能在发散**…"}
+    ```
+    两个毛病叠在一起：
+    1. **结论错**：那条 run 的 `loss` 本窗口 1.92e+04 → 29.86（**降 99.8%**，正常收敛），
+       末 15 点只有 +1.5% 的回升，而噪声尺度是 8.8% ⇒ **根本不是发散**
+       （他的原话："差点让我以为自己的配置在发散"）；
+    2. **文案自相矛盾**：说"在上升"却印出 `136→29.86`（数字是降的）——
+       "这种自相矛盾的文案比没有文案更糟"。
+
+    ⇒ 本判据钉四件事（都用他这条 run 的夹具）：
+    ① `loss` / `val_loss` **一律不许** `diverging`（正确结论是 `noisy_tail`）；
+    ② 文案的**数字必须与结论一致**（说"降到"就不能配一个上升的数字）；
+    ③ 真发散（合成：单调暴涨 / 先降后爆）**仍要报 `diverging`**（闸门不许把真阳性也掐掉）；
+    ④ `fid/sub0` 这类**主指标在爬**仍报 `underfit`（他要保留的正例）。
+    """
+    sys.path.insert(0, str(REPO))
+    from ml_mecha import curve
+
+    # ① 用户那条 run：loss 与 val_loss 都不许报发散
+    for tag in ("loss", "val_loss"):
+        fx = _curve_fixture("custom_network-3906151-1101", tag)
+        sh = curve.shape(fx["steps"], fx["values"])
+        note = curve.convergence_note(tag, sh)
+        assert note["kind"] != "diverging", (tag, note)
+        assert note["kind"] == "noisy_tail", (tag, note)
+        assert sh["whole_frac"] <= -curve.WHOLE_DROP_FRAC, sh
+        # ② 文案与数字一致：这条 note 说"降到"，那它就**不能**同时说"在上升"
+        assert "降到" in note["note"], note
+        assert "在**上升**" not in note["note"], note
+        assert curve._fmt(sh["first"]) in note["note"], note
+        assert curve._fmt(sh["last"]) in note["note"], note
+
+    # ③ 真发散仍要报（两道闸门都不许掐掉真阳性）
+    diverge = curve.shape(list(range(60)), [0.5 * (1.15 ** i) for i in range(60)])
+    assert curve.convergence_note("loss", diverge)["kind"] == "diverging", diverge
+    # 先降到很低、然后**末段爆炸**（>50%）⇒ 无论历史都算发散
+    vals = [100.0 * (0.9 ** i) for i in range(40)] + [5.0 * (1.5 ** i)
+                                                      for i in range(15)]
+    late = curve.shape(list(range(len(vals))), vals)
+    assert curve.convergence_note("loss", late)["kind"] == "diverging", late
+
+    # ④ 主指标在爬 ⇒ 仍报 `underfit`（用户点名"不要改"的正例）
+    fid = _curve_fixture("custom_network-3906151-1101", "fid/sub0")
+    sh_fid = curve.shape(fid["steps"], fid["values"])
+    note_fid = curve.convergence_note("fid/sub0", sh_fid)
+    assert sh_fid["trend"] == "rising", sh_fid
+    assert note_fid["kind"] == "underfit", note_fid
+    assert "别按终值" in note_fid["note"], note_fid
+
+
+def test_curve_analysis_uses_the_full_readable_history_not_the_display_limit():
+    """⭐ 判读窗口必须**独立于 `limit`**：否则"回执说发散、证据却只有 200 点"。
+
+    实测（2026-10-06）：我一开始让判读和 `series` 共用 `limit`（默认 200）⇒
+    用户那条 `val_loss`（全程 6372→1060）在只看**末 200 点**时被误报成"发散"，
+    而参数一调大就变成"不构成发散"。⇒ 判读用**可读到的全部点**（上限
+    `MAX_POINTS`），`series` 才按 `limit` 切；并且 note 里写明**本窗口多少点**。
+    """
+    sys.path.insert(0, str(REPO))
+    import tempfile
+
+    from ml_mecha.assembly import assemble_ml_mecha
+
+    run_id = "custom_network-3906151-1101"
+    ml = assemble_ml_mecha(root=tempfile.mkdtemp(prefix="ml-curvewin-"), seed=13)
+    try:
+        got = ml.engine.query("training_detail", run_id=run_id, limit=200,
+                              include_series=True)
+        assert got["available"] is True, got.get("reason")
+        # ① 判读窗口是**全部可读点**（远超 limit=200）
+        ns = {t: sh["n"] for t, sh in got["curve"].items() if t == "val_loss"}
+        assert ns["val_loss"] > 200, ns
+        # ② `series` 仍按 limit 切（大负载受控）
+        assert len(got["series"]["val_loss"]["values"]) == 200, len(
+            got["series"]["val_loss"]["values"])
+        assert got["series_limit"] == 200, got.get("series_limit")
+        # ③ 判读结论用的是全量窗口 ⇒ 不许发散
+        kinds = {n["tag"]: n["kind"] for n in got["convergence"]}
+        assert kinds.get("val_loss") != "diverging", kinds
+        assert kinds.get("loss") != "diverging", kinds
+        # ④ note 里写明窗口点数（读数的人知道它覆盖了多少历史）
+        for note in got["convergence"]:
+            if note["kind"] == "noisy_tail":
+                assert "本窗口" in note["note"], note
+        # ⑤ 逐层梯度**一律不给诊断**（词元级方向判定的回归）
+        assert not [n for n in got["convergence"]
+                    if str(n["tag"]).startswith("grad/")], got["convergence"]
+    finally:
+        ml.close()
 
 
 def test_cancel_run_rejects_uncancellable_job():

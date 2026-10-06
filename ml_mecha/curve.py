@@ -48,6 +48,15 @@ def _floats(values: Sequence[Any]) -> list[float]:
     return out
 
 
+def _median(values: list[float]) -> float:
+    """中位数（自实现：不引 numpy —— 本模块只做纯 Python 的曲线算术）。"""
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2.0
+
+
 def shape(steps: Sequence[Any], values: Sequence[Any], *,
           tail: int = TAIL, rel_tol: float = REL_TOL) -> dict[str, Any]:
     """一条曲线的**形状摘要**（端点 + 末段斜率 + 单调性 + 平台占比 + 趋势）。
@@ -66,7 +75,10 @@ def shape(steps: Sequence[Any], values: Sequence[Any], *,
                 "monotone_up_tail": None, "flat_frac": None, "trend": "no_data"}
     first, last = ys[0], ys[-1]
     out: dict[str, Any] = {"n": n, "first": first, "last": last,
-                           "delta": last - first}
+                           "delta": last - first,
+                           #: 全程相对变化（末值 vs 起点）——判"到底在学没有"用**它**，
+                           #: 不能只看末段（见 A52：末段回升 + 全程暴跌 ≠ 发散）。
+                           "whole_frac": ((last - first) / abs(first)) if first else None}
     if n < 3:
         out.update({"tail": n, "slope_tail": None, "tail_rise": None,
                     "monotone_up_tail": None, "flat_frac": None,
@@ -78,6 +90,7 @@ def shape(steps: Sequence[Any], values: Sequence[Any], *,
     tol = float(rel_tol) * scale
     diffs = [ty[i + 1] - ty[i] for i in range(len(ty) - 1)]
     flat = sum(1 for d in diffs if abs(d) <= tol)
+    med = _median([abs(d) for d in diffs])
     span = (tx[-1] - tx[0]) or 1.0
     slope = (ty[-1] - ty[0]) / span
     rise = ty[-1] - ty[0]
@@ -101,7 +114,17 @@ def shape(steps: Sequence[Any], values: Sequence[Any], *,
         trend = "mixed"
     out.update({"tail": w, "slope_tail": slope, "tail_rise": rise,
                 "monotone_up_tail": bool(mono_up), "flat_frac": flat / len(diffs),
-                "tail_third_delta": d3, "trend": trend})
+                "tail_third_delta": d3, "trend": trend,
+                #: **末段窗口自己的**端点与相对变化 —— 文案里说"末段在爬"时，
+                #: 括号里的数字必须是**这两个**（拿全程端点去配末段的结论，
+                #: 会写出"在上升（136→29.86）"这种自相矛盾的话；用户实测抓到的）。
+                "tail_first": ty[0], "tail_last": ty[-1],
+                "tail_rise_frac": rise / scale,
+                #: 噪声尺度（末段相邻差的中位绝对差）与"回升/噪声"倍数：
+                #: **给读数的人做判断用**，不作为唯一闸门——实测它分不开
+                #: "真欠训练"和"已收敛"（0.93 vs 0.35，阈值放哪儿都误伤）。
+                "noise_mad": med, "noise_frac": med / scale,
+                "rise_over_noise": (rise / (3.0 * med)) if med > 0 else None})
     return out
 
 
@@ -109,8 +132,34 @@ def shape(steps: Sequence[Any], values: Sequence[Any], *,
 _LOSS_LIKE = ("loss", "err", "nll", "mse", "mae", "rmse", "mape", "kl", "divergence")
 
 #: "越大越好"的**名字特征**（质量指标家族）：在爬 ⇒ 还没到头（可能欠训练）。
-_QUALITY_LIKE = ("fid", "famp", "acc", "auc", "f1", "precision", "recall", "r2",
-                 "silhouette", "score")
+_QUALITY_LIKE = ("fid", "famp", "acc", "accuracy", "auc", "f1", "precision",
+                 "recall", "r2", "silhouette", "score")
+
+#: 全程降幅超过这个比例 ⇒ 这个配置在**学**，末段小回升**不构成发散**（见 A52）。
+WHOLE_DROP_FRAC = 0.2
+
+#: 末段涨幅超过这个比例 ⇒ **无论全程如何**都算真发散（后期爆炸）。
+BIG_TAIL_FRAC = 0.5
+
+
+def _tokens(tag: str) -> list[str]:
+    """把 tag 切成**词元**（`/`、`_`、`.`、`-` 都算分隔）。"""
+    import re
+    return [t for t in re.split(r"[^0-9A-Za-z]+", str(tag)) if t]
+
+
+def _matches(token: str, pattern: str) -> bool:
+    """词元级匹配（允许 `val_loss` 这类**前缀_特征**写法，但**不许子串乱撞**）。
+
+    ## 为什么必须词元级（实测教训 2026-10-06）
+
+    第一版用**子串**匹配 ⇒ `grad/dec.1.linea**r2**.weight` 命中了特征 `r2`
+    ⇒ 一个**逐层梯度**标签被当成"越大越好的质量指标"，于是梯度范数在爬被判成
+    "**可能欠训练**"（用户实测抓到的：33 个 `grad/*` 里恰好这一个被诊断）。
+    ⇒ 词元级后 `linear2` 是 `linear2` 而不是 `r2`，逐层梯度一律落到"方向未知"。
+    """
+    t, p = token.lower(), pattern.lower()
+    return t == p or t.startswith(p + "_") or t.endswith("_" + p)
 
 
 def direction(tag: str) -> str:
@@ -122,9 +171,15 @@ def direction(tag: str) -> str:
     rmse/mae/mape/silhouette_deficit）⇒ `val_loss` 被当成"越大越好"，
     于是**"loss 在爬"被报成了"欠训练"**。两者的处置完全相反（一个是配置要改，
     一个是再多跑几轮）——**用一个词盖住两种病**正是本仓反复在防的。
-    ⇒ 这里自己判方向，并且**判不出来就承认判不出来**：
-    `grad_norm` / `ph/std` / `weights_norm/*` 这类"没有好坏方向"的量
+    ⇒ 这里自己判方向并且**词元级**匹配（见 `_matches`）；**判不出来就承认判不出来**：
+    `grad_norm` / `ph/std` / `grad/<层名>` / `weights_norm/*` 这类"没有好坏方向"的量
     **不给结论**（趋势仍照给，只是不诊断）。
+
+    ## 定论（用户要求"别两边都留一半"）
+
+    **逐层梯度与范数类一律不给诊断** —— 理由：它们在爬既可能"还没学完"、
+    也可能是"梯度爆炸的早期"，**方向本身没有好坏**；把没有方向的东西安上一个
+    诊断，就是把噪声变成结论。趋势照给（`curve[tag]`），读数的人自己判断。
     """
     try:
         from ml_toolbox.core.contracts import is_lower_better
@@ -132,10 +187,10 @@ def direction(tag: str) -> str:
             return "lower"
     except Exception:                                          # noqa: BLE001
         pass
-    low = str(tag).lower()
-    if any(w in low for w in _LOSS_LIKE):
+    toks = _tokens(tag)
+    if any(_matches(t, p) for t in toks for p in _LOSS_LIKE):
         return "lower"
-    if any(w in low for w in _QUALITY_LIKE):
+    if any(_matches(t, p) for t in toks for p in _QUALITY_LIKE):
         return "higher"
     return "unknown"
 
@@ -146,32 +201,69 @@ def _lower_is_better(tag: str) -> bool:
 
 
 def convergence_note(tag: str, sh: Mapping[str, Any]) -> dict[str, Any]:
-    """"末段还在动"要说清 —— 但**分开说两种病**（用户实测的那个误判）。
+    """"末段还在动"要说清 —— 但**分开说三种情形**（都被用户实测打出来过）。
 
-    - **loss 类在爬** ⇒ `diverging`（发散：这个配置有问题）；
     - **指标在爬** ⇒ `underfit`（欠训练：**别按终值判断饱和**，延长 epoch 再下结论）；
-    - 其余（在掉/平/抖） ⇒ 不给结论（`kind=""`）。**不硬凑一句话**。
+    - **loss 类在爬、且全程也在涨** ⇒ `diverging`（发散：这个配置有问题）；
+    - **loss 类末段小回升、但全程是大幅下降** ⇒ `noisy_tail`（**不构成发散**）；
+    - 方向未知（`grad*` / `ph/std` …）或趋势不是"在爬" ⇒ **不给结论**。
+
+    ## 两条实测教训（都在这里修）
+
+    1. **末段回升 ≠ 发散**（用户 2026-10-06 的 bug 报告）：他的 `loss` 全程
+       1.92e+04 → 29.86（**降 99.8%**），只是末 15 点有 +1.5% 的噪声回升
+       （噪声尺度 8.8%！），却被报成 `diverging` ⇒ 差点让他以为配置在发散。
+       ⇒ 加**全程闸门**：全程显著下降时，末段小回升最多是 `noisy_tail`；
+       只有"末段涨过 `BIG_TAIL_FRAC`"才**无论历史**都算真发散（后期爆炸）。
+    2. **文案必须与数字一致**：旧版说"末段在上升"却印**全程**的 `first→last`
+       ⇒ 写出了"在上升（136→29.86）"这种自相矛盾的话（用户原话："这种自相矛盾的
+       文案比没有文案更糟"）。⇒ 现在"末段"那句印的是**末段窗口自己的**端点，
+       全程数字单独说、带"全程"两个字。
     """
     trend = str(sh.get("trend") or "")
     if trend not in ("rising",):
         return {"kind": "", "note": ""}
     tail = int(sh.get("tail") or 0)
-    first = sh.get("first")
-    last = sh.get("last")
-    #: ⚠ **方向未知就不诊断**（趋势仍然照给，见 `curve[tag].trend`）：
-    #: `grad_norm` 在涨既不是发散也不是欠训练，硬凑一句会变成噪声警告。
+    t_first, t_last = sh.get("tail_first"), sh.get("tail_last")
+    whole_frac = sh.get("whole_frac")
+    tail_frac = sh.get("tail_rise_frac")
     where = direction(str(tag))
     if where == "lower":
+        dropped = (whole_frac is not None and whole_frac <= -WHOLE_DROP_FRAC)
+        blowup = (tail_frac is not None and tail_frac >= BIG_TAIL_FRAC)
+        if dropped and not blowup:
+            return {"kind": "noisy_tail",
+                    "note": (f"⚠ {tag} **本窗口（{int(sh.get('n') or 0)} 点）**从 "
+                             f"{_fmt(sh.get('first'))} 降到 {_fmt(sh.get('last'))}"
+                             f"（{_fmt_pct(whole_frac)}）——末 {tail} 个点的 "
+                             f"{_fmt_pct(tail_frac)} 回升"
+                             f"（噪声尺度约 {_fmt_pct(sh.get('noise_frac'))}）"
+                             f"**不构成发散**，只是抖动；要看更细就用 "
+                             f"`include_series` 拉序列，或看验证集")}
         return {"kind": "diverging",
                 "note": (f"⚠ {tag} 在末 {tail} 个评估点仍在**上升**（"
-                         f"{_fmt(first)}→{_fmt(last)}）⇒ 这个配置**可能在发散**"
-                         f"（{tag} 应当下降）；先别开长训练，查学习率/归一化")}
+                         f"{_fmt(t_first)}→{_fmt(t_last)}，{_fmt_pct(tail_frac)}）"
+                         f"⇒ 这个配置**可能在发散**（{tag} 应当下降）；"
+                         f"⚠ 本窗口（{int(sh.get('n') or 0)} 点）："
+                         f"{_fmt(sh.get('first'))}→{_fmt(sh.get('last'))}"
+                         f"（{_fmt_pct(whole_frac)}）——先别开长训练，"
+                         f"查学习率/归一化")}
     if where == "higher":
         return {"kind": "underfit",
                 "note": (f"⚠ {tag} 在末 {tail} 个评估点仍在上升（"
-                         f"{_fmt(first)}→{_fmt(last)}）⇒ **可能欠训练**："
-                         f"别按终值判断'已饱和'，延长 epoch 再下结论")}
+                         f"{_fmt(t_first)}→{_fmt(t_last)}，{_fmt_pct(tail_frac)}）"
+                         f"⇒ **可能欠训练**：别按终值判断'已饱和'，延长 epoch 再下结论"
+                         f"（本窗口 {int(sh.get('n') or 0)} 点："
+                         f"{_fmt(sh.get('first'))}→{_fmt(sh.get('last'))}，"
+                         f"{_fmt_pct(whole_frac)}）")}
     return {"kind": "", "note": ""}
+
+
+def _fmt_pct(value: Any) -> str:
+    try:
+        return f"{float(value):+.1%}"
+    except (TypeError, ValueError):
+        return "?"
 
 
 def _fmt(value: Any) -> str:
