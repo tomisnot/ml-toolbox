@@ -188,8 +188,12 @@ def _frame(n: int = 160, d: int = 5, seed: int = 11):
 
 
 def _spawn_authority_proc(root, *, extra_args=()):
-    """起一台**真子进程**权威（``app_entry.py --authority``）；调用方负责收尾。"""
-    cmd = [sys.executable, str(REPO / "app_entry.py"), "--authority",
+    """起一台**真子进程**端点（``app_entry.py --mcp``）；调用方负责收尾。
+
+    ⚠ 辅助名里的 "authority" 保留（它是**编排角色**的旧词，本文件里到处在用）；
+    但**传给 CLI 的旗标是 ``--mcp``** —— 那个词描述"对外提供什么"，是 CLI 契约。
+    """
+    cmd = [sys.executable, str(REPO / "app_entry.py"), "--mcp",
            "--root", str(root), *extra_args]
     return subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -521,7 +525,7 @@ def _real_default(ml, tool: str, param: str):
 
 #: ``defaulted`` 全表快照（实测；迁移不得静默增删——多了会吞掉"清空语义"的显式 null，
 #: 少了会让某类工具的默认值失效）。键是工具名，值是**排序后**的参数名列表。
-#: 16 项 = 全部「声明了非 None default」的参数（R8-2a：声明是唯一权威来源）。
+#: = 全部「声明了非 None default」的参数（R8-2a：声明是唯一权威来源）。
 EXPECTED_DEFAULTED = {
     "cancel_run": [],
     "compare_methods": ["dataset_id"],
@@ -529,26 +533,32 @@ EXPECTED_DEFAULTED = {
     "describe_method": [],
     "describe_methods": ["dataset_id", "family"],
     "describe_run": ["run_id"],
-    "describe_training": ["best_by", "grad_layers", "include_series", "limit", "run_id"],
+    "describe_training": ["best_by", "curve", "grad_layers", "include_series",
+                          "limit", "run_id"],
     "describe_network": ["limit"],
     "describe_networks": ["limit"],
     # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
     #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
     "prepare_dataset": ["diag", "name", "target", "target_kind", "time_col"],
-    "read_job": ["detail", "job_id", "tail", "timeout_s", "wait", "wait_s"],
+    "read_job": ["detail", "job_id", "logs", "tail", "timeout_s", "wait", "wait_s"],
     # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
     #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
     # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）；
     # `dry_run`（False）与 `code_path`（""）也进了这张表。
     # ⚠ `code` 现在**也有**默认（`""`）：为的是 `code_path` 能单独用（二选一）。
     # `shapes_verbosity`（"trace"）同样进表。
-    "run_custom": ["code", "code_path", "dataset_id", "device", "diag", "dry_run",
-                   "name", "persist", "shapes_verbosity", "warmup_steps"],
+    # ---- 2026-10-07 中途存档（A1）----
+    # `checkpoint_every` 声明了 `0`（= 只在终态写）⇒ 进表（排序后排在 `code` 前）。
+    # 同日**续训**（Q7）再 +2：`resume_from`（默认 `""`）与 `resume_which`（默认 `"last"`）。
+    "run_custom": ["checkpoint_every", "code", "code_path", "dataset_id", "device",
+                   "diag", "dry_run", "name", "persist", "resume_from",
+                   "resume_which", "shapes_verbosity", "warmup_steps"],
     "run_method": ["dataset_id", "device", "diag", "persist"],
     "run_method_batch": ["dataset_id"],
     # `method`/`code`/`name` 都声明了 `""` 默认 ⇒ 进这张表（"未给"= 空串）。
-    "submit_run": ["code", "code_path", "dataset_id", "device", "diag",
-                   "method", "name", "persist"],
+    "submit_run": ["checkpoint_every", "code", "code_path", "dataset_id", "device",
+                   "diag", "method", "name", "persist", "resume_from",
+                   "resume_which"],
     # ---- 2026-10-03 新增（AI 调用体验）----
     # `clear_current_state` 无参数（语义就是"全部清零"，不给"清一部分"的语义面）。
     "clear_current_state": [],
@@ -567,7 +577,7 @@ EXPECTED_DEFAULTED = {
 }
 
 #: 逐参数行为判据：(工具, 最小必填参数, 参数名, 真值)。
-#: **覆盖全部 16 个 defaulted 参数**，真值必须是该参数类型的合法取值。
+#: **覆盖全部 defaulted 参数**，真值必须是该参数类型的合法取值。
 #: 备注一栏说明该参数的默认值原本来自哪一侧（R8-2a 之后一律由**声明**承载）：
 #: - 写工具的 `**kwargs` 包装会遮住内层闭包 ⇒ 只能靠声明（`diag`/`persist`/`name`/
 #:   `target`/`time_col`/`dataset_id`/`device`）；
@@ -584,6 +594,8 @@ _DEFAULTED_PROBES = (
     ("describe_training", {}, "grad_layers", "full"),
     # ---- R41（2026-10-05）：按任意 tag 挑最佳 step ----
     ("describe_training", {}, "best_by", "fid/sub1"),
+    # ---- 2026-10-07：`curve` 详细度（默认 brief；形状占默认回执近九成）----
+    ("describe_training", {}, "curve", "all"),
     ("describe_networks", {}, "limit", 10),
     ("describe_network", {"name": "n"}, "limit", 10),
     ("prepare_dataset", {"source": dict(_SYNTHETIC)}, "name", "my-ds"),
@@ -614,11 +626,18 @@ _DEFAULTED_PROBES = (
     ("run_custom", {"code": _MIN_NET_CODE}, "code_path", "net.py"),
     ("run_custom", {"code": _MIN_NET_CODE}, "shapes_verbosity", "summary"),
     ("run_custom", {"code": _MIN_NET_CODE}, "warmup_steps", 5),
+    # ---- 2026-10-07 中途存档（A1）：`checkpoint_every` 也声明了默认（0）----
+    ("run_custom", {"code": _MIN_NET_CODE}, "checkpoint_every", 200),
+    # ---- Q7 续训：`resume_from`（默认 ""）与 `resume_which`（默认 "last"）----
+    ("run_custom", {"code": _MIN_NET_CODE}, "resume_from", "custom_network-1-1"),
+    ("run_custom", {"code": _MIN_NET_CODE}, "resume_which", "best"),
     ("run_method_batch", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("compare_methods", {"methods": ["logistic"]}, "dataset_id", "ds-null-shim"),
     ("read_job", {"job_id": "job-null-shim"}, "wait_s", 5.0),
     ("read_job", {"job_id": "job-null-shim"}, "detail", "full"),
     ("read_job", {"job_id": "job-null-shim"}, "tail", 3),
+    # ---- 2026-10-07 服务端 stdout/stderr（A5）：`logs` 声明了默认（10）----
+    ("read_job", {"job_id": "job-null-shim"}, "logs", 50),
     # ---- 长任务编排（2026-10-05）：等待原语折进 read_job（不新增工具）----
     ("read_job", {"job_id": "job-null-shim"}, "wait", "terminal"),
     ("read_job", {"job_id": "job-null-shim"}, "timeout_s", 5.0),
@@ -635,9 +654,14 @@ _DEFAULTED_PROBES = (
     #   `test_tool_params_stay_within_command_declaration` 与端到端判据覆盖。
     ("submit_run", {"method": "logistic"}, "code", _MIN_NET_CODE),
     ("submit_run", {"method": "logistic"}, "name", "my-net"),
+    # ---- 2026-10-07 中途存档（A1）：后台长训练的一等参数 ----
+    ("submit_run", {"method": "logistic"}, "checkpoint_every", 200),
+    # ---- Q7 续训（同样只对自定义网络有意义）----
+    ("submit_run", {"method": "logistic"}, "resume_from", "custom_network-1-1"),
+    ("submit_run", {"method": "logistic"}, "resume_which", "best"),
 )
 
-#: 真实默认**本就是 None** 的参数（10 项）：显式 null 必须**原样保留**（这是"清空/
+#: 真实默认**本就是 None** 的参数（14 项）：显式 null 必须**原样保留**（这是"清空/
 #: 不指定"的唯一表达方式，也是 EL P0-1 注释里点名不许误伤的一类）。垫片必须是"按
 #: ``defaulted`` 精确剥"，**不是**"见 null 就剥"。
 _NONE_DEFAULTED_PROBES = (
@@ -657,6 +681,8 @@ _NONE_DEFAULTED_PROBES = (
     # ---- R40（2026-10-05）：多 run 曲线对齐的两个参数（**无默认**）
     ("describe_training", {}, "compare", ["run-a", "run-b"]),
     ("describe_training", {}, "tags", ["fid/sub1"]),
+    # ---- 2026-10-07：`curve_tags` 是**无默认**的可选参数（None = 不点名）----
+    ("describe_training", {}, "curve_tags", ["fid/sub1"]),
 )
 
 
@@ -759,10 +785,16 @@ _MIN_ARGS = {
 #: —— 这是"AI 写网络代码 + 按名字复用"那条路。
 #: 2026-10-05 长任务编排 +4：`read_job` 的 `wait`/`timeout_s`（阻塞到终态）、
 #: `job_ids`（一次等多个/等任意一个）与 `job_id`（二选一 ⇒ 不再是必填）。
-#: 2026-10-05 长任务编排 +4：`read_job` 的 `wait`/`timeout_s`（阻塞到终态）、
-#: `job_ids`（一次等多个/等任意一个）与 `job_id`（二选一 ⇒ 不再是必填）。
 #: 同日曲线分析（R40–R43）+3：`describe_training` 的 `best_by` / `compare` / `tags`。
-_EXPECTED_OPTIONAL_PARAMS = 74
+#: 2026-10-07 中途存档（A1）+2：`run_custom` 与 `submit_run` 各多一个
+#: `checkpoint_every`（每 N 个优化步原子落盘 `last.pt`；0 = 只在终态写）。
+#: 同日 `curve` 详细度 +2：`describe_training` 的 `curve`（默认 `brief`）与
+#: `curve_tags`（无默认）—— 形状占默认回执近九成，默认必须收窄。
+#: 同日服务端日志（A5）+1：`read_job.logs`（默认 10 行，`logs_tail` 是唯一能读到
+#: 网络代码里 `print` 的口子）。
+#: 同日**续训**（Q7）+4：`run_custom` 与 `submit_run` 各多 `resume_from`（默认 `""`）
+#: 与 `resume_which`（默认 `"last"`）—— 显式续训入口（不用再在 `build()` 里 `torch.load`）。
+_EXPECTED_OPTIONAL_PARAMS = 83
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -2436,6 +2468,125 @@ def test_launcher_pick_dsh_port_skips_official_3080():
         port = launcher.pick_dsh_port()
         assert port != 3080, port
         assert 3081 <= port <= 3090, port
+
+
+def test_child_processes_force_utf8_io_encoding():
+    """⭐⭐ 子进程的 stdio **强制 UTF-8**（A7②）：一句 `print("⚠")` 不许把任务搞崩。
+
+    用户实测（原话）："我这边 Windows 是 GBK 控制台：我的网络代码里
+    `print('⚠ …')` 会让**后台任务整个崩掉**（`UnicodeEncodeError`）。"
+
+    我现场核实的真相是**更坏的那种**：这条保证当时是**偶然的** ——
+    权威进程的 stdout 恰好是真控制台（utf-8）且 `app_entry.main()` 会 reconfigure，
+    但 `PYTHONIOENCODING` **从来没设过**、`_spawn(env=None)` **什么都不注入**、
+    reconfigure 只配 stdout 且只在走到 `main()` 时发生。⇒ 只要输出被重定向
+    （`> log.txt` / 被上层按管道捕获），编码就退回 **cp936**，同一个 `print` 立刻致命
+    （证据：我自己的探针脚本当场死于 `'\u26a0'`）。
+
+    本条钉两件：
+    1. `launcher._spawn` 的子进程环境里**必须有** `PYTHONIOENCODING=utf-8`
+       （不依赖"是否走到 main()"，对所有子进程生效）；
+    2. ⭐ **端到端**：一个 **stdout 是管道** 的子进程打印 `⚠` 必须 **exit 0**
+       —— 并给出**对照组**（显式抹掉 `PYTHONIOENCODING` ⇒ 在本机应当崩），
+       以证明这条判据真的在测那个机制（对照组崩不了就如实说明，不当成通过）。
+    """
+    import io
+    import re
+    import subprocess
+
+    import launcher
+
+    # ① 注入是**默认行为**（不给 env 也要有）
+    seen = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kw):
+            seen.update(kw)
+
+    real = launcher.subprocess.Popen
+    launcher.subprocess.Popen = _FakePopen
+    try:
+        launcher._spawn(["python", "-c", "pass"])
+    finally:
+        launcher.subprocess.Popen = real
+    env = dict(seen.get("env") or {})
+    assert env.get("PYTHONIOENCODING") == "utf-8", (
+        f"`_spawn` 没有注入 PYTHONIOENCODING ⇒ 重定向时子进程会退回 cp936：{env}")
+    # ② 调用方显式给的编码优先（判据要能构造对照组）
+    seen.clear()
+    launcher.subprocess.Popen = _FakePopen
+    try:
+        launcher._spawn(["python", "-c", "pass"],
+                        env={"PYTHONIOENCODING": "cp936", "X": "1"})
+    finally:
+        launcher.subprocess.Popen = real
+    assert (seen.get("env") or {}).get("PYTHONIOENCODING") == "cp936", seen.get("env")
+    assert (seen.get("env") or {}).get("X") == "1", seen.get("env")
+
+    # ③ 端到端：**管道**里的 `print("⚠")` 必须活着（这正是崩掉的现场）
+    code = "print('[probe] \u26a0 non-ascii')"
+    base = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+
+    def _run(child_env):
+        p = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, env=child_env, timeout=60)
+        return p.returncode, (p.stdout or b"").decode("utf-8", "replace")
+
+    # ③ 端到端：**管道**里的 `print("⚠")` 必须活着（这正是崩掉的现场）
+    #    ⚠ 用**① 里真的从 `_spawn` 抓到的那个 env**（不是手写的等价物）——
+    #      否则这条只证明"我手写的 env 有用"，不证明"启动路径会这么写"。
+    code = "import sys; print('[enc]', sys.stdout.encoding); print('[probe] \u26a0 ok')"
+    injected = dict(env)                                     # ① 抓到的（含注入）
+    base = {k: v for k, v in injected.items() if k != "PYTHONIOENCODING"}
+
+    def _run(child_env):
+        p = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, env=child_env, timeout=60)
+        return p.returncode, (p.stdout or b"").decode("utf-8", "replace")
+
+    rc_bad, out_bad = _run(dict(base))                       # 对照组：抹掉注入
+    rc_ok, out_ok = _run(injected)                           # 实验组：启动路径给的 env
+    assert rc_ok == 0, (
+        f"注入后仍然崩了（这就是用户遇到的那个病）：rc={rc_ok} out={out_ok[:300]}")
+    assert "\u26a0" in out_ok, f"字符没到管道里：{out_ok[:200]}"
+    assert "[enc] utf-8" in out_ok, (
+        f"子进程自己的 stdout.encoding 不是 utf-8 ⇒ 注入没生效：{out_ok[:200]}")
+    #: ⭐ **对照组必须真的复现**（否则这条判据只是"看起来在测"）：本机是 cp936
+    #:   ⇒ 不注入时应当在 **print 这一步** 抛 `UnicodeEncodeError`，并说出 **codec 名**
+    #:   与**那个字符**。把两者都打出来，作为"修复前确实会崩"的证据。
+    m = re.search(r"UnicodeEncodeError: '([\w-]+)' codec can't encode character "
+                  r"'([^']*)'", out_bad)
+    if rc_bad == 0:
+        print("    （注意：本机没能复现对照组的崩溃 ⇒ 机制由 ① 的注入断言钉住；"
+              f"观测：rc=0 out={out_ok[:80]!r}）")
+    else:
+        assert m, f"对照组崩了但不是编码错（那就不是这条判据要测的机制）：{out_bad[:300]}"
+        codec, ch = m.group(1), m.group(2)
+        print(f"    （对照组**复现**了用户的病：codec={codec!r} 字符={ch!r} "
+              f"⇒ 不注入时 `print` 这一步就崩）")
+        assert codec.lower() != "utf-8", m.group(0)
+        assert "26a0" in ch.lower() or ch == "\u26a0", m.group(0)
+        # 对照组自报的编码也该是 gbk（把"现场"钉住，而不是只钉错误字符串）
+        assert "[enc] gbk" in out_bad, out_bad[:200]
+
+    # ④ ⭐ **stderr 也要被 reconfigure**（只配 stdout = 只修一半）
+    #    直接验 `app_entry.main`：把两个流都换成 cp936 的包装，跑一次 `--help`
+    #    （不开服务、立刻返回）⇒ 两个流的编码都必须变成 utf-8。
+    import io
+
+    import app_entry
+    real_out, real_err = sys.stdout, sys.stderr
+    mine_out = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
+    mine_err = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
+    try:
+        sys.stdout, sys.stderr = mine_out, mine_err
+        assert app_entry.main(["--help"]) == 0
+        assert str(sys.stdout.encoding).lower().startswith("utf-8"), sys.stdout.encoding
+        assert str(sys.stderr.encoding).lower().startswith("utf-8"), (
+            f"stderr 没被 reconfigure（cp936 下 `print(…, file=sys.stderr)` 仍会崩）："
+            f"{sys.stderr.encoding}")
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
 
 
 def test_launcher_await_authority_rejects_stale_port_file():

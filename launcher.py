@@ -4,7 +4,7 @@
 心智模型（见 内部记录（未随仓发布，存档在仓外））：
 
 - **本地 GUI 模式**：纯本地软件（``app_entry.py --gui``），写权在人，不起任何端点。
-- **AI 模式**：headless 权威（``app_entry.py --authority``，写权自动落 AI）
+- **AI 模式**：headless 权威（``app_entry.py --mcp``，写权自动落 AI）
   + dsh 前台（AI 界面 + 驾驶舱监控面板）。
 
 看门人常驻（无窗口，日志进本控制台），职责：
@@ -78,6 +78,14 @@ DSH_PLUGIN_BUNDLE = HERE / "dsh" / "lib" / "index.mjs"
 DSH_SRC_DIR = HERE / "dsh" / "src"
 #: 面板插件目录（node_modules / package.json 都在这）。
 DSH_DIR = HERE / "dsh"
+#: **AI 可读数据目录的授权清单**（人类侧配置，一行一个绝对路径；`#` 开头为注释）。
+#: 存在则逐行转成 ``--dataset-roots`` 传给权威；不存在 = 维持原行为
+#: （不声明任何数据根 ⇒ 文件型数据源 fail closed）。
+#: 为什么要这个文件：``--dataset-roots`` 此前只能加在 ``app_entry.py`` 的命令行上，
+#: 而 AI 模式下权威是看门人 spawn 的（``python app_entry.py --mcp``，不带任何
+#: 参数）⇒ **没有任何可用的授权入口**，AI 既读不了 HDF5 逐行负载，也读不了 csv。
+#: 这是**授权入口**，不是放宽判据：文件由人类写、看门人只读、权威照旧 fail closed。
+DATASET_ROOTS_FILE = HERE / "dataset_roots.txt"
 
 GUI, AI = "gui", "ai"
 
@@ -115,8 +123,67 @@ def _log(msg: str) -> None:
 
 # ---------------------------------------------------------------- 进程组
 def _spawn(cmd, env=None) -> subprocess.Popen:
-    """起一个子进程，输出继承本控制台（权威日志/dsh 进度可见）。"""
-    return subprocess.Popen(cmd, cwd=str(HERE), creationflags=_FLAGS, env=env)
+    """起一个子进程，输出继承本控制台（权威日志/dsh 进度可见）。
+
+    ⭐ **强制 `PYTHONIOENCODING=utf-8`**（2026-10-07，A7② 的修法）：
+    在此之前，"子进程的 stdio 是 UTF-8"这件事**全靠运气**——
+    - `app_entry.main()` 会把 **stdout** reconfigure 成 utf-8
+      （但只配 stdout、且只有走到 `main()` 才发生）；
+    - `PYTHONIOENCODING` **从来不设**（实测 `env_pyioencoding_unset`）。
+
+    ⇒ 一旦子进程的 stdout 不是真控制台（重定向到文件/被上层按管道捕获），
+    编码就退回 **cp936**：网络代码里一句 `print("⚠ …")` 会抛
+    `UnicodeEncodeError`，**让整个后台任务崩掉**（用户实测；本机复现：探针脚本
+    当场死在 `'\u26a0'` 上）。⇒ 在这里**统一注入**，把"偶然"改成"强制"。
+    ⚠ 用 `setdefault`：调用方显式给的编码优先（判据要能构造"不注入"的对照组）。
+    """
+    child_env = dict(env if env is not None else os.environ)
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    return subprocess.Popen(cmd, cwd=str(HERE), creationflags=_FLAGS,
+                            env=child_env)
+
+
+def _dataset_roots_argv() -> list:
+    """读 ``dataset_roots.txt`` → ``["--dataset-roots", <绝对路径>, …]``。
+
+    不存在/读不出/全是注释 ⇒ 回空列表（**维持 fail closed**，不猜任何默认根）。
+    相对路径按本文件所在目录解析后取绝对路径——权威的校验是"resolve 后必须在
+    允许根之下"，交相对路径会随 cwd 漂移。
+
+    ⚠ **每个路径都要带一次旗标**：`app_entry.py` 那边是
+    ``action="append"``（一个 ``--dataset-roots`` 配一个值）。
+    实测教训：这个函数曾经只回**路径**（没有旗标），而调用方直接
+    ``[PY, APP, "--mcp", *roots]`` ⇒ argparse 收到一个裸参数
+    ⇒ `unrecognized arguments` ⇒ **权威 exit=2 ⇒ 看门人 exit=1**，
+    现象就是"改完打不开了"。而且它只在**真的存在 dataset_roots.txt** 时发作
+    （空清单 ⇒ `*roots` 什么都没加 ⇒ 一切正常），所以"手动跑一下"很容易看着没问题。
+    """
+    if not DATASET_ROOTS_FILE.is_file():
+        return []
+    try:
+        text = DATASET_ROOTS_FILE.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = DATASET_ROOTS_FILE.read_text(encoding="gbk")
+        except OSError:
+            return []
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(os.path.expandvars(os.path.expanduser(line)))
+        if not p.is_absolute():
+            p = HERE / p
+        out += ["--dataset-roots", str(p.resolve())]
+    return out
+
+
+def _dataset_roots_paths(argv: list) -> list:
+    """从 `_dataset_roots_argv()` 的结果里取出**路径**（日志用，跳过旗标）。"""
+    return [str(a) for i, a in enumerate(argv) if i % 2 == 1]
 
 
 def start_group(mode: str):
@@ -127,7 +194,11 @@ def start_group(mode: str):
     """
     if mode == GUI:
         return [_spawn([PY, APP, "--gui"])], 0, {}
-    authority = _spawn([PY, APP, "--authority"])
+    roots = _dataset_roots_argv()
+    if roots:
+        _log("数据根授权：%s（来自 %s）"
+             % (", ".join(_dataset_roots_paths(roots)), DATASET_ROOTS_FILE.name))
+    authority = _spawn([PY, APP, "--mcp", *roots])
     ok, port, reason = await_authority(authority, MCP_PORT_PATH)
     if not ok:
         # 不静默降级：权威没就绪就不起 dsh，并把原因说清楚（D13 第 3 条）。
@@ -664,11 +735,15 @@ def start_console_listener():
 
 # ---------------------------------------------------------------- 主循环
 def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, OSError):
-            pass
+    # ⚠ **stdout 与 stderr 都要配**（A7②）：只配 stdout 时，一句 `print(…, file=sys.stderr)`
+    #   或一条 warning 仍会在 cp936 控制台上抛 `UnicodeEncodeError`（`panel_web.py`
+    #   就是两个都配的——这里跟上，别只修一半）。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
     # 单实例：同 root 已有活看门人就拒绝（陈旧锁自动接管）。
     if not acquire_singleton():
         return 2
@@ -700,7 +775,7 @@ def _run() -> int:
     except Exception as exc:                            # noqa: BLE001 - Qt 起不来也要说清楚
         _log("⚠ 模式弹窗起不来（%s）。" % exc)
         _log("  绕过办法：python app_entry.py --gui（本地 GUI 模式）"
-             "或 python app_entry.py --authority（AI 模式的权威，dsh 另起）。")
+             "或 python app_entry.py --mcp（AI 模式的权威，dsh 另起）。")
         return 1
     if mode is None:
         _log("未选模式，退出。")
