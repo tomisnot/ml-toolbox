@@ -9,7 +9,8 @@
 | `ready.port_file` 与 `runtime.MCP_PORT_FILE` 一致 | 两处各写一个字面量 ⇒ **改了名字会分叉**，而现象是"永远不就绪" |
 | ⭐ 两条腿的 `ML_TOOLBOX_RUNS` 相同 | 不一致 ⇒ 切手动后看到**另一份 runs**，现象是"切了但看着是空的"，**且没有任何报错** |
 | ⭐ `dataset_roots` 解析保真 | 那段逻辑从旧 launcher 搬来，**行为一旦漂移**，现象是"AI 读不到数据"或"能读不该读的" |
-| `manual` 与 svc 同 `data_root` | 换腿的定义是"同一份账、同一个写租约根"；不同根就不是换腿 |
+| ⚠ 三层架构换代：`manual` **已删** | "切手动"不再是另一条要 spawn 的腿，而是**写权切换**（`Mode`）；窗口开在**软件进程内** ⇒ 不需要再判"两条腿同源" |
+| `has_gui` / `initial_mode` 在 | 新架构下"有没有人操作的面"与"初始写权"的**表达** |
 
 ⚠ **parity 用内嵌期望值**，**不 import 旧 `launcher`** —— 那个文件是**要被删掉的**
 （设计文档 §7.4）⇒ 判据不能依赖它，否则删它的那天判据一起塌。
@@ -69,43 +70,41 @@ def test_ready_port_file_matches_runtime_constant():
 
 # ============================================================ ⭐ 两条腿看同一份账
 
-def test_both_legs_pin_the_same_runs_root():
-    """⭐ svc 与 manual 的 `ML_TOOLBOX_RUNS` 必须**指向同一处**。
+def test_runs_root_is_still_pinned_by_the_software_itself():
+    """`ML_TOOLBOX_RUNS` 仍**由软件自己钉死**（换代后语义变了，但这条不能丢）。
 
-    ⚠ 这条是"**切了但看着是空的**"的**唯一防线**：
-    `runs/` 的根由该环境变量开关（`ml_toolbox/core/runs.py`）。
-    若两腿不一致（或哪条腿没继承），换腿后 GUI 会渲染**另一份** runs ——
-    **没有报错、没有异常**，人只会觉得"我的运行记录没了"。
+    ⚠ 旧判据是"svc 与 manual **两条腿**必须指向同一处" —— 那是防止
+    "切手动后看到另一份 runs"。**新架构下不需要它了**：GUI 是**软件进程内的窗口**，
+    与软件天然共享同一份状态（公理 A1）⇒ 那个失败模式**结构上不存在**。
+
+    但 `ML_TOOLBOX_RUNS` **这条钉死本身仍必须留**：它决定 `runs/` 落在哪
+    （`core/runs.py`），若留给继承，软件进程会读到**别处**的一份 ⇒ 现象是
+    "我的运行记录没了"、**且无任何报错**。
     """
     from ml_mecha.mecha_site import SITE
 
     svc = [s for s in SITE.services if s.id == "ML"][0]
-    assert svc.manual is not None, "本项目声明了 human adapter（切手动要起它）"
-
-    a = svc.env.get("ML_TOOLBOX_RUNS")
-    b = svc.manual.env.get("ML_TOOLBOX_RUNS")
-    assert a, "svc 没钉死 ML_TOOLBOX_RUNS（不许留给继承）"
-    assert b, "manual 没钉死 ML_TOOLBOX_RUNS（不许留给继承）"
-    assert Path(a).resolve() == Path(b).resolve(), (
-        f"两条腿的 runs 根不同：{a!r} vs {b!r} ⇒ 换腿后会看到另一份 runs")
+    runs = svc.env.get("ML_TOOLBOX_RUNS")
+    assert runs, "没钉死 ML_TOOLBOX_RUNS（不许留给继承）"
+    assert Path(runs).is_absolute(), f"必须是绝对路径：{runs!r}"
 
 
-def test_both_legs_share_the_same_data_root():
-    """换腿的定义：**同一份账、同一个写租约根**，只换操作者。
+def test_manual_is_gone_and_new_fields_are_in_place():
+    """⭐ 换代断言：`manual` **不许回来**；`has_gui` / `initial_mode` **必须在**。
 
-    ⚠ 框架也会校验这条（`site.py::Service.validate`）—— 这里再钉一次，
-    因为它是**语义**要求，而不是格式要求。
+    ⚠ 为什么把"`manual` 不存在"也写成判据：**旧形态是"要 spawn 的进程"**，
+    而它一旦回来，就会重新出现"两条腿各持一个写宿主"的那套问题
+    （框架侧已删该字段 ⇒ 传它会 `TypeError`，这里在**声明层**再钉一次）。
     """
     from ml_mecha.mecha_site import SITE
 
     svc = [s for s in SITE.services if s.id == "ML"][0]
-    assert svc.manual is not None
-    assert Path(svc.manual.data_root) == Path(svc.data_root)
-    assert svc.manual.id == f"{svc.id}:manual", (
-        "约定 id 形如 <svc_id>:manual ⇒ 换腿时能机械认出这对腿")
+    assert not hasattr(svc, "manual"), "`manual` 已被三层架构删除，不许回来"
+    assert svc.has_gui is True, "ML 有 PyQt5 窗口 ⇒ has_gui 必须为 True"
+    #: ⚠ 比 `.value`：`Mode` 是 `str` 枚举，`str(Mode.AI)` 是 `'Mode.AI'` 不是 `'ai'`
+    assert getattr(svc.initial_mode, "value", None) == "ai", (
+        f"initial_mode 应为 AI（从 mecha 启动永远 AI 组）：{svc.initial_mode!r}")
 
-
-# ============================================================ ⭐ dataset_roots 保真
 
 #: ⭐ **在旧实现还在时逐项对拍出来的期望值**（12 用例 + GBK 兜底）。
 #: ⚠ 这些期望值**故意内嵌**，不 import 旧 `launcher`（它要被删）。
@@ -198,18 +197,17 @@ def test_ready_declares_any_http_response_with_reason():
     assert svc.ready.probe and "/mcp" in svc.ready.probe, svc.ready.probe
 
 
-def test_manual_ready_is_honestly_absent():
-    """human adapter 的 `ready` 必须**如实为 None**（今天没有可探信号）。
+def test_initial_mode_is_declared_and_the_gap_is_recorded():
+    """`initial_mode` 已声明，且**声明与实现之间那段缺口**被如实记下（不是假装已接上）。
 
-    ⚠ GUI 不监听端口、不写端口文件、不握手（全仓 grep 零命中）
-    ⇒ "窗口可用"这件事**今天判不了**。**不许编一个假判据**
-    （例如"进程活着就算窗口好用了"）—— 见设计文档 §5.3.1。
+    ⚠ ML 的软件进程（`--mcp`）**今天还没有门** —— `--mcp` 侧有门，而 GUI 从不经 mecha
+    ⇒ 框架注入的 `MECHA_INITIAL_MODE` **今天没有消费者**。
+    ⇒ 这条判据钉的是"**缺口被写下来**"，而不是"它已经生效"：
+    假装生效比不生效更坏（下一个人会照着它推理）。
     """
-    from ml_mecha.mecha_site import SITE
+    from ml_mecha import mecha_site
 
-    svc = [s for s in SITE.services if s.id == "ML"][0]
-    assert svc.manual is not None
-    assert svc.manual.ready is None, (
-        "GUI 没有可探信号 ⇒ ready 必须是 None（起完即算就绪），不要编判据")
-    assert svc.manual.stop_timeout >= 15.0, (
-        "Qt 事件循环需要时间正常退出；强杀会让 finally 不跑（A7/A56 的同类教训）")
+    src = Path(mecha_site.__file__).read_text(encoding="utf-8")
+    assert "MECHA_INITIAL_MODE" in src, "声明里要写明框架会用这个变量送值"
+    assert "缺口" in src or "已知" in src, (
+        "必须**如实记下**『声明了但软件进程还没消费它』这段缺口，不许假装已接上")

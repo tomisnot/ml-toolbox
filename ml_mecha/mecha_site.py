@@ -10,26 +10,53 @@ mecha 的 supervisor 按约定发现本文件（模块级 ``SITE``）并把声�
 唯一允许的"计算"是下面那段**读 ``dataset_roots.txt``**（那是宿主策略的内容，
 按设计文档 §5.5(3) 归项目所有）。
 
+## ⚠ 三层架构换代（2026-10-08）：``manual`` 已删，别再往回加
+
+本声明**曾经**把"切手动"建成 ``Service.manual: ChildSpec``（**要 spawn 的进程**）。
+三层架构（``docs/v2/软件-交互-写权-三层架构.md`` §3 裁决 1 / §6）**推翻了它**：
+
+| 旧说法（已废） | 定论 |
+|---|---|
+| 人那条腿是 ``manual: ChildSpec``（要 spawn 的进程） | ⭐ **错** —— 它是**软件进程内的一个窗口** |
+| "切手动 = 换腿（停一条起一条）" | ⭐ **切手动 = 只切写权**（``Mode``）；不动进程、不动连接、不动状态 |
+
+⇒ 那条腿现在由两个**声明**表达：``has_gui``（面板据此决定显不显示"切到手动"）
+与 ``initial_mode``（启动者声明的初始写权）。**判定依据是"窗口在软件进程内"，
+所以它根本不是 supervisor 的 child** —— 写在这里只会逼 supervisor 去 spawn 一个
+它不该管的东西。
+
 ## 为什么每一行是现在这样（改之前先读）
 
 | 声明 | 依据 |
 |---|---|
 | ``ready.port_file = ".mcp-port"`` | 与 ``ml_mecha/runtime.py`` 的 ``MCP_PORT_FILE`` **同一个名字**（跨语言单一事实：dsh 插件也读它） |
 | ``ready.ok_codes = ()`` | ⚠ 见下方 `_READY_ANY_RESPONSE` 的说明 —— 实测 `GET /mcp` 回 **406** |
-| ``env["ML_TOOLBOX_RUNS"]`` | ⚠ **必须显式钉死**：它是 ``runs/`` 的唯一开关（``core/runs.py``），两条腿若不一致，切手动后会看到**另一份** runs（"切了但看着是空的"） |
+| ``has_gui = True`` | ML 有 PyQt5 窗口（``app.py`` → ``ml_toolbox/ui/main_window.py``）⇒ 面板**该**显示"切到手动" |
+| ``initial_mode = Mode.AI`` | 从 mecha 启动 = **永远是 AI 组**；启动者（人）即声明"我起它就是要用"（理由与保留一并写在下面） |
+| ``env["ML_TOOLBOX_RUNS"]`` | ⚠ **必须显式钉死**：它是 ``runs/`` 的唯一开关（``core/runs.py``）⇒ 不许留给继承（§5.6 环境变量陷阱） |
 | ``env["PYTHONIOENCODING"] = ""`` | 让 supervisor 的 ``setdefault("utf-8")`` 生效（见下方说明） |
 | ``DSHSpec.env["MLTB_ML_ROOT"]`` | 它是 **dsh 插件**读的数据根（``dsh/src/index.ts:56``），不是 Python 侧读的 |
-| ``manual.stop_timeout = 20.0`` | GUI 是 Qt 事件循环；强杀会让 ``finally`` 不跑（A7/A56 的同类教训），给足时间正常退出 |
-| ``manual.ready`` 只能判存活 | ⚠ GUI **没有任何可探信号**（无端口文件、无握手）⇒ 如实声明，不编假判据 |
 
 ## 三处"不许静默"的底线
 
 1. **`dataset_roots` 搬迁要保真**：下面 ``dataset_roots()`` 的行为与旧
    ``launcher._dataset_roots_argv`` **逐项等价**（判据里直接对拍）——
    尤其是"**每个路径带一次旗标**"那条（曾经不带旗标 ⇒ 权威 exit=2 ⇒ 打不开）。
-2. **`runs/` 两腿同源**：svc 与 manual 都由 supervisor 注同一个 ``ML_TOOLBOX_RUNS``。
+2. **`runs/` 根不许留给继承**：``ML_TOOLBOX_RUNS`` 由本项目显式钉死
+   （三层架构下"两条腿"已不是两个进程，但**软件进程与 GUI 内窗口仍必须看同一份**
+   —— 窗口如果自己另算一遍 runs 根，人看到的就是另一份）。
 3. **`ok_codes=()`` 不许滥用**：它表达的是"**有 HTTP 响应即证明服务在听**"，
    不是"错误码无所谓"。
+
+## Known Limitations and Deferred Work
+
+- ⚠ **`initial_mode` 只是声明：ML 的软件进程今天还没有读它。**
+  框架按 §5.1 用环境变量 ``MECHA_INITIAL_MODE`` 把值**送**到软件进程，
+  而"**应用**它是软件的事"（§5.1 明写：闸门在软件进程内）。
+  今天 ``app_entry.py`` 走的是 ``--no-open-gate`` 那条**旧**口径（见该文件），
+  **不读** ``MECHA_INITIAL_MODE`` ⇒ 声明与实现之间有一段**已知缺口**，
+  由三层架构的**项目义务 3**（写权闸门在软件进程内）在后续步骤补。
+  在那之前这里声明的是**策略意图**，不是"已经接好"。
 """
 
 from __future__ import annotations
@@ -38,6 +65,7 @@ import os
 import sys
 from pathlib import Path
 
+from mecha.authority import Mode
 from mecha.site import DSHSpec, ReadySpec, Service, Site
 
 #: 本仓根（声明文件位于 ``ml_mecha/`` 下一层 ⇒ 上跳一层）。
@@ -127,40 +155,6 @@ _RUNS_ENV = {"ML_TOOLBOX_RUNS": str((_SITE_ROOT / "runs").resolve())}
 _NO_CODEC = {"PYTHONIOENCODING": ""}
 
 
-def _manual_child():
-    """human adapter 的 ``ChildSpec``（"切手动"要起的那个 child）。
-
-    ⚠ **为什么只能是"存活"这一档**（不是偷懒）：
-    GUI 的最后一步就是 ``win.show(); app.exec_()``（``app.py``）——
-    它**不监听端口、不写端口文件、不握手**（全仓 grep
-    ``QLocalServer|QLocalSocket|socket|http.server`` 在 UI 层零命中）。
-    ⇒ **今天没有任何可探信号**。能诚实做到的只有"进程还活着且一段时间没退出"。
-    ⇒ ⚠ **判不了"窗口真的可用"**（Qt 可能在缺字体/插件/无显示时窗口空白而不崩）。
-      真要 ``ready`` 就得让 GUI 侧加一条**显式握手**（写标记文件或起 QLocalServer），
-      那是第二段的事，见设计文档 §5.3.1。
-
-    ⚠ 本轮**不实现**换腿本身（那是步骤 3）：这里只声明，让框架知道"这条腿存在、
-    怎么起、怎么收"。``id`` 必须是 ``<svc_id>:manual``（框架会校验）。
-    """
-    from mecha.supervise import ChildSpec
-
-    return ChildSpec(
-        id="ML:manual",
-        argv=(_PY, "app_entry.py", "--gui"),
-        cwd=_SITE_ROOT,
-        env={**_RUNS_ENV, **_NO_CODEC},
-        # ⚠ **必须与 svc 的 data_root 相同**（框架会校验）：换腿的定义就是
-        # "同一份账、同一个写租约根，只换操作者" —— 不同的根就不是换腿，是另一个实例了。
-        data_root=_SITE_ROOT,
-        # ⚠ 不是 ReadySpec(...)：见上面"只能判存活"。`ready=None` ⇒ 起完即算就绪，
-        # 若进程当场崩，supervisor 仍能从退出码看出（`state()` 里有 exit_code）。
-        ready=None,
-        # GUI 自然退出**不该**触发整组收尾（它不是这个站点的"主心骨"）。
-        significant=False,
-        # Qt 事件循环要时间；强杀会让 finally 不跑（A7/A56 的同类教训）。
-        stop_timeout=20.0,
-    )
-
 
 SITE = Site(
     name="ML Toolbox",
@@ -180,9 +174,16 @@ SITE = Site(
             ),
             #: 写租约根 = 本仓根（每个软件各自持自己的；**不跨软件共享**）。
             data_root=_SITE_ROOT,
-            #: ⭐ human adapter（"接手动"要起的那条腿）。与本体**互斥**：
-            #: 同一 ``data_root`` 同一时刻只能一个写宿主（框架的写租约是 OS 级独占锁）。
-            manual=_manual_child(),
+            #: ⭐ 三层架构：**"切手动"不是另一条要 spawn 的腿**，而是**写权切换**
+            #: （``Mode``）—— 窗口开在**本进程内**（旧文的 ``manual: ChildSpec`` 已删，
+            #: 那条路会被判据 ⑬ 当场 ``TypeError``）。
+            #: ``has_gui`` 只回答"**本项目有没有人操作的那个窗口**"（面板据此显示按钮）。
+            has_gui=True,
+            #: ⭐ 启动者（人）声明的初始写权。⚠ 从 mecha 启动 = **永远是 AI 组**。
+            #: ⚠ 但 ML 的软件进程**今天还没有门**（``--mcp`` 侧有门，而 GUI 从不经 mecha）
+            #: ⇒ 这里声明 AI 是**意图**；「应用它」在软件侧（读 ``MECHA_INITIAL_MODE``）——
+            #: 那一段是**已知缺口**，见本文件顶部说明。
+            initial_mode=Mode.AI,
             env={**_RUNS_ENV, **_NO_CODEC},
         ),
     ),
