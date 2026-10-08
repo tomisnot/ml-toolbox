@@ -11,6 +11,9 @@ dist/
 # 实验记录（本地资产，不入库）
 runs/
 
+# AI 数据根授权清单（本机路径，不入库；模板见 docs/交付说明.md）
+dataset_roots.txt
+
 # UI 截图自查临时产物
 checks/shots/
 
@@ -52,3 +55,7 @@ runtime/
 .vscode/
 # Trae IDE 的文档目录（AI 编辑器的过程产物；曾入库现已不在树）
 .trae/
+
+# 统一启动器的运行期产物（pid / 日志）：每台机器各自生成，不入库。
+# ⚠ 由框架 `mecha/launch.py` 写在「启动时的 cwd」下；含本机 pid。
+_mecha_runtime/
