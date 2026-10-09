@@ -180,9 +180,12 @@ def test_without_the_flag_open_surface_fails_loudly():
 
 # ============================================================ ⑥
 def test_control_ops_are_not_on_the_ai_capability_surface():
-    """⭐ AI 的能力面上**看不到**那两个控制操作（防线=地址只给框架）。
+    """⭐ AI 的能力面上**没有**那两个**改**写权的操作（防线=地址只给框架）。
 
     ⚠ 靠"没人告诉 AI 那个地址"是**薄**的；这条把"真没漏进工具表"钉住。
+    ⚠ **只读自省 `read_write_authority` 例外**：设计 §7.1.1 定案它要在**三处**
+    都出现（能力面 / 控制端点 / 聚合端点）——AI 写被拒后要能**自查**
+    （见 `tests/test_authority_read.py`）。这里只拦"**能改**"的那两个。
     """
     import asyncio
 
@@ -201,10 +204,12 @@ def test_control_ops_are_not_on_the_ai_capability_surface():
                     return sorted(t.name for t in (await session.list_tools()).tools)
 
         got = asyncio.run(asyncio.wait_for(names(), timeout=_TIMEOUT))
-        for banned in ("set_write_authority", "open_manual_surface",
-                       "read_write_authority"):
+        for banned in ("set_write_authority", "open_manual_surface"):
             assert banned not in got, (
-                f"控制操作 {banned!r} 漏进了 AI 的能力面：{got}")
+                f"**改**写权的操作 {banned!r} 漏进了 AI 的能力面 ⇒ AI 能给自己解锁：{got}")
+        #: 对偶（防止把"只读自省也要拦"误当成纪律）：只读那一件**必须在**
+        assert "read_write_authority" in got, (
+            f"只读自省不在能力面上 ⇒ AI 被拒后无法自查：{got}")
 
 
 # ============================================================ ⑦

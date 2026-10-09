@@ -59,9 +59,14 @@ TOOL_NAMES = ("cancel_run", "checkpoint_detail", "clear_current_state",
               "compare_methods", "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
-              "eval_custom", "prepare_dataset", "read_job", "run_custom",
-              "run_method", "run_method_batch", "run_queries", "set_job_limit",
-              "submit_run")
+              "eval_custom", "prepare_dataset", "read_job", "read_write_authority",
+              "run_custom", "run_method", "run_method_batch", "run_queries",
+              "set_job_limit", "submit_run")
+
+#: ⚠ **框架注册进来**的工具名（文案在框架仓，ML 无权改）⇒ 词表扫描豁免它们。
+#: 现状只有 `read_write_authority`（`mecha.authority.register_authority_read`）。
+#: ⚠ **逐个列出**，不用"放过所有外来工具"那种松口径；判据会自证它们真在表里。
+_FRAMEWORK_OWNED_TOOLS = ("read_write_authority",)
 
 
 # ---------------------------------------------------------------- 夹具
@@ -113,7 +118,10 @@ def _prepared(app):
 def test_tool_projection_is_read_only_capable(app):
     """工具面：命名合法、白名单投影、read 工具在 LOCKED 下可用。"""
     names = [t["name"] for t in app.tools.schemas()]
-    assert names == sorted(TOOL_NAMES), names
+    #: ⚠ 比**集合**不比顺序：`TOOL_NAMES` 是"有哪些工具"的声明，
+    #: 而注册表按名排序（`schemas()` 亦然）——两者的**顺序口径不同**，
+    #: 拿顺序去比会把"加了工具忘了重排"当成失败（那是假红）。
+    assert sorted(names) == sorted(TOOL_NAMES), names
     for name in names:
         check_tool_name(name)            # 命名律：动词_宾语，无 get_/list_/mecha_
         assert not name.startswith(("get_", "list_", "mecha_"))
@@ -1660,6 +1668,14 @@ def test_tool_descriptions_carry_no_implementation_words(app):
 
     本判据从两侧钉：① 装配期用的是非空词表；② 线上每一条描述都不含表里的词
     （即使有人绕过装配点加了工具，这里也会红）。
+
+    ⚠ **豁免：框架注册进来的那一个**（`read_write_authority`）——
+    它是**框架的机制**（`mecha.authority.register_authority_read`），文案**在框架仓**，
+    ML **无权改也不该改**（改了就是"各家自己抄一遍机制"）。它的描述里天然有
+    "写权"（那是**领域词**：这条工具的职责**就是**报告写权归属）。
+    ⇒ 豁免**逐个工具名**列出（不是"放过所有外来工具"那种松口径），
+    见下面的 `_FRAMEWORK_OWNED_TOOLS`；且断言它**确实在**表里
+    （防"豁免写了个不存在的名字"这种哑配置）。
     """
     from ml_mecha.tools import BANNED_WORDS
     assert BANNED_WORDS, "词表是空的 ⇒ 这条纪律等于没启用"
@@ -1667,11 +1683,18 @@ def test_tool_descriptions_carry_no_implementation_words(app):
     assert schemas, "没有工具面"
     offenders = []
     for s in schemas:
+        if s["name"] in _FRAMEWORK_OWNED_TOOLS:
+            continue
         low = s["description"].lower()
         for w in BANNED_WORDS:
             if w.lower() in low:
                 offenders.append((s["name"], w))
     assert not offenders, f"描述里出现实现词汇：{offenders}"
+
+    #: R16 自证：豁免名单里的名字**真的在**线上工具表里（否则那条豁免是空转的）
+    online = {s["name"] for s in schemas}
+    missing = [n for n in _FRAMEWORK_OWNED_TOOLS if n not in online]
+    assert missing == [], f"豁免名单里有不存在的工具（哑配置）：{missing}"
 
 
 def test_blank_run_id_finds_the_latest_run_with_observations(app):
@@ -2346,6 +2369,274 @@ def test_approval_channel_is_injected_into_invoke(app):
         "审批通道没接到 invoke ⇒ 将来声明 approval_required=True 的命令会因"
         "「没接通道」被 fail closed 拒（那是设计，但会让声明者以为闸坏了）")
     assert seen.get("gate") is app.software.gate, seen
+
+
+def test_job_stdout_is_readable_and_still_reaches_the_console(app):
+    """⭐⭐ 服务端 `print` 可读（用户实测 A5）：`read_job.logs_tail`，且**仍然透传**。
+
+    用户原话：网络代码里的 `print("[resume] …")` / `print("[snap] …")` 是重要的运行时
+    诊断（证明续训/快照真的生效），但他**没有任何工具能读后台任务的 stdout**，
+    只能靠 `run_id` + 指标**反推**一个布尔事实。
+
+    ⚠ **两条必须一起钉**（缺一条都会走向一个坏结局）：
+    - 只钉"能读到" ⇒ 有人会用 `redirect_stdout` **只**收进缓冲（= 把 print 从
+      人的视野里删掉，而"控制台是给人看的"正是我们要保的）；
+    - 只钉"能打印" ⇒ 回到那个缺口本身。
+
+    ⚠ 还要钉**非 ASCII**：`⚠` 在 GBK 控制台上会让 print 抛 `UnicodeEncodeError`
+    （A42/A7②）—— 日志设施**不许**因为这个把 job 或自己搞崩。
+    """
+    import io
+    import sys as _sys
+
+    from ml_mecha import job_logs
+
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+    net = '''
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        print("[net] build ok \\u26a0 non-ascii")      # stdout + 非 ASCII
+        import sys
+        print("[net] stderr line", file=sys.stderr)     # stderr 也要能读
+        return nn.Sequential(nn.Linear(n_in, 4), nn.ReLU(), nn.Linear(4, n_out))
+'''
+    real_out, real_err = _sys.stdout, _sys.stderr
+    spy = io.StringIO()
+    job_logs.uninstall()
+    _sys.stdout = spy                     # "真流"换成记录型替身：用来验**透传**
+    tail, logs_n, spy_text = [], 0, ""
+    try:
+        job_logs.install()                # tee 装在 spy 之外 ⇒ 透传目标 = spy
+        job = app.submit({"command": "run_custom", "code": net,
+                          "dataset_id": dataset_id, "name": "logs",
+                          "overrides": {"epochs": 2, "batch": 4}}, side="ai")
+        status = app.wait_job(job, timeout=180.0)
+        # ⚠ 先钉 job 本身成功：否则后面"读不到日志"可能是**训练就失败了**
+        #   （那是完全不同的病，别让一条判据把两种病混成一个症状）。
+        assert status["state"] == "done", status
+        got_raw = app.tools.execute("read_job", {"job_id": job.id, "logs": 50})
+        # ⚠ 先看清 read_job 为什么失败（它的失败**本身就是可教学的**：未知句柄 /
+        #   命令层失败都会抛），别用 `["value"]` 把一个有信息量的错误盖成 KeyError。
+        assert got_raw.get("is_error") is not True, got_raw
+        got = got_raw["value"]
+        tail = list(got.get("logs_tail") or [])
+        logs_n = int(got.get("logs_n") or 0)
+        spy_text = spy.getvalue()
+    finally:
+        _sys.stdout, _sys.stderr = real_out, real_err
+        job_logs.uninstall()
+
+    text = "\n".join(tail)
+    assert any("[net] build ok" in ln for ln in tail), (
+        f"read_job 读不到服务端 stdout ⇒ 又回到'只能靠指标反推'：{tail}")
+    assert "non-ascii" in text, text                        # 非 ASCII 没被吞/没炸
+    assert any(ln.startswith("[err]") and "stderr line" in ln for ln in tail), tail
+    assert logs_n >= 2, logs_n                              # 真行数（不虚报）
+    # ⭐ **透传**：同一行也必须到了"真流"（tee 不是只收不发）
+    assert "[net] build ok" in spy_text, "tee 把 print 从控制台吞掉了（只剩缓冲）"
+    # `logs=0` 能关掉（默认给，但要能关）
+    off = app.tools.execute("read_job", {"job_id": job.id, "logs": 0})["value"]
+    assert list(off.get("logs_tail") or []) == [], off.get("logs_tail")
+    assert int(off.get("logs_n") or 0) >= 2, off.get("logs_n")
+
+
+def test_concurrent_job_logs_do_not_cross_contaminate(app):
+    """⭐⭐ **并发 job 的日志不许串台**（Q1-②）：tee 必须**按线程分桶**。
+
+    为什么这条是 A5 的**核心**判据：最省事的实现是 `contextlib.redirect_stdout`
+    —— 而它换的是**进程级** `sys.stdout`，而 job 是**线程** ⇒ 两个 job 同时跑时，
+    A 的 `print` 会出现在 **B 的** `logs_tail` 里。那种错**不会报错**、只会让人
+    读到另一份训练的日志（比"读不到"更坏：它是**假事实**）。
+
+    判据四步：
+    1. 两个 job **同时**在跑（用框架的 `started_at/finished_at` 断言区间相交，
+       不相交就**如实说明**——不然这条判据是空转的）；
+    2. 每个 job 在**每一轮**都打印自己的**唯一标记**；
+    3. 各自的 `logs_tail` 里**只有自己的标记**（对方的标记出现一次即红）；
+    4. **没有日志的 job** 要给**可教学的解释**（不然空数组会被读成"工具没这能力"）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+
+    def _net(tag):
+        return f'''
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        print("[{tag}] build")
+        return nn.Sequential(nn.Linear(n_in, 4), nn.ReLU(), nn.Linear(4, n_out))
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        print("[{tag}] step")
+        return model(x), y
+'''
+
+    jobs = {}
+    for tag in ("alpha", "beta"):
+        jobs[tag] = app.submit({"command": "run_custom", "code": _net(tag),
+                                "dataset_id": dataset_id, "name": tag,
+                                "overrides": {"epochs": 8, "batch": 2}},
+                               side="ai")
+    for tag, job in jobs.items():
+        st = app.wait_job(job, timeout=240.0)
+        assert st["state"] == "done", (tag, st)
+
+    # ① 两个 job 真的**并发**过（否则"不串台"没被考到）
+    spans = {}
+    for tag, job in jobs.items():
+        d = app.jobs.get(job.id).to_dict()
+        spans[tag] = (float(d.get("started_at") or 0.0),
+                      float(d.get("finished_at") or 0.0))
+    assert spans["alpha"][0] < spans["beta"][1] and \
+        spans["beta"][0] < spans["alpha"][1], (
+        f"两个 job 没有并发执行过（{spans}）—— 判据没考到要考的东西"
+        "（若调度上限被设成 1，它只会串行）")
+
+    # ②③ 各自只看得见自己的标记
+    for tag, other in (("alpha", "beta"), ("beta", "alpha")):
+        got = app.tools.execute("read_job", {"job_id": jobs[tag].id, "logs": 100})
+        assert got.get("is_error") is not True, got
+        lines = list((got["value"].get("logs_tail") or []))
+        assert lines, f"{tag} 一条日志都没读到：{got['value'].get('logs_note')}"
+        text = "\n".join(lines)
+        assert f"[{tag}]" in text, (tag, lines[:5])
+        assert f"[{other}]" not in text, (
+            f"❌ 串台了：{tag} 的 logs_tail 里出现了 {other} 的输出 ⇒ "
+            f"tee 不是按线程分桶（多半用了进程级的 redirect_stdout）：{lines[:8]}")
+
+    # ④ **没有日志的 job 要可教学地拒**（不是静默空数组）
+    quiet = app.submit({"command": "run_custom", "code": _MIN_NET_CODE,
+                        "dataset_id": dataset_id, "name": "quiet",
+                        "overrides": {"epochs": 1, "batch": 4}}, side="ai")
+    assert app.wait_job(quiet, timeout=180.0)["state"] == "done"
+    q = app.tools.execute("read_job", {"job_id": quiet.id})["value"]
+    assert list(q.get("logs_tail") or []) == [] and int(q.get("logs_n") or 0) == 0, q
+    assert "没有向 stdout/stderr 打印过" in (q.get("logs_note") or ""), (
+        f"空日志没给出可教学的解释（会被读成'这个工具没有日志能力'）："
+        f"{q.get('logs_note')}")
+
+
+def test_job_log_buffer_is_bounded_with_a_true_total(app):
+    """⭐⭐ tee 必须**真的有界**，且**总行数不许丢**（Q1 补强，使用者点出的风险）。
+
+    为什么这条必须单钉（不是理论洁癖，是这台机器上刚发生的）：
+    使用者那轮是**6 小时级**训练，网络代码里**每个 batch 都可能 print**；
+    而当时 **commit 内存到过 92%**，还出现过 `torch/lib/vrtc64_120_0.alt.dll …
+    or one of its dependencies`（DLL 装载失败）与 `Insufficient system resources`。
+    ⇒ **无界的 tee ⇒ 一个长训练就能把内存吃干**，而且失败会伪装成"torch 坏了"。
+
+    判据（一个 job 打印 20 000 行）：
+    1. **桶占用停在 cap**（不随输出量增长）—— 直接读 sidecar 里的桶长度；
+    2. `logs_n` = **真实总行数**（20 000），不是缓冲长度；
+    3. `logs_tail` 回的是**最后 N 行**（首尾行号对得上）；
+    4. `logs_truncated=true` + `logs_cap` 说明上限；
+    5. **顺序保序**（tee 最容易写错的地方之一：先收后拼会乱序）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    from ml_mecha import job_logs
+
+    dataset_id = _prepared(app)
+    N = 20000
+    cap = int(job_logs.MAX_LINES)
+    net = f'''
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        for i in range({N}):
+            print("[flood] line %d" % i)
+        return nn.Sequential(nn.Linear(n_in, 4), nn.ReLU(), nn.Linear(4, n_out))
+'''
+    job = app.submit({"command": "run_custom", "code": net,
+                      "dataset_id": dataset_id, "name": "flood",
+                      "overrides": {"epochs": 1, "batch": 4}}, side="ai")
+    st = app.wait_job(job, timeout=300.0)
+    assert st["state"] == "done", st
+
+    got = app.tools.execute("read_job", {"job_id": job.id, "logs": 1000})["value"]
+    tail = list(got.get("logs_tail") or [])
+    # ① 桶占用停在 cap（**不随输出量增长**）
+    sink = getattr(app.jobs.get(job.id).context, job_logs.LOG_SIDECAR)[ "sink"]
+    assert sink.size() <= cap, (sink.size(), cap)
+    assert sink.size() == cap, (
+        f"桶没被填满（{sink.size()}/{cap}）⇒ 判据没考到'有界'那件事")
+    assert sink.cap == cap, (sink.cap, cap)
+    # ② 总行数是真的（不是缓冲长度）；⚠ 给一点余量：同一线程上框架自己也可能打印
+    #    （这里实测正好 20 000 —— 余量只是为了防止未来框架加一行日志就假红）
+    assert N <= int(got["logs_n"]) <= N + 50, (got["logs_n"], N)
+    # ③ 回的是**最后** cap 行，且**保序**
+    assert len(tail) == cap, (len(tail), cap)
+    assert "line %d" % (N - 1) in tail[-1], tail[-1]
+    assert "line %d" % (N - cap) in tail[0], tail[0]
+    nums = [int(ln.split("line")[-1].split("…")[0].strip())
+            for ln in tail if "line" in ln]
+    assert nums == sorted(nums), "日志乱序了（tee 必须按写入顺序 append）"
+    # ④ 截断要显式说
+    assert got["logs_truncated"] is True, got
+    assert int(got["logs_cap"]) == cap, got
+    assert "有界" in (got.get("logs_note") or ""), got.get("logs_note")
+    # ⑤ `logs=N` 调大也**不会**超过桶容量（有界性是硬约束，不是默认值）
+    more = app.tools.execute("read_job", {"job_id": job.id, "logs": N})["value"]
+    assert len(more["logs_tail"]) == cap, len(more["logs_tail"])
+
+
+def test_native_fd_output_is_outside_logs_tail_and_note_says_so(app):
+    """⭐⭐ **fd 层输出不在 `logs_tail` 里 —— 而且空回执必须说清这一点**（Q3.5）。
+
+    为什么要单钉（这是"假事实"的另一种形态）：这台机器上最迷惑的两次失败报的都是
+    `torch/lib/vrtc64_120_0.alt.dll … or one of its dependencies` 与
+    `Insufficient system resources` —— **这类消息是 C/C++ 运行时直接写 fd 1/2 的**
+    （torch / CUDA / OpenMP / MKL），**不走 `sys.stdout`** ⇒ tee 一条都抓不到。
+    若 `logs_tail` 只回一个空数组，AI 会得出"**这个 job 什么都没打印**"，
+    而真相是**最关键的报错在 fd 层**。
+
+    判据两半：
+    1. **证明边界**：job 里 `os.write(2, b"[native] …")`（绕过 `sys.stdout`）⇒
+       `logs_tail` **里没有它**（把它钉成"已知且写明的边界"，而不是让人以为是漏抓）；
+    2. **证明它不撒谎**：空日志的 `logs_note` 必须**点名** C 层/子进程写 fd 的情形，
+       并给出**按时间对齐**的口子（`started_at`/`finished_at`）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    dataset_id = _prepared(app)
+    net = '''
+class Network:
+    def build(self, n_in, n_out, *, nn):
+        import os
+        os.write(2, b"[native] this goes straight to fd 2\\n")   # 绕过 sys.stderr
+        print("[py] this one is captured")                        # 走 sys.stderr
+        return nn.Sequential(nn.Linear(n_in, 4), nn.ReLU(), nn.Linear(4, n_out))
+'''
+    job = app.submit({"command": "run_custom", "code": net,
+                      "dataset_id": dataset_id, "name": "native",
+                      "overrides": {"epochs": 1, "batch": 4}}, side="ai")
+    assert app.wait_job(job, timeout=180.0)["state"] == "done"
+    got = app.tools.execute("read_job", {"job_id": job.id, "logs": 50})["value"]
+    text = "\n".join(got.get("logs_tail") or [])
+    # ① **边界**：Python 层抓得到，fd 层抓不到（如实钉住，别假装能抓）
+    assert "[py] this one is captured" in text, text
+    assert "[native]" not in text, (
+        "fd 层输出竟然进了 logs_tail ⇒ 要么实现变了（那就更新这条判据与文档），"
+        f"要么它其实是 Python 层写的：{text}")
+    # ② **不撒谎**：空/缺日志的说明必须点名 fd 层，并给"按时间对齐"的口子
+    quiet = app.submit({"command": "run_custom", "code": _MIN_NET_CODE,
+                        "dataset_id": dataset_id, "name": "quiet2",
+                        "overrides": {"epochs": 1, "batch": 4}}, side="ai")
+    assert app.wait_job(quiet, timeout=180.0)["state"] == "done"
+    q = app.tools.execute("read_job", {"job_id": quiet.id})["value"]
+    note = q.get("logs_note") or ""
+    assert "不代表它没报过错" in note and "fd 1/2" in note, (
+        f"空日志的说明没点明 fd 层边界 ⇒ 会被读成'这个 job 什么都没打印'：{note}")
+    # ③ 时间区间：拿它去对齐权威那段时间的原始输出（这是"无从下手"与"有口子"的区别）
+    assert q.get("started_at") and q.get("finished_at"), (q.get("started_at"),
+                                                          q.get("finished_at"))
+    assert q["started_at"][:2] == "20", q["started_at"]
 
 
 def test_no_ml_command_declares_approval_required(app):

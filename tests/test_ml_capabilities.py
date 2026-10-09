@@ -88,7 +88,15 @@ def _rows(kind: str) -> list[dict]:
 
 
 def _tool_names() -> list[str]:
-    return [tool.name for tool in build_ml_tools(MLEngine())]
+    """⚠ 从**能力清单自己**取工具名（不再拿 `build_ml_tools` 当第二份真值）。
+
+    为什么改（2026-10-09）：清单里多了**框架注册进来**的那一件
+    （`read_write_authority`，见 `ml_mecha/authority_read.py`）⇒ `build_ml_tools`
+    不再是工具名的**全集**。两边各列一份必然漂移；而下面
+    `assert sorted(tool_names) == schema_names` 才是真正有价值的对账：
+    **声明（清单）↔ 运行时注册表（ToolRegistry）**。
+    """
+    return [row["declared_name"] for row in _rows(KIND_TOOL)]
 
 
 def _write_command_names() -> set[str]:
@@ -161,10 +169,13 @@ def test_map_covers_commands_queries_tools_exactly(app):
     assert sorted(tool_names) == schema_names
     # ⚠ 2026-10-05 长任务编排（L2）：`set_job_limit` 让工具数 19→20
     #   （等待原语折进了 `read_job`，没有新增工具；调度器旋钮是新能力，没有既有入口）。
-    assert len(tool_rows) == 20
+    # ⚠ 2026-10-09 写权自省：`read_write_authority` 让工具数 20→21 ——
+    #   它是**框架**注册进本仓能力面的（`mecha.authority.register_authority_read`），
+    #   但**必须进本仓清单**，否则"声明 ↔ 注册表"对不上账（下面 :161 那条会红）。
+    assert len(tool_rows) == 21
 
-    # 19→20 之后总行数：命令 7 + 查询 9 + 工具 20 = 36（原 34）。
-    assert len(rows) == 36
+    # 21 工具之后总行数：命令 7 + 查询 9 + 工具 21 = 37（原 36）。
+    assert len(rows) == 37
 
 
 # ---------------------------------------------------------------- 2. 命令字段

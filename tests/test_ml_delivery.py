@@ -98,9 +98,9 @@ TOOL_NAMES = ("cancel_run", "checkpoint_detail", "clear_current_state",
               "compare_methods", "describe_dataset",
               "describe_method", "describe_methods", "describe_network",
               "describe_networks", "describe_run", "describe_training",
-              "eval_custom", "prepare_dataset", "read_job", "run_custom",
-              "run_method", "run_method_batch", "run_queries", "set_job_limit",
-              "submit_run")
+              "eval_custom", "prepare_dataset", "read_job", "read_write_authority",
+              "run_custom", "run_method", "run_method_batch", "run_queries",
+              "set_job_limit", "submit_run")
 
 #: 每个工具的必填项（写工具取**命令声明**，只读与 job 调度面取闭包签名）。
 EXPECTED_REQUIRED = {
@@ -131,6 +131,10 @@ EXPECTED_REQUIRED = {
     #   **在参数校验层就被拒**（实测 `1 validation error … code Field required`），
     #   而声明里的注释却写着"也可用 code_path（二选一）"——自相矛盾。
     "run_custom": [],
+    #: ⚠ **框架注册进来**的那一个（`mecha.authority.register_authority_read`）：
+    #: **零参数**（只读自省，没有旋钮）⇒ 必填与 defaulted 都是空集。
+    #: 它出现在这里是为了让本表与 `TOOL_NAMES` **逐项对齐**（少一个就红）。
+    "read_write_authority": [],
     # ⚠ `method` **不是**必填：`submit_run` 允许 `method` / `code` 二选一
     #   （给了 code 就走自定义网络）。必填项由工具自己判并给可读错误。
     "run_method": ["method"],
@@ -216,7 +220,7 @@ def _spawned_authority(root, *, open_gate: bool = True, extra_args=()):
     用监督者还顺带证明了"**框架真能起本软件**"——站点声明的 ``ReadySpec``
     在**真装配**里被消费（R10：光跑门禁不够）。
     """
-    from mecha.supervise import ChildSpec, Supervisor
+    from mecha.supervise import ChildSpec, ReadySpec, Supervisor
 
     args = list(extra_args)
     if not open_gate:
@@ -232,8 +236,17 @@ def _spawned_authority(root, *, open_gate: bool = True, extra_args=()):
     with tempfile.TemporaryDirectory(prefix="ml-delivery-logs-") as _ld:
         sup = Supervisor(log_dir=Path(_ld))
         try:
-            sup.start(ChildSpec(id="ml", argv=argv, cwd=REPO,
-                                env={"ML_TOOLBOX_RUNS": str(root / "runs")},
+            #: ⚠⚠ **`cwd` 必须 = 数据根**：框架把 `ready.port_file` 解析成
+            #: **相对 `ChildSpec.cwd`** 的路径（`supervise.py:366`）⇒ cwd 与
+            #: 子进程实际写端口文件的根（`--root`）必须是**同一个**，
+            #: 否则监督者盯着一个**永远不出现**的文件、等到超时
+            #: （现象极具误导性："端口文件仍是 spawn 前的旧值"，而子进程其实早就就绪了）。
+            sup.start(ChildSpec(id="ml", argv=argv, cwd=Path(root),
+                                #: ⚠ 显式钉死数据根：`run_mcp` 里
+                                #: `software_root_from_env()` **优先于** `--root`
+                                #: ⇒ 不钉它就可能与 cwd 分叉（§5.6 环境变量陷阱）。
+                                env={"ML_TOOLBOX_RUNS": str(root / "runs"),
+                                     "MECHA_SOFTWARE_ROOT": str(root)},
                                 ready=ready, data_root=Path(root)))
             row = next(r for r in sup.state()["children"] if r["id"] == "ml")
             assert row["state"] == "ready", (
@@ -350,7 +363,8 @@ def test_required_from_signature_and_declaration_survives():
             server = build_mcp_server(ml)
             tools = asyncio.run(server.list_tools())
             by_name = {t.name: t for t in tools}
-            assert sorted(by_name) == list(TOOL_NAMES), sorted(by_name)
+            #: ⚠ 比**集合**不比顺序（同 `test_ml_mecha` 那条的理由）。
+            assert sorted(by_name) == sorted(TOOL_NAMES), sorted(by_name)
 
             # 参数名逐字来自 schemas() 的声明（不手抄、不多不少）
             declared = {s["name"]: s["parameters"] for s in ml.tools.schemas()}
@@ -397,7 +411,7 @@ def test_mcp_wire_declares_no_output_schema():
     with tempfile.TemporaryDirectory(prefix="ml-delivery-outschema-") as td:
         with _authority(td) as (_ml, host):
             tools = _list_tools(host.url)
-            assert sorted(t.name for t in tools) == list(TOOL_NAMES)
+            assert sorted(t.name for t in tools) == sorted(TOOL_NAMES)
             offenders = [(t.name, t.output_schema) for t in tools
                          if getattr(t, "output_schema", None) is not None]
             assert not offenders, f"线上出现了 outputSchema（假契约）：{offenders}"
@@ -609,6 +623,9 @@ EXPECTED_DEFAULTED = {
     #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
     "prepare_dataset": ["diag", "name", "target", "target_kind", "time_col"],
     "read_job": ["detail", "job_id", "logs", "tail", "timeout_s", "wait", "wait_s"],
+    #: ⚠ 框架注册的那一个：**没有参数** ⇒ 没有可剥的 defaulted 键（但**必须在表里**，
+    #:   否则 `got == EXPECTED_DEFAULTED` 那条会因为"多了一个工具"而红）。
+    "read_write_authority": [],
     # ⚠ 只列**声明了非 None default** 的（`overrides`/`seed`/`resource_guard`
     #   在 `run_custom` 上是"无默认"⇒ 不进这张表，但它们仍是**可选**参数）。
     # `device` 声明了 `""` 默认 ⇒ 进表（"未给"= 空串 = auto）；
@@ -1092,7 +1109,7 @@ def test_mcp_host_exposes_every_declared_tool_over_http():
             assert host.url.endswith("/mcp"), host.url
             tools = _list_tools(host.url)
             names = sorted(t.name for t in tools)
-            assert names == list(TOOL_NAMES), names
+            assert names == sorted(TOOL_NAMES), names
             for tool in tools:
                 assert tool.description, tool.name
                 assert tool.input_schema["type"] == "object", tool.name

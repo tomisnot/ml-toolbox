@@ -77,6 +77,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mecha.assembly import build_roles
+from mecha.authority import READ_AUTHORITY_TOOL
 from mecha.errors import MechaError
 from mecha.gate import Channel
 
@@ -120,6 +121,9 @@ TABLE_HEADER = "| 能力 | 角色 | provider | 消费方 |\n|---|---|---|---|\n"
 
 #: mecha 出厂行的 source 标签（并表时用于定位"这一行是谁生成的"）。
 MECHA_SOURCE = "mecha.assembly.build_roles"
+
+#: 框架注册进本仓能力面的那一件（`read_write_authority`）的 source 标签。
+AUTHORITY_READ_SOURCE = "mecha.authority.register_authority_read"
 
 
 @dataclass(frozen=True)
@@ -271,6 +275,31 @@ def _tool_rows(core: Mapping[str, Any], engine: Any) -> list[dict[str, Any]]:
             "approval_required": bool(spec.approval_required) if spec is not None else False,
             "source": "ml_mecha.tools.build_ml_tools",
         })
+    #: ⭐ **框架注册进来的那一个工具也要进清单**（`read_write_authority`）：
+    #: 它是**框架的机制**（`mecha.authority.register_authority_read`），
+    #: 但注册在**本仓的能力面**上 ⇒ 必须出现在本仓的能力清单里，
+    #: 否则"声明 ↔ 运行时注册表"就**对不上账**（`test_ml_capabilities` 会当场红：
+    #: `assert sorted(tool_names) == schema_names`）。
+    #: ⚠ 为什么在这里显式列举而不是自动扫注册表：清单的**单一来源**是"谁声明了它"
+    #:   （本仓声明的在 `build_ml_tools`，框架声明的就是这一行）——扫注册表会把
+    #:   "有人偷偷注册了个没声明的工具"也吞进去，那正是清单要防的。
+    #: ⚠ **顺序**：清单的顺序就是"声明顺序"（本仓声明的在前，框架注册的在最后）
+    #:   ⇒ 直接追加即可，与 `test_ml_capabilities` 的逐项对账口径一致。
+    authority_row = {
+        "name": capability_name(KIND_TOOL, READ_AUTHORITY_TOOL),
+        "declared_name": READ_AUTHORITY_TOOL,
+        "kind": KIND_TOOL,
+        "role": ROLE_PROVIDER,
+        "provider": PROVIDER,
+        "consumer": _join(CONSUMERS_BY_KIND[KIND_TOOL]),
+        #: 只读自省：不改任何东西 ⇒ 无副作用、无 scope、无审批
+        "side_effect": False,
+        "scope": (),
+        "risk": RISK_READ,
+        "approval_required": False,
+        "source": AUTHORITY_READ_SOURCE,
+    }
+    rows.append(authority_row)
     return rows
 
 

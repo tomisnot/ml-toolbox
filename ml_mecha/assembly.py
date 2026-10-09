@@ -83,8 +83,10 @@ from .core_commands import core_command_specs
 from .engine import (JOB_RUN_FLAG, READ_QUERY_NAMES, RUN_COMMANDS, MLEngine,
                      clear_channel, make_state_writer, use_channel)
 from . import vram
+from . import job_logs
 from .summarizer import ml_summarizer
 from .tools import BANNED_WORDS, register_ml_tools
+from .authority_read import register_authority_read_tool
 
 #: ML adapter 的只读查询面（注册进 ``Surface``，经 ``Surface.query`` 分派）。
 #: ⚠ **不在这里另立一份字面量**：查询名、`_query_handler_map` 的键、编排入口的
@@ -448,7 +450,15 @@ class MLMecha:
                 job_spec = dict(spec)
                 if job_spec.get("command") in RUN_COMMANDS:
                     job_spec[JOB_RUN_FLAG] = True
-                receipt = self.engine.run(job_spec, context=ctx)
+                # ⭐ **服务端 stdout/stderr 可读化**（用户实测 A5）：job 是**线程**，
+                #   而 `redirect_stdout` 是**进程级** ⇒ 不能直接 redirect（并发 job 会
+                #   串台）。`job_logs.capture` 装一次进程内的 **tee**，按
+                #   `threading.get_ident()` 分桶，桶挂在 `ctx` 的 sidecar 上
+                #   ⇒ `read_job` 的 `logs_tail` 就能读到网络代码里的 `print`。
+                #   ⚠ 透传仍在（控制台照旧看到），且**日志设施永不拖垮 job**
+                #     （`capture.__exit__` 明确不吞异常，job 的失败语义一行不变）。
+                with job_logs.capture(ctx):
+                    receipt = self.engine.run(job_spec, context=ctx)
                 # ⭐ **终态不变量**（用户点名的那条）：终态必须"要么有 run、
                 #   要么有可读的失败"。挂在这里的原因与落盘兜底**同一个**：
                 #   `submit` 是后台 job 的唯一入口 ⇒ 不变量对所有命令自动生效，
@@ -727,6 +737,11 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
         #   ⚠ 此前传的是默认空表 ⇒ 纪律铺了却没启用（见 `BANNED_WORDS` 的说明）。
         register_ml_tools(software.tools, engine, actor=AI_ACTOR, side="ai",
                           host=ml, banned_words=BANNED_WORDS, codeact=codeact)
+        #: ⭐ **写权自省也注册进能力面**（设计 §7.1.1 的"三处"之①）：
+        #: 漏了它，AI 写被拒后**无法自查**、只能盲撞（而那正是最容易漏的一处）。
+        #: ⛔ `set_write_authority` / `open_manual_surface` **不给 AI**（那是改写权）。
+        #: ⚠ 机制在框架，这里只注册（`ml_mecha/authority_read.py` 说明理由）。
+        register_authority_read_tool(software.tools, software.authority)
     # ToolHost 契约的真实消费者：装配时把模型可见投影交给宿主传输面校验
     # （白名单形状不对会当场 fail loud），宿主调工具走 MLMecha.call_tool。
     software.toolhost.declare(software.tools.schemas())
