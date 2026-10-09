@@ -4,7 +4,8 @@
 ## 这个文件是什么
 
 mecha 的 supervisor 按约定发现本文件（模块级 ``SITE``）并把声明翻成进程编排。
-⇒ **本项目不再自己编排进程**（原 ``launcher.py`` 的那套是它的前身，逐步作废）。
+⇒ **本项目不再自己编排进程**（旧 ``launcher.py`` 是它的前身，**已删**；
+只有几处踩出来的坑与实测常量被抽成 ``docs/旧启动器-活知识存档.md``）。
 
 ⚠ **它是数据，不是逻辑**：不许在这里起线程、连网络、读业务状态。
 唯一允许的"计算"是下面那段**读 ``dataset_roots.txt``**（那是宿主策略的内容，
@@ -32,6 +33,7 @@ mecha 的 supervisor 按约定发现本文件（模块级 ``SITE``）并把声�
 | ``ready.port_file = ".mcp-port"`` | 与 ``ml_mecha/runtime.py`` 的 ``MCP_PORT_FILE`` **同一个名字**（跨语言单一事实：dsh 插件也读它） |
 | ``ready.ok_codes = ()`` | ⚠ 见下方 `_READY_ANY_RESPONSE` 的说明 —— 实测 `GET /mcp` 回 **406** |
 | ``has_gui = True`` | ML 有 PyQt5 窗口（``app.py`` → ``ml_toolbox/ui/main_window.py``）⇒ 面板**该**显示"切到手动" |
+| ``how_to_open`` | 面板/聚合面把它**原话**回给 AI（``mecha/aggregate.py``）⇒ 由项目给，框架不写死 |
 | ``initial_mode = Mode.AI`` | 从 mecha 启动 = **永远是 AI 组**；启动者（人）即声明"我起它就是要用"（理由与保留一并写在下面） |
 | ``env["ML_TOOLBOX_RUNS"]`` | ⚠ **必须显式钉死**：它是 ``runs/`` 的唯一开关（``core/runs.py``）⇒ 不许留给继承（§5.6 环境变量陷阱） |
 | ``env["PYTHONIOENCODING"] = ""`` | 让 supervisor 的 ``setdefault("utf-8")`` 生效（见下方说明） |
@@ -74,19 +76,21 @@ _SITE_ROOT = Path(__file__).resolve().parent.parent
 #: ``dataset_roots.txt`` 的位置（人写的白名单；内容是本机绝对路径，不入库）。
 _DATASET_ROOTS_FILE = _SITE_ROOT / "dataset_roots.txt"
 
-#: 解释器：用**当前解释器**，与旧 launcher 的 ``PY = sys.executable`` 同源
-#: （用别的 python 会换掉 site-packages，是在另一个环境里跑）。
+#: 解释器：用**当前解释器**。理由：换一个 python 就等于换掉 site-packages，
+#: 是在**另一个环境**里跑（旧 launcher 当年也是这么取的：``PY = sys.executable``）。
 _PY = sys.executable
 
 #: ⚠ **实测依据**：本项目 MCP 端点的 ``GET /mcp`` 回 **406**（不是 2xx），
 #: 而该端点（`:mcp-port`）上**没有**任何回 2xx 的只读路由
 #: （``/summary``/``/runs`` 等属**监控端点**，在另一个端口 ``.ml-monitor-port``）。
 #:
-#: "就绪"要表达的是"**这个服务真的在听**" —— 旧判据正是
-#: "有 HTTP 响应即算在听（4xx 也是响应）"，理由是"TCP 连得上还不够：
+#: "就绪"要表达的是"**这个服务真的在听**" —— 这条口径来自旧看门人的 D13 双条件
+#: （spawn 前**快照**端口文件 + **真探活**），理由是"TCP 连得上还不够：
 #: 同一端口上可能是别的东西在听"。
+#: ⚠ 快照那一条**不用**在这里表达：框架的 ``ReadySpec`` 已经把它做进去了
+#: （它自己比对"端口文件相对 spawn 前变化过"），声明只负责说清**探活**怎么做。
 #: ⇒ 故这里用 ``ok_codes=()``（**任意 HTTP 响应都算在听**）而不是 ``tcp=True``，
-#:   为的是保住那条"**必须是 HTTP 在听，不只是 TCP 有人**"的精度。
+#:   为的是保住"**必须是 HTTP 在听，不只是 TCP 有人**"的精度。
 _READY_ANY_RESPONSE: tuple[int, ...] = ()
 
 
@@ -98,7 +102,9 @@ def dataset_roots() -> list[str]:
     相对路径按**本文件所在目录**解析后取绝对路径 —— 权威侧校验的是
     "resolve 之后必须在允许根之下"，交相对路径会随 cwd 漂移。
 
-    ⚠ **行为必须与旧 ``launcher._dataset_roots_argv`` 逐项等价**（判据里直接对拍）。
+    ⚠ **行为必须与旧 ``launcher._dataset_roots_argv`` 逐项等价**（判据里直接对拍）——
+    那段实现**已随 launcher 删除**，所以这里的等价性是**冻结的期望值**在守
+    （`tests/test_mecha_site.py` 内嵌 12 个用例 + GBK 兜底），不是"再去 import 它"。
     """
     if not _DATASET_ROOTS_FILE.is_file():
         return []
@@ -138,9 +144,10 @@ def _service_argv() -> tuple[str, ...]:
     return tuple(argv)
 
 
-#: ⚠ **这一行是"两腿同源"的唯一防线**：``runs/`` 的根由它开关
+#: ⚠ **这一行是"看到同一份账"的唯一防线**：``runs/`` 的根由它开关
 #: （``ml_toolbox/core/runs.py``：``os.environ.get("ML_TOOLBOX_RUNS") or <包根>/runs``）。
-#: 若 svc 与 manual 两侧不一致，切手动之后人会看到**另一份 runs** ——
+#: ⚠ **不许留给继承**：三层架构下"两条腿"不再是两个进程，但**软件进程与它要开的
+#: GUI 窗口仍必须看同一份** —— 窗口若自己另算一遍 runs 根，人看到的就是另一份，
 #: 现象是"切了但看着是空的/老的"，且**没有任何报错**。
 _RUNS_ENV = {"ML_TOOLBOX_RUNS": str((_SITE_ROOT / "runs").resolve())}
 
@@ -148,10 +155,10 @@ _RUNS_ENV = {"ML_TOOLBOX_RUNS": str((_SITE_ROOT / "runs").resolve())}
 #: ``child_env.setdefault("PYTHONIOENCODING", "utf-8")`` 生效
 #: （``setdefault`` 只在键**不存在**时补 ⇒ 置空串会挡住它，故传空串表示"不设这个键"）。
 #:
-#: 为什么必须由框架统一注入（而不是这里写死 "utf-8"）：见旧 ``launcher._spawn`` 的注释 ——
-#: 子进程 stdout 一旦不是真控制台（被重定向到文件/管道），编码就退回 **cp936**，
-#: 网络代码里一句 ``print("⚠ …")`` 会抛 ``UnicodeEncodeError``，**让整个后台任务崩掉**
-#: （用户实测、本机可复现）。那是**所有子进程**的共同需求 ⇒ 归 supervisor。
+#: 为什么必须由框架统一注入（而不是这里写死 "utf-8"）：子进程 stdout 一旦不是真控制台
+#: （被重定向到文件/管道），编码就退回 **cp936**，网络代码里一句 ``print("⚠ …")``
+#: 会抛 ``UnicodeEncodeError``，**让整个后台任务崩掉**（用户实测、本机可复现）。
+#: 那是**所有子进程**的共同需求 ⇒ 归 supervisor（活知识：``docs/旧启动器-活知识存档.md`` §3）。
 _NO_CODEC = {"PYTHONIOENCODING": ""}
 
 

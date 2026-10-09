@@ -17,19 +17,24 @@
 5. 开闸后写工具真跑通（``dataset_id`` / ``run_id`` / 指标），且 History 事件带
    **非空 call_id**——这是 MCP 的 ``request_id`` 经 ``Context`` 注入、
    落到 mecha 归因链（"AI 做了什么"↔"域变成了什么"互引）的真实证据；
-6. 端口文件起写止删（看门人/发现机制依赖它），且**被强杀后留下的陈旧端口文件
+6. 端口文件起写止删（**发现机制**依赖它），且**被强杀后留下的陈旧端口文件
    会被启动时清掉**（Windows 的强杀不跑 ``finally``——这是实测得出的坑）。
 
-P1 追加（工具面补齐 + 看门人机械件）：
+P1 追加（工具面补齐）：
 
 7. 批量工具：**部分成功不是工具失败**（成功项的 ``run_id`` 不许被丢掉），
    全部失败才 fail loud；
 8. job 三件套：``submit_run`` → ``read_job`` 拿到终态与 ``result_ref``；
    ``cancel_run`` 对不可取消命令结构化拒（``job_not_cancellable``）；
 9. ``--dataset-roots`` 授权面（**真子进程** + MCP）：不给 roots ⇒ csv 来源
-   fail closed；给了才允许；
-10. 看门人机械件：dsh 端口 3080 硬跳过；**D13 就绪判据拒绝陈旧端口文件**；
-    交接（terminate + 等退出）后写租约真的释放、同根可再起一台权威。
+   fail closed；给了才允许。
+
+⚠ **本文件不再自建就绪判据/进程编排**（那是框架的活）：真子进程夹具走
+``mecha.supervise.Supervisor`` + 本站点声明（``ml_mecha/mecha_site.py``）的
+``ReadySpec``。旧的"看门人机械件"4 条判据（D13 双条件 / 3080 硬跳过 /
+``PYTHONIOENCODING`` 注入 / 进程树终止）**已随旧 ``launcher.py`` 删除**，
+其承诺由框架门禁接管：``mecha/checks/launch_selfcheck.py``
+（③ 陈旧端口文件 / ③b 非空但没人听 / kill_tree / env_probe 四条都在那里）。
 
 迁移前置（P3，给 mecha extras 的 MCP 投影迁移当安全网）：
 
@@ -201,25 +206,51 @@ def _spawn_authority_proc(root, *, extra_args=()):
 
 @contextlib.contextmanager
 def _spawned_authority(root, *, open_gate: bool = True, extra_args=()):
-    """真子进程权威 + 就绪等待（走 launcher 的 D13 判据），yield ``(url, proc)``。
+    """真子进程权威 + 就绪等待（走**框架**的 supervisor 与本仓声明），yield ``(url, proc)``。
 
     用真子进程而不是进程内装配，是因为 ``--dataset-roots`` 是 **CLI 授权面**：
     只有经 ``app_entry.py`` 的参数路径才证明它真的接上了。
+
+    ⚠ **这里刻意用框架的 ``Supervisor`` 而不是自己写一套就绪判据**：
+    旧 ``launcher.await_authority`` / ``_terminate_group`` 已随旧架构删除。
+    用监督者还顺带证明了"**框架真能起本软件**"——站点声明的 ``ReadySpec``
+    在**真装配**里被消费（R10：光跑门禁不够）。
     """
-    import launcher
+    from mecha.supervise import ChildSpec, Supervisor
 
     args = list(extra_args)
     if not open_gate:
         args.append("--no-open-gate")
-    proc = _spawn_authority_proc(root, extra_args=args)
-    try:
-        ok, port, reason = launcher.await_authority(proc, Path(root) / ".mcp-port",
-                                                    timeout=90.0)
-        assert ok is True, f"权威未就绪：{reason}"
-        yield f"http://127.0.0.1:{port}/mcp", proc
-    finally:
-        launcher._terminate_group([proc])
-        launcher.await_exit([proc], timeout=20)
+    argv = (sys.executable, str(REPO / "app_entry.py"), "--mcp",
+            "--root", str(root), *args)
+    #: ⚠ 与声明里同名的就绪判据（`ml_mecha/mecha_site.py` 的 `ReadySpec`）：
+    #: 端口文件新鲜度 + 真探活，`ok_codes=()` = 任意 HTTP 响应算在听。
+    ready = ReadySpec(port_file=".mcp-port",
+                      probe="http://127.0.0.1:{port}/mcp",
+                      ok_codes=(), timeout_s=90.0)
+    log_dir = Path(root) / "_test_logs"
+    with tempfile.TemporaryDirectory(prefix="ml-delivery-logs-") as _ld:
+        sup = Supervisor(log_dir=Path(_ld))
+        try:
+            sup.start(ChildSpec(id="ml", argv=argv, cwd=REPO,
+                                env={"ML_TOOLBOX_RUNS": str(root / "runs")},
+                                ready=ready, data_root=Path(root)))
+            row = next(r for r in sup.state()["children"] if r["id"] == "ml")
+            assert row["state"] == "ready", (
+                f"权威未就绪：{row.get('ready_evidence')!r} / "
+                f"last_error={row.get('last_error')!r}")
+            port = row["port"]
+            yield f"http://127.0.0.1:{port}/mcp", sup
+        finally:
+            sup.shutdown()
+
+
+def _supervisor_proc(sup):
+    """取监督者里那个 child 的 Popen（判据要读退出码/pid 时用）。"""
+    for child in getattr(sup, "_children", {}).values():
+        if getattr(child, "id", None) == "ml":
+            return getattr(child, "proc", None) or getattr(child, "_proc", None)
+    return None
 
 
 def _http_get(url: str, method: str = "GET"):
@@ -3235,7 +3266,9 @@ def test_panel_host_half_serves_monitor_url_route():
                                       port_file=root / MONITOR_PORT_FILE)
             try:
                 mon_port = monitor.start()
-                write_runtime(root, mode="ai", mcp_port=host.port,
+                # ⚠ 不传 mode：描述符里**不再有**那个字段（写权运行中可切，
+                # "启动时那个值"不是真相）。`/status` 的 `mode` 来自 authority 本身。
+                write_runtime(root, mcp_port=host.port,
                               monitor_port=mon_port)
                 rc, out, err = _run_node(_HOST_HALF_JS, root)
                 assert rc == 0, (rc, out[-1200:], err[-1200:])

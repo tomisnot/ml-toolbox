@@ -13,6 +13,8 @@ whenToUse: >-
 
 > 本文件是 AI harness 的 skill 说明书：连接方式、工具清单、正典工作流、纪律与已知边界。
 > **AI 使用中发现文档与实态不符，应回头修正本文件**（自我迭代）。
+> - ⭐ **使用侧最佳实践（推荐先读）**：`docs/usage-best-practices.md`
+> - ⭐ **软件缺口与接口审查（开发者视角）**：`docs/反馈-ML工具使用体验与接口审查.md`
 > 工具清单那张表由 `tests/test_skill_surface.py` 与**真注册表**逐名对账
 > （清单少一个/多一个都判红），所以**改工具面必须同时改这张表**。
 
@@ -39,6 +41,264 @@ whenToUse: >-
 
 ---
 
+## ⭐ 第 0 步：开工前 90 秒自检（**照做，能挡掉一轮里 80% 的返工**）
+
+> 这一节的每一条都来自**真实踩坑**（一次 5 小时级 NQS 训练会话），
+> 不是泛泛的注意事项。**先跑完这 6 条再写第一行训练代码。**
+
+| # | 自检 | 为什么（实测代价） |
+|---|---|---|
+| **1** | **这是不是一轮长训练（>1 小时）？** → 若是，**必须显式给 `checkpoint_every`**（如 200）：不给就**只在训练终态**写 `checkpoint/`，中途死机＝**全丢**（实测：一个跑到 284 epoch 的 run，`runs/<id>/` 下只有 `tb/`）。见下文 §中途存档。 | 一次 5 小时训练裸奔，死机即全丢 |
+| **2** | **要对比吗？和谁比？** 先把"同一份数据、同一口径下的上界"算出来（不依赖模型的天花板：恒模上界、oracle 截断…），否则你无法判断模型是好是坏 | 我一度拿"**另一个数据集**上的最好成绩"当靶子，方向错了一整轮 |
+| **3** | **主指标 vs 代理指标分清了没？** 见 §指标层级。**代理指标的下降/平缓不能否定主指标** | 我用"系数相关"否掉了一个**训练集 `fid` 已 0.86** 的方向（主指标才是判据） |
+| **4** | **量纲/口径自检**：你的度量函数在一个**已知答案**上是否返回预期值？（归一化、`1/M`、恒模 vs 实际模长） | 我两次把口径写错（差 256 倍），得出"模型全错"的假结论 |
+| **5** | **有不可导操作吗？** 输出过 `sign()`/`argmax()`/硬阈值后，**梯度还到得了那个分支吗**？实测 `sign()` 让主损失对该分支的梯度**精确为 0** | 一个分支白训了 3 次（各 30 分钟–6 小时），根因是一条 `sign()` |
+| **6** | **路径一律绝对**；网络代码里的 `print` **只用 ASCII** | 相对路径被解析到错位置，**等了 120 分钟**才发现；非 ASCII `print` 在 GBK 控制台让**整个后台任务崩掉** |
+
+**⇒ 更细的版本见 `docs/usage-best-practices.md`。开发者视角的缺口见 `docs/反馈-ML工具使用体验与接口审查.md`。**
+
+---
+
+## ⭐ 指标层级（**最容易被误用的一条**）
+
+**同一轮实验里，必须同时看这几个层次，不许只盯一个：**
+
+| 层级 | 例子 | 能否单独定罪 |
+|---|---|---|
+| **主指标** | 目标函数本身（`fid/sub1`、`acc`、`RMSE`） | ✅ **最终判据** |
+| **主指标（训练集）** | `fid/step`、`loss` | ✅ 与基线**训练集口径**可比；⚠ 与"留出"不可直接比 |
+| **代理指标** | "子目标学得对不对"（我用的"系数相关"） | ❌ **只能参考**；实测**代理降而主指标升** |
+| **分解量** | 主指标 = A × B（我的是 `fid = famp × 相位因子`） | ✅ **必须同时报**，它把"两半各自好不好"分开 |
+| **泛化差** | train − hold | ✅ 判断过拟合/欠拟合 |
+| **成本** | s/epoch | ✅ 决定你能不能做对比实验 |
+
+**三条硬纪律**：
+
+1. **代理指标不能否定主指标。** 若主指标在涨而代理平/降，**先信主指标**（代理可能本就不是主目标的充分统计量）。
+2. **跨数据集比主指标无意义。** 数据集越难，同一个模型的指标越低。要比就比
+   **"相对同一份数据的上界"**，或比**分解量**。
+3. **量纲自检**：任何自定义度量都要在一个**已知答案**的输入上验证（例：用精确目标代进去，
+   必须得 1.0；用随机基线代进去，必须 ≈ 常数）。
+
+---
+
+## ⭐ 中途存档（`checkpoint_every`：**框架自己做，别再往网络代码里塞 `torch.save`**）
+
+> **2026-10-07 起这是一等参数**：此前框架**只在训练终态**写 `checkpoint/`，
+> 长训练必须自己用 `on_step` 打补丁（实测：一个跑到 284 epoch 的 run，
+> `runs/<id>/` 下**只有 `tb/`** ⇒ 中途死机＝全部参数丢失）。
+
+```jsonc
+run_custom(..., checkpoint_every=200)        // 每 200 个**优化步**原子落盘 last.pt
+submit_run(code_path=…, checkpoint_every=200)  // 后台长训练同样给（第一等参数）
+```
+
+- **单位是"优化步"**（一个 batch 一次 `optimizer.step()`），**不是 epoch**：
+  长训练里一轮可能几十分钟，按轮数存档粒度太粗。⚠ **图任务里 1 epoch = 1 步**
+  （整图前向、没有 batch）。
+- **`best.pt` 的语义没变**：仍按**验证损失**更新（与 `last.pt` 各自独立）。
+- **默认 `0` = 关**（与从前逐位一致）⇒ **长训练请显式给**（200 量级是合理起点）。
+- **原子写**：先写同目录临时文件再 `os.replace` ⇒ 写一半被杀**不会**留下半个档、
+  **也不会**把上一份好的覆盖掉。
+- 落盘失败**不拖垮训练**（与 TB 同纪律），但**会在存档里留痕**：
+  `nn_checkpoint_errors` / `diag.checkpoint_periodic`（**不静默**）。
+- **对账**：`checkpoint_detail(run_id=…)` 的
+  `last_saved.saved_at_step` / `files_meta.<tag>.saved_at_step` 就是
+  "这份存档落在第几步"（训练**还在跑**时也读得到 ⇒ 能判断它是不是最新的）。
+
+**老写法（仅当你要存到框架管不到的地方，如自己的绝对路径）**：
+`on_step` 里自己 `torch.save`——但要绝对路径、要 try/except、且**别再重造一份
+`last.pt`**（那会与框架的写盘互相覆盖）。
+
+**⚠ 服务端 `print` 现在读得到**：`read_job(job_id, logs=N)` 的 **`logs_tail`**
+就是那次 job 的 stdout/stderr 尾巴（默认 10 行，每行带 `[out]`/`[err]`；`logs=0` 关；
+**桶有界**：默认 200 行/任务，`logs_n` 是总行数，截断看 `logs_truncated`）。
+⇒ 网络代码里的 `print("[snap] step=…")` 这种诊断**不用再只写盘**——它直接可查。
+
+⚠ **它只覆盖 Python 层的 print**：**C 层**（torch / CUDA / OpenMP / MKL）与**子进程**直接写
+fd 1/2 的输出（例如 `vrtc64_120_0.alt.dll … or one of its dependencies`、
+`Insufficient system resources`）**不在里面** ⇒ **`logs_tail` 空 ≠ 没报错**。
+要对齐那种输出：用 `read_job` 回的 **`started_at`/`finished_at`** 去权威的控制台/日志文件里按时间找。
+
+---
+
+## ⭐ 续训（`resume_from`：**框架已有入口，别自己 `torch.load`**）
+
+```jsonc
+run_custom(code_path=…, dataset_id=…, resume_from="custom_network-2334125-0",   // 或 .pt 绝对路径
+           resume_which="last")                                                // last（默认）/ best
+submit_run(code_path=…, resume_from=…)      // 长训练同样给
+```
+
+- **装载在 `build()` 之后、训练之前**，**默认 `strict=True`** ⇒ 权重与这次 `build`
+  不匹配就**响亮失败**（`resume_state_mismatch`，带缺失/多出键）——**不会**静默随机初始化。
+- **找不到存档 ⇒ 可教学地拒**（`no_resume_checkpoint`）：**绝不静默从头训**
+  （"以为在续训、其实从零"跑得很好，你只会觉得"这轮收敛慢"）。
+- **回执与存档都记得"从哪续的"**：`resumed_from` / `resumed_which` / `resumed_at_step`
+  + `artifacts["nn_resumed_from"]`。
+- **判据（他给的）**：续训后**起始 `loss` 应贴近断点**而不是初值
+  （实测 99.68 vs 1017.6，一眼可辨；本仓判据用的是"离断点更近、离从头更远"的**自归一化**比较）。
+- 需要**只装一部分**（改了结构/分片）⇒ 实现可选钩子 `Network.load_state(model, state)`。
+
+**⚠ 旧写法（`build()` 里自己 `torch.load`）降级为"特殊情形的退路"**：只在
+① 存档来自**旧框架**、② 你要装的不是 `checkpoint/*.pt`（自己的快照格式）时用。
+用的时候 **`ck["state_dict"]` 这一层仍然必须取对**（见下面"两个坑"第 1 条，
+那条坑**依然有效**：`strict=False` 会静默全不匹配）。
+
+**⚠ 两个坑**：
+
+1. **存档顶层是 `{'state_dict': …, 'params': …}`**。
+   **`load_state_dict(ck)` 默认 `strict=True` 会抛** `RuntimeError`（实测列出 121 个 missing key）；
+   **真正静默的是 `strict=False`**（missing=121 / unexpected=16，**无报错**），
+   而**旧版本文档里推荐的正是 `strict=False`** ⇒ 坑是按文档写出来的。
+   **必须取 `ck['state_dict']`**（`checkpoint_detail` 的 `load_hint.state_dict_key` 会直接告诉你）；
+   若用 `strict=False`，**必须检查返回的 missing/unexpected 并在非空时报错**。
+2. **类定义体用了 `nn`/`torch` 的文件，在框架外 import 会 `NameError`**
+   （框架只在 `build()` 时注入这两个名字）。要让本地脚本也能 exec，
+   **显式 `import torch` / `import torch.nn as nn`**。
+
+**验证续训生效（判据）**：看**起始 `loss`**——应从**断点附近**开始而不是初值
+（实测：续训首值 99.68 vs 从头 1017.6，一眼可辨）。
+
+**⚠ 更正（我原先写错过）**：`run_id` 带毫秒（`core/runner.py:52-53`）⇒ **每次重跑都是新 id**，
+**不存在"两条训练混在一根轴上"**。真实的坑是**同一 run 内两族 tag 的 step 轴不同**：
+`loss`/`val_loss`/`grad/*` 的 step = **epoch 序号**；`on_step` 上报的 `fid/step` 等
+= **全局 batch 步**（实测差 ~277 倍）。
+
+⇒ **读法**（回执里现在直接写着，不用自己推）：
+
+```jsonc
+"latest_steps": {"loss": 283, "fid/step": 78410},
+"step_units":   {"fid/step": "batch", "dist/step": "batch"},   // 不在表里 = epoch 级
+"axes": {"epoch_tags_n": 51, "batch_tags": ["fid/step", …],
+         "per_epoch_estimate": 276.3}                          // 那个"差 277 倍"的来源
+```
+
+跨族给 `tags=[…]` 对齐时，回执会带 **`compare.axis_warning`** —— 因为轴取的是两族步号的
+并集，**粗粒度那一族会大片 `null`**（看起来像"这段没有 loss"，其实是**不在同一个 step 尺度上**）
+⇒ **同族之间比，跨族只看趋势**；且每 tag 按点数截断（默认 500），
+**不同 tag 的覆盖区间可能差几百倍**（`loss` 覆盖最近 500 轮，`fid/step` 只覆盖最近约 2 轮）。
+
+---
+
+## ⭐ 结果拿回来（训练完 → 评估）
+
+```
+run_custom(..., persist=true, checkpoint_every=200)
+                                       # 终态写 checkpoint/{best,last}.pt（完整，含 bias/LN）
+                                       # + 每 200 步原子落盘一份 last.pt（中途存档）
+  → checkpoint_detail(run_id=…)        # 在不在、多少张量、含不含 bias、每份**落在第几步**
+                                       # （`last_saved` / `files_meta` / `load_hint`）
+  → eval_custom(run_id=…, code=…)      # 装载模型交给你的代码；默认继承训练负载
+```
+
+**⚠ `best.pt` 是按 `val_loss` 选的**——而 `val_loss` 的尺度可能与你的主指标不一致
+⇒ **`best.pt` 常常不是主指标最好的那一轮**（实测：按 `val_loss` 挑的轮在 `fid` 上差很多）。
+**判据用主指标时，请自己用 `last.pt` 或按主指标挑轮。**
+**⚠ 装载时用 `ck["state_dict"]`**（`checkpoint_detail` 的 `load_hint` 直接给这句话）。
+
+**⭐ 想让 `best.pt` 按你的主指标选（2026-10-07 起可声明）**：
+
+```python
+class Network:
+    best_metric = "fid/sub1"            # 方向自动判（判不出来会报错，**不许猜**）
+    best_metric = ("ph/std", "lower")   # 方向没有好坏的量：显式给 higher/lower
+    def metrics(self, model, ctx):      # 值从这里来（每轮一次；该轮没报就跳过那轮）
+        return {"fid/sub1": …}
+```
+
+- 声明后 `best.pt` **按那个 tag** 选；`checkpoint_detail` 的
+  `files_meta.best.best_by` 报 **tag / direction / value / epoch / step**，
+  `val_loss_best` 给对照（两者常常**不是同一轮**）。
+- ⚠ **未声明时仍按 `val_loss`**（与从前逐位一致）—— 声明是显式选择，不是新默认。
+- 声明了却整场一次都没上报 ⇒ **退回 `val_loss` 并留痕**（`nn_best_metric_missing`）。
+
+---
+
+## ⚠ 别重造轮子：框架已有实时观测设施
+
+- **数据实时写入**：训练循环**每轮 flush** 事件文件（实测训练中每 20 秒 +30 KB）；
+- **实时读取路由**（`ml_mecha/monitor_http.py`）：**`/latest`**（最新一轮，**专为 AI 研判**）、
+  **`/series`**（整条曲线，给面板折线）、`/summary`、`/runs`；
+- **给人看的界面**：TensorBoard 辅进程（**惰性启动**、端口文件发现、起不来会如实说）；
+- **AI 侧**：`describe_training`（读同一份事件文件，**训练中就能读到新点**）。
+
+**⇒ 不要自己去解析 `events.out.tfevents.*`**（我就这么干过，还因此踩了"两段曲线混在一起"的坑）。
+优先 `describe_training` 的 `curve` / `convergence` / `pick`。
+
+**⚠ 读数值前先看轴**（`latest_steps` + `step_units` + `axes`）：同一个 run 里有**两种步号**——
+epoch 级（`loss`/`val_loss`/`lr`/`grad/*`）与 **batch 级**（`on_step` 上报的 tag）。
+`axes.per_epoch_estimate` 就是两者的比值（实测 ~277）。**跨族别并排比**（见 §续训的更正）。
+
+**⚠ 回执大小由你自己控**：`curve` 默认 **`brief`**（核心 tag + **有判读的 tag**），
+实测一个 58 tag 的真 run **38 891 → 10 664 字符（−72.6%）**，而 `convergence` 判读**一条不少**；
+要全量写 `curve="all"`，只要某几个写 `curve_tags=["fid/sub1"]`（`off` = 一个形状都不回）。
+`pick` 只省**非必填**的大块（如 `series`）——**必填键**（`latest`/`curve`）只能靠它们自己的旋钮
+（`grad_layers` / `curve`）。
+
+---
+
+## ⭐ 三种正典情形（照抄骨架）
+
+### 情形 A：内置方法、短任务
+
+```
+describe_methods → describe_method(name) → prepare_dataset → run_method → describe_run
+```
+`run_method` 是**同步**的，适合秒级–分钟级。
+
+### 情形 B：自定义网络（`run_custom`）
+
+```python
+class Network:
+    primary_metric = "fid/sub1"        # 声明主指标（不上报就取字典序第一个）
+    best_metric = "fid/sub1"           # 可选：让 best.pt 按**这个** tag 选（默认按 val_loss）
+    metrics_every = 3                  # 贵指标降频；末轮一定算
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        # ⚠ 用 ctx["payload_shapes"] 推维度，别写死（换数据会静默跑偏）
+        ...
+    def forward_step(self, model, batch, ctx):     # 训练/验证/探针/预测**唯一入口**
+        return out, target                          # 两者都给
+    def on_step(self, model, step, ctx):            # 每步；做**步级指标**（存档交给 checkpoint_every）
+        return {"my/step": ...}
+    def metrics(self, model, ctx):                  # 每轮；贵指标放这里
+        return {"fid/sub0": ..., "fid/sub1": ...}
+```
+
+**⚠ `metrics` 每轮拿的是「全量负载」**（`ctx["payload"]`，**不是一批**）⇒ **里面必须自己分批**：
+实测反例——7344 行 + 256-token 解码器**不清边就 OOM**；而这类失败在旧版里是**静默**的
+（整场一个 epoch 级 tag 都没有，看起来像"你没写 `metrics`"）。
+现在它**留痕且可查**：`checkpoint_detail(...).files_meta.<tag>.metrics_health`
+（`hook`/`failures`/`errors`）与 `artifacts["nn_metrics_errors"]`；
+而且**只降级、不永久关闭**（连续失败 3 次后每 10 轮 + 末轮再试，**会自己恢复**）。
+
+**⚠ `best_metric` 与 `metrics_every` 必须相容**：声明 `best_metric="fid/sub1"` 而
+`metrics_every=3` 且只跑 3 轮 ⇒ 该 tag 可能**一次都没上报**（会**有留痕地**退回 `val_loss`）。
+要么把 `metrics_every` 调小、要么跑够轮数。
+
+**⚠ `resume_from` 只恢复权重，不恢复优化器状态**（也不恢复 `scheduler`/步数）⇒
+续训第一轮可能有**暂态回退**（实测：源 `dist 7.88` → 续训 1 轮 `10.37`）。
+崩溃恢复时考虑**降 lr 或先预热几百步**再回到原 lr。
+
+**提交前**：`run_custom(..., dry_run=true)` 看形状轨迹；再加 `warmup_steps=60` 真反传，
+看 `loss_curve` / `grad_norm_curve` / `verdict`。**长训练走 `submit_run`（后台）+ 看门狗。**
+
+### 情形 C：长训练（>10 分钟）
+
+```
+submit_run(code_path=…, dataset_id=…, overrides=…, persist=true, checkpoint_every=200)
+  → job_id
+read_job(job_id, wait="terminal", timeout_s=540)      # 一次阻塞到终态；超时不是错误
+# 超 9 分钟的：
+pwsh(run_in_background): python -m ml_mecha.watch <job_id> --poll 60   # 到终态才退出
+```
+
+**⇒ 长训练的提交前 checklist**：① **`checkpoint_every=200` 给了**（中途存档，自检 #1）；
+② `persist=true`；③ `resource_guard.max_peak_mb` 声明；④ 记下 `job_id` 与 **`dataset_id`**
+（**重启后都失效**，`dataset_id` 要重新 `prepare_dataset`——同内容会得到**同一个 id**）。
+
+---
+
 ## 工具清单
 
 > 共 **20** 个。表里的名字必须与注册表逐字一致（有判据钉着）。
@@ -52,7 +312,7 @@ whenToUse: >-
 | `describe_training` | **训练过程观测**：逐 epoch 的 loss/val_loss/grad_norm/lr/dead_relu + **逐层梯度**（默认只给**前 3 + 后 3** 与总数）+ **网络自己上报的自定义 tag**。⭐ 还默认给 **`curve`（每个 tag 的「曲线形状」**：起点/末值/**末段斜率**/是否单调/平台占比/趋势）与 **`convergence`**：**末段还在爬的非 loss 指标会明确警告「可能欠训练——别按终值判断饱和」**；loss 类在爬则说「发散」（两者处置相反）。⭐ `best_by="fid/sub1"` 按**任意 tag**挑最佳 step（并对照 val_loss 的选择——两者常常不是同一轮）；⭐ `compare=[run_a, run_b]` + `tags=[…]` **多 run 曲线对齐**（同 tag、同一根 step 轴；缺失处 `null`，**不插值**） | 默认只给**最新一轮**；`include_series` 才给序列；逐层要全量写 `grad_layers="full"`；可用 `pick` 只取几条 |
 | `describe_networks` | 列出自定义网络（名字/指标/源码行数/用过几次） | 清单，不含源码 |
 | `describe_network` | 按名字取回网络**源码**（改一版再跑，免重贴） | 源码 + 来源 run |
-| `checkpoint_detail` | 某次运行**存下来的模型**在不在、多少张量/参数、含不含偏置、在哪块设备上训的 | **权重不内联**；真要用模型走 `eval_custom` |
+| `checkpoint_detail` | 某次运行**存下来的模型**在不在、多少张量/参数、含不含偏置、在哪块设备上训的、**每份落在第几步**（`last_saved`/`files_meta`）、**该用哪个键 load**（`load_hint`） | **权重不内联**；真要用模型走 `eval_custom` |
 | `eval_custom` | **装载某次训练的模型，交给你的代码去评估**（采样/算能量/换个尺寸外推） | 它上报的指标 |
 | `prepare_dataset` | 登记数据 + 拟合预处理链；可**自己组装**这条链（选步骤/换顺序/写自定义步骤/**分组留出**/给图边表/**给逐行负载**） | `dataset_id` + 链摘要 + 划分口径 + 负载形状 |
 | `run_method` | 跑一个内置方法（**同步**，适合短任务） | `run_id` + 指标 |
@@ -60,7 +320,7 @@ whenToUse: >-
 | `compare_methods` | 多方法对比 | 对比表 + 最优（**要比多个就用它**，别逐个拉） |
 | `run_custom` | 跑一段**自定义网络代码**（AI 写结构，系统管训练与观测）；可给 `device`；**`dry_run=true` 先试跑**（回形状轨迹，不落盘）；也可 `code_path` 从文件读 | `run_id` + 指标（自定义任务时是网络上报的） |
 | `submit_run` | 把一次运行提交为**后台任务**（给 `method` 或 `code`）——**长训练就走这条** | `job_id`（立刻返回） |
-| `read_job` | 查后台任务进度/结果。⭐ **要等它跑完就给 `wait="terminal"`**（阻塞到终态，上限 540s；超时**不是错误**）；多个任务用 `job_ids=[…]` + `wait="any"`。⚠ **默认只回摘要**：`progress_latest`（含 loss/val_loss）+ 最近 `tail`（默认 8）条 + 真实条数 `n_progress`/`n_epochs`/`truncated` | 要全量历史写 `detail="full"`；要更多条写 `tail=N`；旧名 `wait_s` 等价于 `wait="terminal"`+同秒数 |
+| `read_job` | 查后台任务进度/结果。⭐ **要等它跑完就给 `wait="terminal"`**（阻塞到终态，上限 540s；超时**不是错误**）；多个任务用 `job_ids=[…]` + `wait="any"`。⚠ **默认只回摘要**：`progress_latest`（含 loss/val_loss）+ 最近 `tail`（默认 8）条 + 真实条数 `n_progress`/`n_epochs`/`truncated`。⭐ **`logs_tail`**：服务端 stdout/stderr 的最后 `logs` 行（默认 10）—— 网络代码里的 `print` 在这里；**桶有界**（默认 200 行/任务，`logs_n` 是**总行数**，截断看 `logs_truncated`/`logs_cap`）。⚠ **只覆盖 Python 层**（C 层/CUDA/子进程写 fd 的不在）；**空 ≠ 没报错**，用 `started_at`/`finished_at` 去对齐 | 要全量历史写 `detail="full"`；要更多条写 `tail=N`；要更多日志写 `logs=N`（`0` = 关；**调大也不会超过桶容量**）；旧名 `wait_s` 等价于 `wait="terminal"`+同秒数 |
 | `cancel_run` | 请求取消后台任务（**排队中的也能取消**：会在开跑前就撤掉） | 明确回"已请求"（在 epoch 边界生效，不谎报"已取消"） |
 | `set_job_limit` | **热改并发名额**（不必重启权威；调大立刻唤醒排队者） | 改动前后上限 + 正在跑/排队数 |
 | `run_queries` | **一次往返跑一串只读查询**（列方法→看参数→查数据集→看训练） | 每步自带结果与短摘要 |
@@ -357,8 +617,10 @@ class Network:
 ## 训练完把模型拿回来（三个工具串起来）
 
 ```
-run_custom(..., persist=true)          # 训练结束会写 checkpoint（best + last，**全量**含偏置）
-  → checkpoint_detail(run_id=…)        # 在不在、多少张量、含不含 bias、最佳轮第几轮
+run_custom(..., persist=true, checkpoint_every=200)
+                                       # 训练结束写 checkpoint（best + last，**全量**含偏置）
+                                       # + 中途每 200 步一份 last.pt
+  → checkpoint_detail(run_id=…)        # 在不在、多少张量、含不含 bias、**每份落在第几步**
   → eval_custom(run_id=…, code=…)      # 装载模型，**交给你的代码**（采样/算能量/换 N）
 ```
 
@@ -493,3 +755,6 @@ def forward_step(self, model, batch, ctx):
 | 后台任务并发 | 上限 **4**（不排队） |
 | `device` | 真上卡（`auto`/`cpu`/`cuda:0`）；要求 cuda 而没卡**报错**，不回落 CPU |
 | 只有 `run_custom` 有 checkpoint | 内置方法的权重仍只有诊断产物（`nn_weights`，不含偏置） |
+
+---
+

@@ -3,11 +3,12 @@
 
 ⚠ **本文件不编排任何东西**（不起 dsh、不等别人、不选模式）。
 进程编排整块归 mecha 的统一启动器（supervisor）：声明在 ``ml_mecha/mecha_site.py``，
-入口是 ``python -m mecha.launch``。这里只负责"起本软件自己的一个形态"。
+入口是 ``python -m mecha``。这里只负责"起本软件自己的一个形态"。
 
 - ``--gui``  本地 GUI：走 ``app.py`` 的路径（不订阅 MCP、不起端点、不持写租约）。
-             ⚠ 它是 human adapter 的候选实现 —— "切手动"要起的就是它。
-             见设计文档 `docs/v2/统一启动器-设计.md` §5.3.1（它的 ready 只能判存活）。
+             ⚠ 三层架构下"人那条腿"是**软件进程内的窗口**（不是 supervisor 的子进程）：
+             今天 ``--gui`` 起的还是**另一个进程**，把它并进 ``--mcp`` 那个进程
+             属**后续步骤**（见 `docs/v2/软件-交互-写权-三层架构.md` §3 裁决 1）。
 - ``--mcp``  起 MCP 服务端点（原 ``--authority``）：headless 装配 ``assemble_ml_mecha``
              （出厂 ``Mode.LOCKED``）→ 起 MCP 服务（同进程后台线程）+
              只读监控端点 → 人类侧开闸 ``switch_ai()`` → 阻塞到 Ctrl+C / 被 terminate。
@@ -25,7 +26,7 @@
    调 ``switch_ai()``——打开闸门的动作发生在启动序列里，AI 面永远拿不到
    ``side='human'`` 的通道（``mecha/authority.py::switch_mode`` 的硬判定）。
 
-无参数运行时**明确报错**并指向 ``python -m mecha.launch``，**不静默降级成 GUI**
+无参数运行时**明确报错**并指向 ``python -m mecha``，**不静默降级成 GUI**
 （那会让人以为"AI 没生效"是个 bug）。
 """
 from __future__ import annotations
@@ -37,7 +38,10 @@ import threading
 from pathlib import Path
 
 #: 本文件所在目录 = 项目根。``.ml-mecha``（journal + 写租约）与 ``.mcp-port``
-#: 都挂在这里——与看门人（P2 的 ``launcher.py``）必须同源，否则"起得来但看不见"。
+#: 都挂在这里 —— ⚠ **"同源"这条关系仍然成立**（发现文件、写租约、数据根必须在
+#: 同一个根上，否则"起得来但看不见"），只是**机制换了**：
+#: 今天这个根由框架按声明传进来（``ml_mecha/mecha_site.py`` 的 ``data_root`` /
+#: ``cwd``），不再由项目的看门人自己编排（旧 ``launcher.py`` 已删）。
 PROJ_ROOT = Path(__file__).resolve().parent
 
 _USAGE = """用法：
@@ -45,7 +49,7 @@ _USAGE = """用法：
   python app_entry.py --mcp [选项]              起 MCP 服务端点（headless；不给 dsh 编排）
 
 ⚠ 进程编排（起谁、等谁、收谁）**已整块归 mecha 的 supervisor**
-  ⇒ 用 `python -m mecha.launch` 起整站；本文件只负责"起一个软件自己的端点"。
+  ⇒ 用 `python -m mecha` 起整站；本文件只负责"起一个软件自己的端点"。
   ⇒ 声明在哪：`ml_mecha/mecha_site.py`
 
 --mcp 选项：
@@ -125,16 +129,21 @@ def run_mcp(args: argparse.Namespace) -> int:
         if args.no_open_gate:
             print("[mcp] 写权保持 LOCKED（--no-open-gate）。", flush=True)
         else:
-            # 看门人代理人的启动意图开闸：人选了 AI 模式即授权 AI 写。
+            # ⚠ **启动者声明的初始写权**：声明在 ``ml_mecha/mecha_site.py``
+            # （``initial_mode``），框架按《三层架构》§5.1 用 ``MECHA_INITIAL_MODE``
+            # **送**进来。⚠ 今天这里还**没读**那个环境变量（见 mecha_site.py 的
+            # Known Limitations）⇒ 仍旧按"启动即授权 AI 写"这条**旧口径**开闸，
             # 这不是 AI 自解锁——AI 侧拿不到 side='human' 的通道。
             ml.switch_ai()
-        # 运行期描述符 = 端口/模式的单一真源（看门人、监控页、故障排查都读它）。
-        write_runtime(root, mode=ml.mode.value, authority_pid=os.getpid(),
+        # 运行期描述符 = 端口的单一真源（启动方、监控页、故障排查都读它）。
+        # ⚠ **不写 mode**：写权是**运行中可切**的（任何本机客户端都能请求切），
+        #   "启动时那个值"不是值得持久化的真相；要读当前写权走控制端点。
+        write_runtime(root, authority_pid=os.getpid(),
                       mcp_port=port, monitor_port=monitor.port)
         print(f"[mcp] 端点就绪：写权 {'LOCKED' if args.no_open_gate else 'AI'}，"
               f"MCP {host.url}，只读监控 {monitor.url}（端口文件 "
               f"{mcp_port_file.name} / {MONITOR_PORT_FILE}）"
-              f"（Ctrl+C 或看门人交接时退出，写租约随进程释放）。", flush=True)
+              f"（Ctrl+C 或启动方收尾时退出，写租约随进程释放）。", flush=True)
         threading.Event().wait()
     except KeyboardInterrupt:
         print("\n[authority] 收到 Ctrl+C，收尾（释放写租约）。", flush=True)
@@ -151,8 +160,10 @@ def main(argv: list[str] | None = None) -> int:
     #   `print(…, file=sys.stderr)`（或一条 warning）在 cp936 管道里仍会抛
     #   `UnicodeEncodeError`；而"输出被重定向"时默认编码是 **cp936**，不是 UTF-8
     #   （用户实测：网络代码里的 `print('⚠ …')` 让整个后台任务崩掉）。
-    #   ⚠ 这里只是**兜底**：真正的强制在 `launcher._spawn` —— 它给所有子进程
-    #   注入 `PYTHONIOENCODING=utf-8`（不依赖"是否走到 main()"）。
+    #   ⚠ 这里只是**兜底**：真正的强制在**框架的 spawn 层**（supervisor）——
+    #   它统一给所有子进程注入 `PYTHONIOENCODING=utf-8`（不依赖"是否走到 main()"）。
+    #   本项目声明里把该变量**显式置空**就是为了让那个注入生效
+    #   （见 `ml_mecha/mecha_site.py::_NO_CODEC`）。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
@@ -171,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mcp:
         return run_mcp(args)
     print("未指定：本文件只起【一个软件自己的形态】（--gui 或 --mcp）。\n"
-          "要起整站（含 harness 与进程编排）用：python -m mecha.launch\n" + _USAGE)
+          "要起整站（含 harness 与进程编排）用：python -m mecha\n" + _USAGE)
     return 2
 
 

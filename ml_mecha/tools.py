@@ -56,8 +56,10 @@ LOCAL_ACTOR = "ml-local"
 #:
 #: 上限由**客户端**决定，不是我们能选的：dsh 的 MCP 客户端对**每次 `tools/call`**
 #: 有超时（`@deepseek-ai/dsh-mcp-client` 的 ``toolCallTimeoutMs``，默认 60 s），
-#: 而本仓 `launcher.py` 已经把它显式设成 **600000 ms = 10 分钟**
-#: （`TOOL_CALL_TIMEOUT_MS`，注释原话："默认 60 s 会让长训练'假失败'"）。
+#: 而本站点的 dsh overlay 已经把它显式设成 **600000 ms = 10 分钟**
+#: （`TOOL_CALL_TIMEOUT_MS`，原话："默认 60 s 会让长训练'假失败'"）。
+#: ⚠ 那份 overlay 现在由**框架**按聚合端点生成（旧 `launcher.py` 已删）——
+#: 值本身要保住，见 `docs/旧启动器-活知识存档.md` §2。
 #: ⇒ 540 s 在 600 s 之内留了余量：**阻塞到 540 也不会撞客户端超时**。
 #: 更长的等待（900 epoch 那种一小时级）走 `python -m ml_mecha.watch`——它是
 #: **独立进程**，不受工具调用超时约束（见该模块 docstring）。
@@ -737,13 +739,16 @@ def _describe_training(engine: MLEngine,
     def execute(*, run_id: str = "", include_series: bool = False,
                 limit: int = 200, pick: Any = None,
                 grad_layers: str = "summary", best_by: str = "",
-                compare: Any = None, tags: Any = None) -> Mapping[str, Any]:
+                compare: Any = None, tags: Any = None,
+                curve: str = "brief", curve_tags: Any = None) -> Mapping[str, Any]:
         detail = engine.query("training_detail", run_id=run_id,
                               include_series=bool(include_series),
                               limit=int(limit), grad_layers=str(grad_layers),
                               best_by=str(best_by or ""),
                               compare=[str(x) for x in (compare or [])],
-                              tags=[str(x) for x in (tags or [])])
+                              tags=[str(x) for x in (tags or [])],
+                              curve=str(curve or "brief"),
+                              curve_tags=[str(x) for x in (curve_tags or [])])
         out = {"ok": True, **detail, "error": ""}
         # ⚠ `pick` 的**边界**（实测踩过，别想当然）：回执里声明的**必填键**
         #   （`output_schema.required`）必须始终在 ⇒ 工具面会校验、缺了直接
@@ -769,6 +774,10 @@ def _describe_training(engine: MLEngine,
                     "是否单调/平台占比/趋势）与 **`convergence` 判读**——"
                     "**末段还在爬的非 loss 指标会明确警告「可能欠训练」**"
                     "（实测：只看终值会误判'已饱和'，把 1500 epoch 砍成 250）。"
+                    "⚠ **`curve` 默认是 `brief`**：只给核心 tag（loss/val_loss/lr/grad_norm/"
+                    "dead_relu）+ **有判读的 tag**（长训练里全量形状占默认回执的 87%）；"
+                    "要全量写 `curve=\"all\"`，只要某几个写 `curve_tags=[\"fid/sub1\"]`。"
+                    "⚠ 省形状**不会**漏判读：`convergence` 始终基于全部 tag 算。"
                     "⭐ `best_by=\"<tag>\"`：按**任意 tag** 挑最佳 step（`best.pt` 是按 "
                     "val_loss 选的，两者常常不是同一轮）。"
                     "⭐ `compare=[run_a, run_b, …]`：**多 run 曲线对齐**（同 tag、同一根 "
@@ -791,6 +800,19 @@ def _describe_training(engine: MLEngine,
                             "description": "逐层梯度的详细度：summary（默认，前 3 + 后 3 + "
                                            "总数；几十层的网络能省一大截）/ full（全部）",
                             "default": "summary"},
+            "curve": {"type": "string",
+                      "description": "⭐ **曲线形状的详细度**（默认 brief；形状是每 tag 六个"
+                                     "数，长训练里 55 个 tag ⇒ 全量占默认回执的 87%）："
+                                     "brief（默认）= 核心 tag + **有判读的 tag** + "
+                                     "`best_by` 点名的那个；all = 全部 tag；"
+                                     "off = 一个形状都不回（`convergence` 判读仍在）。"
+                                     "⚠ 省形状**不会**漏判读",
+                      "default": "brief"},
+            "curve_tags": {"type": "array",
+                           "description": "只要这几个 tag 的形状（如 "
+                                          "[\"fid/sub1\",\"sign/agree\"]）；给了它就以"
+                                          "点名为准（**有判读的 tag 照给**，不会漏警告）。"
+                                          "⚠ 不存在的名字会如实出现在 `curve_tags_missing`"},
             "best_by": {"type": "string",
                         "description": "⭐ 按这个 tag 挑**最佳 step**（如 'fid/sub1'）"
                                        "并与按 val_loss 的选择对照；留空不挑",
@@ -889,14 +911,24 @@ def _run_custom(engine: MLEngine, wrap,
                 resource_guard: Mapping[str, Any] | None = None,
                 device: str = "", dry_run: bool = False,
                 batch_probes: Any = None, code_path: str = "",
-                shapes_verbosity: str = "", warmup_steps: int = 0
+                shapes_verbosity: str = "", warmup_steps: int = 0,
+                checkpoint_every: int = 0,
+                resume_from: str = "", resume_which: str = "last"
                 ) -> Mapping[str, Any]:
         spec: dict[str, Any] = {"command": "run_custom", "code": str(code),
                                 "diag": bool(diag), "persist": bool(persist)}
+        #: ⭐ **续训**（Q7）：显式入口（不用再在 `build()` 里自己 `torch.load`）。
+        if resume_from:
+            spec["resume_from"] = str(resume_from)
+            spec["resume_which"] = str(resume_which or "last")
         if dataset_id:
             spec["dataset_id"] = dataset_id
         if overrides:
             spec["overrides"] = dict(overrides)
+        if checkpoint_every:
+            # ⭐ 一等参数（工具面的 schema 才读得到"能力清单"）；引擎侧与
+            #   `overrides.checkpoint_every` 合流，**顶层为准**。
+            spec["checkpoint_every"] = int(checkpoint_every)
         if seed is not None:
             spec["seed"] = seed
         if name:
@@ -934,6 +966,9 @@ def _run_custom(engine: MLEngine, wrap,
                     "modules": list(receipt.get("modules") or []),
                     "loss_first_batch": receipt.get("loss_first_batch"),
                     "code_path": receipt.get("code_path", ""),
+                    #: A7③：解析后的绝对路径（试跑也要能回答"读的是哪个文件"）
+                    "code_path_resolved": receipt.get("code_path_resolved", ""),
+                    "payload_resolved": dict(receipt.get("payload_resolved") or {}),
                     "code_source": receipt.get("code_source", ""),
                     "code_lines": int(receipt.get("code_lines") or 0),
                     "shapes_verbosity": receipt.get("shapes_verbosity", "trace"),
@@ -955,6 +990,20 @@ def _run_custom(engine: MLEngine, wrap,
                 "metrics": dict(receipt.get("metrics", {})),
                 "elapsed_s": receipt.get("elapsed_s", 0.0),
                 "code_path": receipt.get("code_path", ""),
+                #: ⭐ **解析后的绝对路径**（A7③）：相对路径按 `dataset_roots[0]` 解析
+                #:   （不是按 cwd）⇒ 不回显的话，"读到了另一个也存在的位置"看不出来。
+                "code_path_resolved": receipt.get("code_path_resolved", ""),
+                "payload_resolved": dict(receipt.get("payload_resolved") or {}),
+                #: 源码行数 = "这次跑的是哪一版"的一个便宜指纹（与 code_path_resolved
+                #: 配合就能回答"我改了文件、跑的是不是新版本"）
+                "code_lines": int(receipt.get("code_lines") or 0),
+                #: ⭐ **续训的事实**（Q7）：从哪份存档接着训的、它是哪一步写的 ——
+                #:   "这一轮为什么收敛得快/慢"必须能反查（否则只能靠记忆）。
+                "resumed_from": receipt.get("resumed_from", ""),
+                "resumed_which": receipt.get("resumed_which", ""),
+                "resumed_at_step": receipt.get("resumed_at_step"),
+                # ⭐ 这次实际用的存档口径（0 = 只在终态写一次）——省掉"我给没给"的一次往返
+                "checkpoint_every": int(receipt.get("checkpoint_every") or 0),
                 "warnings": list(receipt.get("warnings", [])),
                 "error": receipt.get("error", "")}
 
@@ -1004,7 +1053,30 @@ def _run_custom(engine: MLEngine, wrap,
             "overrides": {"type": "object",
                           "description": "训练超参覆写：epochs/batch/lr/"
                                          "weight_decay/val_split/latent_every/"
-                                         "grad_clip/early_stop/early_stop_patience"},
+                                         "grad_clip/early_stop/early_stop_patience/"
+                                         "checkpoint_every"},
+            "checkpoint_every": {"type": "integer",
+                                 "description": "⭐ **中途存档间隔**：每 N 个**优化步**把 "
+                                                "`last.pt` **原子**落盘（0 = 关，只在训练"
+                                                "终态写一次）。长训练（>1 小时）务必给"
+                                                "（如 200）—— 否则中途死机＝**全部参数丢失**"
+                                                "（实测：跑到 284 epoch 的 run 目录里只有 "
+                                                "`tb/`）。⚠ 图任务里 1 epoch = 1 步；"
+                                                "`best.pt` 语义不变。"
+                                                "落盘于第几步看 `checkpoint_detail` 的 "
+                                                "`last_saved`",
+                                 "default": 0},
+            "resume_from": {"type": "string",
+                            "description": "⭐ **续训：从哪份存档接着训**（`run_id` 或 "
+                                           "`.pt` 的**绝对路径**）。⚠ 找不到会**可教学地拒**"
+                                           "（绝不静默从头训）；装载默认 `strict=True`"
+                                           "（权重与这次 `build` 不匹配就响亮失败）。"
+                                           "回执会带 `resumed_from`/`resumed_at_step`",
+                            "default": ""},
+            "resume_which": {"type": "string",
+                             "description": "续训用哪一份：`last`（默认）或 `best`"
+                                            "（按 `best_metric` 口径选的那份）",
+                             "default": "last"},
             "seed": {"type": "integer", "description": "随机种子（整数）"},
             "diag": {"type": "boolean", "description": "是否保留诊断信息",
                      "default": False},
@@ -1083,6 +1155,10 @@ def _prepare_dataset(engine: MLEngine, wrap,
                 # 负载的**形状与 dtype**：这是"我的复数还在不在"的直接答案
                 "payload": dict(receipt.get("payload") or {}),
                 "target_kind": receipt.get("target_kind", ""),
+                # ⭐ **判定依据**（Q5-②）："数值且基数 > 20 才算回归"这条规则
+                #   要写给人看 —— 否则一个连续目标被判成分类时，你只能在下游很远
+                #   的地方看到一句 `Found dtype Long but expected Float`。
+                "target_kind_reason": receipt.get("target_kind_reason", ""),
                 "warnings": list(receipt.get("warnings", [])),
                 "error": receipt.get("error", "")}
 
@@ -1340,7 +1416,8 @@ def _submit_run(host: Any, side: str,
                 device: str = "",
                 persist: bool = False, diag: bool = False,
                 code: str = "", code_path: str = "",
-                name: str = "") -> Mapping[str, Any]:
+                name: str = "", checkpoint_every: int = 0,
+                resume_from: str = "", resume_which: str = "last") -> Mapping[str, Any]:
         ml = _require_job_host(host)
         # ⭐ **长训练的正确形态**（用户裁决）：只发一个"开始"信号就走，
         #   之后靠 read_job 主动轮询。这是唯一可行的模式——LLM 的一次工具调用
@@ -1386,6 +1463,14 @@ def _submit_run(host: Any, side: str,
             spec["dataset_id"] = dataset_id
         if overrides:
             spec["overrides"] = dict(overrides)
+        if checkpoint_every:
+            # ⭐ **中途存档**（只对 `run_custom` 有意义：只有自定义网络写 checkpoint）。
+            #   ⚠ 给内置方法传它会被命令参数面拒 —— 那是**对的**（不静默忽略）。
+            spec["checkpoint_every"] = int(checkpoint_every)
+        if resume_from:
+            #: ⭐ **续训**（Q7）：同样只对自定义网络有意义（只有它有 checkpoint）。
+            spec["resume_from"] = str(resume_from)
+            spec["resume_which"] = str(resume_which or "last")
         if seed is not None:
             spec["seed"] = seed
         if device:
@@ -1432,6 +1517,15 @@ def _submit_run(host: Any, side: str,
                            "description": "数据集引用；留空用最近准备的一份",
                            "default": ""},
             "overrides": {"type": "object", "description": "运行级参数覆写（不改全局默认）"},
+            "checkpoint_every": {"type": "integer",
+                                 "description": "⭐ **中途存档间隔**（只对 `code`/"
+                                                "`code_path` 的自定义网络有意义）：每 N 个"
+                                                "**优化步**把 `last.pt` 原子落盘；"
+                                                "0（默认）= 只在训练终态写一次。"
+                                                "长训练（>1 小时）务必给（如 200）——"
+                                                "否则中途死机＝全部参数丢失。"
+                                                "⚠ 图任务里 1 epoch = 1 步",
+                                 "default": 0},
             "seed": {"type": "integer", "description": "随机种子（整数）"},
             "device": {"type": "string", "description": "计算设备声明：auto / cpu / cuda:0",
                        "default": ""},
@@ -1442,6 +1536,15 @@ def _submit_run(host: Any, side: str,
             "diag": {"type": "boolean",
                      "description": "是否保留诊断信息（如神经网络的特征归因页需要它）",
                      "default": False},
+            "resume_from": {"type": "string",
+                            "description": "⭐ **续训（只对 `code`/`code_path` 有意义）**："
+                                           "从哪份存档接着训 —— `run_id` 或 `.pt` 的"
+                                           "**绝对路径**。⚠ 找不到会**可教学地拒**；"
+                                           "装载默认 `strict=True`",
+                            "default": ""},
+            "resume_which": {"type": "string",
+                             "description": "续训用哪一份：`last`（默认）/ `best`",
+                             "default": "last"},
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "command", "cancel_supported",
@@ -1548,11 +1651,44 @@ def _wait_jobs(ml: Any, handles: list, mode: str, budget: float) -> None:
         time.sleep(min(_WAIT_POLL_S, remaining))
 
 
+def _iso_from_epoch(value: Any) -> str:
+    """epoch 秒 → 本地 ISO 串（取不到回空串，**不编时间**）。"""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(value)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _logs_note(total: int, shown: int, asked: int, cap: int = 0) -> str:
+    """`read_job.logs_tail` 的**人话说明**（三件事分开说，不靠沉默）。
+
+    - 有日志且被截断 ⇒ 告诉怎么拿更多，并说清**桶是有界的**（"共 N 行，只留最后 cap 行"）；
+    - 有日志但 `logs=0` ⇒ 说明"是你自己关掉的"；
+    - **一条都没有** ⇒ 说明"这个 job 没往 stdout/stderr 打印过任何东西"
+      （并指出该看什么），**不是**"工具没有这个能力"。
+    """
+    if total <= 0:
+        return ("⚠ 这个 job 没有向 stdout/stderr 打印过任何东西（不是'读不到'："
+                "日志捕获已经在跑）。**⚠ 但这不代表它没报过错**：C 层"
+                "（torch / CUDA / OpenMP / MKL）与**子进程**直接写 fd 1/2 的输出"
+                "**不在**这里——那种报错只出现在权威的控制台/日志里。"
+                "⇒ 要按时间对齐：用本回执的 `started_at`/`finished_at` 去查权威那段时间的原始输出；"
+                "要让它以后有日志，在你的网络代码里 `print(...)` 即可。")
+    if asked <= 0:
+        return f"（有 {total} 行日志，但你写了 `logs=0` 把它们关掉了）"
+    if total > shown:
+        return (f"（共 {total} 行；日志桶**有界**（上限 {cap or '?'} 行/任务，"
+                f"老的自动丢），这里回最后 {shown} 行。要更多把 `logs=N` 调大"
+                f"（上限仍是桶容量；要全量请把关键信息写进指标或盘上文件））")
+    return ""
+
+
 def _read_job(host: Any,
               banned_words: tuple[str, ...] = ()) -> ToolDefinition:
     def execute(*, job_id: str = "", job_ids: Any = None, wait: str = "none",
                 timeout_s: float = 0.0, wait_s: float = 0.0,
-                detail: str = "summary", tail: int = 0) -> Mapping[str, Any]:
+                detail: str = "summary", tail: int = 0,
+                logs: int = 10) -> Mapping[str, Any]:
         ml = _require_job_host(host)
         handles = _job_handles(job_id, job_ids)
         mode = str(wait or "none").strip().lower()
@@ -1627,6 +1763,21 @@ def _read_job(host: Any,
                                  _PROGRESS_SIDECAR, None) or {})
         except Exception:                                   # noqa: BLE001
             extra = {}
+        # ⭐ **服务端 print 可读**（用户实测 A5）：job 线程里的 stdout/stderr
+        #   经 `job_logs` 的 tee 收进环形缓冲（挂在同一个 ExecutionContext 上）
+        #   ⇒ 每次轮询顺手回**最后 `logs` 行**（默认 10；写 0 = 不要）。
+        #   ⚠ 默认给（而不是要一个显式开关）：使用者的痛点是"**没有工具能读
+        #     服务端 print**"⇒ 还要先知道有个开关才看得到，等于没修。
+        #     代价有界：只有真打印过的 job 才带这段（10 行 ≤ 约 1 KB）。
+        from ml_mecha import job_logs as _job_logs
+        logs_tail: list = []
+        logs_n = 0
+        logs_cap = 0
+        try:
+            logs_tail, logs_n, logs_cap = _job_logs.capture.tail(
+                ml.jobs.get(job_id).context, int(logs or 0))
+        except Exception:                                   # noqa: BLE001
+            logs_tail, logs_n, logs_cap = [], 0, 0
         latest = dict(progress[-1]) if progress else {}
         latest.update(extra.get("latest") or {})
         # ⭐⭐ **job 完成 ≠ 命令成功**：命令层的失败（`ok=false`）留在**回执**里，
@@ -1726,6 +1877,24 @@ def _read_job(host: Any,
                                                 or len(all_epochs) > tail_n)),
                 "detail": "full" if full else "summary",
                 "tail": tail_n,
+                # ⭐ 服务端 stdout/stderr 的尾巴（网络代码里的 `print` 就在这里）
+                "logs_tail": logs_tail,
+                "logs_n": int(logs_n),
+                #: ⭐ **截断要显式说**（Q1 补强）：`logs_n` 是**总行数**（无界事实），
+                #:   而缓冲是**有界**的（`logs_cap`）⇒ 总行数 > 回的行数 = 截断过。
+                "logs_cap": int(logs_cap),
+                "logs_truncated": bool(logs_n > len(logs_tail)),
+                # ⚠ **空要说清是哪一种空**（Q1-③）：是"这个 job 什么都没打印"，
+                #   还是"日志还没收 / 你写了 logs=0"。沉默的空数组会被读成"没有日志
+                #   这个能力"——那是本仓反复在防的那类误读。
+                "logs_note": _logs_note(int(logs_n), len(logs_tail), int(logs or 0),
+                                        int(logs_cap)),
+                # ⭐ **时间区间**（Q3.5）：`logs_tail` 只覆盖 **Python 层**的 print；
+                #   C 层（torch/CUDA/OpenMP/MKL）与子进程直接写 fd 1/2 的输出抓不到
+                #   ⇒ 给一对**时间戳**，人/AI 才能拿它去权威控制台或日志文件里
+                #   **按时间对齐**那段原生输出（这是"看不到"与"无从下手"的区别）。
+                "started_at": _iso_from_epoch(status.get("started_at")),
+                "finished_at": _iso_from_epoch(status.get("finished_at")),
                 "result_ref": dict(status.get("result_ref") or {}),
                 "error": str(status.get("error") or ""),
                 "ref_error": str(status.get("ref_error") or ""),
@@ -1755,7 +1924,10 @@ def _read_job(host: Any,
                     "⚠ `wait_s` 是旧名（等价于 `wait=\"terminal\"` + 同秒数），新调用用 `timeout_s`。"
                     "⚠ **默认只回摘要**（`progress_latest` + 最近 `tail` 条 + 真实条数"
                     "`n_progress`/`n_epochs`）：`progress`/`epochs` 的全量历史在长训练里"
-                    "是几百 KB。要全量显式给 `detail=\"full\"`，要更多条给 `tail=N`。",
+                    "是几百 KB。要全量显式给 `detail=\"full\"`，要更多条给 `tail=N`。"
+                    "⭐ **`logs_tail`：服务端 stdout/stderr 的最后几行**（网络代码里的 "
+                    "`print` 就在这里，默认 10 行，`logs=N` 调条数，`logs=0` 关掉）——"
+                    "它是唯一能读到「服务端 print」的口子。",
         parameters={
             "job_id": {"type": "string", "description": "submit_run 返回的任务编号",
                        "default": ""},
@@ -1781,6 +1953,12 @@ def _read_job(host: Any,
             "tail": {"type": "integer",
                      "description": f"摘要档回多少条历史（默认 {READ_JOB_TAIL}）",
                      "default": 0},
+            "logs": {"type": "integer",
+                     "description": "⭐ **服务端 stdout/stderr 回最后几行**（默认 10；写 0 = 不要）。"
+                                    "网络代码里的 `print(...)` 就在 `logs_tail` 里"
+                                    "（每行带 `[out]`/`[err]` 前缀）—— 这是**唯一**能读到"
+                                    "服务端 print 的口子（`[snap]`/`[resume]` 这类诊断靠它）",
+                     "default": 10},
         },
         output_schema={"type": "object",
                        "required": ["ok", "job_id", "state", "cancel_supported",
@@ -1793,7 +1971,12 @@ def _read_job(host: Any,
                                     "wait", "waited_s", "timed_out", "wait_cap_s",
                                     "wait_clamped", "jobs", "wait_note",
                                     # 调度层（队列）：与框架 state 分开报。
-                                    "queued", "queue_position", "queue_wait_s"]},
+                                    "queued", "queue_position", "queue_wait_s",
+                                    # 服务端 stdout/stderr 的尾巴（2026-10-07，A5）
+                                    "logs_tail", "logs_n", "logs_cap",
+                                    "logs_truncated", "logs_note",
+                                    # 时间区间（Q3.5：拿它去对齐 fd 层原生输出）
+                                    "started_at", "finished_at"]},
         execute=execute,
         banned_words=banned_words,
     )

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """运行期描述符与端口文件的**单一真源**（交付形态 P2）。
 
-为什么要单独一个模块：端口/状态文件名在四个地方被读写（权威写、看门人读与写、
+为什么要单独一个模块：端口/状态文件名在四个地方被读写（权威写、启动方读、
 监控页读、故障排查的人读），散落各处的字面量一旦漂移就是"起得来但看不见"
 （``07`` §3.3 点名的假绿温床）。本模块把**文件名、语义、清理规则**收在一处。
 
@@ -12,10 +12,14 @@
 ============================  ==========================  ==============================
 ``.mcp-port``                  权威                        裸端口（MCP 服务）
 ``.ml-monitor-port``           权威                        裸端口（只读监控端点）
-``.ml-mecha-runtime.json``     看门人（模式/端口）、权威补 pid  运行期描述符（单一真源）
-``.mode-request``              任意子进程                  切换意图（gui / ai）
-``.mode-state``                看门人                      当前模式
+``.ml-mecha-runtime.json``     启动方（模式/端口）、权威补 pid  运行期描述符（单一真源）
 ============================  ==========================  ==============================
+
+⚠ **曾经**还有 ``.mode-request`` / ``.mode-state`` 两个"两模式交接"的握手文件，
+以及一把 ``.launcher.lock`` 单实例锁 —— 那是**旧看门人**（``launcher.py``）的东西。
+三层架构下"切写权**不动进程**"（没有"模式交接"这回事），进程编排归框架
+⇒ 三个都随 launcher 一起删。⚠ **别加回来**；活知识见
+``docs/旧启动器-活知识存档.md``。
 
 **清理规则同一条**（针对 Windows 的现实）：``terminate()`` / ``taskkill /F``
 **不跑** Python 的 ``finally`` ⇒ "起写止删"不能只靠收尾。因此：
@@ -36,15 +40,19 @@ from pathlib import Path
 #: 端口文件（裸端口文本；EL 同名的发现约定，人/工具都认）。
 MCP_PORT_FILE = ".mcp-port"
 MONITOR_PORT_FILE = ".ml-monitor-port"
-#: 运行期描述符（模式 / pid / 端口）——端口发现的单一真源。
+#: 运行期描述符（pid / 端口）——端口发现的单一真源。
 RUNTIME_JSON = ".ml-mecha-runtime.json"
-#: 看门人两模式的状态文件。
-MODE_REQUEST = ".mode-request"
-MODE_STATE = ".mode-state"
-#: 看门人单实例锁（同 root 只允许一个看门人；含 pid ⇒ 陈旧锁可自动接管）。
-LAUNCHER_LOCK = ".launcher.lock"
+# ⚠ **曾经有** ``MODE_REQUEST`` / ``MODE_STATE`` / ``LAUNCHER_LOCK`` 三个常量：
+# 前两个是"两模式交接"的握手文件，第三个是旧看门人的单实例锁。
+# 三层架构下"切写权不动进程"（**没有"模式交接"这回事**）、进程编排归框架
+# ⇒ 三个常量与它们的唯一消费者（``launcher.py``）一起删。⚠ **别加回来**。
 
-_RUNTIME_FIELDS = ("mode", "pid", "authority_pid", "mcp_port", "monitor_port",
+#: 描述符里允许写的字段。
+#: ⚠ **曾经有** ``mode``：旧看门人把"当前模式"写进来当台面读数。三层架构下写权是
+#: **运行中可切**的（任何本机客户端都能请求切，见《软件-交互-写权-三层架构》§5）
+#: ⇒ "启动时那个值"不再是值得持久化的真相，字段随模式概念一起去掉；
+#: 要读当前写权请走控制端点，不要来这里找。
+_RUNTIME_FIELDS = ("pid", "authority_pid", "mcp_port", "monitor_port",
                    "dsh_port", "root", "started_at", "updated_at")
 
 
@@ -104,39 +112,14 @@ def clear_runtime(root: str | Path) -> None:
 
 
 # ---------------------------------------------------------------- 单实例锁
-def read_lock_pid(root: str | Path) -> int | None:
-    """读看门人锁里的 pid；缺失/损坏返回 ``None``（调用方按"无锁"处理）。"""
-    try:
-        raw = resolve(root, LAUNCHER_LOCK).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return int(raw) if raw.isdigit() else None
+# ⚠ **曾经有** ``read_lock_pid`` / ``write_lock`` / ``clear_lock`` 三个函数与
+# ``LAUNCHER_LOCK = ".launcher.lock"``：它们是**旧看门人**（``launcher.py``）的单实例锁。
+# 三层架构把进程编排整块归框架（``python -m mecha``）⇒ 项目**不再自己编排**，
+# 那把锁连同消费者一起删（唯一消费者就是 launcher）。
+# ⚠ **别加回来**：今天的单实例语义由框架的 ``_mecha_runtime/supervisor.pid`` 承担。
+# 活知识存档：``docs/旧启动器-活知识存档.md``。
 
 
-def write_lock(root: str | Path, pid: int | None = None) -> None:
-    try:
-        resolve(root, LAUNCHER_LOCK).write_text(str(int(pid or os.getpid())),
-                                                encoding="utf-8")
-    except OSError:
-        pass
-
-
-def clear_lock(root: str | Path, pid: int | None = None) -> None:
-    """删锁；``pid`` 给了就只在锁里仍是它时删（别误删接管者的新锁）。"""
-    target = resolve(root, LAUNCHER_LOCK)
-    try:
-        if not target.exists():
-            return
-        if pid is not None:
-            raw = target.read_text(encoding="utf-8").strip()
-            if raw and raw != str(int(pid)):
-                return
-        target.unlink()
-    except OSError:
-        pass
-
-
-__all__ = ["MCP_PORT_FILE", "MONITOR_PORT_FILE", "RUNTIME_JSON", "MODE_REQUEST",
-           "MODE_STATE", "LAUNCHER_LOCK", "resolve", "read_port",
-           "write_port_file", "clear_port_file", "read_runtime", "write_runtime",
-           "clear_runtime", "read_lock_pid", "write_lock", "clear_lock"]
+__all__ = ["MCP_PORT_FILE", "MONITOR_PORT_FILE", "RUNTIME_JSON", "resolve",
+           "read_port", "write_port_file", "clear_port_file", "read_runtime",
+           "write_runtime", "clear_runtime"]

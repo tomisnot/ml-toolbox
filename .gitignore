@@ -33,16 +33,16 @@ logs/
 .ml-mecha/
 .ml-mecha-hub/
 
-# 交付形态运行期状态文件（看门人/发现用；每次启动重写）
+# 交付形态运行期状态文件（发现用；每次启动重写）
+# ⚠ **曾经还有** `.mode-state` / `.mode-request` / `.launcher.lock`（旧看门人的两模式
+#   握手与单实例锁）—— 三层架构下"切写权不动进程"、编排归框架 ⇒ 三个都随
+#   `launcher.py` 删掉了。活知识：`docs/旧启动器-活知识存档.md`。
 .mcp-port
 .ml-monitor-port
 .mlweb-port
 .ml-mecha-runtime.json
-.mode-state
-.mode-request
-.launcher.lock
 
-# AI 模式运行期生成的 dsh overlay（每次启动按实际端口重写）
+# 运行期生成的 dsh overlay（每次启动按实际端口重写）
 runtime/
 
 # dsh 的工作区目录：`.dsh/skills/<name>` 是指向 `skills/<name>` 的 **junction**

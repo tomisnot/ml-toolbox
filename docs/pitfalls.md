@@ -411,26 +411,28 @@
 - **为什么值得单列**：这是"参数形同生效"的又一例，而且**只在端到端断言
   （点数）时才显形**——单元层看不出（`extras` 里确实没有那个键）。
 
-### A6. `run_id` 是确定性的 ⇒ 重跑会往**同一个** `tb/` 里追加
-- **症状**：一次 6 epoch 的训练，`describe_training` 读出 **60** 个 loss 点。
-- **原因**：`runner._run_id(method, seed)` 只由"方法名 + 种子"决定
-  ⇒ 同方法同种子**重跑会复用同一个 `runs/<id>/tb/`**（这是刻意的：让
-  TensorBoard 直播目录在跑之前就定死）。多份事件文件叠在同一目录里，
-  步数就累加了。
-- **修法**：这是**有意行为**，别当 bug 修；但**用固定 run_id 的判据必须
-  给一个独特的种子**（否则上一轮的事件会污染断言）。
-  代码侧的留痕机制是 `tb_series.read_run` 的 `duplicate_steps`
-  （同一步被写多次时如实报出来，不静默去重）。
-
-- **症状**：一次 6 epoch 的训练，`describe_training` 读出 **60** 个 loss 点。
-- **原因**：`runner._run_id(method, seed)` 只由"方法名 + 种子"决定
-  ⇒ 同方法同种子**重跑会复用同一个 `runs/<id>/tb/`**（这是刻意的：让
-  TensorBoard 直播目录在跑之前就定死）。多份事件文件叠在同一目录里，
-  步数就累加了。
-- **修法**：这是**有意行为**，别当 bug 修；但**用固定 run_id 的判据必须
-  给一个独特的种子**（否则上一轮的事件会污染断言）。
-  代码侧的留痕机制是 `tb_series.read_run` 的 `duplicate_steps`
-  （同一步被写多次时如实报出来，不静默去重）。
+### A6. `run_id` 是确定性的 ⇒ 重跑会往**同一个** `tb/` 里追加（⚠ **旧行为，已改**）
+- **症状**（旧版）：一次 6 epoch 的训练，`describe_training` 读出 **60** 个 loss 点。
+- **原因**（旧版）：`runner._run_id(method, seed)` 曾经**只由"方法名 + 种子"决定**
+  ⇒ 同方法同种子**重跑会复用同一个 `runs/<id>/tb/`**（当时是刻意的：让
+  TensorBoard 直播目录在跑之前就定死）。多份事件文件叠在同一目录里，步数就累加了。
+- **已改（2026-10-05 起）**：`_run_id` 带**毫秒**——
+  `f"{method}-{int(time.time() * 1000) % 10_000_000}-{seed}"`
+  （`ml_toolbox/core/runner.py:52-53`）⇒ **同 seed 重跑得到不同的 id**
+  （盘上实证：`custom_network-2334125-0` / `-1202787-0` / `-4953756-0` 全是 seed 0）。
+  ⇒ **"同 seed 会复用同一个 `tb/`"这句话现在是错的**，别照它做判断
+  （`docs/usage-best-practices.md` §5.3 与 `SKILL.md` §续训已同步更正）。
+- **仍然成立的残留风险**（所以本条不删）：
+  1. 毫秒字段是 `% 10_000_000` ⇒ **2.78 小时一个周期**：同方法 + 同 seed +
+     同毫秒残差会撞进同一个目录，且**撞了没有任何检测**；
+  2. **显式固定 `run_id` 的探针/扫参**会真的追加。盘上抓到过活例：
+     `runs/linear_regression-155284-42/`（`record.json` 里 `method=ridge`，而
+     `config.extras.run_id=linear_regression-155284-42`，`tb/` 下**两个**事件文件、
+     同进程相隔 4 秒）⇒ 用固定 run_id 的判据**必须**给一个独特种子，或先清目录。
+- **留痕机制**：`tb_series.read_run` 的 `duplicate_steps`（同一步被写多次时如实报出，
+  **不静默去重**）。
+- ⚠ **别再把它当成"曲线被污染"的成因**：同一 run 内读起来"两条曲线不像一回事"，
+  真正常见的原因是 **A55（两族 tag 的 step 轴单位不同）**，与 append 无关。
 
 ### A7. 内部标记经 spec 传递 ⇒ 被当成"未声明的参数"，job 瞬间假完成
 - **症状**：给后台请求打了内部标记之后，job **立刻**以 `state=done` 结束、
@@ -1154,4 +1156,218 @@
 - **判据**：`test_ml_delivery.py::test_same_run_cross_tag_alignment_exposes_unequal_step_cadence`
   （用用户那条 run：`fid/sub0` 在非 3 倍数处必须是 `null`；步长完全错开时
   `aligned_at_step` 必须是 `None`）。
+
+### A55. **同一根轴上有两种步号单位**：epoch 序号 vs 全局 batch 步（读数的人会把它读成"点数"）
+- **症状**（用户 2026-10-07）："`fid/step` 累计 **4698** 点而 `loss` 只有 **102** 点
+  ⇒ 两条不同训练的曲线混在一根轴上了，按 `wall_time` 过滤也切不干净。"
+  ⚠ 真实现场（同一份回执）：`loss` 的 `latest_step` = **283**，
+  `fid/step` 的 `latest_step` = **78410**，比值 ≈277 = **每 epoch 的批数**。
+  4 698 ÷ 102 ≈ 46 也是同一个比值 ⇒ 他**把 `latest_step` 读成了"累计点数"**
+  （`tb_series.MAX_POINTS=500`：单个 tag 的点数不可能到 4 698）。
+- **原因**：`tb_log` 里有**两条**写标量的路，轴的单位不同，而回执**只给步号、不给单位**：
+  - `log_epoch`（loss/val_loss/lr/grad_norm/逐层梯度/权重范数）：`step = ep` ⇒ **第几轮**；
+  - `log_step`（`Network.on_step` 上报的步级指标）：`step = gstep` ⇒ **第几个 batch**。
+  ⇒ `latest`/`latest_steps` 把它们并排放着，读者自然会认为"同一根轴"（A54 的同族病，
+  这次不是"步长不同"而是**单位不同**，比值可达几百倍）。
+- **第二个症状（更坏）**：`tags=[…]` 把两族强行对齐时，轴取**并集的尾部** ⇒
+  末尾全是 batch 步 ⇒ **epoch 级那一族整列 `null`**（实测 `loss`/`val_loss` 六个点全 `null`，
+  `aligned_at_step=null`）。回执看起来像"**这段区间根本没有记 loss**"——那是**假事实**。
+- **修法**（2026-10-07）：
+  1. `latest_steps` 之外新增 **`step_units`**（只列**非 epoch 级**的 tag：`batch`/`mixed`；
+     不在表里的一律 epoch 级）；
+  2. 新增 **`axes`**：`epoch_tags_n` / `batch_tags` / `mixed_tags` / `epoch_axis_len` /
+     **`per_epoch_estimate`**（就是那个"看起来差几百倍"的来源）/ `note`；
+  3. `tags=[…]` 跨族对齐时**当场给出 `compare.axis_warning`**（说清"epoch 级那一族会大片
+     `null`，不是没记，是不在这个 step 尺度上"）——**不删数据**（有人确实要看），
+     但**结论必须写在数字旁边**；
+  4. `mixed`（同名 tag 被两条路都写过）**要点名**：它的轴**本身**不干净。
+- **教训**：与 A54 同一条纪律的加强版——**"并排"不只断言"同一时刻"，还断言"同一种刻度"**。
+  单位是契约的一部分：只给数字不给单位，等于把"读数的人会自己编一个含义"写进设计里。
+- **判据**：`tests/test_nqs_path.py::test_step_axis_units_are_reported_and_cross_family_alignment_warns`
+  （一个既有 `on_step` tag 又有 epoch tag 的真 run ⇒ `step_units` 里前者必须是 `batch`、
+  `axes.per_epoch_estimate` 必须 ≈ 每轮批数、跨族 `tags=[…]` 必须带 `axis_warning`）。
+
+### A56. **服务端 `print` 读不到**：job 是线程，而 `redirect_stdout` 是进程级
+- **症状**（用户 2026-10-07）：网络代码里的 `print("[resume] …")` / `print("[snap] …")`
+  是**重要的运行时诊断**（证明续训/快照真的生效），但**没有任何工具能读后台任务的 stdout**
+  ⇒ 只能靠 `run_id` + 指标**反推**一个布尔事实，一次往返。
+- **原因**：job 是**权威进程里的一条 daemon 线程**（`assembly.JobService.submit` →
+  `JobRegistry._run`），`print` 只落在权威的控制台；框架的 `Job.to_dict()`
+  （`mecha/providers/jobs.py`）**没有任何日志字段**；`ml_mecha` 侧也没有捕获。
+- **修法**（2026-10-07，`ml_mecha/job_logs.py`）：进程内装**一个 tee**
+  （`sys.stdout`/`sys.stderr` 的代理），**按 `threading.get_ident()` 分桶**，
+  桶挂在 `ExecutionContext` 的 sidecar 上（与 `_PROGRESS_SIDECAR` 同一手法），
+  `read_job` 增 `logs_tail`/`logs_n`（默认 10 行，`logs=0` 关）。
+- **两条设计约束**（写下来，因为它们是"看着简单、写错就坏事"的地方）：
+  1. ⚠ **不能直接用 `contextlib.redirect_stdout`**：它换的是**进程级** `sys.stdout`，
+     而 job 是**线程** ⇒ 并发两个 job 时输出会**串台**（A 的 print 出现在 B 的日志里）。
+  2. ⚠ **透传与编码兜底都不能省**：tee 必须把内容照原样写给真流（否则等于把 print 从
+     人的视野里删掉），且写入自身**永不抛**（A42/A7②：GBK 控制台遇 `⚠` 会
+     `UnicodeEncodeError`）—— 日志设施只能"少一行日志"，不能"让任务失败"。
+- **边界（如实说）**：只覆盖走 `sys.stdout`/`sys.stderr` 的 Python 输出；
+  C 扩展直接写 fd 1/2 的收不到；每 job 的环形缓冲**有界**（默认 `MAX_LINES=200` 行，
+  可用 `MLTB_JOB_LOG_LINES` 覆盖；`logs_n` 是**总行数**，截断看 `logs_truncated`/`logs_cap`）。
+- ⚠ **两条实现约束（都是实测踩出来的，别"优化"掉）**：
+  1. **桶必须有界**：使用者那轮是 **6 小时级**训练、网络代码里**每个 batch 都可能 print**
+     （几十万行），而当时 commit 内存到过 92% ⇒ **无界缓冲会把内存吃干**，
+     失败还会伪装成「torch DLL 装载失败 / Insufficient system resources」（离根因很远）。
+     `deque(maxlen=cap)` 是**环形**（老的自动丢），**不是**"先全存再截"；
+     而"总行数"只是一个整数 ⇒ 它无界也不吃内存 —— **两者必须分开**
+     （只回 `len(缓冲)` 会把"截掉了多少"藏起来）。
+  2. ⚠ **一次 `print` = 两次 `write`**（值 + `"\n"`）⇒ 按 write 计数会把 20 000 行记成
+     **40 000 行**，而且 `"\n".splitlines() == ['']` 会让每次 print **多出一条空行**
+     （判据当场红）。正解：桶里攒 `_partial`，按 `split("\n")` 组装**真的行**，
+     收尾再 flush 没换行的那一段（否则 `print(x, end="")` 会丢）。
+- **判据**：① `tests/test_ml_mecha.py::test_job_stdout_is_readable_and_still_reaches_the_console`
+  （`logs_tail` 里有网络代码的 stdout 与 stderr 行（含非 ASCII）；**同一行也到了"真流"**
+  —— 用记录型替身验透传，防止有人改成"只收不发"；`logs=0` 能关；job 本身必须 done）；
+  ② `::test_concurrent_job_logs_do_not_cross_contaminate`
+  （**先断言两个 job 区间真的相交**，再断言各自的 `logs_tail` 里没有对方的标记 ——
+  串行跑时这条判据是**空转的**，所以那个前置断言不能省）；
+  ③ `::test_job_log_buffer_is_bounded_with_a_true_total`  （20 000 行 ⇒ 桶占用**停在 cap**、`logs_n` 是**真总行数**、回的是**最后** cap 行且**保序**、
+  `logs_truncated=true`、`logs=N` 调大也**不会**超过桶容量）；
+  ④ `::test_native_fd_output_is_outside_logs_tail_and_note_says_so`（**边界**，见下）。
+- ⚠⚠ **边界（Q3.5，2026-10-07，必须写在这里而不是只写在代码里）**：
+  `logs_tail` 只覆盖**走 `sys.stdout`/`sys.stderr` 的 Python 输出**。
+  **C 层（torch / CUDA / OpenMP / MKL）与子进程直接写 fd 1/2 的输出抓不到** ——
+  而这台机器上最迷惑的两次失败恰恰是那一类
+  （`torch/lib/vrtc64_120_0.alt.dll … or one of its dependencies`、
+  `Insufficient system resources`）。
+  ⇒ **`logs_tail` 是空，不等于"没有报错"**（这正是"假事实"的另一种形态）。
+  为此做了两件**低风险**的事：
+  1. **空日志的说明点名这个边界**（`logs_note`：="不代表它没报过错…C 层与子进程直接写 fd 1/2 的
+     输出**不在**这里"），并指出**按时间对齐**的口子；
+  2. `read_job` 回 **`started_at`/`finished_at`** ⇒ 人/AI 能拿这段时间去权威的控制台
+     或日志文件里对齐那段**原生输出**（"看不到"与"无从下手"的区别）。
+  ⚠ **没有做"把 fd 1/2 也接进管道"的 native 桶**。判定与**核实过的事实**都写在下面
+  （将来有人想做得先反驳这三条；⚠ 其中**两条我一开始写错过**，被使用者要求核实后改正，
+  所以这里保留"错在哪"，免得后人照抄错的理由）：
+  - **风险 A（真正的阻塞）—— 排空方"活着但不排空"**：管道写满缓冲区（Windows 默认约 64 KB）后
+    `write` 会**阻塞** ⇒ 一个 6 小时训练**挂死在 write 上**（比"读不到日志"坏得多）。
+  - **风险 B（不是挂死，是报错）—— 排空方"死亡"**：读端句柄关闭后，写端得到的是
+    **`BrokenPipeError`**（Windows 上也是报错，不是阻塞）。⚠ 它本身不等于挂死，
+    但它会打在**任意一次写入**上（包括 torch/第三方库的 C 层 fd 写，那些代码不一定处理它）
+    ⇒ 也需要处理，只是**与 A 是两种不同的失效模式**。
+    （我第一版把 B 也写成"照样阻塞"——**不准确**，使用者指出后已改正。）
+  - **代价 C（唯一消不掉的）—— 人失去实时可视面**：fd 1/2 被接走后，原生输出**不再出现在控制台**，
+    要看只能走转发出来的文件。
+  - ❌ **一条不成立的反对理由（我写过，实测推翻）**："接走 fd 会破坏 utf-8 保证"——
+    **不成立**：`app_entry.main()` 的 `reconfigure` 是**无条件**的（不看 `isatty`）。
+    实测（`checks/oneoff/_factcheck_isatty_utf8.py`，**剥掉 `PYTHONIOENCODING`** 后）：
+    `stdout=PIPE` 时 `BEFORE gbk isatty=False` → 调 `app_entry.main(['--help'])` 后
+    `AFTER utf-8 isatty=False`；而同样走管道、不调 main 的对照是 `gbk`。
+    ⇒ 换成管道**不会**破坏编码（Q2 的 `PYTHONIOENCODING` 注入还是第二层保险）。
+  - 另外：它**不可能**归属到某个 job（fd 是进程级、job 是线程）⇒ 只能另开
+    **`logs_native_tail`** 并明确标注"进程级、无法归属"；**不要**试图把它并进 per-job 日志
+    （那会重新引入串台）。
+
+### A57. `best.pt` **只按 `val_loss` 选** ⇒ 自定义任务的主指标被无视（`best` 比 `last` 差很多）
+- **症状**（用户 2026-10-07）：同一场训练里 **`best` 0.6464 vs `last` 0.8174**（主指标口径）
+  —— 而 `checkpoint_detail` 只报 `best_epoch`，**不说"这份 best 是按什么选的"**
+  ⇒ 拿到 `best.pt` 不知道能不能用。
+- **原因**：`trainer.train` 的 `watch = vl if vl is not None else train_loss`
+  —— `best_state` 的**唯一**口径是**验证损失**；而自定义任务（`target_kind="custom"`）
+  的主指标常常**不是** `val_loss`（NQS 是 `fid/*`）⇒ "最佳轮"选的是另一个目标的最佳。
+- **修法（2026-10-07，Q4）**：`Network.best_metric` 可声明用哪个 tag 选 best：
+  ```python
+  best_metric = "fid/sub1"              # 方向由 `curve.direction` 判（判不出就报错，**不猜**）
+  best_metric = ("ph/std", "lower")     # 方向没有好坏的量必须显式给
+  ```
+  - 值来自 `Network.metrics(model, ctx)` 的返回（每轮一次；`metrics_every=N` 可降频；
+    **该轮没上报就跳过那一轮**，跳过数进 `best_by.skipped_epochs`）；
+  - `checkpoint_detail` 的 `files_meta.best.best_by` 报 **tag / direction / value / epoch / step**，
+    `val_loss_best` 给**对照**（两者常常不是同一轮）；
+  - ⚠ **未声明时逐位不变**（`best_by.tag == "val_loss"`，值与从前的 `best_watch` 一致）
+    —— 声明是**显式选择**，不是新默认；
+  - ⚠ 声明了但**整场一次都没上报** ⇒ **退回 val_loss 并留痕**
+    （`nn_best_metric_missing` + `best_by.note`）—— 不静默、也不让 `best.pt` 缺席。
+- **教训**：**"最佳"必须有口径**。当一个工具替你挑"最好的一轮"，它必须：
+  ① 说清按什么挑；② 允许你换口径；③ 口径判不出来时报错而**不是猜**
+  （猜错会让 best 选到反着的轮次，而回执看着一切正常）。
+- **判据**：`tests/test_nqs_path.py::test_best_pt_selection_is_declarable_and_default_is_unchanged`
+  （声明的 tag **严格上升** ⇒ best 必落在最后一轮 ⇒ 断言 `best.pt` 与 `last.pt` **逐张量相等**；
+  未声明 ⇒ `best_by.tag == "val_loss"`；`ph/std` ⇒ `bad_best_metric` 可教学地拒；
+  tuple 形式能通）。
+
+### A58. 周期存档**只写 `last.pt`** ⇒ 被中断的长训练拿不到"最好的那一份"
+- **症状**（使用者 2026-10-07，Q4b）：`checkpoint_every` 在训练中途**只更新 `last.pt`**，
+  `best.pt` 要等**终态**才写 ⇒ 一次**被中断**（死机/取消/被杀）的长训练
+  **只有 `last.pt`**，而 `last` 那一轮的指标常常**不是**最好的那一轮
+  （实测：`best` 0.6464 vs `last` 0.8174）—— "周期存档"的意义正是防这个。
+- **原因**：周期回调当初只为"别丢参数"设计（只落当前权重），而"最佳快照"一直由
+  训练循环在**终态**交给 `_save_checkpoints`。
+- **修法**（Q4b）：周期回调**同时**收到训练循环维护的**最佳快照**（`best_state`）与
+  它的轮次/取值；当最佳轮**刷新过**时，就在下一个周期**原子写一份 `best.pt`**
+  （`save_reason="periodic"`，带上 `best_by` 口径）。
+  ⚠ **写的是快照，不是当前 model**：中途那一刻的 model 权重早已不是 best 那一轮的
+  ⇒ 写错等于把"最佳"记成"此刻"（假事实）。⚠ 顺序也重要：回调放在 **best 更新之后**。
+- **判据**：`tests/test_nqs_path.py::test_periodic_best_pt_is_written_mid_run_so_an_interrupted_run_keeps_it`
+  （网络让指标**中途到峰值再回落**，峰值轮是常数 ⇒ 断言：训练**还在跑时**就观测到
+  `best.pt` 且 `save_reason=periodic`；观测到的"最佳轮"序列**先出现早期轮、最终追到峰值轮**；
+  终态那份 `best_by.epoch` 仍是峰值轮，且权重与 `last.pt` **必须不同**）。
+
+### A59. 续训**没有入口** ⇒ 只能在 `build()` 里自己 `torch.load`（而那条路正是 A7-① 的坑）
+- **症状**（使用者 2026-10-07）：`Network` 契约只有
+  `build/loss/configure/forward_step/forward_graph/on_step/metrics`，**没有装载存档的钩子**
+  ⇒ 续训要在 `build()` 里手写 `torch.load` + `load_state_dict`；而文档推荐的那个片段
+  用的是 `strict=False` ⇒ **静默全不匹配**（A7-①：模型等于随机初始化而你看不出来）。
+- **修法**（Q7）：显式入口 `run_custom`/`submit_run` 的
+  `resume_from=<run_id|.pt 路径>` + `resume_which=last|best`；
+  - 装载在 **`build()` 之后**（顺序反了会被 build 覆盖），**默认 `strict=True`**
+    ⇒ 结构变过就 `resume_state_mismatch`（带缺失/多出键）；
+  - **找不到存档 ⇒ `no_resume_checkpoint`**（**绝不静默从头训**）；
+  - 回执/存档记 `resumed_from`/`resumed_which`/`resumed_at_step`（来源可反查）；
+  - 需要"只装一部分"⇒ 可选钩子 `Network.load_state(model, state)`。
+- ⚠ **踩到的第二个坑（A38 的复发）**：`resume_state` 是**张量 dict**，塞进
+  `cfg.extras` 之后 **训练成功、写 `record.json` 时炸**（"不可 JSON 序列化"）——
+  与 `on_progress` 同一类。⇒ 方法层用完**就地 pop**，`runner.run_one` 的 `finally`
+  **再摘一次**（两道，因为这条只在落盘路径暴露）。
+- **判据**：`tests/test_nqs_path.py::test_resume_from_starts_near_the_breakpoint_and_fails_teachably`
+  （**自归一化**：续训首轮 loss 离**断点**更近、离"从头首轮"更远；不依赖绝对阈值。
+  另含：不存在 ⇒ `no_resume_checkpoint`、`resume_which` 越界 ⇒ `bad_resume_which`、
+  结构变过 ⇒ `resume_state_mismatch`）。
+
+### A61. **`metrics` 抛异常会被永久静默关闭** ⇒ "一个 epoch 级 tag 都没有"却看着一切正常
+- **症状**（使用者 2026-10-07，白跑一轮）：TB 里**一个 epoch 级 tag 都没有**
+  （`fid/sub1`、`famp/sub1`…），而**训练完全正常**（`loss` 在降、**步级** tag 都在）；
+  `best_metric` 也因此在整场里"一次都没上报"。**看起来像"作者没写 `metrics`"，其实他写了。**
+- **原因**（三条叠加才致命，旧 `trainer.py`）：`except Exception: metrics = None`
+  ① **异常被吞掉、不留任何痕**；② **`None` 是永久关闭**（第一次失败后整场再也不调用）；
+  ③ **失败不体现在任何回执里**。
+- **触发原因极常见**：`metrics` 拿的是**全量负载**（作者 7344 行、一次 256-token 解码就 **OOM**）
+  ⇒ "数据一大就静默丢观测"。⚠ **旧 run 之所以有 `fid/sub1`，只是因为那时数据只有 522 行。**
+- **修法**（2026-10-07）：
+  1. **留痕**：`_metrics_failed()` 记"轮次 + 异常类型 + 消息"（最多 3 条）进
+     `stats["metrics_health"]` ⇒ 三条路都能读到：**artifacts**（`nn_metrics_errors`/`nn_metrics_throttled`）、
+     **`checkpoint_detail().files_meta.<tag>.metrics_health`**（**只有磁盘、跨重启也查得到**）、
+     **`diag.metrics_health`**；顶层还给一句 `metrics_note`（最常问的那句）。
+  2. **不永久关闭**：连续失败 `METRICS_FAIL_TOLERANCE=3` 次后**降级**为
+     "每 `METRICS_RETRY_EVERY=10` 轮再试一次 + **末轮必试**"；一次成功就**恢复**
+     （`recovered_after_epoch`）⇒ 临时性失败（显存一时紧张）能自己恢复，而代价有界
+     （他那个失败是 OOM，每轮重试很贵）。
+  3. **三种病分得开**（修法完全不同）：`hook=False` ⇒ **没写钩子**；
+     `failures>0` ⇒ **写了但每轮失败**（`errors` 里有原因）；两者都正常而 tag 不在 `tags` 里 ⇒ **名字写错**。
+- **边界（写进文档）**：`metrics` 每轮拿**全量负载** ⇒ **里面必须分批**（他给的反例：
+  同一份代码他的 `_step_one` 是分批的、`metrics` 忘了 ⇒ 只在**大数据**上炸）。
+- **判据**：`tests/test_nqs_path.py::test_metrics_failure_is_traced_and_not_permanently_disabled`
+  （网络**第 0 轮抛异常、之后正常** ⇒ 断言：训练照常成功 / artifacts **与** checkpoint_detail
+  都能看到失败原因 / ⭐ **后面的 epoch 必须真的产出 `fid/ok`**（旧实现下这条一定红：
+  整场没有 epoch 级 tag）/ `hook=True` 与"没写"分得开）。
+
+### A60. **判据被自己的环境变量喂成了假象**（"恒定正确"比"红"更危险）
+- **症状**（我 2026-10-07 亲历）：为核实"子进程 stdout 变成管道时，`app_entry.main()`
+  的 utf-8 `reconfigure` 还成立吗"，我写了个三次对照的探针 —— **三次都是 utf-8**，
+  看着像"管道恒定 utf-8"（⇒ 差点据此否掉一条**真实存在**的风险）。
+- **原因**：**我自己的 shell 里设了 `PYTHONIOENCODING=utf-8`**，它经 `os.environ`
+  继承给了每个子进程 ⇒ 探针测的是"注入生效"，**不是默认行为**。
+  剥掉之后结论立刻出来：`PIPE: BEFORE gbk isatty=False → AFTER utf-8 isatty=False`
+  （所以 `reconfigure` 是**无条件**的，与 `isatty` 无关）。
+- **纪律**：**凡"验证编码/环境相关行为"的判据，必须先剥掉自己 shell 的环境变量**
+  （`PYTHONIOENCODING` / `TZ` / `LANG` / `CUDA_VISIBLE_DEVICES` / `ML_TOOLBOX_*` /
+  `MLTB_*`），否则会得到"**恒定正确**"的假象 —— 这与"判据在串行执行下空转"、
+  "挑的变异与原实现等价"（A13）是**同一族病**：**判据看起来绿，但它没有真的在测那件事**。
+- **可复现的样本**：`checks/oneoff/_factcheck_isatty_utf8.py`
+  （里面**显式**把 `PYTHONIOENCODING` 从子进程环境里剥掉，并在注释里写明"我第一版就是被它骗的"）。
+- ⚠ **未做完的部分（挂起）**：现有判据里还有没有同类（依赖上述环境变量而"恒定绿"）
+  **尚未系统扫过** —— 这是重启后的一项遗留工作（见 `docs/交接-重启后待办与验收.md`）。
 
