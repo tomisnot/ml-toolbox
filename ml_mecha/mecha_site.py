@@ -62,12 +62,16 @@ mecha 的 supervisor 按约定发现本文件（模块级 ``SITE``）并把声�
   ``software_control.build_control_registry`` / ``start_control_endpoint`` 起了
   ``.control-port``（三个操作：``read_write_authority`` / ``set_write_authority`` /
   ``open_manual_surface``）。⚠ **机制在框架，本项目只交 3 个回调 + 2 个值**。
-- ⚠ **仍然缺的一段：ML 没有"人手面"**（`open_surface=None`）。
-  ``--mcp`` 是 headless，而 ML 的 GUI 是**另一个进程**（``app_entry.py --gui``，
-  从不经 mecha）⇒ 面板按「切到手动」时：**写权会成功交给人，但窗口开不了**
-  （框架**分两步如实报告**："写权已交给人工，但**窗口没开成**"，**不假装成功**）。
-  ⇒ 要真做到"切手动就开窗"，需要把窗口搬进软件进程（或让它成为客户端）——
-  **那是下一段**（设计文档 §2.3 记的"ML 门化"）。
+- ✅ **"人手面"已接通**（本轮 = **ML 门化**）：``--mcp --with-gui`` 那一档让**本进程**
+  按需开窗（⭐ 收到 ``open_manual_surface()`` 才建窗口，**不是启动就开** —— 设计 §7.1）；
+  ⚠ **不带那一档 ⇒ ``open_surface=None`` ⇒ 响亮失败**（"这个进程有没有人手面"是
+  **启动者选的形态**，不是猜的）。从 mecha 启动那条路**默认带**它（见下面的 ``argv``）。
+  ⚠ 窗口**复用装配好的那份桥/门**（设计 §11 的 A4：各建一份桥 ⇒ ``writer_lease_held``）。
+  ⇒ 行为判据：``tests/test_manual_surface.py``（**真起子进程**：按需开窗 / 幂等 /
+  不带档响亮失败 / 控制操作不在 AI 能力面上 / 切写权立刻生效）。
+  ⚠ 实测附带发现（已修在**框架**）：``open_manual_surface`` 要 **5.8 秒**建窗
+  ⇒ 框架原先把控制超时**一刀切 3 秒** ⇒ 窗口**开成功了却报"协议错"**；
+  现在**按操作分别定超时**（查询/切写权 3s，**开窗 60s**）。
 - ⚠ **数据根同源**：``app_entry.py`` 现在读 ``MECHA_SOFTWARE_ROOT``（框架声明的根），
   读到了就以它为准。⚠ 它与本项目的 ``ML_TOOLBOX_RUNS`` **各有各的用途**
   （前者是本进程的数据根/写租约根，后者决定 ``runs/`` 落在哪）——
@@ -144,14 +148,20 @@ def dataset_roots() -> list[str]:
 
 
 def _service_argv() -> tuple[str, ...]:
-    """起本项目服务（headless 权威）的命令行。
+    """起本项目服务（headless + **人手面**）的命令行。
 
     ⚠ **每个数据根带一次旗标**：``app_entry.py`` 那边是 ``action="append"``
     （一个 ``--dataset-roots`` 配一个值）。旧实现曾经只回**路径**（没有旗标），
     调用方直接展开 ⇒ argparse 收到裸参数 ⇒ ``unrecognized arguments``
     ⇒ **权威 exit=2 ⇒ 看门人 exit=1**，现象是"改完打不开了"。
+
+    ⭐ ``--with-gui``：**从 mecha 启动的那条路默认带人手面**（三层架构 A1：
+    人那条腿是**软件进程内的窗口**）⇒ 控制端点的「开手动面」**真能开窗**。
+    ⚠ 它是**按需**开（不是启动就开）；⚠ 不带它的形态（例如手工
+    `python app_entry.py --mcp`）⇒ `open_manual_surface()` **响亮失败**——
+    "这个进程有没有人手面"是**启动者选的形态**，不是猜的。
     """
-    argv = [_PY, "app_entry.py", "--mcp", "--root", str(_SITE_ROOT)]
+    argv = [_PY, "app_entry.py", "--mcp", "--with-gui", "--root", str(_SITE_ROOT)]
     for root in dataset_roots():
         argv += ["--dataset-roots", root]
     return tuple(argv)

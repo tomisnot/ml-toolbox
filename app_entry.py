@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -59,7 +60,116 @@ _USAGE = """用法：
   --port-file PATH      端口文件（默认 <root>/.mcp-port）
   --dataset-roots DIR   允许 AI 读取的数据目录（可重复）；不给则 csv 来源 fail closed
   --no-open-gate        起来后不开闸（保持 LOCKED，供判据/维护用）
+  --with-gui            ⭐ **本进程带"人面"**：收到 `open_manual_surface()`（控制端点）
+                        才把 GUI 窗口开出来（**按需开，不是启动就开**）。
+                        ⚠ 不带它 ⇒ 控制端点传 `open_surface=None` ⇒ 调它**响亮失败**。
 """
+
+
+class _ManualSurface:
+    """"手动面" = **本进程内的那个 GUI 窗口**（三层架构 A1/A2：人那条腿不是子进程）。
+
+    ## 线程模型（⚠ 这里是最容易挂死的地方）
+
+    控制请求到达的是 **MCP 服务器线程**，而 **Qt 只能在主线程建窗** ⇒
+    直接建 = **挂死**（EL 第一版判据已实测）。所以分工是：
+
+    .. code-block:: text
+
+        服务器线程  ── open() ──►  队列（threading.Queue）
+                                      │
+        Qt 主线程   ◄── QTimer ───────┘  drain() ⇒ 真正 MainWindow()
+
+    `open()` 会**等主线程兑现后的回执**（`_ACK`）再返回 ⇒ 判据能断言
+    "真的开了"（窗口对象在），而不是只看到一句乐观的字符串。
+
+    ## 幂等
+
+    已经开着 ⇒ 回 ``"already-open"``（**不重复开、不报错**）⇒ 判据可以断言窗口数还是 1。
+    """
+
+    #: `open()` 的最长等待（秒）。主线程在跑（drain 每 50ms 一次）⇒ 正常毫秒级。
+    OPEN_TIMEOUT_S = 20.0
+
+    def __init__(self, app) -> None:
+        self._app = app
+        self._q: queue.Queue = queue.Queue()
+        self._window = None
+        self._last_error = ""
+        #: 驱动 `drain()` 的 QTimer（由 `_attach_manual_surface` 装；收尾时停掉）。
+        self.timer = None
+
+    # ---- 判据用的只读事实面（**不加锁**：只在断言里读，且值单调） ----
+    @property
+    def is_open(self) -> bool:
+        return self._window is not None
+
+    @property
+    def window_count(self) -> int:
+        """开过几个窗口（幂等判据：必须恒为 0 或 1）。"""
+        return 1 if self._window is not None else 0
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
+    # ---- 服务器线程侧 ----
+    def open(self) -> str:
+        """请求开窗（**可在服务器线程调用**）；返回状态字符串给控制端点。
+
+        ⚠ **失败必须响亮**：主线程建窗抛了 ⇒ 这里 `raise`（把真因带出去），
+        绝不回一句"开好了"——"静默假成功"正是本条要防的形态。
+        """
+        if self._window is not None:
+            return "already-open"
+        ack: queue.Queue = queue.Queue(maxsize=1)
+        self._q.put((ack, threading.get_ident()))
+        try:
+            opened = ack.get(timeout=self.OPEN_TIMEOUT_S)
+        except queue.Empty:
+            raise RuntimeError(
+                "主线程没有在 %.0fs 内兑现开窗请求（Qt 事件循环没在跑？）"
+                % self.OPEN_TIMEOUT_S)
+        if isinstance(opened, BaseException):
+            raise RuntimeError(f"建窗失败：{opened!r}") from opened
+        if not opened:
+            raise RuntimeError(f"建窗未生效（last_error={self._last_error!r}）")
+        return "opened"
+
+    # ---- Qt 主线程侧（由 QTimer 驱动） ----
+    def drain(self) -> None:
+        while True:
+            try:
+                ack, _tid = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if self._window is not None:
+                ack.put(True)                 # 幂等：别人已经开好了
+                continue
+            try:
+                self._build_window()
+                #: 打印一行**可据以断言**的证据（判据要证明"真建了窗"，不是只看返回值）。
+                print(f"[mcp] 人手面已开：主窗口 {type(self._window).__name__} "
+                      f"（在本进程内，与 MCP 面共用同一份门/账）", flush=True)
+                ack.put(True)
+            except BaseException as exc:       # noqa: BLE001 - **必须带出去**
+                # ⚠ 不吞异常：把真因放进 ack，让服务器线程抛给调用方；
+                #   否则主线程抛一个没有信息量的错，表现成"崩溃"而不是"干净地红"。
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                ack.put(exc)
+
+    def _build_window(self) -> None:
+        """**只在 Qt 主线程调用**：建主窗口并 `show()`。
+
+        ⚠ 与 MCP 服务**同一个进程** ⇒ 复用同一份 Gate/Authority/History；
+        窗口自己**不建桥**（`ml_toolbox.ui` 不许 import `ml_mecha`，那条边界有判据守着）。
+        """
+        # ⚠ 导入顺序铁律：lightgbm（经 registry 顶层导入）必须先于 PyQt5 模块。
+        #   `run_mcp` 在起服务前已经 `load_builtin()` ⇒ 这里只补 Qt 侧导入。
+        from ml_toolbox.ui.main_window import MainWindow
+
+        self._window = MainWindow()
+        self._window.show()
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -75,6 +185,11 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--port-file", default="")
     parser.add_argument("--dataset-roots", action="append", default=[])
     parser.add_argument("--no-open-gate", action="store_true")
+    #: ⭐ **本进程带不带"人面"**（三层架构 A1：人那条腿是**软件进程内的窗口**）。
+    #: ⚠ **启动时不开窗**：收到 `open_manual_surface()`（控制端点）才开 —— 按需开。
+    #: ⚠ 不带这一档 ⇒ 控制端点传 `open_surface=None` ⇒ 调它**响亮失败**
+    #:   （"这个进程有没有人手面"是**启动者选的形态**，不是猜的）。
+    parser.add_argument("--with-gui", action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
     return parser.parse_args(argv)
 
@@ -89,6 +204,53 @@ def run_gui() -> int:
     import app                        # noqa: PLC0415 - 见纪律 1：必须惰性导入
     app.main()
     return 0                          # pragma: no cover - app.main 不返回
+
+
+def _drain_control_queue(surface) -> None:
+    """把控制线程排队的"开窗"请求**在主线程上兑现**。
+
+    ⚠ **本函数必须在 Qt 主线程上跑**（由 `QTimer` 驱动，见 `_attach_manual_surface`）：
+    控制请求到达的是 **MCP 服务器线程**，在那里直接 `MainWindow()` ⇒ **挂死**
+    （EL 第一版判据就这么写的，已实测）。⇒ 分工是"**线程只入队，主线程建窗**"。
+    """
+    surface.drain()
+
+
+def _pump_until_quit(app, stop_event) -> None:
+    """在**主线程**上跑 Qt 事件循环，直到 `stop_event` 被置位（收尾信号）。
+
+    ⚠ 为什么不用 `while not stop: app.processEvents()` 那种忙转：
+    那会把 CPU 打满、且拿不到 Qt 的"窗口关闭"语义。这里用一个 200ms 的定时器
+    去看收尾信号，正常路径仍由 `app.exec_()` 事件循环驱动。
+    """
+    from PyQt5.QtCore import QTimer
+
+    watchdog = QTimer()
+    watchdog.setInterval(200)
+    watchdog.timeout.connect(lambda: app.quit() if stop_event.is_set() else None)
+    watchdog.start()
+    app.exec_()
+
+
+def _attach_manual_surface(app):
+    """建人手面并接线；返回 :class:`_ManualSurface`（**不建窗**）。
+
+    ⚠ 起进程时**先不开窗**（用户裁决：按需开，不是启动就开）——
+    这里只装一个 50ms 的 `QTimer`：它每次在主线程上跑，把服务器线程排进队列的
+    开窗请求兑现（`_drain_control_queue`）。真正的 `MainWindow()` 在第一次
+    `open_manual_surface()` 到达时才建。
+    ⚠ 建窗与 MCP 服务**同一个进程** ⇒ 天然复用同一份 Gate/Authority/History
+    （不是第二个装配）；ML 的窗口本来就不自建桥（`ml_toolbox.ui` 不 import `ml_mecha`）。
+    """
+    from PyQt5.QtCore import QTimer
+
+    surface = _ManualSurface(app)
+    timer = QTimer()
+    timer.setInterval(50)
+    timer.timeout.connect(lambda: _drain_control_queue(surface))
+    timer.start()
+    surface.timer = timer                      # 收尾时停掉（防"收尾后又来一次请求"）
+    return surface
 
 
 def run_mcp(args: argparse.Namespace) -> int:
@@ -126,15 +288,38 @@ def run_mcp(args: argparse.Namespace) -> int:
 
     #: ⭐ 给 AI 看的"怎么切写权"（框架**不写死**这句：那是**项目知识**）。
     #: ⚠ **别写端口/凭据**（它会给 AI 读）。
-    how_to_open = (
-        "在启动面板（常驻控制台）上点本软件的「切到手动」：写权即归人"
-        "（本机可信、无口令），再点「交还给 AI」交还模型。"
-        "⚠ ML 的 GUI 是**独立进程**（`app_entry.py --gui`），不在本进程内 ⇒ "
-        "本进程**没有人手面可开**（框架会如实报「窗口没开成」，不会假装开了）。"
-    )
+    #: ⚠ **文案必须与形态一致**（`--with-gui` 决定本进程有没有人手面）——
+    #:   声明与实现不一致会让 AI 照着错的前提推理。
+    if args.with_gui:
+        how_to_open = (
+            "在启动面板（常驻控制台）上点本软件的「切到手动」：写权即归人"
+            "（本机可信、无口令），再点「交还给 AI」交还模型。"
+            "本进程带人手面（`--with-gui`）⇒ 同一页的「开手动面」会**真的把 "
+            "GUI 窗口开出来**（开在本进程内，与 MCP 面共用同一份门/账）。"
+        )
+    else:
+        how_to_open = (
+            "在启动面板（常驻控制台）上点本软件的「切到手动」：写权即归人"
+            "（本机可信、无口令），再点「交还给 AI」交还模型。"
+            "⚠ 本进程**没有人手面**（没带 `--with-gui`）⇒ 「开手动面」会**响亮失败**"
+            "（不假装开了窗）；要看窗口请用 `app_entry.py --gui` 另起一个进程。"
+        )
+
+    #: ⭐ **人手面**（三层架构 A1：人那条腿是**软件进程内的窗口**）。
+    #: ⚠ 只有 `--with-gui` 才建 —— "这个进程有没有人手面"是**启动者选的形态**。
+    #: ⚠ 建窗**要在 Qt 主线程**做 ⇒ 这里只建 QApplication，真正开窗留给
+    #:   `_ManualSurface.drain()`（由主线程的 QTimer 驱动）。
+    surface = None
+    qt_app = None
+    if args.with_gui:
+        from PyQt5.QtWidgets import QApplication
+        qt_app = QApplication.instance() or QApplication(sys.argv[:1])
+        surface = _attach_manual_surface(qt_app)
 
     mcp_port_file = (Path(args.port_file) if args.port_file
                      else resolve(root, MCP_PORT_FILE))
+    #: 收尾信号（Ctrl+C / 启动方终止）：主线程跑 Qt 事件循环时由定时器看它。
+    stop_event = threading.Event()
     ml = assemble_ml_mecha(root=root, dataset_roots=args.dataset_roots or None)
     host = McpHost(ml, host=args.host, port=args.port, port_file=mcp_port_file,
                    log=lambda m: print(m, flush=True))
@@ -166,14 +351,15 @@ def run_mcp(args: argparse.Namespace) -> int:
         #:   （EL/GP 曾各写 ~134 行，ML 此前完全没有 ⇒ 切不了手动）。
         #: ⚠ **记账走 `gate.record`（只记史、不过写权门）**：切写权本身就是要改的东西，
         #:   过门会**自锁**（切到 ai 之后人侧再也记不了账、也切不回来）。
+        #: ⭐ **人手面回调**：`--with-gui` 时是"**入队 → 主线程建窗**"那条路
+        #: （⚠ 直接在 MCP 服务器线程建 Qt 窗口会**挂死**，EL 已实测）；
+        #: 不带那一档 ⇒ `None` ⇒ `open_manual_surface()` **响亮失败**（诚实）。
         reg = build_control_registry(
             ml.authority,
             switch=lambda v: ml.authority.switch_mode(Mode(v), "human"),
             audit=lambda op, val, why: ml.gate.record(op, "authority", val,
                                                       actor="human", reason=why),
-            #: ⚠ ML 的 GUI **不在本进程**（`--mcp` 是 headless）⇒ 没有人手面可开
-            #: ⇒ 传 `None` ⇒ `open_manual_surface()` **响亮失败**（诚实，不假装开了窗）。
-            open_surface=None,
+            open_surface=(surface.open if surface is not None else None),
             how_to_open=how_to_open,
         )
         control, control_port = start_control_endpoint(
@@ -188,11 +374,24 @@ def run_mcp(args: argparse.Namespace) -> int:
               f"MCP {host.url}，只读监控 {monitor.url}，"
               f"控制端点 {'.control-port'}（文件 "
               f"{mcp_port_file.name} / {MONITOR_PORT_FILE} / {CONTROL_PORT_FILE}）"
-              f"（Ctrl+C 或启动方收尾时退出，写租约随进程释放）。", flush=True)
-        threading.Event().wait()
+              + ("，人手面：**按需开**（尚未开窗）" if surface is not None else
+                 "，人手面：无（未带 --with-gui）")
+              + "（Ctrl+C 或启动方收尾时退出，写租约随进程释放）。", flush=True)
+        if surface is not None:
+            #: 主线程跑 Qt 事件循环（收尾信号由 200ms 定时器看）——**不忙转**。
+            _pump_until_quit(qt_app, stop_event)
+        else:
+            stop_event.wait()
     except KeyboardInterrupt:
         print("\n[authority] 收到 Ctrl+C，收尾（释放写租约）。", flush=True)
     finally:
+        stop_event.set()
+        timer = getattr(surface, "timer", None) if surface is not None else None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
         if control is not None:
             control.stop()
         if monitor is not None:
