@@ -81,7 +81,7 @@ def test_torch_mlp_artifacts_and_metrics_survive():
     assert TORCH_AVAILABLE, "torch 不可用"
     import pandas as pd
     from sklearn.datasets import make_classification
-    from ml_toolbox.core.contracts import RunConfig
+    from ml_toolbox.core.contracts import DataSpec, RunConfig
     from ml_toolbox.core.registry import get, load_builtin
     from ml_toolbox.methods.neural.mlp import TorchMLP
 
@@ -91,7 +91,14 @@ def test_torch_mlp_artifacts_and_metrics_survive():
     X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
     y = pd.Series(y)
     method = TorchMLP()
-    result = method.fit(X, y, RunConfig(seed=11, overrides={
+    #: ⚠ **新范式**（`contracts.MLMethod.fit(problem, cfg, diag=False)`，2026-10-03 扩张）：
+    #: 方法收的是**一个问题**，不是裸的 `(X, y)`。老写法 `method.fit(X, y, cfg)` 会把
+    #: `y` 当成 `cfg` ⇒ 里面 `problem.rows("train")` 直接炸
+    #: `AttributeError: 'DataFrame' object has no attribute 'rows'`（**本轮实测就是这么红的**）。
+    n = len(y)
+    spec = DataSpec(X=X, y=y, train_idx=np.arange(n), test_idx=np.arange(n),
+                    target_kind="classification", meta={"dataset": "nn_perf"})
+    result = method.fit(method.problem(spec), RunConfig(seed=11, overrides={
         "hidden": "8,4", "epochs": 6, "batch": 32, "val_split": 0,
         "latent_every": 2, "device": "cpu",
     }))

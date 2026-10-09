@@ -28,7 +28,11 @@ class _TimedProbe(MLMethod):
     target_kind = "regression"
     param_schema = []
 
-    def fit(self, X, y, cfg, diag=False):
+    #: ⚠ **签名必须是新范式**：`fit(problem, cfg, diag=False)`
+    #: （`contracts.MLMethod.fit`，2026-10-03 扩张，取代 `fit(X, y, cfg, diag)`）
+    #: —— 老签名会被 runner 当成 `problem→X`、`cfg→y` ⇒ `TypeError: missing 'cfg'`
+    #: ⇒ 整条 run 变成 `internal_error`、判据红（**本轮实测就是这么红的**）。
+    def fit(self, problem, cfg, diag=False):
         time.sleep(0.001)
         return self._new_result(params={}, target_kind="regression")
 
@@ -40,7 +44,9 @@ class _TimedProbe(MLMethod):
         time.sleep(0.001)
         return {"rmse": 0.0}
 
-    def cross_validate(self, X, y, cfg, cv_folds=5):
+    def cross_validate(self, X, y, cfg, cv_folds=5, *, target_kind=None, aux=None):
+        #: ⚠ runner 会带上 `target_kind=` / `aux=`（`runner.py` 的 CV 那一段）⇒ 签名要对齐，
+        #: 否则它会被 `except` 收成"CV 没跑"，判据就测不到 CV 那一段了。
         time.sleep(0.001)
         return {"cv_rmse_mean": 0.0, "cv_scores": [0.0] * cv_folds}
 
@@ -54,7 +60,7 @@ class _KernelProbe(MLMethod):
     param_schema = []
     fitted = False
 
-    def fit(self, X, y, cfg, diag=False):
+    def fit(self, problem, cfg, diag=False):        # 同上：新范式签名
         type(self).fitted = True
         return self._new_result(params={}, target_kind="regression")
 
