@@ -281,7 +281,7 @@ SITE = Site(
         ),
     ),
     dsh=DSHSpec(
-        command=("dsh",),
+        command=("dsh", "web"),
         cwd=_SITE_ROOT,
         #: 入库的两层 patch（顺序即命令行顺序）。
         #: ⚠ 第三层（指向 MCP 端点的 ``runtime/dsh-ml-mcp.patch.yml``）是**生成物**，
