@@ -40,6 +40,8 @@ logs/
 .mcp-port
 .ml-monitor-port
 .mlweb-port
+#: 控制端点（人侧那条腿）的端口文件 —— 与上面几个同族，同样每台机器重写。
+.control-port
 .ml-mecha-runtime.json
 
 # 运行期生成的 dsh overlay（每次启动按实际端口重写）
