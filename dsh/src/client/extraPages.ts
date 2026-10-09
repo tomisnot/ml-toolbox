@@ -1,22 +1,31 @@
 /**
- * ML 的**附加页声明**（共享面板的 `ExtraPageSpec[]`）：数据层，**无 react、无 DOM**。
+ * ML 的**附加页呈现细化**（"自定义 UI"那一半；数据层，**无 react、无 DOM**）。
  *
- * ## 为什么单独一个文件（与资产 `panel-data.ts` 同一条理由）
+ * ## 阶段② 起本文件的**职责缩小了**（这是刻意的）
  *
- * 1. **判据要落在这一层**：Node 能直接 import 它喂真 payload（本文件只 import `type`，
- *    运行时零依赖 ⇒ `node --test` 直接测，不需要 react —— react 是 dsh 宿主提供的 peer）；
- * 2. **领域词全部收在这里**：共享资产里零 ML 字面量（词表守卫在扫 `.ts`/`.tsx`），
- *    ML 的列名、文案、取值都在本文件 ⇒ "能力并入、领域词不进框架"。
+ * | 项 | 现在谁拥有 |
+ * |---|---|
+ * | 页集 / 页签文案 / 请求路径 / 页内标题 / 空表文案 / 读不到文案 / 脚注 | ⭐ **声明**（`ml_mecha/mecha_site.py` 的 `ExtraPage`） |
+ * | 列名与"取哪个字段" | ⭐ **声明**（`ExtraColumn(label, field)`） |
+ * | 列的**取值函数**（`metricCell` 等）与概括行 | **本文件**（代码 —— JSON 装不下，故走"自定义 UI"那条路） |
+ *
+ * ⇒ 于是"一页一条路由""空表 ≠ 读不到"那些**声明性**的事由声明与它的判据管，
+ * 本文件只管**怎么把一行渲染得好看**。⚠ 两处**不许重叠**（重叠就是两份真值）。
+ *
+ * ## 为什么还留着（不是没删干净）
+ *
+ * 主指标列有**真 bug 的历史**：两个来源的字段名不同（操作史行在 `score`、磁盘行在
+ * `metrics[主指标]`），旧自绘面板只读 `r.value` ⇒ **磁盘行渲染成 `f1=`（值丢了）**。
+ * 那份按来源各取一次的逻辑是**代码**，进不了声明 ⇒ 只能住这里。
  *
  * ## 数据契约（共享面板定 wire 形状）
  *
  * 附加路由**必须**回 `{ rows: [...] }`：表格行取 `payload.rows`，其余键交给 `summaryLine`。
- * ⚠ **实测边界**：`extraPageHtml` 在 `rows` 为空时**走 emptyText 分支**（把"没有行"当成
- * 空表）——所以**没有行但有数据的**载荷（如 `/summary` 的概括信封）不能只给信封：
- * 本仓让 `/summary` 也回 `rows`（= 操作史里的 `recent_runs`），于是"概括一行 + 表格"都在，
- * 既不丢信息也不会被误显示成"没有记录"。
+ * ⚠ **实测边界**：`extraPageHtml` 在 `rows` 为空时**走 emptyText 分支**（把"没有行"当成空表）
+ * ——所以**没有行但有数据的**载荷（如 `/summary` 的概括信封）不能只给信封：
+ * 本仓让 `/summary` 也回 `rows`（= 操作史里的 `recent_runs`），于是"概括一行 + 表格"都在。
  */
-import type { ExtraPageSpec } from '@mecha/dsh-panel/panel/panel-view.ts'
+import type { ExtraPageRender } from '@mecha/dsh-panel/panel/auto.ts'
 
 /** 取文本（`cell` 用；缺字段给空串，**不渲染 `undefined`**）。 */
 export const asText = (v: unknown): string =>
@@ -72,17 +81,14 @@ export function summaryLine(payload: unknown): string {
 }
 
 /**
- * ML 的两条附加页（**声明式**）。
+ * ⭐ 本项目的**呈现细化表**（键 = 页 id；⚠ 注册时还要带上服务 id，见 `client/index.ts`）。
  *
- * ⚠ **一页一条路由**（资产机制）⇒ 旧面板里"操作史与磁盘存档并列一页"变成**两页**
- * （已申报的行为变更；功能不丢）。
+ * ⚠ **只放"怎么渲染"**：页集/路由/文案/列名都在声明里。
+ * ⚠ `runs` 那份**不给 `summaryLine`**：它的概括在声明里本来就没有（旧面板也没有）——
+ * 不给就是不给，别编一个空的（`extraPageSpecsFrom` 只在**有**的时候才挂上去）。
  */
-export const EXTRA_PAGES: ExtraPageSpec[] = [
-  {
-    id: 'summary',
-    label: '运行记录',
-    path: '/summary',
-    title: '运行记录（操作史 ml.run 事件）',
+export const ML_EXTRA_PAGE_RENDERS: Record<string, ExtraPageRender> = {
+  summary: {
     columns: [
       { label: '运行编号', cell: (r) => asText((r as any)?.run_id) },
       { label: '方法', cell: (r) => asText((r as any)?.method) },
@@ -90,27 +96,13 @@ export const EXTRA_PAGES: ExtraPageSpec[] = [
       { label: '操作者', cell: actorCell },
     ],
     summaryLine,
-    emptyText: '本次会话还没有运行记录——AI/人每跑一次方法都会出现在这里。',
-    unreadableText: '运行记录读取失败：这一格不是「没有运行」，是没读到',
-    note: '来自操作史 ml.run 事件：AI 跑过就一定在这里（与磁盘存档是两件事）。',
   },
-  {
-    id: 'runs',
-    label: '磁盘存档',
-    path: '/runs?limit=50',
-    title: '磁盘存档 runs/（跨重启可见）',
+  runs: {
     columns: [
       { label: '运行编号', cell: (r) => asText((r as any)?.run_id) },
       { label: '方法', cell: (r) => asText((r as any)?.method) },
       { label: '主指标', cell: metricCell },
       { label: '时间', cell: savedAtCell },
     ],
-    emptyText:
-      '磁盘上没有落盘的运行。**注意：存档为空不等于没跑过**——' +
-      '运行只在 persist=True（或 GUI 批量成功）时写入 runs/。',
-    // ⚠「读不到 ≠ 空表」：真因摆成人能读的文本（旧面板在这一点上的措辞原样保留）。
-    unreadableText:
-      '磁盘存档读取失败：这一格**不是空的**，是没读到（权威的存档读取出错了）',
-    note: '跨重启可见；与「运行记录」是两件事（那份来自操作史，这份来自磁盘）。',
   },
-]
+}

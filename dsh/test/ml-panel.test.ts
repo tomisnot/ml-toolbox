@@ -159,8 +159,14 @@ test('⭐ ML 入口 + 资产包的 import 闭包里没有 node:*，且真的走�
   assert.ok(seen.length >= 5, `闭包只走了 ${seen.length} 个文件 ⇒ 检查可能没生效：${seen}`)
   assert.ok(seen.some(s => s.startsWith('pkg/') && s.endsWith('/routes.ts')),
     `闭包必须走进资产包（junction 没被跟随？）：${seen}`)
-  assert.ok(seen.includes('ml/ml-panel-params.ts'),
-    `闭包里应当有 ML 的参数家（否则参数没接上）：${seen}`)
+  // ⚠ 2026-10 阶段②：ML 的参数家（`ml-panel-params.ts`）**不再进 client 闭包** ——
+  //   面板参数的家已经在**声明**（`ml_mecha/mecha_site.py` 的 `Service.monitor`），
+  //   client 半只接框架的那一行 + 自己的呈现细化。⇒ 这里改点名**呈现细化**那份文件
+  //   （否则"client 半还带着 ML 自己的东西"这条自证就落空了）。
+  assert.ok(seen.includes('ml/client/extraPages.ts'),
+    `闭包里应当有 ML 的呈现细化（否则 client 半只剩一行 bootstrap）：${seen}`)
+  assert.ok(seen.some(s => s.startsWith('pkg/') && s.endsWith('/panels.ts')),
+    `闭包必须走进框架那份 client 插件（面板参数靠它按声明挂 tab）：${seen}`)
   assert.ok(!seen.some(s => s.includes('monitor-url')),
     `client 半不许碰到 node-only 的 monitor-url.ts：${seen}`)
   // 对偶（不许空洞）：资产的 node 半**必须**仍依赖 node —— 否则上一条"没东西可抓"
@@ -169,23 +175,43 @@ test('⭐ ML 入口 + 资产包的 import 闭包里没有 node:*，且真的走�
 })
 
 // ---------------------------------------------------------------- 3 单一来源
-test('⭐ 单一来源：路由字面量只在 ml-panel-params.ts，两半各注入一次', () => {
+test('⭐ 单一来源：路由字面量只在 ml-panel-params.ts 与**声明**里（两处同值，由本判据对拍）', () => {
   // host 半：自己注入（**不换 `mountHostPlugin` 骨架**——ML 没有 MCP 桥，骨架主要装桥的生命周期）
   assert.match(read('index.ts'), /^configurePanel\(ML_PANEL\)$/m,
     'host 半必须在模块顶层注入 ML 的面板参数')
-  // client 半：另一份 bundle / 另一个进程 ⇒ 它自己把参数交出去（host 那次到不了浏览器）
-  // ⚠ 2026-10 阶段①：**交出方式**从"顶层 `configurePanel(ML_PANEL)`"变成
-  //   "`mountClientPanel(..., { panelConfig: ML_PANEL, ... })`"（按钮/ tab 注册归框架）。
-  //   ⇒ 判据跟着改**机制**，但断言的**性质**没变：**client 半必须把 ML 那份参数交进去**
-  //   （资产的 `openPanelConfig` 未注入即抛 ⇒ 少了它就是浏览器里才炸的那类故障）。
-  assert.match(read('client/index.ts'), /panelConfig:\s*ML_PANEL/,
-    'client 半必须把 ML 的面板参数交给框架 helper（另一份 bundle，host 那次到不了这里）')
+  // client 半：⭐ 2026-10 阶段② 起**它不再拿面板参数** —— 接上框架那条插件即可
+  //   （参数的家在 `mecha_site.py` 的声明里，框架生成后经同源路由交给浏览器）。
+  //   ⇒ 断言的**性质**变了但没放宽：**client 半必须接上框架那份插件**
+  //   （少了它 = 右栏一个 tab 都没有，而那不会报错）。
+  assert.match(read('client/index.ts'),
+    /export \{ apply, name, inject \} from '@mecha\/dsh-panel\/panel\/auto\.ts'/,
+    'client 半必须有那一行 bootstrap（框架的代码，不是本项目的领域代码）')
   assert.match(read('ml-panel-params.ts'), /'\/ml-toolbox\/monitor-url'/,
     '路由字面量必须住在 ml-panel-params.ts（ML 的参数家）')
   const offenders = literalOutsideParams(ML_PANEL.routePath,
     ['index.ts', 'client/index.ts', 'ml-panel-params.ts'])
   assert.deepEqual(offenders.filter((f) => f !== 'ml-panel-params.ts'), [],
     `路由字面量被抄进了参数家之外：${offenders.join('、')}`)
+})
+
+/**
+ * ⭐ **声明 ↔ 参数家对拍**（阶段②新增）：面板参数的家搬到声明之后，两份值必须一致
+ * —— 不一致的症状是"右栏 tab 在、取数却打到别的路由"（浏览器里才看得见）。
+ * ⚠ 判据读的是**声明的原文**（Python 还是 TS 读不了对方的结构，只能对拍）。
+ */
+test('⭐ 声明与参数家同值：mecha_site.py 的 monitor 三项 = ML_PANEL', () => {
+  const decl = readFileSync(join(HERE, '..', '..', 'ml_mecha', 'mecha_site.py'), 'utf8')
+  for (const [what, literal] of [
+    ['route_path', `route_path="${ML_PANEL.routePath}"`],
+    ['port_file', `port_file="${ML_PANEL.portFile}"`],
+    ['title', `title="${ML_PANEL.title}"`],
+  ] as const) {
+    assert.ok(decl.includes(literal),
+      `声明里没有 ${what} = ${literal}（两处必须同值：面板参数的家在声明，`
+      + 'host 半那条地址路由仍读 ml-panel-params.ts）')
+  }
+  // 对偶（不许空洞）：那份声明**必须**真的声明了监控面（否则上面三条只是碰巧命中注释）
+  assert.match(decl, /monitor=MonitorSpec\(/, '声明里没有 monitor=MonitorSpec(...)')
 })
 
 // ---------------------------------------------------------------- 4 参数真的被资产消费

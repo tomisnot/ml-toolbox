@@ -85,7 +85,7 @@ import sys
 from pathlib import Path
 
 from mecha.authority import Mode
-from mecha.site import DSHSpec, ReadySpec, Service, Site
+from mecha.site import DSHSpec, ExtraColumn, ExtraPage, MonitorSpec, ReadySpec, Service, Site
 
 #: 本仓根（声明文件位于 ``ml_mecha/`` 下一层 ⇒ 上跳一层）。
 _SITE_ROOT = Path(__file__).resolve().parent.parent
@@ -224,6 +224,58 @@ SITE = Site(
                 "⚠ 但 ML 的 GUI 是**独立进程**、不在软件进程内 ⇒ 「切到手动」会"
                 "**写权成功、窗口开不了**（框架分两步如实报告，不假装成功，"
                 "见本文件顶部 Known Limitations 的『仍然缺的一段』）。"
+            ),
+            #: ⭐ **监控面声明**（三层架构 §7.3.6）：路由 / 端口文件名 / 标题 / 附加页
+            #: **只在这里写一次** —— 它就是"声明 ↔ 面板"之间的唯一那份真值。
+            #: ⚠ 框架把它生成成一份参数（**不含端口号**），经**框架自己的 patch** 带上的
+            #: 插件交给浏览器 ⇒ 本项目 dsh 侧只留一行 bootstrap（`dsh/src/client/index.ts`）。
+            #: ⚠ 与 `dsh/src/ml-panel-params.ts` 的 `ML_PANEL` **必须同值**（host 半那条
+            #: 监控地址路由仍由本项目注册）；由 `dsh/test/ml-panel.test.ts` 的声明对拍钉住。
+            monitor=MonitorSpec(
+                route_path="/ml-toolbox/monitor-url",
+                port_file=".ml-monitor-port",      # 与 ml_mecha/runtime.py 的 MONITOR_PORT_FILE 同名
+                title="ML 监控",
+                #: 两条附加页：⚠ 这里只放**数据**（页集 / 路由 / 文案 / 列名与取值字段）。
+                #: 取值**函数**（`metricCell` 要按来源各取一次 `score` / `metrics[主指标]`）
+                #: 是**代码** ⇒ 留在 `dsh/src/client/extraPages.ts`，走"自定义 UI"那条路。
+                extra_pages=(
+                    ExtraPage(
+                        id="summary",
+                        label="运行记录",
+                        path="/summary",
+                        title="运行记录（操作史 ml.run 事件）",
+                        empty_text="本次会话还没有运行记录——AI/人每跑一次方法都会出现在这里。",
+                        unreadable_text="运行记录读取失败：这一格不是「没有运行」，是没读到",
+                        note="来自操作史 ml.run 事件：AI 跑过就一定在这里（与磁盘存档是两件事）。",
+                        columns=(
+                            ExtraColumn("运行编号", "run_id"),
+                            ExtraColumn("方法", "method"),
+                            ExtraColumn("主指标", "primary_metric"),
+                            ExtraColumn("操作者", "actor"),
+                        ),
+                    ),
+                    ExtraPage(
+                        id="runs",
+                        label="磁盘存档",
+                        path="/runs?limit=50",
+                        title="磁盘存档 runs/（跨重启可见）",
+                        empty_text=(
+                            "磁盘上没有落盘的运行。**注意：存档为空不等于没跑过**——"
+                            "运行只在 persist=True（或 GUI 批量成功）时写入 runs/。"
+                        ),
+                        # ⚠「读不到 ≠ 空表」：真因摆成人能读的文本（旧面板在这点上的措辞原样保留）。
+                        unreadable_text=(
+                            "磁盘存档读取失败：这一格**不是空的**，是没读到（权威的存档读取出错了）"
+                        ),
+                        note="跨重启可见；与「运行记录」是两件事（那份来自操作史，这份来自磁盘）。",
+                        columns=(
+                            ExtraColumn("运行编号", "run_id"),
+                            ExtraColumn("方法", "method"),
+                            ExtraColumn("主指标", "primary_metric"),
+                            ExtraColumn("时间", "saved_at"),
+                        ),
+                    ),
+                ),
             ),
             env={**_RUNS_ENV, **_NO_CODEC},
         ),
