@@ -99,6 +99,13 @@ def run_mcp(args: argparse.Namespace) -> int:
     mecha 的 supervisor ⇒ 留着旧名会让人以为本进程还在编排什么。**它不编排任何东西。**
     """
     root = Path(args.root).resolve() if args.root else PROJ_ROOT
+    #: ⭐ **框架声明的数据根优先**（三层架构 §5.1）：框架 spawn 本进程时注入
+    #: `MECHA_SOFTWARE_ROOT`；⚠ 读它才不会出现"框架以为软件在用 A 根、软件实际在写 B 根"
+    #: （那个坑的现象是"看不到刚才的改动"，**且无任何报错**）。
+    from mecha.site import software_root_from_env
+    declared_root = software_root_from_env(None)
+    if declared_root is not None:
+        root = Path(declared_root)
     root.mkdir(parents=True, exist_ok=True)
 
     # 训练核心（lightgbm/torch 等）先于一切 GUI 栈导入——headless 路径本就不
@@ -112,12 +119,27 @@ def run_mcp(args: argparse.Namespace) -> int:
     from ml_mecha.runtime import (MCP_PORT_FILE, MONITOR_PORT_FILE, resolve,
                                   write_runtime)
 
+    from mecha.authority import Mode
+    from mecha.software_control import (CONTROL_PORT_FILE, build_control_registry,
+                                        start_control_endpoint)
+    from mecha.site import initial_mode_from_env
+
+    #: ⭐ 给 AI 看的"怎么切写权"（框架**不写死**这句：那是**项目知识**）。
+    #: ⚠ **别写端口/凭据**（它会给 AI 读）。
+    how_to_open = (
+        "在启动面板（常驻控制台）上点本软件的「切到手动」：写权即归人"
+        "（本机可信、无口令），再点「交还给 AI」交还模型。"
+        "⚠ ML 的 GUI 是**独立进程**（`app_entry.py --gui`），不在本进程内 ⇒ "
+        "本进程**没有人手面可开**（框架会如实报「窗口没开成」，不会假装开了）。"
+    )
+
     mcp_port_file = (Path(args.port_file) if args.port_file
                      else resolve(root, MCP_PORT_FILE))
     ml = assemble_ml_mecha(root=root, dataset_roots=args.dataset_roots or None)
     host = McpHost(ml, host=args.host, port=args.port, port_file=mcp_port_file,
                    log=lambda m: print(m, flush=True))
     monitor = None
+    control = None
     try:
         port = host.start()
         # 监控端点在同一权威进程内（与 MCP 共一份 History/Gate）——这正是
@@ -129,25 +151,50 @@ def run_mcp(args: argparse.Namespace) -> int:
         if args.no_open_gate:
             print("[mcp] 写权保持 LOCKED（--no-open-gate）。", flush=True)
         else:
-            # ⚠ **启动者声明的初始写权**：声明在 ``ml_mecha/mecha_site.py``
-            # （``initial_mode``），框架按《三层架构》§5.1 用 ``MECHA_INITIAL_MODE``
-            # **送**进来。⚠ 今天这里还**没读**那个环境变量（见 mecha_site.py 的
-            # Known Limitations）⇒ 仍旧按"启动即授权 AI 写"这条**旧口径**开闸，
-            # 这不是 AI 自解锁——AI 侧拿不到 side='human' 的通道。
-            ml.switch_ai()
+            #: ⭐ **启动者声明的初始写权**（三层架构 §5.1）：框架 spawn 本进程时注入
+            #: `MECHA_INITIAL_MODE`；读取口是框架的 `initial_mode_from_env`
+            #: （**同一个契约的两半住在一起**：注入在 `Service.child()`、读取在 `mecha.site`）。
+            #: ⚠ 空串 = 显式取消 ⇒ 回落默认；⚠ 非法值 ⇒ 回落**并出声**（`'Mode.AI'` 那个坑）。
+            #: ⚠ 开闸发生在**启动序列里**，AI 面永远拿不到 `side='human'` 的通道
+            #:   （`mecha/authority.py::switch_mode` 的硬判定）⇒ 这不是 AI 自解锁。
+            declared = initial_mode_from_env(Mode.AI)      # 缺省 = 本项目声明的 AI
+            ml.authority.switch_mode(declared, "human")
+            print(f"[mcp] 写权按启动者声明装配：{declared.value}", flush=True)
+
+        #: ⭐ **控制端点**（人侧专用那条腿，三层架构 §7.1.1）。
+        #: ⚠ 框架给**机制**，本项目只交 3 个回调 + 2 个值 —— 不必再手写一遍
+        #:   （EL/GP 曾各写 ~134 行，ML 此前完全没有 ⇒ 切不了手动）。
+        #: ⚠ **记账走 `gate.record`（只记史、不过写权门）**：切写权本身就是要改的东西，
+        #:   过门会**自锁**（切到 ai 之后人侧再也记不了账、也切不回来）。
+        reg = build_control_registry(
+            ml.authority,
+            switch=lambda v: ml.authority.switch_mode(Mode(v), "human"),
+            audit=lambda op, val, why: ml.gate.record(op, "authority", val,
+                                                      actor="human", reason=why),
+            #: ⚠ ML 的 GUI **不在本进程**（`--mcp` 是 headless）⇒ 没有人手面可开
+            #: ⇒ 传 `None` ⇒ `open_manual_surface()` **响亮失败**（诚实，不假装开了窗）。
+            open_surface=None,
+            how_to_open=how_to_open,
+        )
+        control, control_port = start_control_endpoint(
+            reg, port_file=resolve(root, CONTROL_PORT_FILE),
+            server_name="ml-toolbox-control", log=lambda m: print(m, flush=True))
         # 运行期描述符 = 端口的单一真源（启动方、监控页、故障排查都读它）。
         # ⚠ **不写 mode**：写权是**运行中可切**的（任何本机客户端都能请求切），
         #   "启动时那个值"不是值得持久化的真相；要读当前写权走控制端点。
         write_runtime(root, authority_pid=os.getpid(),
                       mcp_port=port, monitor_port=monitor.port)
-        print(f"[mcp] 端点就绪：写权 {'LOCKED' if args.no_open_gate else 'AI'}，"
-              f"MCP {host.url}，只读监控 {monitor.url}（端口文件 "
-              f"{mcp_port_file.name} / {MONITOR_PORT_FILE}）"
+        print(f"[mcp] 端点就绪：写权 {'LOCKED' if args.no_open_gate else '按启动者声明'}，"
+              f"MCP {host.url}，只读监控 {monitor.url}，"
+              f"控制端点 {'.control-port'}（文件 "
+              f"{mcp_port_file.name} / {MONITOR_PORT_FILE} / {CONTROL_PORT_FILE}）"
               f"（Ctrl+C 或启动方收尾时退出，写租约随进程释放）。", flush=True)
         threading.Event().wait()
     except KeyboardInterrupt:
         print("\n[authority] 收到 Ctrl+C，收尾（释放写租约）。", flush=True)
     finally:
+        if control is not None:
+            control.stop()
         if monitor is not None:
             monitor.stop()
         host.stop()

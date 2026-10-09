@@ -197,17 +197,30 @@ def test_ready_declares_any_http_response_with_reason():
     assert svc.ready.probe and "/mcp" in svc.ready.probe, svc.ready.probe
 
 
-def test_initial_mode_is_declared_and_the_gap_is_recorded():
-    """`initial_mode` 已声明，且**声明与实现之间那段缺口**被如实记下（不是假装已接上）。
+def test_initial_mode_is_declared_and_the_remaining_gap_is_recorded():
+    """`initial_mode` 已声明；⭐ **它现在真的接通了**；⚠ **剩下的缺口**被如实记下。
 
-    ⚠ ML 的软件进程（`--mcp`）**今天还没有门** —— `--mcp` 侧有门，而 GUI 从不经 mecha
-    ⇒ 框架注入的 `MECHA_INITIAL_MODE` **今天没有消费者**。
-    ⇒ 这条判据钉的是"**缺口被写下来**"，而不是"它已经生效"：
-    假装生效比不生效更坏（下一个人会照着它推理）。
+    ## 这条判据的来历（**它自己换过一次对象**）
+
+    原先它钉的是"**缺口被写下来**"：当时 `app_entry.py` **不读** `MECHA_INITIAL_MODE`
+    （注释里自认"今天这里还没读"）⇒ 声明与实现之间有一段缺口，**假装生效比不生效更坏**。
+
+    ✅ 现在 `--mcp` 用**框架的读取口**（`mecha.site.initial_mode_from_env`）读并应用它
+    （真进程判据在 `tests/test_control_endpoint.py`：给 `human` ⇒ 软件起来后写权就是 `human`）。
+    ⚠ 所以本判据**换对象**：从"钉住缺口"改为"钉住**已接通**"，同时**仍要求**
+    剩下的缺口（**没有人手面**）被如实记下 —— 那条**今天还真的存在**：
+    ML 的 GUI 是**独立进程** ⇒ 面板「切到手动」会"写权成功、窗口开不了"。
+
+    ⚠ 教训：**判据会过期**。缺口闭合了就必须**换对象**（R13：删机制/闭缺口时，
+    把它守的承诺改写成**行为级**判据），否则它会一直红着、或更坏 —— 被改成"永远绿"。
     """
     from ml_mecha import mecha_site
 
     src = Path(mecha_site.__file__).read_text(encoding="utf-8")
     assert "MECHA_INITIAL_MODE" in src, "声明里要写明框架会用这个变量送值"
-    assert "缺口" in src or "已知" in src, (
-        "必须**如实记下**『声明了但软件进程还没消费它』这段缺口，不许假装已接上")
+    #: ⭐ 已接通：声明里必须**不再**声称"还没读"
+    assert "还没读" not in src and "没有读它" not in src, (
+        "`initial_mode` 已接通（`app_entry.py` 读并应用了）⇒ 声明不许再写『还没读』")
+    #: ⚠ 剩下的缺口仍必须如实记下（今天真实存在：ML 没有人手面）
+    assert "人手面" in src or "没有手动面" in src, (
+        "必须**如实记下**『ML 没有人手面 ⇒ 切手动会写权成功、窗口开不了』这段缺口")
