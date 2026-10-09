@@ -337,6 +337,293 @@ def test_code_path_reads_the_network_from_a_file():
             ml.close()
 
 
+def test_receipts_echo_resolved_absolute_paths_for_code_and_payload():
+    """⭐⭐ A7③：回执必须回**解析后的绝对路径**（相对路径按 `dataset_roots[0]`，不是 cwd）。
+
+    使用者实测的代价：他用 `../../data/...` 被解析到**错误位置**，"等了 120 分钟才发现"。
+    我核实到的真相是**一半已修**：**失败路径**本来就打绝对路径
+    （`dataset_not_found` 的 message 里就是解析后的位置）；缺的是**成功路径** ——
+    相对路径**解析到另一个也存在的位置**时**零留痕**（回执只回原样入参）。
+    ⇒ 本条钉：代码文件与 HDF5 负载都要回**解析后的绝对路径**。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-resolve-") as td:
+        ml = _ml(td, roots=[td])           # 数据根 = td ⇒ 相对路径按它解析
+        try:
+            # ① **代码文件**：给相对路径，回执要能说出它被解析到哪
+            (Path(td) / "rel_net.py").write_text(GOOD, encoding="utf-8")
+            ds = _payload_ds(ml)
+            out = ml.tools.execute("run_custom", {
+                "code_path": "rel_net.py", "dataset_id": ds, "name": "rel",
+                "overrides": {"epochs": 2, "batch": 4}, "device": _DEV})["value"]
+            assert out["ok"] is True, out
+            assert out["code_path"] == "rel_net.py", out      # 原样入参照旧（可对齐输入）
+            res = str(out.get("code_path_resolved") or "")
+            assert res and os.path.isabs(res), (
+                f"没有回解析后的绝对路径 ⇒ 读错位置时看不出来：{out.get('code_path_resolved')}")
+            assert Path(res).resolve() == (Path(td) / "rel_net.py").resolve(), res
+
+            # ② **HDF5 负载**：同样要回解析后的绝对路径（试跑一次即可，不必真训）
+            pytest_mod = __import__("pytest")
+            h5py = pytest_mod.importorskip("h5py")
+            h5 = Path(td) / "rel_payload.h5"
+            with h5py.File(h5, "w") as f:
+                f.create_dataset("/amp", data=np.arange(24, dtype="float32").reshape(6, 4))
+            meta = pd.DataFrame({"m": np.arange(6.0)})
+            got = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame", "frame": meta}, "name": "h5p",
+                "target_kind": "custom",
+                "payload": {"hdf5": {"path": "rel_payload.h5",
+                                     "datasets": {"amp": "/amp"}}},
+                "pipeline": {"steps": [{"key": "scale"}]}})
+            assert got["is_error"] is False, got
+            ds2 = got["value"]["dataset_id"]
+            dry = ml.tools.execute("run_custom", {
+                "code": GOOD, "dataset_id": ds2, "dry_run": True,
+                "device": _DEV})["value"]
+            pr = dict(dry.get("payload_resolved") or {})
+            # 无产物/无形状的边界：试跑回执里必须有解析后的 HDF5 绝对路径
+            assert pr.get("hdf5_path"), f"负载路径没回解析结果：{pr}"
+            assert Path(pr["hdf5_path"]).resolve() == h5.resolve(), pr
+            assert pr.get("datasets") == {"amp": "/amp"}, pr
+
+            # ③ ⭐ **Q3 的关键现场**：相对路径**解析到"另一个也真实存在"的文件**时，
+            #    回执必须能看出**读的是哪一个**（这正是"等了 120 分钟"那类事故）。
+            #    造两个同名文件：`td/rel_net.py`（要读的）与 `td/sub/rel_net.py`（诱饵，
+            #    行数不同）⇒ 给 `sub/../rel_net.py`，断言解析结果与实际读到的**都指向**前者。
+            (Path(td) / "sub").mkdir(exist_ok=True)
+            decoy = Path(td) / "sub" / "rel_net.py"
+            decoy.write_text("# 诱饵：这个文件**不该**被读\n" * 50, encoding="utf-8")
+            tricky = ml.tools.execute("run_custom", {
+                "code_path": "sub/../rel_net.py", "dataset_id": ds, "name": "tricky",
+                "overrides": {"epochs": 2, "batch": 4}, "device": _DEV})["value"]
+            assert tricky["ok"] is True, tricky
+            assert tricky["code_path"] == "sub/../rel_net.py", tricky   # 原样入参
+            assert Path(str(tricky["code_path_resolved"])).resolve() == \
+                (Path(td) / "rel_net.py").resolve(), tricky["code_path_resolved"]
+            # "读的是哪一个"还得有**内容**证据：行数必须是真文件那份（不是诱饵）
+            assert int(tricky["code_lines"]) == len(GOOD.splitlines()), (
+                f"实际读到的不是解析出来的那份（行数 {tricky['code_lines']} "
+                f"vs 真文件 {len(GOOD.splitlines())}）")
+            # 另一条常被误解的规则：相对路径按 **dataset_roots[0]** 解析，**不是按 cwd**
+            assert Path(ml.engine._dataset_roots[0]).resolve() == Path(td).resolve()
+        finally:
+            ml.close()
+
+
+def test_run_id_collision_is_detected_and_disentangled():
+    """⭐ 自动生成的 `run_id` 撞车要**被检测并让开**（Q5-①）。
+
+    残留风险（不是理论）：`run_id = f"{method}-{ms % 10_000_000}-{seed}"`
+    ⇒ **2.78 小时一个周期**，同方法 + 同种子 + 同毫秒残差 ⇒ 两个互不相干的训练
+    落进**同一个** `runs/<id>/` ⇒ TB 事件**追加**、曲线混在一根轴上
+    （`pitfalls.md` A6 记的就是这一类现象）。概率极小，但**撞了没有任何提示**。
+
+    判据两半：
+    ① **自动生成**的 id 撞上已有内容 ⇒ 换一个（`-b1`）并**留痕**（谁被撞了）；
+    ② ⚠ **显式给**的 id **必须原样保留**（GUI 就地重跑、固定 id 的判据要的就是"追加"）
+       —— 这是"不许过度修正"的边界。
+    """
+    from pathlib import Path as _P
+
+    from ml_toolbox.core.persistence import RUNS_DIR
+    from ml_toolbox.core.runner import reserve_run_id
+
+    root = _P(RUNS_DIR)
+    # 用一个**独一无二**的候选 id（避免与盘上真实 run 交互）
+    cand = "collision-probe-0000001-77"
+    occupied = root / cand
+    occupied.mkdir(parents=True, exist_ok=True)
+    try:
+        # ① 空目录**不算**占用（失败留下的空壳不该顶开后续 id）
+        used, collided = reserve_run_id(cand)
+        assert (used, collided) == (cand, ""), (used, collided)
+        # ② 有内容（record.json / tb / checkpoint 任一）才算撞车
+        (occupied / "record.json").write_text("{}", encoding="utf-8")
+        used2, collided2 = reserve_run_id(cand)
+        assert used2 != cand and collided2 == cand, (used2, collided2)
+        assert used2.startswith(cand), used2
+        # ③ 第二个也占了 ⇒ 继续让开（不会反复给同一个）
+        (root / used2).mkdir(parents=True, exist_ok=True)
+        (root / used2 / "record.json").write_text("{}", encoding="utf-8")
+        used3, _ = reserve_run_id(cand)
+        assert used3 not in (cand, used2), used3
+    finally:
+        import shutil
+        for name in (cand, f"{cand}-b1", f"{cand}-b2"):
+            shutil.rmtree(root / name, ignore_errors=True)
+
+    # ② **显式给的 id 不动**：显式路径根本不进 `reserve_run_id`（runner 只在自动生成时调）
+    import inspect
+
+    from ml_toolbox.core import runner as _runner
+    src = inspect.getsource(_runner.run_one)
+    assert "if not run_id:" in src and "reserve_run_id" in src, (
+        "runner 里没有'只在自动生成时做撞车检测'的分支 ⇒ 显式 id 可能被动过")
+    with tempfile.TemporaryDirectory(prefix="eff-explicit-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=12, with_target=True)
+            fixed = "explicit-id-probe-42"
+            for _ in range(2):            # 同一个显式 id 跑两次：**必须都成功、都不改名**
+                out = ml.tools.execute("run_custom", {
+                    "code": GOOD, "dataset_id": ds, "name": "fixed",
+                    "overrides": {"epochs": 1, "batch": 4}, "device": _DEV,
+                    "seed": 7})["value"]
+                assert out["ok"] is True, out
+        finally:
+            ml.close()
+
+
+def test_prepare_dataset_explains_the_target_kind_decision():
+    """⭐ `prepare_dataset` 要**说出目标类型的判定依据**（Q5-②）。
+
+    踩过的现场：一份 24 行的**连续**目标，因为"数值且基数 ≤ 20"被判成
+    **classification**，而报出来的错是下游很远处的一句
+    `RuntimeError: Found dtype Long but expected Float`（`MSELoss` 拿到 Long 标签）
+    —— 它完全不指向"你的目标被当成分类了"。
+    ⇒ 判据：`target_kind_reason` 必须同时给出**基数**、**阈值**与**结论**。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-kind-") as td:
+        ml = _ml(td)
+        try:
+            # 少基数（会被判分类）+ 多基数（会被判回归）各一份。
+            # ⚠ 分类那份的类别要**有重复成员**：默认管道是**分层**切分，
+            #   每类只有 1 个成员时会抛 sklearn 的 "least populated class" ——
+            #   那本身就是另一条判据（见下面的 `stratify_on_low_cardinality_target`）。
+            small = pd.DataFrame({"a": np.arange(18.0),
+                                  "y": np.tile([0.0, 1.0, 2.0], 6)})
+            many = pd.DataFrame({"a": np.arange(120.0), "y": np.arange(120.0) * 0.5})
+            for frame, want in ((small, "classification"), (many, "regression")):
+                got = ml.tools.execute("prepare_dataset", {
+                    "source": {"kind": "frame", "frame": frame}, "name": "k",
+                    "target": "y",
+                    "pipeline": {"steps": [{"key": "scale"}]}})["value"]
+                assert got["target_kind"] == want, got["target_kind"]
+                reason = got.get("target_kind_reason") or ""
+                assert "基数" in reason, reason
+                assert "20" in reason, reason                     # 阈值要写出来
+                assert want in reason, reason
+                if want == "classification":
+                    assert "连续" in reason or "custom" in reason, reason
+            # ⭐ **离根因很远的那类错也要可教学**：每类只剩 1 个成员时
+            #   sklearn 说的是"分层抽样"，而真相是"你的连续目标被判成分类了"
+            #   ⇒ 必须翻成一句指向根因的话（Q5-②）。
+            broken = ml.tools.execute("prepare_dataset", {
+                "source": {"kind": "frame",
+                           "frame": pd.DataFrame({"a": np.arange(18.0),
+                                                  "y": np.arange(18.0) * 0.5})},
+                "name": "k2", "target": "y",
+                "pipeline": {"steps": [{"key": "scale"}]}})
+            assert broken.get("is_error") is True, broken
+            info = (broken.get("error") or {}).get("info") or {}
+            assert info.get("kind") == "stratify_on_low_cardinality_target", info
+            #: hint 里要带上**判定依据**（基数/阈值）——那才是根因
+            assert "基数" in (info.get("hint") or ""), info
+            assert "classification" in (info.get("hint") or ""), info
+            assert "stratify" in (info.get("suggest") or ""), info
+        finally:
+            ml.close()
+
+
+#: Q7b 判据用的网络：**两个参数组、两组 lr 不同**（幅度组 / 相位组）。
+#: ⇒ `configure` 里设的值必须能从观测面**读回来且两者不同**（否则这个能力等于没接线）。
+_NET_TWO_LRS = '''
+class Net(nn.Module):
+    def __init__(self, d, hidden=16):
+        super().__init__()
+        self.amp = nn.Linear(d, hidden)         # "幅度组"
+        self.ph = nn.Linear(hidden, 2)          # "相位组"
+
+    def forward(self, x):
+        return self.ph(torch.tanh(self.amp(x)))
+
+
+class Network:
+    primary_metric = "lr/probe"
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(int(ctx["payload_shapes"]["xr"][-1]))
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def configure(self, model, *, torch, lr, weight_decay):
+        #: ⭐ **不对称步长**（文献里的 m = δτ_φ/δτ_A ≥ 1）：两组 lr 差 5 倍。
+        #:   ⚠ 组名靠 `param_groups[i]["name"]` —— PyTorch 允许这个额外键。
+        return torch.optim.Adam([
+            {"params": model.amp.parameters(), "lr": lr, "name": "amp"},
+            {"params": model.ph.parameters(), "lr": lr * 5.0, "name": "phase"},
+        ])
+
+    def on_step(self, model, step, ctx):
+        #: `on_step` 里也应当能读到每组的 lr（Q7b：分到组，而不是猜）
+        g = dict(ctx.get("lr_by_group") or {})
+        return {"lr/probe": float(g.get("phase") or 0.0)}
+
+    def forward_step(self, model, batch, ctx):
+        #: ⚠ 负载是逐行的：`xr` 是 (R, L, d) ⇒ 按 L 取均值才是 (R, d)
+        return model(ctx["payload"]["xr"].mean(1)), ctx["payload"]["tgt"]
+'''
+
+
+def test_per_group_learning_rates_reach_the_observation_surface():
+    """⭐⭐ **每个参数组的 lr** 必须能从观测面读回来（Q7b）。
+
+    使用者的实测需求：NQS 修复要用**不对称步长**（幅度组 / 相位组不同 lr，
+    文献 `m = δτ_φ/δτ_A ≥ 1`），而观测面原来**只有一个标量 `lr`**
+    ⇒ "**改了个东西却无法确认它真的生效**"（他这一路最大的坑之一）。
+
+    判据（两条缺一不可）：
+    ① `describe_training` 的 **`lr_by_group`** 里两组都在，且值与 `configure` 给的一致；
+    ② ⭐ **两组必须不同**（否则"能读到"这件事是空转的 —— 与 Q4b 用
+       "`best.pt` ≠ `last.pt`"防空转同一个思路）；
+    ③ `on_step` 的 `ctx["lr_by_group"]` 也读得到（可以把组 lr 当 tag 上报）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="eff-lr-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=16, with_target=True)
+            out = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _NET_TWO_LRS, "dataset_id": ds,
+                "name": "twolr", "persist": True,
+                "overrides": {"epochs": 4, "batch": 8, "lr": 1e-3,
+                              "val_split": 0.25}})["value"]
+            assert out.get("ok") is True, out
+            rid = out["run_id"]
+            tr = ml.tools.execute("describe_training", {"run_id": rid})["value"]
+            assert tr["available"] is True, tr.get("reason")
+            got = dict(tr.get("lr_by_group") or {})
+            assert "amp" in got and "phase" in got, (
+                f"观测面读不到每个参数组的 lr（只有标量 `lr`？）：{got}")
+            amp, ph = float(got["amp"]["lr"]), float(got["phase"]["lr"])
+            # ① 与 `configure` 给的一致（lr=1e-3；phase = lr×5）
+            assert abs(amp - 1e-3) < 1e-9, (amp, got)
+            assert abs(ph - 5e-3) < 1e-9, (ph, got)
+            # ② ⭐ 两组**必须不同**（否则这条判据是空转的）
+            assert amp != ph, f"两组 lr 相同 ⇒ 不对称步长没有被证明：{got}"
+            # ③ `on_step` 也能分到组（它上报的 probe tag 就等于 phase 组的 lr）
+            probe = (tr.get("latest") or {}).get("other", {}).get("lr/probe")
+            assert probe is not None and abs(float(probe) - ph) < 1e-9, (
+                f"`on_step` 的 ctx 里读不到组 lr：latest.other={tr.get('latest')}")
+            # ④ artifacts 里也留一份（`describe_run` / 存档能看）
+            from ml_toolbox.core.persistence import load_run_record
+            arts = load_run_record(rid).result.artifacts
+            assert "nn_lr_by_group" in arts, sorted(arts)
+            assert "phase" in str(np.asarray(arts["nn_lr_by_group"]).ravel()[0]), \
+                arts["nn_lr_by_group"]
+        finally:
+            ml.close()
+
+
 # ============================================================ 4. 负载继承
 def test_eval_custom_inherits_the_training_payload():
     """⭐ `eval_custom` **默认继承训练时的负载**（反馈建议 4），并**明说数据从哪来**。
@@ -555,6 +842,46 @@ class Network:
 '''
 
 
+#: `curve` 详细度判据用的网络：**一个在爬的 tag + 一群平的 tag**。
+#: - `fid/climb` 逐轮上升 ⇒ `convergence` 必须报 `underfit`，
+#:   且 `curve="brief"` 时**它的形状必须照给**（否则"说它欠训练却看不到曲线"）；
+#: - `fid/flat`/`nll/a`… 平 ⇒ 默认被省掉（省的就是它们）。
+CURVE_TAGS_NET = '''
+class Net(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.f = nn.Linear(d, 8)
+        self.h = nn.Linear(8, 2)
+
+    def forward(self, x):
+        return self.h(torch.tanh(self.f(x.mean(1))))
+
+
+class Network:
+    def __init__(self):
+        self.ep = 0
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(int(ctx["payload_shapes"]["xr"][-1]))
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(ctx["payload"]["xr"]), ctx["payload"]["tgt"]
+
+    def metrics(self, model, ctx):
+        self.ep = int(ctx.get("step") or 0)
+        # ⚠ `fid/*` 在 `curve.direction` 里是"越大越好" ⇒ 上升 = underfit（正是要的）。
+        # 平的那些给足够多条：真实 run 是几十个 tag ⇒ 形状总量才看得出来（实测 58 个）。
+        out = {"fid/climb": 0.1 * (self.ep + 1), "fid/flat": 0.5}
+        for i in range(11):
+            out["aux/c%d" % i] = 0.1 * (i + 1)
+        return out
+'''
+
+
 def test_read_job_defaults_to_a_summary_not_the_whole_history():
     """⭐ `read_job` **默认只回摘要**（缺口 A）。
 
@@ -705,6 +1032,95 @@ def test_describe_training_summarizes_grad_by_layer():
             full = ml.tools.execute("describe_training", {
                 "run_id": rid, "grad_layers": "full"})["value"]
             assert len(full["latest"]["grad_by_layer"]) == n_all, full["latest"]
+        finally:
+            ml.close()
+
+
+def test_describe_training_curve_default_is_bounded_and_keeps_warnings():
+    """⭐⭐ `curve` **默认只给该看的形状**，但**绝不漏判读**（缺口 A33/缺口B 的复发）。
+
+    实测（真 run，58 个 tag）：全量形状占默认回执 **87%**（38 891 字符里 31 140 是
+    `curve`），而 `curve` 在**必填键**里 ⇒ `pick` 最多省 9%。这一条钉三件事：
+
+    1. 默认（`brief`）明显更小（形状只留核心 tag + **有判读的 tag**）；
+    2. ⭐ **有判读的 tag 必须在 brief 里也给出形状** —— 否则会出现"回执说某 tag
+       欠训练、却看不到它的形状"这种自相矛盾（比浪费 token 更坏）；
+    3. `curve="all"` 能拿回全量、`curve_tags=[…]` 能点名、`off` 仍保留判读。
+
+    ⚠ 判读（`convergence`）**始终基于全部 tag 算**：省形状**不会**漏掉
+    "末段还在爬 ⇒ 可能欠训练"这类警告，这正是本判据第 ② 条要钉的。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import json
+
+    def _n(o):
+        return len(json.dumps(o, ensure_ascii=True, default=str))
+
+    with tempfile.TemporaryDirectory(prefix="eff-curve-") as td:
+        ml = _ml(td)
+        try:
+            ds = _payload_ds(ml, rows=16, with_target=True)
+            rid = ml.tools.execute("run_custom", {
+                "code": CURVE_TAGS_NET, "dataset_id": ds, "name": "curve",
+                "overrides": {"epochs": 8, "batch": 4, "val_split": 0.25},
+                "device": _DEV})["value"]["run_id"]
+
+            brief = ml.tools.execute("describe_training", {"run_id": rid})["value"]
+            full = ml.tools.execute("describe_training", {
+                "run_id": rid, "curve": "all"})["value"]
+            off = ml.tools.execute("describe_training", {
+                "run_id": rid, "curve": "off"})["value"]
+
+            # ① 全量一定有足够多的 tag（否则下面的大小比较没有意义）
+            assert len(full["curve"]) >= 12, sorted(full["curve"])
+            assert full["curve_mode"] == "all", full["curve_mode"]
+            # ② 默认明显更小（形状这一项是机制；整份回执是它的效果）
+            assert len(brief["curve"]) < len(full["curve"]), (
+                len(brief["curve"]), len(full["curve"]))
+            assert _n(brief["curve"]) < 0.35 * _n(full["curve"]), (
+                _n(brief["curve"]), _n(full["curve"]))
+            assert _n(brief) < 0.7 * _n(full), (_n(brief), _n(full))
+            # 省下来的**绝对量**才是 AI 的成本（固定开销几千字符谁也去不掉）
+            assert _n(full) - _n(brief) >= 3000, (_n(brief), _n(full))
+            assert brief["curve_omitted_n"] == len(full["curve"]) - len(brief["curve"])
+            assert "curve" in (brief.get("curve_note") or ""), brief.get("curve_note")
+            # 核心 tag 在默认里（否则"看不到自己的损失曲线"）
+            for core in ("loss", "val_loss"):
+                assert core in brief["curve"], sorted(brief["curve"])
+
+            # ③ ⭐ **有判读的 tag：brief 也必须给形状**（不许自相矛盾）
+            kinds = {n["tag"]: n["kind"] for n in full["convergence"]}
+            assert kinds.get("fid/climb") == "underfit", kinds
+            assert "fid/climb" in brief["curve"], (
+                "brief 省掉了**有判读**的 tag 的形状 ⇒ 回执会「说它欠训练、"
+                "却看不到它的曲线」")
+            # ④ 平的那些 tag 在默认里被省掉（省的就是它们）
+            assert "fid/flat" in full["curve"] and "fid/flat" not in brief["curve"], (
+                sorted(brief["curve"]), sorted(full["curve"]))
+
+            # ⑤ `curve_tags` 点名：只要它（+ 有判读的照给）
+            picked = ml.tools.execute("describe_training", {
+                "run_id": rid, "curve_tags": ["fid/flat"]})["value"]
+            assert "fid/flat" in picked["curve"], sorted(picked["curve"])
+            assert "fid/climb" in picked["curve"], sorted(picked["curve"])
+            missing = ml.tools.execute("describe_training", {
+                "run_id": rid, "curve_tags": ["no/such"]})["value"]
+            assert missing["curve_tags_missing"] == ["no/such"], missing.get(
+                "curve_tags_missing")
+
+            # ⑥ `off`：一个形状都不回，但**判读仍在**（信息不丢）
+            assert off["curve"] == {}, off["curve"]
+            assert {n["tag"]: n["kind"] for n in off["convergence"]} == kinds, (
+                off["convergence"])
+
+            # ⑦ 非法模式：**可教学**地拒（不静默退化成默认）
+            bad = ml.tools.execute("describe_training", {
+                "run_id": rid, "curve": "weird"})
+            assert bad["is_error"] is True, bad
+            assert ((bad.get("error") or {}).get("info") or {}).get("kind") \
+                == "bad_curve_mode", bad
         finally:
             ml.close()
 
@@ -866,6 +1282,13 @@ _TESTS = [
     test_eval_custom_inherits_the_training_payload,
     # ---- 第二轮反馈（docs/反馈-code_path接线与dry_run实测.md）----
     test_code_path_is_exclusive_and_says_which_source_was_used,
+    # ---- A7③（2026-10-07）：相对路径要回**解析后的绝对路径** ----
+    test_receipts_echo_resolved_absolute_paths_for_code_and_payload,
+    # ---- Q5（2026-10-07）：run_id 撞车检测 + 目标类型判定依据 ----
+    test_run_id_collision_is_detected_and_disentangled,
+    test_prepare_dataset_explains_the_target_kind_decision,
+    # ---- Q7b（2026-10-07）：每个参数组的 lr（不对称步长要能确认生效）----
+    test_per_group_learning_rates_reach_the_observation_surface,
     test_dry_run_shapes_verbosity_is_smaller,
     test_eval_custom_says_why_the_payload_source_is_what_it_is,
     # ---- 第三轮反馈（docs/反馈-观测面默认全量与AI调用预算.md）----
@@ -873,6 +1296,8 @@ _TESTS = [
     test_unknown_job_gives_on_disk_clues,
     test_dry_run_warmup_steps_catches_dynamics_errors,
     test_describe_training_summarizes_grad_by_layer,
+    # ---- 2026-10-07：`curve` 默认有界（缺口B 在形状上复发；形状占默认回执 87%）----
+    test_describe_training_curve_default_is_bounded_and_keeps_warnings,
     # ---- CUDA 断言与它的回声（多N合并-进展与阻塞.md 的实测代价）----
     test_cuda_device_assert_is_told_apart_from_its_echo,
     # ---- 静默死亡：命令层失败被 job 层吞掉 / 声明非 JSON 安全 ----

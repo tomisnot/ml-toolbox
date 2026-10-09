@@ -53,6 +53,48 @@ def _run_id(method: str, seed: int) -> str:
     return f"{method}-{int(time.time() * 1000) % 10_000_000}-{seed}"
 
 
+def reserve_run_id(candidate: str, *, runs_dir=None, limit: int = 50) -> tuple[str, str]:
+    """给**自动生成**的 `run_id` 做**撞车检测**（Q5-①）：回 ``(实际用的 id, 撞上了谁)``。
+
+    ## 为什么需要（残留风险，不是理论）
+
+    毫秒字段是 `int(time.time()*1000) % 10_000_000` ⇒ **2.78 小时一个周期**：
+    同方法 + 同种子 + 同毫秒残差 ⇒ 两个**互不相干**的训练会落到**同一个
+    `runs/<id>/`**，于是 TB 事件**追加**、曲线混在一根轴上（`pitfalls.md` A6 记的
+    正是这一类现象）。概率极小，但**撞了没有任何提示** —— 而这是"审计型工具"最不该有的歧义。
+
+    ## 两条边界（都很重要）
+
+    1. ⚠ **只对自动生成的 id 去重**：显式给了 `run_id` 的调用方（GUI 的"就地重跑"、
+       固定 id 的判据/探针）**必须原样保留** —— 他们要的就是"往同一个 run 里追加"。
+       ⇒ 判断"是否显式"由调用方做（本函数不知道），它只负责"这个目录被占了就换一个"。
+    2. **只在目录**真的**有内容**时才算撞车（`record.json` / `tb/` / `checkpoint/` 任一），
+       空的目录/残留目录不算 —— 否则一次失败留下的空壳会把后续 id 全都顶开。
+
+    换名规则：`<id>-b1`、`<id>-b2`…（后缀写成 `-b<k>` 而不是再拼毫秒，
+    这样"这是一个被去重过的 id"一眼可辨）。
+    """
+    from pathlib import Path
+    if runs_dir is None:
+        from .persistence import RUNS_DIR as runs_dir     # noqa: PLC0415 - 避免绕圈
+    root = Path(str(runs_dir))
+    cand = str(candidate)
+    try:
+        for k in range(0, max(1, int(limit))):
+            d = root / cand
+            occupied = False
+            if d.is_dir():
+                occupied = any((d / n).exists() for n in ("record.json", "tb", "checkpoint"))
+                if not occupied:
+                    occupied = any(p.is_file() for p in d.iterdir())
+            if not occupied:
+                return cand, ("" if k == 0 else str(candidate))
+            cand = f"{candidate}-b{k + 1}"
+    except OSError:
+        return str(candidate), ""          # 读不到盘就**别动它**（宁可按原样走）
+    return cand, str(candidate)
+
+
 class _StageTimer:
     """极低开销 wall-clock 分段计时器。"""
 
@@ -108,7 +150,20 @@ def run_one(method: MLMethod, spec: DataSpec,
     # 为什么必须在前面：神经网络族的 TensorBoard 事件要**逐 epoch 实时写**到
     # `runs/<run_id>/tb/`，而那个目录一路不能变（变了直播就断）。
     # 经 `cfg.extras` 往下传；末态构造 RunRecord 时**复用同一个值** ⇒ 目录名与记录名一致。
-    run_id = cfg.extras.get("run_id") or _run_id(method.name, cfg.seed)
+    run_id = str(cfg.extras.get("run_id") or "")
+    if not run_id:
+        #: ⭐ **自动生成**的 id 才做撞车检测（Q5-①）：毫秒字段是 `%10_000_000`
+        #: ⇒ 2.78 小时一个周期，同方法+同种子+同毫秒残差会撞进同一个 `runs/<id>/`
+        #: （TB 追加、曲线混轴，`pitfalls.md` A6）。**显式给 id 的调用方不动**
+        #: —— 他们要的就是"往同一个 run 里追加"（GUI 就地重跑、固定 id 的判据）。
+        used, collided = reserve_run_id(_run_id(method.name, cfg.seed))
+        run_id = used
+        if collided:
+            #: 留痕（**不静默**）：`record.json` 的 `config.extras` 会带上它，
+            #: 回执/日志也看得到"这次本来会撞上谁"。
+            cfg.extras["run_id_collision"] = {"requested": collided, "used": used}
+            print(f"[runner] run_id 撞车：{collided} 已被占用 ⇒ 改用 {used}"
+                  f"（Q5-①：毫秒字段 2.78 h 一周期）", flush=True)
     cfg.extras["run_id"] = run_id
     #: **方法内部的进度钩子**（可选，逗号（epoch, total）之外不承诺任何形状）。
     #: 为什么走 extras 而不是新增 `fit` 形参：`fit(problem, cfg, diag)` 是方法层契约，
@@ -217,6 +272,12 @@ def run_one(method: MLMethod, spec: DataSpec,
         #   用 `pop(..., None)`：没传过就是 no-op（零开销，P3）。
         if on_progress is not None:
             cfg.extras.pop("on_progress", None)
+        # ⚠⚠ **续训的状态也必须是"运行时对象"**（Q7）：`resume_state` 是一个
+        #   **张量 dict**，留在 extras 里 ⇒ 训练成功之后**写 `record.json` 时炸**
+        #   （A38 那条：进 extras 的东西必须 JSON 安全，而它**只在 job/落盘路径暴露**）。
+        #   ⇒ 方法层用完之后在这里统一摘掉；**事实**（`resume_meta`）才留下。
+        #   （`custom.py` 里也会在用完时就地 pop 一次——两道，因为这条太容易复现。）
+        cfg.extras.pop("resume_state", None)
 
     # 旧字段语义保持不变：评估/CV 之前结算 elapsed。
     res.target_kind = res.target_kind or spec.target_kind

@@ -78,6 +78,26 @@ describe_training(run_id=…, pick=["latest.other"])
 - `latest.grad_by_layer` 改成**默认摘要**（前 3 + 后 3 + 总数），要全量给 `grad_layers="full"`；
 - 或者允许 `pick` **下钻到必填键内部**（现在是"必填键删不掉"，但那不等于"内部不能再筛"）。
 
+### 3.3 ✅ 处置状态（2026-10-07，**两半都落地了**）
+
+1. **`grad_by_layer` 那一半**：上一轮已按上面第一条修（默认前 3 + 后 3，
+   `grad_layers="full"` 拿全量）。
+2. ⚠ **但同一个病在 `curve` 上复发了，而且规模 ×10**（2026-10-07 实测）：
+   `curve`（每 tag 六个数）随 tag 数线性增长 —— 一个真实 run 有 **58 个 tag**
+   ⇒ 默认回执 **38 891 字符**（≈1.1 万 token），其中 `curve` 占 **31 140（80%）**；
+   而 `curve` 也在**必填键**里 ⇒ `pick` **最多省 9%**（实测）。
+   ⇒ 已修，**沿用你们选的那条路**（"默认摘要 + 显式旋钮"）：
+   `describe_training(..., curve="brief"|"all"|"off")` + `curve_tags=[…]`。
+   默认 `brief` = **核心 tag（loss/val_loss/lr/grad_norm/dead_relu）+ 有判读的 tag**
+   （+ `best_by` 点名的那个）。**实测同一个 run：38 891 → 10 664 字符（−72.6%）**。
+   ⚠ 关键不变量：**判读（`convergence`）始终基于全部 tag** ⇒ 省形状**不会**漏掉
+   "末段还在爬 ⇒ 可能欠训练"这类警告（有判读的 tag 在 `brief` 里**照给形状**，
+   否则会变成"说它欠训练却看不到它的曲线"这种自相矛盾）。
+   - 判据：`tests/test_ai_efficiency.py::test_describe_training_curve_default_is_bounded_and_keeps_warnings`
+     （默认比全量小、**有判读的 tag 必须给形状**、`all`/`off`/`curve_tags` 三种模式、
+     非法模式可教学地拒）。
+3. **`pick` 下钻必填键内部**：仍未做（现在有旋钮了，优先级下降）。
+
 ---
 
 ## 4. 缺口 C【中高】`dry_run` 只验前向 ⇒ 抓不到"训练动态"类错误

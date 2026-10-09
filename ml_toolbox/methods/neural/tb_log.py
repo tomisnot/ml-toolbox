@@ -172,8 +172,10 @@ class TensorBoardLog:
         return self._writer is not None
 
     def log_epoch(self, ep: int, history: dict, grads: dict,
-                  extra: dict | None = None) -> None:
-        """一个 epoch 的标量：5 条核心 + 每层梯度范数 + **调用方自定义 tag**。
+                  extra: dict | None = None,
+                  lr_by_group: dict | None = None) -> None:
+        """一个 epoch 的标量：5 条核心 + 每层梯度范数 + **调用方自定义 tag** +
+        **每个参数组的 lr**（Q7b：`lr/<组名>`）。
 
         ## `extra`：让"方法自己上报想看的指标"直接落到观测面
 
@@ -184,6 +186,14 @@ class TensorBoardLog:
         tag** ⇒ 这里多写一条，AI 那边立刻能看见，**查询面一行都不用改**。
         分组的表达方式就是 **tag 命名约定**：`fid/ch0`、`fid/ood`、`nll/phase`…
         （TensorBoard 的 tag 本来就分层，不必另造结构。）
+
+        ## `lr_by_group`：**不对称步长**必须能查（Q7b）
+
+        使用者的修复要用"幅度组 / 相位组不同 lr"（文献里的 `m = δτ_φ/δτ_A ≥ 1`），
+        而观测面原来**只有一个标量 `lr`** ⇒ **改了个东西却无法确认它真的生效**。
+        ⇒ 每个组写一条 `lr/<组名>`（组名来自 `configure` 的
+        `param_groups[i]["name"]`；没起名就是 `g0`/`g1`…）。
+        ⚠ 与 `extra` 同一纪律：**非有限值不入盘**（不在图里造假点）。
         """
         w = self._ensure()
         if w is None:
@@ -195,6 +205,14 @@ class TensorBoardLog:
                 v = float(seq[step])
                 if np.isfinite(v):                  # ⚠ val_loss 可能是 NaN（无验证集）
                     self._safe(f"scalar/{key}", w.add_scalar, key, v, step)
+        for group, value in (lr_by_group or {}).items():
+            try:
+                lv = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(lv):
+                self._safe(f"scalar/lr/{group}", w.add_scalar,
+                           f"lr/{group}", lv, step)
         for name, seq in (grads or {}).items():
             if len(seq) > step:
                 v = float(seq[step])

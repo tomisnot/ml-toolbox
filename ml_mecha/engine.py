@@ -783,7 +783,9 @@ class MLEngine(Engine):
                                grad_layers: str = "summary",
                                best_by: str = "",
                                compare: Sequence[str] | None = None,
-                               tags: Sequence[str] | None = None) -> dict[str, Any]:
+                               tags: Sequence[str] | None = None,
+                               curve: str = "brief",
+                               curve_tags: Sequence[str] | None = None) -> dict[str, Any]:
         """训练的**逐 epoch 观测数值**（只读；数据源 = TensorBoard 事件文件）。
 
         ## 为什么必须是只读查询 + 不走会话内存
@@ -797,6 +799,17 @@ class MLEngine(Engine):
 
         `include_series` 默认 False：整条序列是"趋势"问题的答案，代价是响应大
         （11 个 tag × 最多 500 点）。要看趋势时显式打开，并按需调 `limit`。
+
+        ## 为什么 `curve` 默认是 `brief`（2026-10-07，缺口 A33/缺口B 的复发）
+
+        `curve`（每 tag 六个数）是**每个 tag 都有一条**，而真实 run 有 **55 个 tag**
+        （47 条 `grad/*` + 核心 + 自定义）⇒ 实测一份默认回执 **36.8 KB ≈ 1 万 token**，
+        其中 `curve` 占 **87%**。而 `pick` 是"补集"投影、`curve` 又在**必填键**里
+        ⇒ **省不掉**（实测最多省 9%）。
+        ⇒ 默认只给"**该看的**"：核心五条 + **有判读的 tag**（`convergence` 命中）
+        + `best_by` 点名的那个；要全量给 `curve="all"`，要点名给 `curve_tags=[…]`。
+        ⚠ **判读始终基于全部 tag**：省形状**不会**漏掉"末段还在爬"这类警告
+        （`convergence` 照常从全量算）。
 
         ⚠ **读不到就说读不到**（`available=false` + `reason`），绝不回空数组假装
         "跑到第 0 个 epoch"——这是本仓反复在守的那条纪律。
@@ -824,7 +837,10 @@ class MLEngine(Engine):
                 "latest": {}, "tags": picked, "histograms": [], "images": [],
                 "text": [], "duplicate_steps": [],
                 "compare": {"runs": compare_ids, **aligned},
-                "curve": {}, "convergence": [],
+                #: `compare` 模式下不做单 run 的形状/判读 ⇒ 模式记空串（**不编一个**）
+                "curve": {}, "curve_mode": "",
+                "convergence": [],
+                "latest_steps": {}, "step_units": {}, "axes": {},
                 "best_by": {"tag": "", "best": {}, "by_val_loss": {},
                             "note": "compare 模式下不做单 run 的 best_by"},
             }
@@ -841,7 +857,10 @@ class MLEngine(Engine):
                     "reason": "没有任何运行写过训练过程事件（只有神经网络类方法会写）",
                     "latest": {}, "tags": [], "histograms": [], "images": [],
                     "text": [], "duplicate_steps": [], "max_points": 0,
-                    "curve": {}, "convergence": [],
+                    #: 没有可读的运行 ⇒ 没有任何形状/判读（如实空，**不假装**）
+                    "curve": {}, "curve_mode": "",
+                    "convergence": [],
+                    "latest_steps": {}, "step_units": {}, "axes": {},
                     "best_by": {"tag": "", "best": {}, "by_val_loss": {},
                                 "note": "没有可读的运行"},
                     "compare": {"runs": [], "tags": {},
@@ -881,7 +900,61 @@ class MLEngine(Engine):
             note = _curve.convergence_note(str(tag), sh)
             if note.get("kind"):
                 notes.append({"tag": str(tag), **note})
-        out["curve"] = shapes
+        #: ⭐⭐ **形状默认只给"该看的"**（2026-10-07，缺口 A33/缺口B 在 `curve` 上复发）：
+        #:   55 个 tag × 六个数 = 30 KB（占默认回执 87%），而 `curve` 在**必填键**里
+        #:   ⇒ `pick` 省不掉。判读（`convergence`）**照旧基于全部 tag**，所以省形状
+        #:   **不会**漏掉"末段还在爬"这种警告；省的只是"平的那些"的六个数。
+        #:   ⚠ 白名单里必须包含**有判读的 tag**——否则会出现"回执说某 tag 欠训练、
+        #:     却看不到它的形状"这种自相矛盾（那是比浪费 token 更坏的错）。
+        curve_mode = str(curve or "brief").strip().lower() or "brief"
+        if curve_mode not in ("brief", "all", "off"):
+            raise MechaError(
+                f"curve 只能是 brief / all / off，收到 {curve!r}",
+                kind="bad_curve_mode",
+                hint="brief（默认）= 核心 tag + **有判读的 tag** + `best_by` 点名的那个；"
+                     "all = 全部 tag（回执明显变大）；off = 一个形状都不回（判读仍在）",
+                suggest='describe_training(run_id=…, curve="all") 或 curve_tags=["fid/sub1"]',
+            )
+        wanted = [str(t) for t in (curve_tags or []) if str(t or "").strip()]
+        keep: set[str] = set()
+        if curve_mode == "off":
+            #: ⚠ `off` 是**显式要求"一个形状都不要"** ⇒ 一律留空（连有判读的也不留）。
+            #: 这**不丢信息**：`convergence` 的 note 文本里自带数字与窗口
+            #: （"末 15 个点 0.1→0.8（+700%）"），判读本身照旧基于全部 tag。
+            keep = set()
+        else:
+            if curve_mode == "all":
+                keep = set(shapes)
+            elif wanted:
+                keep = {t for t in wanted if t in shapes}
+            else:
+                keep = {t for t in _CURVE_BRIEF_CORE if t in shapes}
+            #: ⭐ **有判读的 tag 一定要给形状**（除显式 `off`）：否则回执会出现
+            #:   "说某 tag 欠训练、却看不到它的曲线"这种**自相矛盾**——那比多花
+            #:   几百字符坏得多（`best_by` 点名的那个同理）。
+            keep |= {n["tag"] for n in notes if n["tag"] in shapes}
+            best_want = str(best_by or "").strip()
+            if best_want and best_want in shapes:
+                keep.add(best_want)
+        omitted = [t for t in shapes if t not in keep]
+        out["curve"] = {t: shapes[t] for t in shapes if t in keep}
+        out["curve_mode"] = curve_mode
+        out["curve_omitted_n"] = len(omitted)
+        if omitted:
+            out["curve_omitted"] = omitted[:12]
+            extra = ("⚠ `curve=\"off\"` 是**显式**要求不回形状；`convergence` 的判读"
+                     "仍基于全部 tag（note 文本里自带数字与窗口）。"
+                     if curve_mode == "off" else
+                     "要全量：`curve=\"all\"`；只要某几个：`curve_tags=[\"fid/sub1\", …]`。")
+            out["curve_note"] = (
+                "默认只给**核心 tag（loss/val_loss/lr/grad_norm/dead_relu）+ 有判读的 tag**"
+                "的形状（省上下文：长训练里全量形状可占默认回执的近九成）；"
+                f"本次省了 {len(omitted)} 个 tag 的形状。" + extra +
+                " ⚠ `convergence` 的判读**始终基于全部 tag** ⇒ 这里省掉形状不会漏警告。")
+        if wanted:
+            missing = [t for t in wanted if t not in shapes]
+            if missing:
+                out["curve_tags_missing"] = missing
         #: ⭐ **每个 tag 自己的求值 step**（2026-10-06）：`latest` 是把各 tag 的
         #:   "最新值"并排放的，而它们的**步长可以不同**（`metrics_every` 降频时
         #:   `fid/*` 每 N 轮才记一次）⇒ 不标 step 就等于**暗示它们同一步**。
@@ -891,6 +964,60 @@ class MLEngine(Engine):
             str(tag): (list(got.get("steps") or [])[-1]
                        if (got.get("steps") or []) else None)
             for tag, got in scal.items()}
+        #: ⭐⭐ **步号还得说清单位**（2026-10-07，用户实测的第二次同族误判）：
+        #:   `tb_log` 有**两条**写标量的路，轴的单位不同——
+        #:   `log_epoch`（loss/val_loss/lr/grad_norm/逐层梯度/权重范数）用 `step=ep`
+        #:   ⇒ **第几轮**；`log_step`（`Network.on_step` 上报）用 `step=gstep`
+        #:   ⇒ **第几个 batch**。实测同一个 run：`loss` 的 latest_step=283，
+        #:   而 `fid/step` 的 latest_step=78410（比值 ≈277 = 每轮批数）。
+        #:   ⇒ 只给步号而不给单位，读数的人会把 78410 当成"累计点数"
+        #:   （用户原话就是"fid/step 累计 4698 点而 loss 只有 102 点"），
+        #:   或者把两族并排比 —— 那会造出一个**不存在的矛盾**（pitfalls A54）。
+        loss_max = None
+        if scal.get("loss", {}).get("steps"):
+            loss_max = float(list(scal["loss"]["steps"])[-1])
+        max_step: dict[str, float | None] = {
+            str(tag): (float(list(got.get("steps"))[-1])
+                       if (got.get("steps") or []) else None)
+            for tag, got in scal.items()}
+        units = {tag: _step_unit_of(tag, loss_max=loss_max,
+                                    tag_max=max_step.get(tag))
+                 for tag in max_step}
+        #: ⚠ **只列非 epoch 级**（默认有界：通常只有几条；详见 `axes.note`）。
+        out["step_units"] = {t: u["unit"] for t, u in units.items()
+                             if u["unit"] != "epoch"}
+        #: ⭐ **每个参数组的 lr**（Q7b）：观测面原来只有**一个标量 `lr`**，
+        #:   而"不对称步长"（幅度组/相位组不同 lr）**改了却无法确认它真的生效**。
+        #:   ⇒ 把 `lr` 与 `lr/<组名>` 收成一张表（`lr` 记作 `default`）。
+        #:   ⚠ 组名来自 `Network.configure` 的 `param_groups[i]["name"]`（没起名就是 g0/g1）。
+        lr_groups: dict[str, Any] = {}
+        for tag, got in scal.items():
+            t = str(tag)
+            if t == "lr" or t.startswith("lr/"):
+                latest = (got.get("steps") or []), (got.get("values") or [])
+                if latest[1]:
+                    key = "default" if t == "lr" else t.split("/", 1)[1]
+                    lr_groups[key] = {
+                        "lr": float(latest[1][-1]),
+                        "step": (latest[0][-1] if latest[0] else None),
+                    }
+        if lr_groups:
+            out["lr_by_group"] = lr_groups
+            #: 只有多组时才有意义；单组也给（口径一致），但加一句说明免得误读
+            if len(lr_groups) == 1:
+                out["lr_by_group"]["_note"] = (
+                    "只有一个参数组（`Network.configure` 里没分组建优化器？）"
+                    "⇒ 这时的 `lr_by_group` 与标量 `lr` 是同一个数")
+        batch_tags = sorted(t for t, u in units.items() if u["unit"] == "batch")
+        mixed_tags = sorted(t for t, u in units.items() if u["unit"] == "mixed")
+        epoch_len = (loss_max + 1) if loss_max is not None else None
+        per_epoch = None
+        if epoch_len and batch_tags:
+            per_epoch = round(max(max_step.get(t) or 0.0 for t in batch_tags)
+                              / max(1.0, epoch_len), 1)
+        out["axes"] = _axes_facts(units, epoch_axis_len=epoch_len,
+                                  batch_tags=batch_tags, mixed_tags=mixed_tags,
+                                  per_epoch=per_epoch)
         #: ⚠ 排序：**先报"欠训练/发散"里的欠训练**（那是用户的误判点），
         #:   但两类都要在 ⇒ 一个词盖住两种病是最坏的做法。
         notes.sort(key=lambda n: (n.get("kind") != "underfit", str(n.get("tag"))))
@@ -929,9 +1056,35 @@ class MLEngine(Engine):
         #: - 给了 `tags` ⇒ **同一 run 内多 tag 的对齐**（同一个 step 轴 + `aligned_at_step`）；
         #: - 没给 ⇒ 空表 + 一句说明（"没给"与"给了但没数据"是两件事）。
         if same_run_tags:
+            aligned = _curve.align_tags(scal, same_run_tags,
+                                        limit=max(1, int(limit or 200)))
+            #: ⭐ **跨族对齐要当场说清**（2026-10-07，实测的误导性回执）：
+            #:   把 epoch 级与 batch 级 tag 一起给 `tags=[…]` 时，轴取的是**两族步号的
+            #:   并集**，而 batch 步比 epoch 步大 ~277 倍 ⇒ 取尾部 limit 个之后，
+            #:   **epoch 级那一族全变 `null`**（实测：loss/val_loss 六个点全是 null，
+            #:   而 fid/step 有值）。回执看起来像"这段区间没有记录 loss"——那是**假事实**。
+            #:   ⇒ 不删数据（有人确实要看），但**必须**把这件事写在结论旁边。
+            picked_units = {str(t): str((units.get(str(t)) or {}).get("unit") or "")
+                            for t in same_run_tags}
+            has_batch = [t for t, u in picked_units.items() if u == "batch"]
+            has_epoch = [t for t, u in picked_units.items() if u == "epoch"]
+            if has_batch and has_epoch:
+                aligned["axis_warning"] = (
+                    "⚠ 本次对齐**跨了两种步号单位**："
+                    f"batch 级 {has_batch}（轴 = 全局 batch 步）与 "
+                    f"epoch 级 {has_epoch}（轴 = 第几轮）。轴取的是两族步号的并集，"
+                    "而 batch 步比 epoch 步大得多 ⇒ **epoch 级那一族会大片 `null`**"
+                    "（不是'没记'，是**不在这个 step 尺度上**）。"
+                    "要看同一根轴上的关系，请只在同族内比（如 loss vs val_loss，"
+                    "或 `fid/*` 同族之间）；跨族只能看各自 `curve` 的趋势。")
+            if aligned.get("aligned_at_step") is None and len(same_run_tags) > 1:
+                aligned["axis_warning"] = (
+                    (aligned.get("axis_warning", "") + " " if aligned.get("axis_warning")
+                     else "") +
+                    "⚠ 这些 tag **没有公共 step**（`aligned_at_step=null`）⇒ "
+                    "`aligned` 为空是**真的**：别把它们并排读（各 tag 的求值步长不同）。")
             out["compare"] = {"mode": "tags(同 run)", "run_id": resolved,
-                              **_curve.align_tags(scal, same_run_tags,
-                                                  limit=max(1, int(limit or 200)))}
+                              "step_units": picked_units, **aligned}
         else:
             out["compare"] = {"runs": [], "tags": {},
                               "note": "没有给 `compare` ⇒ 本条只报单 run；"
@@ -1389,9 +1542,31 @@ class MLEngine(Engine):
                 hint="要跑文件里那份：只给 `code_path`；要跑内联那段：只给 `code`。"
                      "⚠ 同时给时旧行为是**静默取 code**，那会让'我改了文件'变成假的")
         code_source = "inline"
+        #: ⭐ **解析后的绝对路径**（A7③）：相对路径按 `dataset_roots[0]` 解析，
+        #: 而回执原来只回**原样入参** ⇒ "读到了另一个也存在的位置"时零留痕。
+        code_path_resolved = ""
         if not code.strip() and code_path:
-            code = self._read_code_file(code_path)
+            code, code_path_resolved = self._read_code_file(code_path)
             code_source = "file"
+        # ⭐ **续训（Q7）**：`resume_from` 可以是 `run_id` 或 `.pt` 的路径；
+        #   装载在**引擎侧**做（只读 `state_dict` + 元信息），再由 extras 下传给方法层。
+        #   ⚠ **找不到就拒**（`no_resume_checkpoint`）—— **绝不静默从头训**：
+        #     "以为在续训、其实从零开始"会跑得很好，你只会觉得"这轮收敛慢"。
+        resume_from = str(spec.get("resume_from") or "").strip()
+        resume_which = str(spec.get("resume_which") or "last").strip() or "last"
+        resume_state = None
+        resume_meta: dict = {}
+        if resume_from:
+            from ml_toolbox.methods.neural.custom import (
+                _resume_error_hint, load_checkpoint_state)
+            try:
+                resume_state, resume_meta = load_checkpoint_state(
+                    resume_from, which=resume_which)
+            except ValueError as exc:
+                kind, hint, suggest = _resume_error_hint(str(exc))
+                raise MechaError(
+                    f"续训装载失败：{str(exc).split('|', 1)[-1]}",
+                    kind=kind, hint=hint, suggest=suggest) from exc
         if not code.strip():
             raise MechaError("run_custom 需要 code（定义 `class Network` 的代码）"
                              "或 code_path（指向代码文件）",
@@ -1405,6 +1580,12 @@ class MLEngine(Engine):
             entry = self.dataset_entry(dataset_id)
         assert entry is not None
         name = str(spec.get("name") or "").strip() or "custom"
+        #: ⭐ **负载声明的单一来源**（登记数据那一步，`spec.meta`；不在本次参数里
+        #:   —— 实测踩过：只看 `spec["payload"]` 会永远是空的）。
+        #:   ⚠ 在**试跑分支之前**就取好：试跑回执同样要回"读的是哪个文件"（A7③）。
+        payload_decl = dict(
+            spec.get("payload") or entry.spec.meta.get("payload_decl") or {})
+        payload_resolved = self._resolved_payload_paths(payload_decl)
         # ⭐⭐ **试跑**（反馈建议 1，他评为最高性价比）：编译 + 建模型 + 用**真实负载**
         #   跑几次一次前向，回逐模块形状轨迹与结构化归因。
         #   ⚠ 三条边界：**不反传、不落盘、不计入实验记录**（不写状态、不建 run）。
@@ -1412,7 +1593,9 @@ class MLEngine(Engine):
         #   （批次相关）**只有用真实负载才抓得到**。
         if bool(spec.get("dry_run", False)):
             return self._cmd_dry_run_custom(spec, entry, code, code_path, name,
-                                            context, code_source)
+                                            context, code_source,
+                                            code_path_resolved=code_path_resolved,
+                                            payload_resolved=payload_resolved)
         method_name = _custom_method_name()
         # ⚠ **先确保注册项在**再按注册表取 schema：这样覆写校验用的就是"运行时
         #   真正那个方法"的声明，而不是另抄一份；且里外只有一个来源。
@@ -1422,19 +1605,39 @@ class MLEngine(Engine):
         # ⚠ **不撤除**（撤除 = 并发竞态的根）：代码随 extras 走，见
         #   `_ensure_custom_method` 的说明。
         self._ensure_custom_method()
+        # ⭐ **中途存档间隔**（2026-10-07，A1）：`checkpoint_every` 既能走顶层参数
+        #   （工具面的一等旋钮），也能走 `overrides`（与其余训练超参同一条路）。
+        #   ⚠ 同时给时**顶层为准**：它是更显式的那一个（而且工具面的 schema 里写着它）。
+        #   ⚠ 这里**只做搬运，不做校验**：类型/范围交给 `ParamSpec.clean`
+        #   （`checkpoint_every` 已进 `CustomNNMethod.param_schema`）——
+        #   在引擎里另写一份判断，就是"兜底与判据各说各话"的老坑。
+        raw_overrides = spec.get("overrides")
+        ck_every_raw = spec.get("checkpoint_every")
+        if ck_every_raw not in (None, "", 0):
+            if isinstance(raw_overrides, Mapping):
+                raw_overrides = {**dict(raw_overrides),
+                                 "checkpoint_every": ck_every_raw}
+            elif raw_overrides is None:
+                raw_overrides = {"checkpoint_every": ck_every_raw}
         request, options = self._build_request(
-            {**spec, "method": method_name}, method=method_name,
+            {**spec, "method": method_name, "overrides": raw_overrides},
+            method=method_name,
             param_schema=self.method_param_schema(method_name))
         # ⭐ 代码经 extras 下传（字符串 ⇒ JSON 可序列化 ⇒ 能原样进 record.json）
         request.extras[_custom_code_key()] = code
         # ⭐ **负载的"声明"也下传**：checkpoint 要把它存起来，`eval_custom` 才能
         #   默认继承训练时的数据（反馈建议 4）。只存声明（HDF5 路径/小数组），
         #   大数组留在原处按需读。
-        #   ⚠ 声明来自**登记数据那一步**（`spec.meta`），不在本次 `run_custom`
-        #     的参数里 —— 实测踩过：只看 `spec["payload"]` 会永远是空的。
-        request.extras["payload_decl"] = dict(
-            spec.get("payload") or entry.spec.meta.get("payload_decl") or {})
+        #   ⚠ 声明在**函数前段**已经取好（`payload_decl`）—— 单一来源，别在两条
+        #     分支里各取一次（试跑分支也要用它，取两次迟早漂移）。
+        request.extras["payload_decl"] = dict(payload_decl)
         request.extras["code_path"] = code_path
+        #: ⭐ 续训：状态与元信息经 extras 下传（方法层在 `build()` 之后装载）。
+        #:   ⚠ `resume_state` 是**张量 dict**，**不进** `record.json`（不是 JSON 安全）——
+        #:   只留一个**事实**（`resume_meta`）在回执与 artifacts 里。
+        if resume_state is not None:
+            request.extras["resume_state"] = resume_state
+            request.extras["resume_meta"] = dict(resume_meta)
         request.extras["network_name"] = name
         _attach_progress(request, context)
         self._write_state(
@@ -1470,6 +1673,21 @@ class MLEngine(Engine):
             #   教训：只回显 `code_path` 会让人以为"读的是文件"。
             "code_source": code_source,
             "code_lines": len(code.splitlines()),
+            #: ⭐ **解析后的绝对路径**（A7③）：相对路径按 `dataset_roots[0]` 解析，
+            #:   只回原样入参时"读到了另一个也存在的位置"**零留痕**
+            #:   （使用者实测：等了 120 分钟才发现读错位置）。
+            "code_path_resolved": code_path_resolved,
+            #: ⭐ 负载（HDF5）路径的解析结果：同一个理由，一并回显。
+            "payload_resolved": dict(payload_resolved or {}),
+            #: ⭐ **续训的事实**（Q7）：从哪份存档接着训的、它是哪一步写的。
+            #:   没有续训时是空串/空 dict（**不假装**）。"这一轮为什么收敛快"要能反查。
+            "resumed_from": (str(resume_meta.get("path") or "") if resume_state else ""),
+            "resumed_which": (str(resume_meta.get("which") or "") if resume_state else ""),
+            "resumed_at_step": (resume_meta.get("saved_at_step") if resume_state else None),
+            # ⭐ **这次实际用了什么存档口径**（A1）：0 = 只在终态写一次。
+            #   回执里说清口径，省掉"我到底给没给"的一次往返。
+            "checkpoint_every": _int_or_zero(
+                request.overrides.get("checkpoint_every")),
             "elapsed_s": summary.elapsed_s,
             "error": warning,
             # 同 `run_method`：失败的可教学三件套（自定义网络的失败同样要能教）
@@ -1478,13 +1696,20 @@ class MLEngine(Engine):
             "error_suggest": summary.error_suggest,
         }
 
-    def _read_code_file(self, code_path: str) -> str:
-        """从文件读网络代码（反馈建议 3：`code_path`）。
+    def _read_code_file(self, code_path: str) -> tuple[str, str]:
+        """从文件读网络代码（反馈建议 3：`code_path`），回 ``(源码, 解析后的绝对路径)``。
 
         ⚠ **受既有 `dataset_roots` 管辖**：读文件的口子只有一个（不新增授权面）。
         路径不在允许根下 ⇒ 沿用 `_resolve_data_path` 的 fail-closed 拒绝。
+
+        ⭐ **为什么要把解析后的绝对路径带出去**（2026-10-07，A7③）：
+        `_resolve_data_path` 对**相对路径**按 `dataset_roots[0]` 解析（不是按 cwd），
+        而回执原来只回**原样入参** ⇒ "我给的相对路径被解析到**另一个也存在**的文件"
+        时**零留痕**（使用者实测：等了 120 分钟才发现读错了位置）。
+        失败路径本来就打了绝对路径（`dataset_not_found`），这里补的是**成功路径**。
         """
         path = self._resolve_data_path(code_path)
+        resolved = str(path)
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -1492,24 +1717,47 @@ class MLEngine(Engine):
                 text = path.read_text(encoding="gbk")
             except (OSError, UnicodeDecodeError) as exc:
                 raise MechaError(
-                    f"读代码文件失败（要从 UTF-8 或 GBK 读）：{code_path}",
+                    f"读代码文件失败（要从 UTF-8 或 GBK 读）：{code_path}"
+                    f"（解析为 {resolved}）",
                     kind="code_path_unreadable",
                     hint="把源码存成 UTF-8 再试") from exc
         except OSError as exc:
             raise MechaError(
-                f"读代码文件失败：{code_path}（{exc}）",
+                f"读代码文件失败：{code_path}（解析为 {resolved}）（{exc}）",
                 kind="code_path_unreadable",
                 hint="确认路径存在；它必须在**已授权的数据根**之下"
                      "（`dataset_roots.txt` / `--dataset-roots`）") from exc
         if not text.strip():
-            raise MechaError(f"代码文件是空的：{code_path}",
+            raise MechaError(f"代码文件是空的：{code_path}（解析为 {resolved}）",
                              kind="code_path_empty",
                              hint="文件里要定义 `class Network`")
-        return text
+        return text, resolved
+
+    def _resolved_payload_paths(self, decl: Any) -> dict[str, Any]:
+        """负载声明里**路径类**字段的**解析结果**（绝对路径）—— A7③。
+
+        与代码文件同一个理由：相对路径按 `dataset_roots[0]` 解析，
+        而回执原来只回声明里的原样路径 ⇒ 读错位置时看不出来。
+        **不抛**：这里只是"回显事实"，取不到就如实说取不到（不新增失败面）。
+        """
+        out: dict[str, Any] = {}
+        try:
+            h5 = (decl or {}).get("hdf5") if isinstance(decl, Mapping) else None
+            if isinstance(h5, Mapping) and h5.get("path"):
+                out["hdf5_path"] = str(self._resolve_data_path(str(h5["path"])))
+                out["datasets"] = dict(h5.get("datasets") or {})
+            elif isinstance(decl, Mapping) and "inline" in decl:
+                out["kind"] = "inline（数组在进程内，没有路径可解析）"
+        except Exception as exc:                               # noqa: BLE001
+            out["hdf5_path"] = ""
+            out["reason"] = f"解析负载路径失败：{type(exc).__name__}: {exc}"
+        return out
 
     def _cmd_dry_run_custom(self, spec: dict[str, Any], entry: Any, code: str,
                             code_path: str, name: str, context: Any,
-                            code_source: str = "inline"
+                            code_source: str = "inline",
+                            code_path_resolved: str = "",
+                            payload_resolved: Any = None,
                             ) -> Mapping[str, Any]:
         """**试跑**：不反传、不落盘、不计入实验记录（反馈建议 1）。
 
@@ -1568,6 +1816,9 @@ class MLEngine(Engine):
                     "warnings": [], "run_id": "", "network_name": name,
                     "code_path": code_path, "code_source": code_source,
                     "code_lines": len(code.splitlines()),
+                    #: ⭐ A7③：**试跑**也要能回答"读的是哪个文件"（同一个回显口径）
+                    "code_path_resolved": code_path_resolved,
+                    "payload_resolved": dict(payload_resolved or {}),
                     "shapes_verbosity": str(spec.get("shapes_verbosity") or "trace"),
                     "warmup_steps": int(spec.get("warmup_steps") or 0),
                     "elapsed_s": round(time.time() - t0, 3)})
@@ -1724,7 +1975,41 @@ class MLEngine(Engine):
         #   声明形状见 `core.pipeline` 的"管道装配"一节；省略整份 ⇒ 用默认链
         #   （**零行为变化**——既有调用方一行不用改）。
         pipeline = self._pipeline_from_spec(spec)
-        fitted = self.session.prepare_fitted(dataset, pipeline=pipeline, diag=diag)
+        try:
+            fitted = self.session.prepare_fitted(dataset, pipeline=pipeline, diag=diag)
+        except ValueError as exc:
+            # ⭐ **把"离根因很远"的那类 sklearn 错翻译过来**（Q5-②）：
+            #   实测现场：一个 18 行的**连续**目标（不同取值 18 个 ≤ 20）被判成
+            #   `classification`，而默认管道 `split.stratify=True` 要求**每类至少 2 个成员**
+            #   ⇒ 抛的是一句 `The least populated class in y has only 1 member…`
+            #   （说的是"分层"，跟"你的目标被当成分类了"毫无关系）。
+            msg = str(exc)
+            if "least populated class" in msg or "stratified" in msg.lower():
+                try:
+                    tgt = getattr(dataset, "target", "") or ""
+                    y = dataset.frame[tgt] if tgt in getattr(dataset, "frame", {}) else None
+                    import types as _types
+
+                    from ml_toolbox.core.contracts import infer_kind as _infer
+                    #: ⚠ 这里要算的是**"会被推断成什么"**（管道就是按它走的），
+                    #:   所以把 `infer_kind(y)` 的结果当作 target_kind 传给 `_kind_reason`。
+                    reason = _kind_reason(_types.SimpleNamespace(
+                        y=y, target_kind=_infer(y)))
+                except Exception:                              # noqa: BLE001
+                    reason = ""
+                raise MechaError(
+                    "分层抽样失败：目标被**推断为分类**，而每类成员太少"
+                    f"（原始错：{msg}）",
+                    kind="stratify_on_low_cardinality_target",
+                    hint=("默认管道用**分层**切分，它要求每个类至少 2 个成员。"
+                          + (f"依据：{reason}。" if reason else "")
+                          + "两个修法：① 关掉分层（`pipeline` 里 "
+                            "`split: {stratify: false}`）；"
+                            "② 若这其实是**连续**目标，用 `target_kind=\"custom\"`"
+                            "（标准指标不计算，由 `Network.metrics` 上报）"),
+                    suggest='pipeline={"steps":[…], "split":{"stratify": false}}',
+                ) from exc
+            raise
         # ⭐ **图结构**（可选）：边表进 `spec.aux`，供声明了 `accepts_aux` 的方法消费。
         #   为什么放 aux 而不是塞进特征表：它是"观测之间的关系"，不是特征。
         graph_facts = self._attach_graph(fitted.spec, spec, dataset)
@@ -1824,6 +2109,12 @@ class MLEngine(Engine):
             # 形状与 dtype 才是"我的复数还在不在"的答案。
             "payload": dict(extra.get("payload") or {}),
             "target_kind": str(entry.spec.target_kind or ""),
+            #: ⭐ **判定的依据**（Q5-②）：`infer_kind` 的规则是"数值且**基数 > 20**
+            #:   才算回归"（`contracts.REGRESSION_CARDINALITY`）⇒ 一个**连续**目标
+            #:   若只有 ≤20 个不同取值会被判成 **classification**，而使用者看到的
+            #:   只是下游一句 `Found dtype Long but expected Float`（离根因很远）。
+            #:   ⇒ 把"基数多少、阈值多少、因此判成什么"直接写出来。
+            "target_kind_reason": _kind_reason(entry.spec),
             "error": "",
         }
 
@@ -3230,6 +3521,19 @@ def _state_value_jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _int_or_zero(value: Any) -> int:
+    """尽力转 `int`，转不了回 0（**回执字段不许因为入参是垃圾而抛**）。
+
+    ⚠ 场景：`checkpoint_every="abc"` 会在方法层被 `ParamSpec.clean` 拒成
+    **可教学的失败**；如果回执构造时又对同一个值做裸 `int()`，就会在**报错的地方**
+    再抛一次 ⇒ 使用者拿到的是 `internal_error`，而真正的病因（参数写错）反而看不到。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _finite_or_none(value: Any) -> float | None:
     """给进度载荷的数值把关：非有限（NaN/inf）**回 None**，不塞进 JSON。"""
     try:
@@ -3264,9 +3568,133 @@ def _attach_progress(request: Any, context: Any) -> None:
     run_id = str(request.extras.get("run_id") or "").strip()
     if not run_id:
         import time as _time
-        run_id = f"{request.method}-{int(_time.time() * 1000) % 10_000_000}-{request.seed}"
+        from ml_toolbox.core.runner import reserve_run_id
+        cand = f"{request.method}-{int(_time.time() * 1000) % 10_000_000}-{request.seed}"
+        #: ⭐ **撞车检测**（Q5-①）：毫秒字段 2.78 小时一周期 ⇒ 极小概率撞进同一个
+        #:   `runs/<id>/`（TB 追加、曲线混轴）。引擎这一侧也必须做，因为**是它**
+        #:   在跑之前就把 id 定下来并塞进 extras（runner 那侧看到"已给"就不再动）。
+        used, collided = reserve_run_id(cand)
+        run_id = used
+        if collided:
+            request.extras["run_id_collision"] = {"requested": collided, "used": used}
+            print(f"[engine] run_id 撞车：{collided} 已被占用 ⇒ 改用 {used}"
+                  "（Q5-①：毫秒字段 2.78 h 一周期）", flush=True)
         request.extras["run_id"] = run_id
     request.extras["on_progress"] = _progress_hook(context, run_id=run_id)
+
+
+#: **epoch 级** tag 的命名空间（由 `tb_log.log_epoch` / `log_weights` 写：轴 = 第几轮）。
+#: ⚠ 单一真源与 `ml_toolbox/methods/neural/tb_log.py` 的 `CORE_SCALARS` /
+#: `layout_groups` 对齐：那里的 `log_epoch` 写 loss/val_loss/lr/grad_norm/dead_relu
+#: 与 `grad/<层名>`，`log_weights` 写 `weights_norm/{first,last,update}`。
+_EPOCH_LEVEL_TAGS = frozenset(("loss", "val_loss", "lr", "grad_norm", "dead_relu"))
+_EPOCH_LEVEL_PREFIXES = ("grad/", "weights_norm/")
+
+#: `curve="brief"`（默认）保留形状的**核心 tag**（= `tb_log.CORE_SCALARS` 的同名集）。
+#: ⚠ 单一真源口径：与 `ml_toolbox/methods/neural/tb_log.py:CORE_SCALARS` 对齐；
+#: 那边加一条核心标量，这里要跟着加（否则"默认看不到自己的核心曲线"）。
+_CURVE_BRIEF_CORE = frozenset(("loss", "val_loss", "lr", "grad_norm", "dead_relu"))
+
+
+def _step_unit_of(tag: str, *, loss_max: float | None,
+                  tag_max: float | None) -> dict[str, Any]:
+    """这条 tag 的 step 轴**是什么单位**（`epoch` / `batch` / `mixed`）+ 为什么。
+
+    ## 为什么必须回答它（实测，2026-10-07）
+
+    `tb_log` 里有**两条**写标量的路，轴的单位不同：
+
+    - `log_epoch`（损失/学习率/逐层梯度/权重范数）写 `step = ep` ⇒ **第几轮**；
+    - `log_step`（`Network.on_step` 上报的步级指标）写 `step = gstep` ⇒ **第几个 batch**。
+
+    于是同一个 run 的 `latest_steps` 里 `loss=283` 与 `fid/step=78410` **都是真数**，
+    但它们**不是同一种单位**（实测比值 ≈277 = 每轮批数）。读数的人据此会把 78410
+    当成"累计点数"（用户原话："`fid/step` 累计 4698 点而 `loss` 只有 102 点"），
+    或者把两族并排比 —— 后者会造出一个**不存在的矛盾**（pitfalls A54）。
+
+    ## 判据是**结构**的，不是数出来的
+
+    哪条路写的就决定了单位（两条路的名字空间互斥）⇒ 名字落在 epoch 命名空间里就是
+    `epoch`，否则是 `batch`。**数字只做交叉校验**：一条自称 epoch 级的 tag，若它的步号
+    远超 `loss` 的（说明同名 tag 被**两条路都写过**），就报 `mixed` —— 那是真坏了
+    （同一根轴上有两种单位），不该沉默。
+    """
+    name = str(tag)
+    epoch_like = (name in _EPOCH_LEVEL_TAGS
+                  or any(name.startswith(p) for p in _EPOCH_LEVEL_PREFIXES))
+    if not epoch_like:
+        return {"unit": "batch",
+                "why": "由 `tb_log.log_step` 写（`Network.on_step` 上报的步级指标）"
+                       "⇒ 轴 = **全局 batch 步**，与 epoch 级 tag 不在同一根轴上"}
+    if (loss_max is not None and tag_max is not None
+            and loss_max > 0 and tag_max > loss_max * 3):
+        return {"unit": "mixed",
+                "why": f"这个 tag **同时**被 epoch 级与步级两条路写过：它的最大步号 "
+                       f"{tag_max:g} 远超 `loss` 的 {loss_max:g} ⇒ 同一根轴上混了两种单位"}
+    return {"unit": "epoch",
+            "why": "由 `tb_log.log_epoch` / `log_weights` 写 ⇒ 轴 = **第几轮**（epoch）"}
+
+
+def _axes_facts(units: Mapping[str, Mapping[str, Any]], *, epoch_axis_len: float | None,
+                batch_tags: Sequence[str], mixed_tags: Sequence[str],
+                per_epoch: float | None) -> dict[str, Any]:
+    """把逐 tag 的单位收成一份**有界的**轴事实（别把 55 条 tag 再抄一遍）。"""
+    n_epoch = sum(1 for u in units.values() if u.get("unit") == "epoch")
+    note = ("同一个回执里可以有**两种步号**：epoch 级（loss/val_loss/lr/grad_norm/"
+            "逐层梯度/权重范数）与 batch 级（`on_step` 上报的 tag）。"
+            "⚠ `step_units` **只列非 epoch 级**的那些（默认有界：通常只有几条）；"
+            "**不在表里的 tag 一律是 epoch 级**（`epoch_tags_n` 是它们的条数）。"
+            "⚠ **跨族别并排比**：`tags=[…]` 强行对齐时，轴会取两族步号的并集 ⇒ "
+            "粗粒度那一族会大片 `null`（看着像'这段没有 loss'）。同族内比、跨族只看趋势。")
+    if mixed_tags:
+        note += (f" ⚠ 另有 {len(mixed_tags)} 个 tag 两族都写过（`mixed`）"
+                 f"：{mixed_tags[:6]} —— 它的轴**本身**不干净，别用它下结论。")
+    return {"epoch_tags_n": n_epoch, "batch_tags": list(batch_tags),
+            "mixed_tags": list(mixed_tags),
+            #: epoch 级轴的长度（= 已记多少轮）
+            "epoch_axis_len": epoch_axis_len,
+            #: **每轮大约多少 batch 步**（= batch 级 tag 的最大步号 ÷ epoch 轴长）：
+            #: 它就是那个"看起来差 277 倍"的来源，给出来读者就不必自己猜。
+            "per_epoch_estimate": per_epoch,
+            #: ⚠ 逐 tag 的单位**只在 `step_units` 里给一次**（这里不再抄一遍：
+            #:   55 条 tag 抄两遍是白花 ~1.7 KB 上下文；观测面默认要变小不是变大）。
+            "note": note}
+
+
+def _kind_reason(spec: Any) -> str:
+    """**目标类型是怎么判出来的**（Q5-②）：把阈值与基数写成人话。
+
+    ⚠ 为什么值得单开一个字段：`infer_kind` 的规则是"数值且**基数 > 20** ⇒ 回归，
+    否则分类"（`contracts.REGRESSION_CARDINALITY`）⇒ 一个**连续**目标只要不同取值
+    ≤20 个就会被判成分类，而使用者在**下游很远的地方**才看到错
+    （`Found dtype Long but expected Float`：他的 `MSELoss` 拿到了 Long 标签）。
+    这个错信息完全不指向"你的目标被当成分类了"——所以把依据写在**登记数据**的回执里。
+    """
+    try:
+        from ml_toolbox.core.contracts import REGRESSION_CARDINALITY
+        y = getattr(spec, "y", None)
+        kind = str(getattr(spec, "target_kind", "") or "")
+        if y is None:
+            return ("没有标准标签（`target_kind='custom'`）⇒ 标签在逐行负载里，"
+                    "损失与指标由网络自己给")
+        import pandas as pd
+        ys = y if isinstance(y, pd.Series) else pd.Series(y)
+        n = int(ys.nunique())
+        if kind == "regression":
+            return (f"数值目标且**基数 {n} > {REGRESSION_CARDINALITY}**"
+                    f"（`REGRESSION_CARDINALITY`）⇒ 判为 regression")
+        if kind == "classification":
+            numeric = bool(pd.api.types.is_numeric_dtype(ys))
+            why = (f"数值目标但**基数 {n} ≤ {REGRESSION_CARDINALITY}**"
+                   if numeric else f"非数值目标（基数 {n}）")
+            return (f"{why} ⇒ 判为 **classification**"
+                    "。⚠ 若这其实是**连续**目标（只是取值少），"
+                    "标准指标会按分类算（而自定义网络若用 `MSELoss` 会报"
+                    " `Found dtype Long but expected Float`）⇒ 请显式声明 "
+                    "`target_kind=\"custom\"` 并自己在 `metrics` 里报指标")
+        return f"未判定（`target_kind={kind!r}`）"
+    except Exception as exc:                                   # noqa: BLE001
+        return f"（判据算不出来：{type(exc).__name__}: {exc}）"
 
 
 def _chain_summary(summary: Any) -> dict[str, Any]:
@@ -3482,7 +3910,8 @@ def _cuda_poison_note(kind: str, hint: str, warning: str,
         f"⚠⚠ **这是回声，不是新故障**：本进程的 CUDA 上下文早在 run `{prev}` 就已被一次 "
         f"`device-side assert` 毒化 ⇒ 当前报错的位置（例如 `custom._fit_table` 里的 "
         f"`rec.set_probe(...)`）**是假的**——它只是下一次与显卡同步的地方。"
-        f"⇒ ① 立刻**重启权威/看门人**；② 要看真位置就先设 `CUDA_LAUNCH_BLOCKING=1` 再重启；"
+        f"⇒ ① 立刻**重启本软件**（`--mcp` 那个进程；CUDA 上下文随进程走）；"
+        f"② 要看真位置就先设 `CUDA_LAUNCH_BLOCKING=1` 再重启；"
         f"③ **别在这里改代码**（那是在修一个不存在的问题）。")
     head = (f"⚠⚠ **这是回声，不是新故障**：本进程 CUDA 上下文早在 run `{prev}` 已被 "
             f"device-side assert 毒化 ⇒ 当前位置是假的（只是下一次同步处）。"

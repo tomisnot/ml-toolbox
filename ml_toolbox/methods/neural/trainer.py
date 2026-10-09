@@ -26,12 +26,166 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
 from ...core.chunks import RowChunks
+
+#: 中途存档的**默认关闭**（0 = 只在终态写一次，与从前逐位一致）。
+#: ⚠ 为什么不默认开：本仓纪律是"默认不改行为"（P3 零开销）。要让长训练默认有存档，
+#: 应该由**调用方**（`run_custom` 的参数/回执提示）显式要求，而不是在这里偷偷改语义。
+DEFAULT_CHECKPOINT_EVERY = 0
+
+#: `metrics` 钩子**连续失败多少次**后开始**降级重试**（不再每轮都试）。
+#: ⚠ 为什么不是"第一次失败就永久关掉"（用户实测的**静默黑洞**，2026-10-07）：
+#: 他的 `metrics` 在**全量负载**上一次 256-token 解码就 **OOM**，而旧实现
+#: `except Exception: metrics = None` ⇒ **第一次失败后整场再也不调用** ⇒
+#: **TB 里一个 epoch 级 tag 都没有**，而训练照常、loss 照降
+#: ⇒ 表面看像"作者没写 metrics"，其实他写了。三种病（**没写 / 每轮失败 / 名字写错**）
+#: 修法完全不同 ⇒ 必须能区分，而且**不能永久关闭**。
+METRICS_FAIL_TOLERANCE = 3
+
+#: 降级之后**每多少轮再试一次**（外加**末轮一定试**）——
+#: "临时性失败"（显存一时紧张）还有机会自己恢复，而代价有界。
+METRICS_RETRY_EVERY = 10
+
+
+def _metrics_due(ep: int, total: int, health: dict, every: int) -> bool:
+    """这一轮该不该调 `metrics`（失败后**降级**而不是永久关闭）。
+
+    - 正常：按 `metrics_every` 的节奏 + **末轮一定算**（原有语义一字不改）；
+    - 连续失败超过 `METRICS_FAIL_TOLERANCE` 之后：**每 `METRICS_RETRY_EVERY` 轮再试一次
+      + 末轮必试** ⇒ 既不放弃（不会"整场一条都没有"），也不再每轮付失败代价
+      （他的失败是 OOM，每轮重试很贵）。
+    """
+    due = (int(ep) % max(1, int(every)) == 0) or int(ep) == int(total) - 1
+    if not due:
+        return False
+    if not health.get("throttled"):
+        return True
+    return int(ep) == int(total) - 1 or int(ep) % METRICS_RETRY_EVERY == 0
+
+
+def _metrics_failed(health: dict, ep: int, exc: BaseException) -> None:
+    """记一次 `metrics` 失败（**留痕**：轮次 + 类型 + 消息；最多留 3 条）。"""
+    health["failures"] = int(health.get("failures", 0)) + 1
+    health["consecutive"] = int(health.get("consecutive", 0)) + 1
+    errs = health.setdefault("errors", [])
+    if len(errs) < 3:
+        errs.append(f"epoch {int(ep)}：{type(exc).__name__}: {str(exc)[:200]}")
+    if int(health["consecutive"]) >= METRICS_FAIL_TOLERANCE \
+            and not health.get("throttled"):
+        health["throttled"] = True
+        health["throttled_from_epoch"] = int(ep)
+        health["note"] = (
+            f"`metrics` 连续失败 {int(health['consecutive'])} 次（见 `errors`）⇒ "
+            f"**降级**为每 {METRICS_RETRY_EVERY} 轮再试一次 + 末轮必试"
+            "（**没有**永久关闭）。⚠ 最常见的原因是**在 `metrics` 里对全量负载做重活**"
+            "——它每轮拿到的是**全量负载**（实测：7344 行、一次 256-token 解码就 OOM）"
+            "⇒ 请在 `metrics` 内部**分批**（`ctx[\"chunks\"]` 或自己切片）")
+
+
+def _metrics_ok(health: dict) -> None:
+    """一次成功：清掉连续失败计数（**降级是可恢复的**）。"""
+    health["consecutive"] = 0
+    if health.get("throttled"):
+        health["recovered_after_epoch"] = health.get("throttled_from_epoch")
+
+
+def _metrics_health(hook, /, **extra) -> dict:
+    """`metrics` 钩子的健康事实（进回执/诊断/checkpoint —— **不静默**）。"""
+    out = {"hook": callable(hook), "calls": 0, "failures": 0, "consecutive": 0,
+           "errors": [], "throttled": False}
+    out.update(extra)
+    return out
+
+
+def _group_lrs(optimizer) -> dict:
+    """优化器**每个参数组**的当前 lr（`{组名: lr}`）—— Q7b。
+
+    ## 为什么必须有（使用者的实测需求）
+
+    他的 NQS 修复要用**不对称步长**（幅度组/相位组不同 lr，文献里的
+    `m = δτ_φ/δτ_A ≥ 1`），而观测面原来**只有一个标量 `lr`**
+    ⇒ **改了却无法确认它真的生效**（"改了个东西但无法确认它生效"是他这一路最大的坑之一）。
+
+    ## 组名从哪来（约定）
+
+    `Network.configure` 建优化器时可以给每个组起名：
+    `torch.optim.Adam([{"params": amp_params, "lr": 1e-3, "name": "amp"},
+                       {"params": ph_params,  "lr": 3e-3, "name": "phase"}])`
+    ⇒ 没起名的组按 `g0`/`g1`…（**如实编号，不假装有名字**）。
+
+    ⚠ PyTorch 允许 `param_groups` 里带任意额外键（`name` 就是其中一个）⇒
+    这条**不需要**框架改契约，只是把它**读出来**。
+    """
+    out: dict = {}
+    try:
+        for i, g in enumerate(getattr(optimizer, "param_groups", []) or []):
+            name = str(g.get("name") or f"g{i}")
+            try:
+                out[name] = float(g.get("lr"))
+            except (TypeError, ValueError):
+                out[name] = None
+    except Exception:                                          # noqa: BLE001
+        return {}
+    return out
+
+
+def _try_checkpoint(on_checkpoint, model, *, step: int, epoch: int,
+                    facts: dict, best_state=None, best_epoch=None,
+                    best_value=None, best_step=None) -> None:
+    """调一次**中途存档**；失败**不拖垮训练**，但必须**留痕**（可教学）。
+
+    ## 为什么不能抛
+
+    与 TensorBoard 那条路同一纪律（`tb_log` 的三处 fail-safe）：观测/存档是**附加的**，
+    主结果（训练）优先。磁盘满/权限/被杀都可能在 5 小时训练里出现一次，
+    为了它整场训练报错是**错的**处置。
+
+    ## 但为什么也不能静默
+
+    反过来，"我给了 `checkpoint_every` 却没有存档"若不留痕，就是本仓反复在防的
+    假绿（使用者会以为"有存档"，直到死机那一刻才发现没有）。⇒ 收集进 `facts["errors"]`，
+    由适配器写进 artifacts / diag / 回执。
+
+    ## `best_state` / `best_epoch`（Q4b）
+
+    周期回调**不只看当前权重**：还要把"**当前的最佳快照**"一并交给它，
+    这样 `best.pt` 也能在**中途**落盘（否则一次被中断的长训练只有 `last.pt`，
+    拿不到"按我的指标最好的那一份"）。⚠ 给的是**快照引用**（不是 model）——
+    中途那一刻的 model 权重早已不是 best 那一轮的了。
+    """
+    if on_checkpoint is None:
+        return
+    kw = {"model": model, "step": int(step), "epoch": int(epoch)}
+    if best_state is not None or best_epoch is not None:
+        kw["best_state"] = best_state
+        kw["best_epoch"] = best_epoch
+        kw["best_value"] = best_value
+        kw["best_step"] = best_step
+    try:
+        said = on_checkpoint(**kw)
+    except TypeError:
+        #: 第三方的 `on_checkpoint` 可能只认三个参数 ⇒ **退回老签名**（不因新能力打红）
+        try:
+            said = on_checkpoint(model=model, step=int(step), epoch=int(epoch))
+        except Exception as exc:                               # noqa: BLE001
+            facts.setdefault("errors", []).append(
+                f"中途存档失败（step={int(step)}）：{type(exc).__name__}: {exc}")
+            return
+    except Exception as exc:                                   # noqa: BLE001
+        facts.setdefault("errors", []).append(
+            f"中途存档失败（step={int(step)}）：{type(exc).__name__}: {exc}")
+        return
+    facts["n_ok"] = int(facts.get("n_ok", 0)) + 1
+    facts["last_step"] = int(step)
+    facts["last_epoch"] = int(epoch)
+    if isinstance(said, Mapping):
+        facts["last"] = dict(said)
+
 
 #: 从 `resource_guard` 里读分块预算（MiB）；没给就用 `core.chunks` 的默认。
 #: ⚠ 为什么走 `resource_guard` 而不是新开一个参数：它本来就是"这次运行的资源声明"
@@ -178,7 +332,10 @@ def train_graph(recorder, *, model, problem, torch, nn,
                 scheduler=None, grad_clip: float = 0.0,
                 early_stop: bool = False, patience: int = 10,
                 on_progress=None, forward_graph=None, device=None,
-                metrics=None, keep_best: bool = False) -> dict:
+                metrics=None, keep_best: bool = False,
+                checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
+                on_checkpoint=None,
+                best_metric: str = "", best_direction: str = "") -> dict:
     """**图任务的训练循环**：一张图、节点掩码划分、全量前向。
 
     与 `train`（表格版）的三处本质差别（都源于"行不独立"）：
@@ -218,6 +375,16 @@ def train_graph(recorder, *, model, problem, torch, nn,
     total, stopped_at, best, bad = int(epochs), None, float("inf"), 0
     cancelled, best_epoch, best_watch = False, None, float("inf")
     best_state = None
+    #: 中途存档的事实（与表格路径同形；见 `train` 里同名变量）。
+    ck_facts: dict = {"errors": [], "n_ok": 0}
+    #: `metrics` 健康（2026-10-07：失败**留痕 + 降级**，不永久关闭）
+    m_health: dict = _metrics_health(metrics)
+    #: `best.pt` 的两套口径（Q4；与 `train` 同形）
+    vl_best_epoch, vl_best_watch = None, float("inf")
+    metric_best_epoch, metric_best_value, metric_best_step = None, None, None
+    metric_skipped = 0
+    fallback_state = None
+    keep_fallback = keep_best
 
     def _loss_on(mask):
         logits = _forward()
@@ -235,6 +402,11 @@ def train_graph(recorder, *, model, problem, torch, nn,
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            # ⭐ **中途存档（图任务）**：图任务**没有 batch**（整图前向，一步 = 一轮）
+            #   ⇒ `checkpoint_every` 在这里的单位是 **epoch**（与表格路径的"优化步"
+            #   不同，如实写在参数说明里，不让使用者自己猜）。
+            #   ⚠ 调用点**只有一个**：在下面"best 刷新之后"（见那里的说明）——
+            #     在这里再放一个会让每个周期**写两次**（且第二次的 best 才是新的）。
             train_loss = float(loss.detach())
             vl = None
             if bool(va_mask.any()):
@@ -244,14 +416,19 @@ def train_graph(recorder, *, model, problem, torch, nn,
                 model.train()
             cur_lr = float(optimizer.param_groups[0]["lr"])
             extra = None
-            if metrics is not None:
+            #: ⚠ 与表格路径同一条纪律（2026-10-07）：**失败留痕 + 降级，不永久关闭**。
+            #:   图任务里 metrics 也是每轮一次（没有 `metrics_every` 的降频语义）。
+            if metrics is not None and _metrics_due(ep, total, m_health, 1):
+                m_health["calls"] = int(m_health.get("calls", 0)) + 1
                 try:
                     got = metrics(model, dict(ctx, step=int(ep), kind="metrics"))
+                    _metrics_ok(m_health)
                     if isinstance(got, dict) and got:
                         extra = got
-                except Exception:                              # noqa: BLE001
-                    metrics = None
-            recorder.epoch(ep, train_loss, vl, cur_lr, extra=extra)
+                except Exception as exc:                       # noqa: BLE001
+                    _metrics_failed(m_health, ep, exc)
+            recorder.epoch(ep, train_loss, vl, cur_lr, extra=extra,
+                           lr_by_group=_group_lrs(optimizer))
             if scheduler is not None:
                 scheduler.step()
             if on_progress is not None:
@@ -269,11 +446,52 @@ def train_graph(recorder, *, model, problem, torch, nn,
                 except Exception:                              # noqa: BLE001
                     on_progress = None
             watch = vl if vl is not None else train_loss
-            if best_epoch is None or watch < best_watch - 1e-9:
+            #: ① val_loss 口径**永远算**（未声明 `best_metric` 时的行为，也是对照）
+            if vl_best_epoch is None or watch < vl_best_watch - 1e-9:
+                vl_best_watch, vl_best_epoch = watch, ep
+                if keep_fallback:
+                    fallback_state = {k: v.detach().cpu().clone()
+                                      for k, v in model.state_dict().items()}
+            #: ② 声明了 `best_metric` 就按那个 tag 选（Q4；图任务同样支持 ——
+            #:   **不许**"声明了却悄悄走 val_loss"）。
+            #:   图任务**没有 batch** ⇒ `step` 就是轮次（如实这么记）。
+            if best_metric:
+                cur = None
+                if isinstance(extra, dict) and best_metric in (extra or {}):
+                    try:
+                        cur = float(extra[best_metric])
+                    except (TypeError, ValueError):
+                        cur = None
+                if cur is None:
+                    metric_skipped += 1
+                else:
+                    better = (metric_best_epoch is None
+                              or (cur > metric_best_value + 1e-12
+                                  if best_direction == "higher"
+                                  else cur < metric_best_value - 1e-12))
+                    if better:
+                        metric_best_value, metric_best_epoch = cur, ep
+                        metric_best_step = int(ep + 1)
+                        best_watch, best_epoch = cur, ep
+                        if keep_best:
+                            best_state = {k: v.detach().cpu().clone()
+                                          for k, v in model.state_dict().items()}
+                        keep_fallback = False
+                        fallback_state = None
+            elif best_epoch is None or watch < best_watch - 1e-9:
                 best_watch, best_epoch = watch, ep
                 if keep_best:
                     best_state = {k: v.detach().cpu().clone()
                                   for k, v in model.state_dict().items()}
+            # ⭐ 中途存档：放在 **best 刷新之后** —— 这样 `best.pt` 落的是**最新**那一份
+            #   （Q4b：被中断的长训练也要能拿到"按我的指标最好的那一份"）。
+            if (on_checkpoint is not None and int(checkpoint_every or 0) > 0
+                    and (ep + 1) % max(1, int(checkpoint_every)) == 0):
+                _try_checkpoint(on_checkpoint, model, step=ep + 1, epoch=ep,
+                                facts=ck_facts, best_state=best_state,
+                                best_epoch=best_epoch, best_value=best_watch,
+                                best_step=(metric_best_step if best_metric
+                                           else None))
             if early_stop and vl is not None:
                 if vl < best - 1e-6:
                     best, bad = vl, 0
@@ -284,6 +502,33 @@ def train_graph(recorder, *, model, problem, torch, nn,
                         break
     finally:
         recorder.close()
+    #: `best.pt` 的选择口径（Q4）——与 `train` 同形（图任务里 step == 轮次）。
+    if best_metric and metric_best_epoch is None:
+        best_epoch, best_watch = vl_best_epoch, vl_best_watch
+        if keep_best and best_state is None:
+            best_state = fallback_state
+        best_by = {"tag": "val_loss", "direction": "lower",
+                   "value": (None if vl_best_watch == float("inf") else vl_best_watch),
+                   "epoch": vl_best_epoch, "step": None,
+                   "requested_tag": str(best_metric),
+                   "note": (f"声明的 `best_metric={best_metric!r}` 在整场训练里"
+                            f"**一次都没上报**（跳过了 {metric_skipped} 轮）"
+                            f"⇒ **退回 val_loss** 选 best。检查 tag 名拼写")}
+    elif best_metric:
+        best_by = {"tag": str(best_metric), "direction": str(best_direction or "lower"),
+                   "value": metric_best_value, "epoch": metric_best_epoch,
+                   "step": metric_best_step, "skipped_epochs": int(metric_skipped),
+                   "note": (f"按 `best_metric={best_metric!r}`（{best_direction}）选；"
+                            f"⚠ val_loss 最佳在第 {vl_best_epoch} 轮"
+                            f"（{vl_best_watch:.6g}）—— 两者常常不是同一轮")}
+    else:
+        best_by = {"tag": "val_loss", "direction": "lower",
+                   "value": (None if best_watch == float("inf") else best_watch),
+                   "epoch": best_epoch, "step": None,
+                   "note": "未声明 `best_metric` ⇒ 仍按 **val_loss** 选（与从前一致）"}
+    val_loss_best = {"epoch": vl_best_epoch,
+                     "value": (None if vl_best_watch == float("inf")
+                               else vl_best_watch)}
     #: ⭐ **实测显存峰值**（事后归因）：只在真跑在 CUDA 上时才有值
     #: —— CPU 回 `None`，**不假装有数字**（用户实测 §3.3：他事前不知道会 OOM，
     #: 事后也没有任何地方告诉他"这次其实用了多少"）。
@@ -305,6 +550,13 @@ def train_graph(recorder, *, model, problem, torch, nn,
             "last_state": {k: v.detach().cpu().clone()
                            for k, v in model.state_dict().items()},
             "best_state": best_state if keep_best else None,
+            # ⭐ 中途存档的事实 + `best.pt` 的选择口径（与表格路径同形）
+            "checkpoint": dict(ck_facts),
+            "best_by": dict(best_by),
+            "val_loss_best": dict(val_loss_best),
+            "best_metric_skipped_n": int(metric_skipped),
+            #: ⭐ `metrics` 健康（图任务同样报：**不静默**）
+            "metrics_health": dict(m_health),
             "graph": problem.graph_facts()}
 
 
@@ -383,7 +635,10 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
           early_stop: bool = False, patience: int = 10,
           on_progress=None, forward_step=None, device=None,
           payload=None, on_step=None, metrics=None, metrics_every: int = 1,
-          keep_best: bool = False, chunk_budget_mb: float | None = None) -> dict:
+          keep_best: bool = False, chunk_budget_mb: float | None = None,
+          checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
+          on_checkpoint=None,
+          best_metric: str = "", best_direction: str = "") -> dict:
     """跑训练循环，**托管全部观测**。
 
     @returns ``{"epochs_run": int, "stopped_at": int|None, "best_val": float,
@@ -457,6 +712,10 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                "kind": kind, "n_rows": int(len(prep.Xs)),
                "train_idx": np.asarray(tr, dtype=np.int64),
                "val_idx": np.asarray(va, dtype=np.int64),
+               #: ⭐ **每个参数组的 lr**（Q7b）：`on_step`/`metrics` 里能直接读到它
+               #:   ⇒ 作者可以在自己的 tag 里**分组上报**（`lr/amp`、`lr/phase`），
+               #:   而不必靠"我记得 configure 里设了多少"。
+               "lr_by_group": _group_lrs(optimizer),
                # ⭐ **框架级分块**（2026-10-05，用户实测 §3.3）：用户不必再手写
                #   "按 R 切块 + 按块加权累加"。`reduce(..., mode="mean")` 里
                #   权重的算法由框架负责（见 `core.chunks` 的模块说明）。
@@ -482,6 +741,21 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
     last_extra: dict = {}
     #: 最近一次 `on_step` 上报的**步级**指标（进回执：让"步"这一级也有数字可看）
     last_step_metrics: dict = {}
+    #: ⭐ **`metrics` 钩子的健康事实**（2026-10-07）：它为什么没产出 tag，
+    #: 必须能区分"没写钩子 / 每轮失败 / 名字写错"——三种病修法完全不同。
+    m_health: dict = _metrics_health(metrics)
+    #: 中途存档的事实（`_try_checkpoint` 往里写）：成功了 N 次 / 失败原因 / 最后一次的步号。
+    #: ⚠ **即使 `checkpoint_every=0` 也要在**（回执形状一致 ⇒ 消费者不用判键在不在）。
+    ck_facts: dict = {"errors": [], "n_ok": 0}
+    #: ⭐ **`best.pt` 的选择口径**（Q4）：val_loss 口径永远算（`vl_*`），
+    #: 声明了 `best_metric` 时另按那个 tag 选（`metric_*`）。
+    #: `fallback_state` 只在"声明的指标一次都还没上报"期间维护 —— 一旦指标可用就释放，
+    #: 这样声明路径的额外内存峰值是**一份快照**（而不是两份）。
+    vl_best_epoch, vl_best_watch = None, float("inf")
+    metric_best_epoch, metric_best_value, metric_best_step = None, None, None
+    metric_skipped = 0
+    fallback_state = None
+    keep_fallback = keep_best
     try:
         for ep in range(total):
             tot = torch.zeros((), dtype=torch.float32, device=dev)
@@ -528,6 +802,20 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                     except Exception:                          # noqa: BLE001
                         on_step = None        # 观测/调度失败不拖垮训练（与进度钩子同纪律）
                 gstep += 1
+                # ⭐⭐ **中途存档**（2026-10-07，用户实测的 A1："5 小时训练中途死机＝全丢"）。
+                #   ⚠ 语义：`checkpoint_every` 数的是**优化步**（= 一个 batch 一次
+                #   `optimizer.step()`），**不是 epoch** —— 用户的原话是"每 N 步落一份"，
+                #   而长训练里 epoch 太粗（一轮可能几十分钟）。
+                #   ⚠ 落盘的是**当前 `last`**；`best` 仍由 `keep_best` 在验证改善时更新
+                #   （语义一行没动）。
+                #   ⚠ 放在 `on_step` **之后**：这样"存档里记的步号"与"on_step 看到的
+                #   步号"是同一个数（同一批的指标与权重**同源**，不是差一步）。
+                if (on_checkpoint is not None and int(checkpoint_every or 0) > 0
+                        and gstep % max(1, int(checkpoint_every)) == 0):
+                    _try_checkpoint(on_checkpoint, model, step=gstep, epoch=ep,
+                                    facts=ck_facts, best_state=best_state,
+                                    best_epoch=best_epoch, best_value=best_watch,
+                                    best_step=metric_best_step)
             vl = None
             if Xva is not None:
                 model.eval()
@@ -557,10 +845,14 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
             #      否则作者算一次保真度就建一整张图（吃显存）；我为此得自己写 no_grad。
             #   2. **它在每轮之后被调用一次、拿全量负载** ⇒ 别在里面做全量重活。
             #      贵的指标用 `Network.metrics_every = N` 降频（末轮一定算，保证终值不假）。
-            #   3. 上报失败只关掉它自己，**不拖垮训练**（观测是附加的）。
+            #   3. ⚠⚠ **失败只降级、不永久关闭，而且必须留痕**（2026-10-07 用户实测的静默黑洞）：
+            #      他的 `metrics` 在全量负载上 OOM ⇒ 旧实现第一次失败后 `metrics = None`
+            #      ⇒ 整场再没调用过 ⇒ **TB 里一个 epoch 级 tag 都没有**，而训练完全正常
+            #      ⇒ 看起来像"作者没写 metrics"。现在：留痕（轮次/类型/消息）+
+            #      连续失败 N 次后**降级重试**（每 10 轮 + 末轮），**永不永久关闭**。
             extra = None
-            if metrics is not None and (
-                    int(ep) % max(1, metrics_every) == 0 or ep == total - 1):
+            if metrics is not None and _metrics_due(ep, total, m_health, metrics_every):
+                m_health["calls"] = int(m_health.get("calls", 0)) + 1
                 try:
                     was_training = bool(model.training)
                     model.eval()
@@ -568,16 +860,19 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                         got = metrics(model, _ctx(None, ep, kind="metrics"))
                     if was_training:
                         model.train()
+                    _metrics_ok(m_health)
                     if isinstance(got, dict) and got:
                         extra = got
                         last_extra = dict(got)
-                except Exception:                              # noqa: BLE001
-                    metrics = None            # 上报失败不拖垮训练（观测是附加的）
+                except Exception as exc:                       # noqa: BLE001
+                    #: ⚠ **留痕 + 降级**（不再 `metrics = None`）：见上面的第 3 条纪律
+                    _metrics_failed(m_health, ep, exc)
                     try:
                         model.train()
                     except Exception:                          # noqa: BLE001
                         pass
-            recorder.epoch(ep, train_loss, vl, cur_lr, extra=extra)
+            recorder.epoch(ep, train_loss, vl, cur_lr, extra=extra,
+                           lr_by_group=_group_lrs(optimizer))
             if scheduler is not None:
                 scheduler.step()
             if on_progress is not None:
@@ -600,7 +895,41 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
             # ⭐ 记"验证损失最好的那一轮"：用户点破的洞见是**末代没有特殊意义**
             #   ⇒ 把"从哪一轮开始就没再好过"变成可查的事实。
             watch = vl if vl is not None else train_loss
-            if best_epoch is None or watch < best_watch - 1e-9:
+            #: ① **val_loss 口径**永远算（它是"未声明 `best_metric`"时的行为，
+            #:   也是声明后要如实报出的对照：两者常常**不是同一轮**）。
+            if vl_best_epoch is None or watch < vl_best_watch - 1e-9:
+                vl_best_watch, vl_best_epoch = watch, ep
+                if keep_fallback:
+                    fallback_state = {k: v.detach().cpu().clone()
+                                      for k, v in model.state_dict().items()}
+            #: ② ⭐ **决定 `best.pt` 的口径**（Q4）：声明了就按声明的 tag 选
+            #:   （`best_metric` 在为空的默认路径上逐位等价于旧行为）。
+            if best_metric:
+                cur = None
+                if isinstance(extra, dict) and best_metric in (extra or {}):
+                    try:
+                        cur = float(extra[best_metric])
+                    except (TypeError, ValueError):
+                        cur = None
+                if cur is None:
+                    metric_skipped += 1
+                else:
+                    better = (metric_best_epoch is None
+                              or (cur > metric_best_value + 1e-12
+                                  if best_direction == "higher"
+                                  else cur < metric_best_value - 1e-12))
+                    if better:
+                        metric_best_value, metric_best_epoch = cur, ep
+                        metric_best_step = int(gstep)
+                        best_watch, best_epoch = cur, ep
+                        if keep_best:
+                            best_state = {k: v.detach().cpu().clone()
+                                          for k, v in model.state_dict().items()}
+                        #: 指标已经能用了 ⇒ 不再维护 val_loss 兜底快照（省一份内存）
+                        if metric_best_epoch is not None:
+                            keep_fallback = False
+                            fallback_state = None
+            elif best_epoch is None or watch < best_watch - 1e-9:
                 best_watch, best_epoch = watch, ep
                 if keep_best:
                     # 快照到 **CPU**：卡上显存要留给训练，且存档不该占显存。
@@ -616,6 +945,42 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                         break
     finally:
         recorder.close()
+    #: ⭐ **`best.pt` 到底按什么选的**（Q4）：说清 tag / 方向 / 值 / 轮次 / 步号。
+    #: ⚠ 两个口径**都报**：声明了 `best_metric` 时 `best_by` 是那个 tag，
+    #: `val_loss_best` 是**同一场训练的 val_loss 口径对照**（实测两者常常不是同一轮）。
+    if best_metric and metric_best_epoch is None:
+        #: 声明的指标**一次都没上报**（名字写错 / `metrics_every` 下从不出现）⇒
+        #: **退回 val_loss 并如实说**（不静默、也不让 best.pt 缺席）。
+        best_epoch, best_watch = vl_best_epoch, vl_best_watch
+        if keep_best and best_state is None:
+            best_state = fallback_state
+        best_by = {"tag": "val_loss", "direction": "lower",
+                   "value": (None if vl_best_watch == float("inf") else vl_best_watch),
+                   "epoch": vl_best_epoch, "step": None,
+                   "requested_tag": str(best_metric),
+                   "note": (f"声明的 `best_metric={best_metric!r}` 在整场训练里"
+                            f"**一次都没上报**（跳过了 {metric_skipped} 轮）"
+                            f"⇒ **退回 val_loss** 选 best。检查 tag 名拼写，"
+                            f"或让 `metrics` 一定返回它")}
+    elif best_metric:
+        best_by = {"tag": str(best_metric),
+                   "direction": str(best_direction or "lower"),
+                   "value": metric_best_value, "epoch": metric_best_epoch,
+                   "step": metric_best_step,
+                   "skipped_epochs": int(metric_skipped),
+                   "note": (f"按 `best_metric={best_metric!r}`"
+                            f"（{best_direction}）选；"
+                            f"⚠ 与 val_loss 的最佳轮**可能不是同一轮**："
+                            f"val_loss 最佳在第 {vl_best_epoch} 轮"
+                            f"（{vl_best_watch:.6g}）")}
+    else:
+        best_by = {"tag": "val_loss", "direction": "lower",
+                   "value": (None if best_watch == float("inf") else best_watch),
+                   "epoch": best_epoch, "step": None,
+                   "note": "未声明 `best_metric` ⇒ 仍按 **val_loss** 选（与从前一致）"}
+    val_loss_best = {"epoch": vl_best_epoch,
+                     "value": (None if vl_best_watch == float("inf")
+                               else vl_best_watch)}
     last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     #: ⭐ **实测显存峰值**（事后归因，用户实测 §3.3）：只在真跑在 CUDA 上时才有值
     #: ⇒ CPU 回 `None`，**不假装有数字**。
@@ -640,6 +1005,19 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
             # 步级指标（`on_step` 的返回）：TB 那条给**曲线**，这条给**数字**，
             # 两者同一批 tag ⇒ 回执与曲线不会各说各话。
             "last_step_metrics": dict(last_step_metrics),
+            # ⭐ **中途存档的事实**（`checkpoint_every>0` 时才有 `n_ok>0`）：
+            #   `n_ok` 是"真的成功落盘了几次"、`last_step` 是最后那次的步号、
+            #   `errors` 是**失败原因**（可教学：不静默，也不拖垮训练）。
+            "checkpoint": dict(ck_facts),
+            # ⭐ **best.pt 的选择口径**（Q4）：`best_by`（决定 best.pt 的那个）+ 
+            #   `val_loss_best`（对照）。未声明时 `best_by.tag == "val_loss"`、
+            #   值与从前的 `best_watch`/`best_epoch` 一致 ⇒ 逐位兼容。
+            "best_by": dict(best_by),
+            "val_loss_best": dict(val_loss_best),
+            "best_metric_skipped_n": int(metric_skipped),
+            # ⭐ **`metrics` 健康**（**不静默**）：作者没写钩子 / 每轮失败 / 名字写错
+            #   是三种病 ⇒ `hook`/`failures`/`errors` 让它们分得开。
+            "metrics_health": dict(m_health),
             "last_state": last_state, "best_state": best_state}
 
 

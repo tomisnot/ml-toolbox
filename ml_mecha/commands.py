@@ -263,6 +263,17 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "最贵的；几十步就能判（回执给 loss/梯度曲线与 verdict）", 0),
             CommandParam("dataset_id", "string", False,
                          "数据集引用；留空用最近准备的一份", ""),
+            # ⭐ **中途存档**（2026-10-07，A1 的修法）：框架此前**只在训练终态**写
+            #   `checkpoint/` ⇒ 5 小时训练中途死机＝全部参数丢失（实测：跑到 284 epoch
+            #   的 run 目录下只有 `tb/`）。这里给它一个**一等参数**，而不只是藏在
+            #   `overrides` 里：工具面的 schema 才是 AI 读得到的"能力清单"
+            #   （藏在 overrides 里的旋钮等于不存在）。
+            CommandParam("checkpoint_every", "integer", False,
+                         "每 N 个**优化步**把 `last.pt` 原子落盘（0 = 关，只在终态写一次）。"
+                         "长训练建议 200 左右；⚠ 图任务里 1 epoch = 1 步（整图前向没有"
+                         "batch）。`best.pt` 的语义不变（仍按验证损失更新）。"
+                         "⚠ 与 `overrides.checkpoint_every` 等价；同时给时**以这里的值为准**",
+                         0),
             CommandParam("overrides", "object", False,
                          "运行级参数覆写（epochs/batch/lr/val_split/latent_every…）"),
             CommandParam("seed", "integer", False, "随机种子（整数）"),
@@ -276,6 +287,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
                          "计算设备：auto（默认，有卡就上卡）/ cpu / cuda:0。"
                          "⚠ 要求 cuda 而没有卡会**报错**（不静默回落 CPU）；"
                          "网络代码里建张量要用 `ctx['device']`，否则会撞'混合设备'"),
+            # ⭐ **续训**（Q7）：显式入口 —— 不用再在 `build()` 里自己 `torch.load`。
+            CommandParam("resume_from", "string", False,
+                         "**从哪份存档接着训**：`run_id`（如 "
+                         "`custom_network-2334125-0`）或 `.pt` 的**绝对路径**。"
+                         "⚠ 找不到会**可教学地拒**（绝不静默从头训）；装载默认 "
+                         "`strict=True`（权重与这次 `build` 不匹配就**响亮失败**）", ""),
+            CommandParam("resume_which", "string", False,
+                         "续训用哪一份：`last`（默认＝末态/最近一份）或 `best`"
+                         "（按 `best_metric` 口径选的那份）", "last"),
         ),
         # ⚠ 写状态的键与 run_method 一致（它本质就是"跑一个方法"），
         #   额外把 `current.method` 记成自定义网络名——审计里要看得见"跑的是代码"。
@@ -287,8 +307,11 @@ COMMANDS: tuple[CommandSpec, ...] = (
                             "dry_run", "shapes", "shapes_summary",
                             "batch_sizes_checked", "runs", "n_params", "modules",
                             "code_path", "code_source", "code_lines",
+                            # A7③：解析后的绝对路径（相对路径按 dataset_roots[0] 解析）
+                            "code_path_resolved", "payload_resolved",
+                            "resumed_from", "resumed_which", "resumed_at_step",
                             "shapes_verbosity", "failed_batch_size",
-                            "loss_first_batch"),
+                            "loss_first_batch", "checkpoint_every"),
     ),
     # ---- 训练后：把模型交给调用方的代码（NQS 的"外部函数口"） ----
     CommandSpec(

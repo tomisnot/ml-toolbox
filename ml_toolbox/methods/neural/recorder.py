@@ -65,6 +65,8 @@ class TrainingRecorder:
         self._probe_selection = None
         self.last_labels = None
         self.last_idx = None
+        #: ⭐ 最新一次的**每个参数组 lr**（Q7b）：`custom.py` 收尾时写进 artifacts。
+        self.lr_by_group: dict = {}
         self._closed = False
         # 轻量运行计数：供性能契约测试与诊断，不改变公开 artifacts。
         self.probe_forward_count = 0
@@ -125,14 +127,24 @@ class TrainingRecorder:
 
     # ------------------------------------------------ 每 epoch 调用
     def epoch(self, ep: int, loss: float, val_loss: float | None,
-              lr: float, extra: dict | None = None):
+              lr: float, extra: dict | None = None,
+              lr_by_group: dict | None = None):
         """记一轮。
 
         ``extra``：**方法层自己上报的标量**（如 `{"fid/ch0": 0.96, "nll/phase": 1.2}`）。
         ⚠ 它们只往 TB 写（见 `tb_log.log_epoch`），**不进 `history`**——
         `history` 的形状有产物契约（`nn_history` 的键集）钉着，加键属行为变更。
         而"AI 看得见"这条已经由 TB 那条路满足了（`describe_training` 读**全部** tag）。
+
+        ``lr_by_group``：**每个参数组的 lr**（Q7b，`{组名: lr}`）⇒ TB 写 `lr/<组名>`，
+        而 `on_step`/`metrics` 也能从 `ctx["lr_by_group"]` 读到。
+        用途：NQS 的**不对称步长**（幅度组/相位组不同 lr）"改了却无法确认生效"
+        必须能查。⚠ 与 `extra` 同一条纪律：**不进 `history`**（那是产物契约）。
         """
+        if lr_by_group:
+            #: 最新一份留在实例上：`custom.py` 训练收尾时把它写进 artifacts，
+            #: 供 `describe_run` / 存档看（不只是 TB）。
+            self.lr_by_group = dict(lr_by_group)
         self.history["epoch"].append(ep)
         self.history["loss"].append(float(loss))
         self.history["val_loss"].append(
@@ -159,9 +171,10 @@ class TrainingRecorder:
                                    or ep == self.epochs - 1):
             self._snapshots.append((ep, self._project_latent(latent)))
 
-        # ⭐ 逐 epoch 直播（本 epoch 的量已在上面全部采集完）——写失败只记账，不拖垮训练。
+        #: ⭐ 逐 epoch 直播（本 epoch 的量已在上面全部采集完）——写失败只记账，不拖垮训练。
         if self.tb is not None:
-            self.tb.log_epoch(ep, self.history, self.grads, extra=extra)
+            self.tb.log_epoch(ep, self.history, self.grads, extra=extra,
+                              lr_by_group=lr_by_group)
 
     def set_probe(self, X_tensor, labels=None, probe_idx=None, probe_fn=None):
         """设置 probe；只计算一次行选择，标签/原行号与 latent 帧永久对齐。

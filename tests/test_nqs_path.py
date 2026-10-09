@@ -1143,6 +1143,758 @@ def test_framework_chunks_match_the_unchunked_result():
             ml.close()
 
 
+#: 判据用的小网络：**标准回归**（不依赖负载），带 `on_step`（制造 batch 级 tag）。
+_NET_PERIODIC = '''
+class Net(nn.Module):
+    def __init__(self, n_in, hidden=64):
+        super().__init__()
+        self.a = nn.Linear(n_in, hidden)
+        self.b = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.b(torch.tanh(self.a(x))).squeeze(-1)
+
+
+class Network:
+    primary_metric = "my/step"
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def on_step(self, model, step, ctx):
+        return {"my/step": float(step)}
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(x), y
+'''
+
+
+def _regression_ds(ml, rows=96, seed=0):
+    """一份小的标准回归数据集（帧 + 目标列）——比 NQS 负载轻，够验存档/轴。"""
+    rng = np.random.RandomState(seed)
+    frame = pd.DataFrame(rng.randn(rows, 4), columns=list("abcd"))
+    frame["y"] = frame["a"] - 0.5 * frame["b"] + 0.1 * rng.randn(rows)
+    return ml.tools.execute("prepare_dataset", {
+        "source": {"kind": "frame", "frame": frame}, "name": "periodic",
+        "target": "y",
+        "pipeline": {"steps": [{"key": "scale"}]}})["value"]["dataset_id"]
+
+
+# ============================================================ 4. 中途存档（A1/A2）
+def test_checkpoint_is_written_periodically_and_reports_its_step():
+    """⭐⭐ **训练还在跑时**盘上就有 `last.pt`，且每份存档报得出"落在第几步"。
+
+    这是使用者实测 A1/A2 的修法判据：
+
+    - **A1**：此前 `_save_checkpoints` 只在**结果组装时**调用 ⇒ 一个跑到 284 epoch
+      的 run，`runs/<id>/` 下**只有 `tb/`**，5 小时训练中途死机＝全部参数丢失。
+    - **A2**：拿到一份 `last.pt` 要能判断"它对应训练到哪" ⇒ `saved_at_step/epoch`。
+
+    ⚠ 本判据**真的在训练进行中读盘**（另起线程跑训练、主线程轮询 `last.pt` 的出现），
+    而不是只看"跑完之后有没有文件"——后者对"只在终态写"的旧实现**同样会绿**
+    （那正是要防的假绿）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import threading
+    import time
+
+    from ml_toolbox.core.persistence import RUNS_DIR, load_run_record
+
+    with tempfile.TemporaryDirectory(prefix="nqs-periodic-") as td:
+        ml = _ml(td)
+        try:
+            ds = _regression_ds(ml, rows=96)
+            root = Path(RUNS_DIR)
+            before = ({p.name for p in root.iterdir() if p.is_dir()}
+                      if root.is_dir() else set())
+            out: dict = {}
+            seen: dict = {}
+            stop = threading.Event()
+
+            def _train():
+                out.update(ml.tools.execute("run_custom", {
+                    "device": _DEV, "code": _NET_PERIODIC, "dataset_id": ds,
+                    "name": "periodic", "persist": True,
+                    "checkpoint_every": 5,
+                    "overrides": {"epochs": 60, "batch": 4, "val_split": 0.25}}))
+
+            def _poll():
+                """轮询"**训练还活着时**盘上出现了 last.pt"（每个新目录只记一次）。"""
+                while not stop.is_set():
+                    try:
+                        for d in root.iterdir():
+                            if d.name in before or d.name in seen:
+                                continue
+                            if (d / "checkpoint" / "last.pt").is_file():
+                                seen[d.name] = bool(th.is_alive())
+                    except OSError:
+                        pass
+                    time.sleep(0.002)
+
+            th = threading.Thread(target=_train, name="periodic-train")
+            th.start()
+            poller = threading.Thread(target=_poll, name="periodic-poll")
+            poller.start()
+            th.join(timeout=900)
+            stop.set()
+            poller.join(timeout=5)
+
+            receipt = out.get("value") or {}
+            assert receipt.get("ok") is True, receipt
+            rid = receipt["run_id"]
+            assert receipt.get("checkpoint_every") == 5, receipt
+
+            # ① ⭐ **中途**：这个 run 的 last.pt 在**训练线程还活着**时就已经在盘上
+            assert rid in seen, (
+                "没能在训练进行中观测到 last.pt（要么是终态才写，要么 checkpoint_every "
+                f"没生效）。观测到的目录：{sorted(seen)}")
+            assert seen[rid] is True, (
+                "last.pt 出现时训练线程已经结束 ⇒ 它还是终态写的（判据失去了意义）")
+
+            # ② 中途落盘的事实（周期性存了几次、最后一次在第几步）
+            arts = load_run_record(rid).result.artifacts
+            n_periodic = int(np.asarray(arts["nn_checkpoint_n"]).ravel()[0])
+            assert n_periodic >= 2, f"周期存档只成功了 {n_periodic} 次：{arts.keys()}"
+            assert "nn_checkpoint_errors" not in arts, (
+                f"周期存档报错了：{arts.get('nn_checkpoint_errors')}")
+            last_step = int(np.asarray(arts["nn_checkpoint_last_step"]).ravel()[0])
+            assert last_step > 0, last_step
+
+            # ③ 每份存档**各自**的"落在第几步"（A2：不再只报 best 的那一份）
+            ck = ml.tools.execute("checkpoint_detail", {"run_id": rid})["value"]
+            assert ck["available"] is True, ck
+            assert set(ck["tags"]) == {"best", "last"}, ck["tags"]
+            for tag in ("best", "last"):
+                info = ck["files_meta"][tag]
+                assert info["saved_at_step"] and info["saved_at_epoch"], (tag, info)
+                assert info["save_reason"] == "final", (tag, info)
+            # `last_saved` = **最后一次**落盘（终态那一份），不是"第一个找到的文件"
+            assert ck["last_saved"]["tag"] == "last", ck["last_saved"]
+            assert ck["last_saved"]["save_reason"] == "final", ck["last_saved"]
+            # ⭐ 该用哪个键 load —— 静默错误的直接来源（A7-①）
+            assert ck["load_hint"]["state_dict_key"] == "state_dict", ck["load_hint"]
+
+            # ④ `best.pt` 的语义**没被改**：仍按验证损失留快照
+            assert ck["files_meta"]["best"]["best_epoch"] is not None, ck["files_meta"]
+            # ⑤ 原子写：不许留临时文件
+            assert not [f for f in ck["files"] if ".tmp-" in f], ck["files"]
+            assert not list((Path(ck["dir"])).glob("*.tmp-*")), "留下半个存档"
+        finally:
+            ml.close()
+
+
+def test_periodic_checkpoint_save_is_atomic_and_cleans_up_on_failure():
+    """**原子写**：成功不留临时文件；失败要清掉临时文件，且**不破坏上一份好存档**。
+
+    ⚠ 为什么这条必须单独钉：中途存档的唯一价值是"被杀死时还有一份能用的"。
+    直接写目标路径时，写一半被杀会留下**半个 zip**（下次 `torch.load` 报的是一句
+    与真相无关的错），而**上一份好的存档已经被覆盖**——那比"没有存档"更坏
+    （你以为有）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import torch
+
+    from ml_toolbox.methods.neural.custom import _atomic_torch_save
+
+    with tempfile.TemporaryDirectory(prefix="nqs-atomic-") as td:
+        path = Path(td) / "last.pt"
+        n = _atomic_torch_save({"state_dict": {"w": torch.zeros(3)}}, path)
+        assert path.is_file() and n > 0, (path, n)
+        assert not list(Path(td).glob("*.tmp-*")), "成功路径留下了临时文件"
+
+        class Unpicklable:
+            def __reduce__(self):
+                raise RuntimeError("不可序列化（模拟写盘中途失败）")
+
+        try:
+            _atomic_torch_save({"state_dict": {"w": Unpicklable()}}, path)
+            raise AssertionError("不可序列化的对象竟然写成功了")
+        except RuntimeError:
+            pass
+        assert not list(Path(td).glob("*.tmp-*")), "失败路径没有清掉临时文件"
+        again = torch.load(path, map_location="cpu", weights_only=False)
+        assert "state_dict" in again and "w" in again["state_dict"], again
+
+
+def test_step_axis_units_are_reported_and_cross_family_alignment_warns():
+    """⭐ 两族 tag 的 step 轴**单位不同**，回执必须说出来（pitfalls A55）。
+
+    实测现场：`loss` 的 `latest_step` 是 **epoch 序号**，而 `on_step` 上报的
+    `fid/step` 是**全局 batch 步**（同一个 run 上差 ~277 倍）。只给步号不给单位，
+    读数的人会把大数读成"累计点数"，或把两族并排比 —— 后者会造出一个**不存在的矛盾**。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    with tempfile.TemporaryDirectory(prefix="nqs-units-") as td:
+        ml = _ml(td)
+        try:
+            # ⚠ 行数必须足够：`infer_kind` 的规则是"数值且**基数 > 20** 才算回归"
+            #   （`contracts.REGRESSION_CARDINALITY`）⇒ 行数太少时，一个连续目标会被
+            #   判成**分类**，报出来的错是 `Found dtype Long but expected Float`
+            #   （离根因很远）。这里给 80 行（切 8:2 后仍有 60 行）避开它。
+            ds = _regression_ds(ml, rows=80, seed=3)
+            rid = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _NET_PERIODIC, "dataset_id": ds,
+                "name": "units",
+                "overrides": {"epochs": 3, "batch": 4, "val_split": 0.0}})["value"]["run_id"]
+
+            tr = ml.tools.execute("describe_training", {"run_id": rid})["value"]
+            assert tr["available"] is True, tr.get("reason")
+            # ① 单位：`loss` 是 epoch 级，`on_step` 的 tag 是 batch 级
+            assert tr["step_units"].get("my/step") == "batch", tr["step_units"]
+            assert "loss" not in tr["step_units"], (
+                "epoch 级 tag 不该出现在 step_units 里（它是**非 epoch** 那一半）")
+            axes = tr["axes"]
+            assert "my/step" in axes["batch_tags"], axes
+            assert axes["mixed_tags"] == [], axes
+            # ② `per_epoch_estimate` = 每轮批数（就是那个"看起来差几百倍"的来源）
+            assert axes["per_epoch_estimate"] and axes["per_epoch_estimate"] >= 2, axes
+
+            # ③ 跨族强行对齐 ⇒ 必须**当场说清**（不静默给一张误导性的表）
+            cmp_ = ml.tools.execute("describe_training", {
+                "run_id": rid, "tags": ["loss", "my/step"]})["value"]["compare"]
+            assert cmp_["step_units"]["loss"] == "epoch", cmp_
+            assert cmp_["step_units"]["my/step"] == "batch", cmp_
+            assert cmp_.get("axis_warning"), (
+                "跨族对齐没有给 axis_warning ⇒ 那张表会被读成'这段没有 loss'")
+            assert "batch" in cmp_["axis_warning"], cmp_["axis_warning"]
+        finally:
+            ml.close()
+
+
+#: Q4 判据用的网络：`fid/climb` **逐轮严格上升** ⇒ 按它选的 best 必然落在**最后一轮**
+#: ⇒ 可以直接断言"best.pt 的权重 == last.pt 的权重"（比"看指标接近"硬得多）。
+_NET_BEST_METRIC = '''
+class Net(nn.Module):
+    def __init__(self, n_in, hidden=32):
+        super().__init__()
+        self.a = nn.Linear(n_in, hidden)
+        self.b = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.b(torch.tanh(self.a(x))).squeeze(-1)
+
+
+class Network:
+    {declare}
+
+    def __init__(self):
+        self.ep = 0
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def metrics(self, model, ctx):
+        self.ep = int(ctx.get("step") or 0)
+        return {{"fid/climb": 0.1 * (self.ep + 1), "flat/x": 1.0}}
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(x), y
+'''
+
+
+def test_best_pt_selection_is_declarable_and_default_is_unchanged():
+    """⭐⭐ `best.pt` 的选择口径**可声明**（Q4），未声明时**与从前一致**。
+
+    使用者实测的痛点：自定义任务的主指标常常**不是** `val_loss`，而 `best.pt` 按
+    `val_loss` 选 ⇒ 同一场训练里 **`best` 0.6464 vs `last` 0.8174**（差得很远）；
+    而 `checkpoint_detail` 只报 `best_epoch`，**不说"按什么选的"** ⇒ 无法判断该不该用它。
+
+    本条钉四件：
+    ① **声明了就按它选**：`best_metric="fid/climb"`（严格上升）⇒ best 必然来自**最后一轮**
+       ⇒ 直接断言 `best.pt` 的权重与 `last.pt` **逐张量相等**（比看指标接近硬得多）；
+    ② **报出口径**：`checkpoint_detail` 的 `files_meta.best.best_by` 给出
+       tag/direction/value/epoch/step，`val_loss_best` 给出对照；
+    ③ ⭐ **未声明时逐位兼容**：`best_by.tag == "val_loss"`（同一份网络、只去掉声明那一行）；
+    ④ **方向判不出来必须可教学地拒**（`ph/std` 这类"没有好坏方向"的量**不许猜**），
+       并证明 tuple 形式（显式给方向）能通。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import torch
+
+    from ml_toolbox.core.persistence import RUNS_DIR, load_run_record
+
+    def _run(ml, ds, declare: str) -> dict:
+        return ml.tools.execute("run_custom", {
+            "device": _DEV, "code": _NET_BEST_METRIC.format(declare=declare),
+            "dataset_id": ds, "name": "best", "persist": True,
+            "overrides": {"epochs": 6, "batch": 4, "val_split": 0.25}})
+
+    with tempfile.TemporaryDirectory(prefix="nqs-best-") as td:
+        ml = _ml(td)
+        try:
+            ds = _regression_ds(ml, rows=96)
+            # ---- ① 声明：按 fid/climb（higher；严格上升 ⇒ best 落在最后一轮）
+            raw = _run(ml, ds, 'best_metric = "fid/climb"')
+            assert raw.get("is_error") is False, raw
+            rid = raw["value"]["run_id"]
+            ck = ml.tools.execute("checkpoint_detail", {"run_id": rid})["value"]
+            bb = ck["files_meta"]["best"]["best_by"]
+            assert bb["tag"] == "fid/climb", bb
+            assert bb["direction"] == "higher", bb
+            assert bb["epoch"] is not None and bb["step"] is not None, bb
+            assert ck["files_meta"]["best"]["val_loss_best"]["epoch"] is not None, ck
+            b = torch.load(Path(RUNS_DIR) / rid / "checkpoint" / "best.pt",
+                           map_location="cpu", weights_only=False)
+            last = torch.load(Path(RUNS_DIR) / rid / "checkpoint" / "last.pt",
+                              map_location="cpu", weights_only=False)
+            assert b["best_by"]["tag"] == "fid/climb", b.get("best_by")
+            assert all(torch.equal(b["state_dict"][k], last["state_dict"][k])
+                       for k in b["state_dict"]), (
+                "按 `fid/climb`（严格上升）选的 best 应当就是最后一轮的权重 —— "
+                "不等说明选择口径没生效")
+            arts = load_run_record(rid).result.artifacts
+            assert "fid/climb" in str(np.asarray(arts["nn_best_by"]).ravel()[0]), \
+                arts.get("nn_best_by")
+
+            # ---- ③ 未声明：与从前一致（val_loss 口径）
+            raw2 = _run(ml, ds, "")
+            assert raw2.get("is_error") is False, raw2
+            rid2 = raw2["value"]["run_id"]
+            ck2 = ml.tools.execute("checkpoint_detail", {"run_id": rid2})["value"]
+            bb2 = ck2["files_meta"]["best"]["best_by"]
+            assert bb2["tag"] == "val_loss", bb2
+            assert bb2["direction"] == "lower", bb2
+            assert ck2["meta"]["best_epoch"] is not None, ck2["meta"]
+            b2 = torch.load(Path(RUNS_DIR) / rid2 / "checkpoint" / "best.pt",
+                            map_location="cpu", weights_only=False)
+            assert b2["best_by"]["tag"] == "val_loss", b2.get("best_by")
+
+            # ---- ④ 方向判不出来 ⇒ 可教学地拒；显式给方向就通
+            bad = _run(ml, ds, 'best_metric = "ph/std"')
+            assert bad.get("is_error") is True, bad
+            info = (bad.get("error") or {}).get("info") or {}
+            assert info.get("kind") == "bad_best_metric", info
+            assert "higher" in (info.get("suggest") or ""), info
+            ok = _run(ml, ds, 'best_metric = ("fid/climb", "higher")')
+            assert ok.get("is_error") is False, ok
+            ck3 = ml.tools.execute("checkpoint_detail",
+                                   {"run_id": ok["value"]["run_id"]})["value"]
+            assert ck3["files_meta"]["best"]["best_by"]["direction"] == "higher", ck3
+        finally:
+            ml.close()
+
+
+#: Q4b 判据用的网络：指标**中途达到峰值再回落**（`fid/peak = -|ep - PEAK|` ⇒ 越大越好）。
+#: 峰值轮是常数 ⇒ 断言"盘上的 best.pt 就是峰值那一轮"是**确定的**，不靠概率。
+_NET_BEST_PERIODIC = '''
+PEAK = 6
+
+
+class Net(nn.Module):
+    def __init__(self, n_in, hidden=32):
+        super().__init__()
+        self.a = nn.Linear(n_in, hidden)
+        self.b = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.b(torch.tanh(self.a(x))).squeeze(-1)
+
+
+class Network:
+    best_metric = "fid/peak"
+
+    def __init__(self):
+        self.ep = 0
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def metrics(self, model, ctx):
+        self.ep = int(ctx.get("step") or 0)
+        return {"fid/peak": -abs(self.ep - PEAK)}
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(x), y
+'''
+
+
+def test_periodic_best_pt_is_written_mid_run_so_an_interrupted_run_keeps_it():
+    """⭐⭐ `checkpoint_every` 也要**中途更新 `best.pt`**（Q4b）。
+
+    为什么这是真缺口（使用者点出）：周期存档原来**只写 `last.pt`**，`best.pt` 只在
+    **终态**与 `last` 一起写 ⇒ **一次被中断的长训练拿不到"按我的指标最好的那一份"**
+    —— 而那正是 `checkpoint_every` 存在的意义（死机后要能续训/取最佳）。
+
+    判据（**在训练还在跑时读盘**，与 A1 那条同款"另起线程 + 轮询"）：
+    ① 训练进行中就能看到 `best.pt`，且它 `save_reason == "periodic"`；
+    ② ⭐ 它**随着 best 刷新被重写**：观测到的 `best_by.epoch` 序列里既有**早期轮**
+       （说明它不是终态才写），又**最终追到峰值轮 6**（说明它按声明口径在追最佳）——
+       而且这些观测都发生在**训练线程还活着**时；
+    ③ 终态那份仍是 `final`、`best_by.epoch` 依然是峰值轮，且权重与 `last.pt`
+       **必须不同**（否则"按峰值轮存档"没被证明）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import threading
+    import time
+
+    import torch
+
+    from ml_toolbox.core.persistence import RUNS_DIR
+
+    with tempfile.TemporaryDirectory(prefix="nqs-bestper-") as td:
+        ml = _ml(td)
+        try:
+            ds = _regression_ds(ml, rows=96)
+            root = Path(RUNS_DIR)
+            before = ({p.name for p in root.iterdir() if p.is_dir()}
+                      if root.is_dir() else set())
+            out: dict = {}
+            #: run_id -> {"sightings": [(epoch, reason)…], "last_mtime": int}
+            seen: dict = {}
+            stop = threading.Event()
+
+            def _train():
+                out.update(ml.tools.execute("run_custom", {
+                    "device": _DEV, "code": _NET_BEST_PERIODIC, "dataset_id": ds,
+                    "name": "bestper", "persist": True,
+                    "checkpoint_every": 5,
+                    "overrides": {"epochs": 40, "batch": 4, "val_split": 0.25}}))
+
+            def _poll():
+                """训练**还在跑**时轮询：`best.pt` 出现过哪些"最佳轮"（**含演化**）。
+
+                ⚠ 只在文件 mtime 变化时重读（否则每 2 ms 反序列化一次太吵）。
+                """
+                while not stop.is_set():
+                    try:
+                        for d in root.iterdir():
+                            if d.name in before:
+                                continue
+                            bp = d / "checkpoint" / "best.pt"
+                            if not bp.is_file():
+                                continue
+                            try:
+                                mt = bp.stat().st_mtime_ns
+                            except OSError:
+                                continue
+                            rec = seen.setdefault(d.name, {"sightings": [],
+                                                           "last_mtime": -1})
+                            if mt == rec["last_mtime"] or not th.is_alive():
+                                continue
+                            rec["last_mtime"] = mt
+                            try:
+                                ck = torch.load(bp, map_location="cpu",
+                                                weights_only=False)
+                                rec["sightings"].append(
+                                    ((ck.get("best_by") or {}).get("epoch"),
+                                     ck.get("save_reason")))
+                            except Exception:              # noqa: BLE001
+                                pass      # 正在被原子换名：下一轮再看（**不报错**）
+                    except OSError:
+                        pass
+                    time.sleep(0.002)
+
+            th = threading.Thread(target=_train, name="bestper-train")
+            th.start()
+            poller = threading.Thread(target=_poll, name="bestper-poll")
+            poller.start()
+            th.join(timeout=900)
+            stop.set()
+            poller.join(timeout=5)
+
+            receipt = out.get("value") or {}
+            assert receipt.get("ok") is True, receipt
+            rid = receipt["run_id"]
+            # ① **训练还在跑时**就看到了 best.pt，且都是 periodic
+            assert rid in seen and seen[rid]["sightings"], (
+                f"训练进行中没看到 best.pt ⇒ 周期存档只写了 last.pt（Q4b 的缺口）：{seen}")
+            epochs = [e for e, _r in seen[rid]["sightings"]]
+            reasons = {r for _e, r in seen[rid]["sightings"]}
+            #: ⚠ 终态那一次也会被轮询看到（`_train` 里落完盘才返回）⇒ 分开看
+            assert "periodic" in reasons, reasons
+            per = [e for e, r in seen[rid]["sightings"] if r == "periodic"]
+            # ② 它**随 best 刷新被重写**：早期轮出现过，最终追到峰值轮
+            assert any(e is not None and e < 6 for e in per), per
+            assert per[-1] == 6, (
+                f"训练进行中最后一次**周期**落盘的 best 应当是峰值轮 6"
+                f"（口径：按 `fid/peak` 选）：{per}（全部观测：{epochs}）")
+            # ③ 终态口径一致 + 权重确实与 last 不同
+            ck = ml.tools.execute("checkpoint_detail", {"run_id": rid})["value"]
+            assert ck["files_meta"]["best"]["best_by"]["epoch"] == 6, ck["files_meta"]
+            assert ck["files_meta"]["best"]["save_reason"] == "final", ck["files_meta"]
+            b = torch.load(Path(RUNS_DIR) / rid / "checkpoint" / "best.pt",
+                           map_location="cpu", weights_only=False)
+            last = torch.load(Path(RUNS_DIR) / rid / "checkpoint" / "last.pt",
+                              map_location="cpu", weights_only=False)
+            assert b["best_by"]["epoch"] != ck["meta"]["epochs_run"] - 1, ck["meta"]
+            assert any(not torch.equal(b["state_dict"][k], last["state_dict"][k])
+                       for k in b["state_dict"]), (
+                "best.pt 与 last.pt 权重完全相同 ⇒ '按峰值轮存档'没有被证明")
+        finally:
+            ml.close()
+
+
+#: Q7 判据用的网络：**先把 loss 压下去**，再续训看"起始 loss 从哪开始"。
+_NET_RESUME = '''
+class Net(nn.Module):
+    def __init__(self, n_in, hidden=32):
+        super().__init__()
+        self.a = nn.Linear(n_in, hidden)
+        self.b = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.b(torch.tanh(self.a(x))).squeeze(-1)
+
+
+class Network:
+    primary_metric = "train/first"
+
+    def __init__(self):
+        self.first = None
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def on_step(self, model, step, ctx):
+        #: 把**第一步**的 loss 记下来：那是"续训生效没有"的最直接读数
+        if self.first is None:
+            self.first = step
+        return {}
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(x), y
+'''
+
+
+#: **结构不同**的网络：用来证明"改过结构 ⇒ 续训装载**响亮失败**"（而不是静默随机初始化）。
+_NET_OTHER_STRUCT = '''
+class Network:
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        # 键集与 `_NET_RESUME` 完全不同（这是最容易发生的那种"改了结构还想续训"）
+        return nn.Sequential(nn.Linear(n_in, 5), nn.ReLU(), nn.Linear(5, n_out))
+'''
+
+
+def test_resume_from_starts_near_the_breakpoint_and_fails_teachably():
+    """⭐⭐ **续训（`resume_from`）**：起始 `loss` 必须接近**断点**而不是初值（Q7）。
+
+    使用者的判据（原话）："续训后**起始 `loss` 必须接近断点**，而不是初值
+    （我实测：续训 99.68 vs 从头 1017.6，一眼可辨）。"
+
+    本条钉四件：
+    ① **主判据（他给的）**：`resume_from` 那一轮的**首轮 loss** 离源 run 的**末轮 loss**
+       更近，而离"从头训练的首轮 loss"更远 —— 判据**自归一化**（用同一次实验里
+       两个对照 run 的读数做比较），不依赖任何绝对阈值；
+    ② **事实可反查**：回执带 `resumed_from`/`resumed_which`/`resumed_at_step`，
+       且 artifacts 里有 `nn_resumed_from`（"这一轮为什么收敛快"要能回答）；
+    ③ **指向不存在的存档 ⇒ 可教学地拒**（`no_resume_checkpoint`），**绝不静默从头训**；
+    ④ `resume_which` 越界 ⇒ `bad_resume_which`；结构改过 ⇒ `resume_state_mismatch`（响亮）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    from ml_toolbox.core.persistence import load_run_record
+
+    def _run(ml, ds, **extra):
+        body = {"device": _DEV, "code": _NET_RESUME, "dataset_id": ds,
+                "name": "resume", "persist": True,
+                "overrides": {"epochs": 8, "batch": 8, "lr": 0.02,
+                              "val_split": 0.25}}
+        body.update(extra)
+        return ml.tools.execute("run_custom", body)
+
+    def _first_loss(rid):
+        h = load_run_record(rid).result.artifacts["nn_history"]
+        return float(np.asarray(h["loss"]).ravel()[0])
+
+    with tempfile.TemporaryDirectory(prefix="nqs-resume-") as td:
+        ml = _ml(td)
+        try:
+            ds = _regression_ds(ml, rows=96)
+            # ① 源 run：训 40 轮把 loss 压下去（它有存档）
+            src_raw = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _NET_RESUME, "dataset_id": ds,
+                "name": "src", "persist": True,
+                "overrides": {"epochs": 40, "batch": 8, "lr": 0.02,
+                              "val_split": 0.25}})
+            assert src_raw.get("is_error") is False, src_raw
+            src = src_raw["value"]["run_id"]
+            src_last = float(np.asarray(
+                load_run_record(src).result.artifacts["nn_history"]["loss"]
+            ).ravel()[-1])
+
+            # ② 从头训练（对照）：另一份**同样的数据**上的首轮 loss
+            fresh = _run(ml, ds)["value"]["run_id"]
+            fresh_first = _first_loss(fresh)
+
+            # ③ ⭐ 续训：首轮 loss 应当**贴着 src 的末轮**，而不是从头那个数
+            got = _run(ml, ds, resume_from=src, resume_which="last")["value"]
+            assert got["ok"] is True, got
+            rid = got["run_id"]
+            resumed_first = _first_loss(rid)
+            d_resume = abs(resumed_first - src_last)
+            d_fresh = abs(resumed_first - fresh_first)
+            assert d_resume < d_fresh, (
+                f"续训没有真正生效：首轮 loss={resumed_first:.4g}，"
+                f"断点(soue末轮)={src_last:.4g}（距离 {d_resume:.4g}），"
+                f"从头首轮={fresh_first:.4g}（距离 {d_fresh:.4g}）")
+            # ② 事实可反查
+            assert str(got.get("resumed_from")).endswith("last.pt"), got
+            assert got.get("resumed_which") == "last", got
+            assert got.get("resumed_at_step"), got
+            arts = load_run_record(rid).result.artifacts
+            assert "nn_resumed_from" in arts, sorted(arts)
+
+            # ③ 不存在的存档 ⇒ 可教学地拒（**绝不静默从头训**）
+            bad = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _NET_RESUME, "dataset_id": ds,
+                "name": "bad", "resume_from": "custom_network-0-0"})
+            assert bad.get("is_error") is True, bad
+            info = (bad.get("error") or {}).get("info") or {}
+            assert info.get("kind") == "no_resume_checkpoint", info
+            assert "checkpoint" in (info.get("hint") or ""), info
+            # ④ `resume_which` 越界
+            bad2 = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _NET_RESUME, "dataset_id": ds,
+                "name": "bad2", "resume_from": src, "resume_which": "third"})
+            assert bad2.get("is_error") is True, bad2
+            assert (((bad2.get("error") or {}).get("info") or {}).get("kind")
+                    == "bad_resume_which"), bad2
+            # ④b 结构改过 ⇒ `resume_state_mismatch`（**响亮**，不静默）
+            other = ml.tools.execute("run_custom", {
+                "device": _DEV, "dataset_id": ds, "name": "other",
+                "code": _NET_OTHER_STRUCT, "resume_from": src})
+            assert other.get("is_error") is True, other
+            assert (((other.get("error") or {}).get("info") or {}).get("kind")
+                    == "resume_state_mismatch"), other
+        finally:
+            ml.close()
+
+
+#: 判据用的网络：`metrics` **故意抛异常**，而且**第 0 轮之后恢复正常**
+#: ⇒ 同时证明"失败留痕"与"**没有**被永久关闭"（旧实现第一次失败就再也不会调用）。
+_NET_METRICS_BOOM = '''
+class Net(nn.Module):
+    def __init__(self, n_in, hidden=32):
+        super().__init__()
+        self.a = nn.Linear(n_in, hidden)
+        self.b = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.b(torch.tanh(self.a(x))).squeeze(-1)
+
+
+class Network:
+    primary_metric = "fid/ok"
+
+    def __init__(self):
+        self.calls = 0
+
+    def build(self, n_in, n_out, *, nn, ctx=None):
+        return Net(n_in)
+
+    def loss(self, *, nn, n_out):
+        return nn.MSELoss()
+
+    def metrics(self, model, ctx):
+        self.calls += 1
+        #: 第 0 轮炸（模拟"在 metrics 里对全量负载做重活 ⇒ OOM"），之后就正常
+        if int(ctx.get("step") or 0) == 0:
+            raise RuntimeError("CUDA out of memory（判据模拟：全量负载上做重活）")
+        return {"fid/ok": 0.5 + 0.01 * self.calls}
+
+    def forward_step(self, model, batch, ctx):
+        x, y = batch
+        return model(x), y
+'''
+
+
+def test_metrics_failure_is_traced_and_not_permanently_disabled():
+    """⭐⭐ `metrics` 抛异常**不许被永久静默关闭**（2026-10-07 使用者实测的静默黑洞）。
+
+    他的现场：TB 里**一个 epoch 级 tag 都没有**（`fid/sub1`…），而**训练完全正常**
+    （loss 在降、步级 tag 都在）；`best_metric` 也因此"整场没上报"。
+    根因（旧 `trainer.py`）：`except Exception: metrics = None` ——
+    ① **异常被吞掉、不留痕**；② **永久关闭**（第一次失败后整场不再调用）；
+    ③ **任何回执都看不出** ⇒ AI 分不清三种病：**没写钩子** / **每轮都失败** / **名字写错**
+    （修法完全不同）。
+
+    触发原因极常见：`metrics` 拿的是**全量负载**（他 7344 行、一次 256-token 解码就 OOM）。
+
+    本条钉四件：
+    ① **训练照常成功**（失败只降级，不拖垮）；
+    ② ⭐ **留痕**：artifacts **与** `checkpoint_detail`（只有磁盘、跨重启也查得到）
+       都能看到"失败了 N 次、原因 X"；
+    ③ ⭐ **没有永久关闭**：第 0 轮炸、之后正常 ⇒ 后面的 epoch **必须产出 `fid/ok`**
+       （旧实现下这条一定红：整场一个 epoch 级 tag 都没有）；
+    ④ 三种病**分得开**：`metrics_health.hook=True` 且 `failures>0`（不是"没写"）。
+    """
+    if not _has_torch():
+        print("    （跳过：未装 torch）")
+        return
+    import json
+
+    from ml_toolbox.core.persistence import load_record, load_run_record
+
+    with tempfile.TemporaryDirectory(prefix="nqs-mhealth-") as td:
+        ml = _ml(td)
+        try:
+            ds = _regression_ds(ml, rows=96)
+            raw = ml.tools.execute("run_custom", {
+                "device": _DEV, "code": _NET_METRICS_BOOM, "dataset_id": ds,
+                "name": "mboom", "persist": True, "diag": True,
+                "overrides": {"epochs": 6, "batch": 8, "val_split": 0.25}})
+            assert raw.get("is_error") is False, raw
+            assert raw["value"]["ok"] is True, raw["value"]      # ① 训练照常
+            rid = raw["value"]["run_id"]
+
+            # ② 留痕：artifacts 里有失败次数与原因
+            arts = load_run_record(rid).result.artifacts
+            assert "nn_metrics_errors" in arts, sorted(arts)
+            err = str(np.asarray(arts["nn_metrics_errors"]).ravel()[0])
+            assert "out of memory" in err, err
+            assert "epoch 0" in err, err
+
+            # ② b 留痕：`checkpoint_detail`（**只有磁盘**、跨重启也查得到）也要给
+            ck = ml.tools.execute("checkpoint_detail", {"run_id": rid})["value"]
+            mh = ck["files_meta"]["last"]["metrics_health"]
+            assert mh["hook"] is True, mh        # ④ 与"没写钩子"分得开
+            assert int(mh["failures"]) >= 1, mh
+            assert mh["errors"] and "epoch 0" in mh["errors"][0], mh
+            assert "metrics" in (ck.get("metrics_note") or ""), ck.get("metrics_note")
+
+            # ③ ⭐ **没有永久关闭**：后面几轮必须真的产出了 epoch 级 tag
+            tr = ml.tools.execute("describe_training", {"run_id": rid})["value"]
+            assert "fid/ok" in tr["tags"], (
+                "`metrics` 在第 0 轮失败后**整场再没被调用**（永久关闭）⇒ "
+                f"epoch 级 tag 缺失：{sorted(tr['tags'])[:12]}…")
+            # ② c `diag` 里也应在（若这次运行把 diag 落了盘）
+            diag = (load_record(rid).get("result") or {}).get("diag") or {}
+            if diag:
+                assert "metrics_health" in json.dumps(diag, default=str), sorted(diag)
+            else:
+                print("    （注意：这次运行的 diag 没有落进 record.json ⇒ 该断言跳过；"
+                      "事实已由 artifacts 与 checkpoint_detail 两条路径钉住）")
+        finally:
+            ml.close()
+
+
 _TESTS = [
     test_unsupported_shapes_are_rejected_teachably,
     test_row_payload_is_accepted_and_keeps_dtypes,
@@ -1166,6 +1918,18 @@ _TESTS = [
     test_concurrent_run_custom_does_not_unregister_each_other,
     # ---- L3 资源：框架级分块（§3.3）----
     test_framework_chunks_match_the_unchunked_result,
+    # ---- 第三轮：A1/A2 中途存档 + A55 步轴单位（docs/反馈-ML工具使用体验与接口审查.md）----
+    test_checkpoint_is_written_periodically_and_reports_its_step,
+    test_periodic_checkpoint_save_is_atomic_and_cleans_up_on_failure,
+    test_step_axis_units_are_reported_and_cross_family_alignment_warns,
+    # ---- Q4（2026-10-07）：`best.pt` 的选择口径可声明（用户实测 best 0.6464 vs last 0.8174）----
+    test_best_pt_selection_is_declarable_and_default_is_unchanged,
+    # ---- Q4b（2026-10-07）：周期存档也要**中途**更新 best.pt（被中断也要有最佳）----
+    test_periodic_best_pt_is_written_mid_run_so_an_interrupted_run_keeps_it,
+    # ---- Q7（2026-10-07）：续训 `resume_from`（起始 loss 要贴着断点，而不是初值）----
+    test_resume_from_starts_near_the_breakpoint_and_fails_teachably,
+    # ---- 2026-10-07 修复：`metrics` 失败**留痕 + 降级**（不许永久静默关闭）----
+    test_metrics_failure_is_traced_and_not_permanently_disabled,
 ]
 
 

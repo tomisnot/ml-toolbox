@@ -59,6 +59,71 @@ CUSTOM_CODE_KEY = "custom_network_code"
 CUSTOM_METHOD_NAME = "custom_network"
 
 
+def _guess_direction(tag: str) -> str:
+    """这个 tag 是"越大越好"还是"越小越好"（判不出回 `"unknown"`，**不猜**）。
+
+    ⚠ 复用 `ml_mecha.curve.direction`（**单一真源**：词元级匹配与"方向未知就不诊断"
+    的定论都在同一处）；`ml_mecha` 只能**惰性** import（本模块顶层 import 它会成环，
+    见模块 docstring）。
+    """
+    try:
+        from ml_mecha.curve import direction        # noqa: PLC0415 - 见上
+        return str(direction(tag))
+    except Exception:                               # noqa: BLE001
+        return "unknown"
+
+
+def _parse_best_metric(net) -> tuple[str, str, tuple | None]:
+    """解析 `Network.best_metric`（Q4）→ ``(tag, direction, error)``。
+
+    ## 契约（两种写法）
+
+    ```python
+    best_metric = "fid/sub1"              # 方向由 `curve.direction` 判（fid ⇒ higher）
+    best_metric = ("ph/std", "lower")     # 方向判不出来时**必须**显式给
+    ```
+
+    ## 为什么判不出来时**不许猜**
+
+    与 `curve.direction` 的定论同源：`ph/std`、`grad_norm` 这类量**方向本身没有好坏**，
+    猜错会让 `best.pt` 选到一个**反着的**轮次，而**回执看着一切正常**（最坏那类假绿）。
+    ⇒ 回一条可教学的错，把"怎么写"直接告诉他。
+    """
+    raw = getattr(net, "best_metric", "") or ""
+    if isinstance(raw, (tuple, list)):
+        if len(raw) != 2 or not str(raw[0]).strip():
+            return "", "", (
+                f"`best_metric` 写成 {raw!r} 认不出来",
+                '两种写法：`best_metric = "fid/sub1"`（方向自动判）或 '
+                '`best_metric = ("ph/std", "lower")`（显式给方向）',
+                "先在 `metrics` 里上报这个 tag，再写 `best_metric`")
+        tag = str(raw[0]).strip()
+        direction = str(raw[1]).strip().lower()
+        aliases = {"max": "higher", "maximum": "higher", "larger": "higher",
+                   "up": "higher", "min": "lower", "minimum": "lower",
+                   "smaller": "lower", "down": "lower"}
+        direction = aliases.get(direction, direction)
+        if direction not in ("higher", "lower"):
+            return "", "", (
+                f"`best_metric` 的方向 {raw[1]!r} 不认识",
+                '方向只能写 `"higher"`（越大越好）或 `"lower"`（越小越好）',
+                f'改成 `best_metric = ({tag!r}, "higher")`（或 "lower"）')
+        return tag, direction, None
+    tag = str(raw).strip()
+    if not tag:
+        return "", "", None
+    direction = _guess_direction(tag)
+    if direction not in ("higher", "lower"):
+        return "", "", (
+            f"声明了 `best_metric = {tag!r}`，但**判不出这个 tag 的方向**"
+            f"（`curve.direction` 回 {direction!r}）",
+            "方向判不出来时**不许猜**：猜错会让 `best.pt` 选到反着的轮次，"
+            "而回执看着一切正常。⇒ 请显式给方向",
+            f'写成 `best_metric = ({tag!r}, "higher")`（越大越好）或 '
+            f'`best_metric = ({tag!r}, "lower")`（越小越好）')
+    return tag, direction, None
+
+
 class CustomNNMethod(MLMethod):
     """AI 写的 `Network` 的宿主方法（`fit` 由本类代写）。
 
@@ -99,6 +164,18 @@ class CustomNNMethod(MLMethod):
         ParamSpec("early_stop", "早停", "select", "off", choices=["off", "on"],
                   hint="on ⇒ 验证损失连续 early_stop_patience 轮不改善就停"),
         ParamSpec("early_stop_patience", "早停耐心", "int", 10, min=1),
+        # ⭐⭐ **中途存档间隔**（2026-10-07，用户实测 A1 的修法）：此前 `checkpoint/`
+        #   只在**训练终态**写一次 ⇒ 5 小时训练中途死机＝**全部参数丢失**
+        #   （实测现场：一个跑到 284 epoch 的 run，`runs/<id>/` 下只有 `tb/`）。
+        #   ⚠ **单位是"优化步"**（一个 batch 一次 `optimizer.step()`），**不是 epoch**：
+        #   长训练里一轮可能几十分钟，按轮数存档粒度太粗。图任务没有 batch
+        #   （整图前向）⇒ 那条路上 1 epoch = 1 步（如实写在 hint 里，不让使用者猜）。
+        #   ⚠ 默认 **0 = 关**（与从前逐位一致：本仓纪律是"默认不改行为"）。
+        #   长训练请显式给（例如 `checkpoint_every=200`）。
+        ParamSpec("checkpoint_every", "中途存档间隔", "int", 0, min=0,
+                  hint="每 N 个**优化步**把 last.pt 原子落盘（0 = 关，只在终态写；"
+                       "长训练建议 200）。⚠ 图任务里 1 epoch = 1 步；"
+                       "best.pt 仍按验证损失更新"),
     ]
 
     #: 由引擎在派发前注入（``make_custom_instance``）；**不进 param_schema**
@@ -208,6 +285,23 @@ class CustomNNMethod(MLMethod):
                 hint="没有标准标签时，框架不知道拿什么算损失 ⇒ 只能由你的网络给"
                      "（`def loss(self, *, nn, n_out): return …`）",
                 suggest="要么加 `loss` 钩子，要么给数据一个标准 `target` 列")
+        # ⭐ **`best.pt` 的选择口径可声明**（Q4）：`Network.best_metric`。
+        #   使用者实测：自定义任务的主指标常常**不是** `val_loss`，而 `best.pt`
+        #   按 val_loss 选 ⇒ 同一场训练里 `best` 0.6464 vs `last` 0.8174。
+        #   ⚠ 校验放在**训练之前**：早失败比"跑完 5 小时才发现选错口径"便宜得多。
+        best_metric, best_direction, bm_err = _parse_best_metric(net)
+        if bm_err is not None:
+            return self._new_result(target_kind=kind).fail(
+                bm_err[0], kind="bad_best_metric", hint=bm_err[1], suggest=bm_err[2])
+        if best_metric and not callable(getattr(net, "metrics", None)):
+            return self._new_result(target_kind=kind).fail(
+                f"声明了 `best_metric = {best_metric!r}`，但网络**没有 `metrics` 钩子**"
+                "⇒ 那个指标永远不会被上报，也就选不出 best",
+                kind="best_metric_without_metrics",
+                hint="`best_metric` 的值来自 `Network.metrics(model, ctx)` 的返回 dict"
+                     "（每轮上报一次；`metrics_every=N` 可降频）",
+                suggest='加上 `def metrics(self, model, ctx): return {"<tag>": …}`，'
+                        "或删掉 `best_metric` 回到 val_loss 口径")
         prep = _trainer.prepare_supervised(
             X, y, kind=kind, seed=int(cfg.seed),
             val_split=float(p.get("val_split", 0.2)))
@@ -223,6 +317,45 @@ class CustomNNMethod(MLMethod):
         build_ctx = _build_ctx(payload, n_rows=int(len(prep.Xs)), n_features=n_in,
                                n_out=n_out, target_kind=kind, device=str(dev))
         model = call_network_build(net, n_in, n_out, torch.nn, ctx=build_ctx)
+        # ⭐⭐ **续训（resume）的显式入口**（Q7）：`cfg.extras["resume_state"]` 由引擎装载后
+        #   下传；在这里（`build()` **之后**）把它装进模型。
+        #   ⚠ **必须响亮**：默认 `strict=True` —— 键不匹配就失败（`pitfalls.md` A7-①：
+        #     `strict=False` 会**静默全不匹配**，模型等于随机初始化而你看不出来）。
+        #   ⚠ 顺序不能反：先 `build` 再装权重（反过来会被 build 覆盖）。
+        resume_state = run_extras.get("resume_state") or None
+        resume_meta = dict(run_extras.get("resume_meta") or {})
+        #: ⚠ **用完就地摘掉**：它是张量 dict，留在 `cfg.extras` 里会在写
+        #:   `record.json` 时炸在"不可 JSON 序列化"上（pitfalls A38）。
+        #:   （`runner.run_one` 的 finally 也会摘一次 —— 两道，因为这条太容易复现。）
+        run_extras.pop("resume_state", None)
+        resumed_at_step = None
+        resumed_at_epoch = None
+        if resume_state:
+            try:
+                loader = getattr(net, "load_state", None)
+                if callable(loader):
+                    #: 作者面钩子（可选）：需要自定义装载（分片/改名/只装一部分）时用
+                    if getattr(loader, "__code__", None) is not None \
+                            and loader.__code__.co_argcount >= 3:
+                        loader(model, resume_state)
+                    else:
+                        loader(resume_state)
+                else:
+                    model.load_state_dict(resume_state, strict=True)
+                resumed_at_step = resume_meta.get("saved_at_step")
+                resumed_at_epoch = resume_meta.get("saved_at_epoch")
+            except Exception as exc:                           # noqa: BLE001
+                miss = list(getattr(exc, "missing_keys", None) or [])
+                unexp = list(getattr(exc, "unexpected_keys", None) or [])
+                return self._new_result(target_kind=self.target_kind).fail(
+                    "续训装载失败（存档的权重与这次 `build` 出来的模型不匹配）："
+                    f"{type(exc).__name__}: {str(exc)[:300]}",
+                    kind="resume_state_mismatch",
+                    hint=(f"缺失键 {miss[:6]}；多出键 {unexp[:6]}；"
+                          if (miss or unexp) else "")
+                         + "改过 `build` 的网络结构后旧存档就装不回去了；"
+                           "要只装一部分请实现 `Network.load_state(model, state)` 钩子",
+                    suggest="确认 `resume_from` 指的是**同一套网络结构**那次运行的存档")
         # 损失/优化器：有钩子用钩子，否则给与 torch_mlp 一致的默认
         if callable(getattr(net, "loss", None)):
             lossf = net.loss(nn=torch.nn, n_out=n_out)
@@ -280,6 +413,23 @@ class CustomNNMethod(MLMethod):
         res.classes_ = (prep.label_encoder.classes_
                         if kind == "classification" and prep.label_encoder is not None
                         else None)
+        # ⭐⭐ **中途存档**（A1 的修法）：`checkpoint_every=N` ⇒ 每 N 个优化步写一份
+        #   `last.pt`。`best.pt` 的语义**不动**（仍由 `keep_best` 按验证损失留快照）。
+        ck_every = int(p.get("checkpoint_every", 0) or 0)
+        ck_saver = None
+        if ck_every > 0:
+            ck_saver = _make_periodic_checkpoint_saver(
+                run_id=run_id, source=str(compiled.source),
+                params={k: v for k, v in p.items() if k != "custom_network_code"},
+                target_kind=kind, n_in=n_in, n_out=n_out, device=str(dev),
+                meta={"n_train": int(len(prep.tr_idx)), "n_val": int(len(prep.va_idx))},
+                payload_decl=payload_decl, build_ctx=build_ctx,
+                inline_payload=_inline_payload_of(payload_decl, payload),
+                interval=ck_every,
+                #: 中途写 `best.pt` 时也要能回答"按什么选的"（Q4+Q4b）
+                best_by_info=({"tag": best_metric or "val_loss",
+                               "direction": best_direction or "lower"} if best_metric
+                              else None))
         try:
             stats = _trainer.train(
                 rec, model=model, prep=prep, torch=torch, nn=torch.nn,
@@ -303,7 +453,13 @@ class CustomNNMethod(MLMethod):
                 # ⭐ 框架分块的预算（`resource_guard.chunk_budget_mb`）：不给就用
                 #   `core.chunks` 的默认，**不影响既有行为**（默认只影响显式用了
                 #   `ctx["chunks"]` 的网络）。
-                chunk_budget_mb=_trainer.chunk_budget_from(run_extras))
+                chunk_budget_mb=_trainer.chunk_budget_from(run_extras),
+                # ⭐ 中途存档：`checkpoint_every=0`（默认）时**逐位等价于从前**
+                #   （`on_checkpoint=None` ⇒ 循环里那一段根本不进）。
+                checkpoint_every=ck_every, on_checkpoint=ck_saver,
+                # ⭐ `best.pt` 口径（Q4）：未声明时空串 ⇒ trainer 走 val_loss 老路
+                #   （**逐位等价于从前**）。
+                best_metric=best_metric, best_direction=best_direction)
         except Exception as exc:                             # noqa: BLE001
             import traceback
             res = self._new_result(target_kind=kind, params={"lr": lr}).fail(
@@ -379,6 +535,63 @@ class CustomNNMethod(MLMethod):
                 [float(stats["peak_vram_mb"])])
         # ⭐ 代码跟着运行走：跨会话能取回、能按名字复用（**别让 AI 反复重贴**）
         res.artifacts["custom_network_source"] = np.array([str(compiled.source)])
+        if resume_state:
+            #: ⭐ **续训的事实**（Q7）：写进 artifacts ⇒ "这一轮是从哪份存档接着训的"
+            #:   可反查（否则审计里查不到来源，只有"这一轮看起来收敛得快"）。
+            res.artifacts["nn_resumed_from"] = np.array([
+                f"{resume_meta.get('path', '')}"
+                f"（which={resume_meta.get('which', '')}，"
+                f"saved_at_step={resumed_at_step}）"])
+        # ⭐ **每个参数组的 lr**（Q7b）：只在**多组**时留（单组与标量 `lr` 重复 ⇒
+        #   留一个键就是噪声；而"不对称步长"正是多组才有的问题）。
+        try:
+            lr_groups = dict(getattr(rec, "lr_by_group", None) or {})
+        except Exception:                                      # noqa: BLE001
+            lr_groups = {}
+        if len(lr_groups) > 1:
+            res.artifacts["nn_lr_by_group"] = np.array(
+                [", ".join(f"{k}={v:g}" for k, v in sorted(lr_groups.items()))])
+        # ⭐ **`metrics` 健康**（2026-10-07 用户实测的静默黑洞）："作者**没写**钩子" /
+        #   "**每轮都失败**（OOM 等）" / "**名字写错**"是三种病 ⇒ 必须分得开
+        #   （修法完全不同；旧实现只表现为"TB 里一个 epoch 级 tag 都没有"）。
+        m_health = dict(stats.get("metrics_health") or {})
+        if m_health.get("failures"):
+            res.artifacts["nn_metrics_errors"] = np.array(
+                [f"metrics 失败 {int(m_health.get('failures') or 0)} 次（"
+                 f"调用 {int(m_health.get('calls') or 0)} 次）："
+                 + "；".join(str(e) for e in (m_health.get("errors") or [])[:3])])
+        if m_health.get("throttled") and not m_health.get("recovered_after_epoch"):
+            res.artifacts["nn_metrics_throttled"] = np.array(
+                [str(m_health.get("note") or "")[:300]])
+        # ⭐ **中途存档的事实**（`checkpoint_every>0` 才有）：几次真的落了盘、
+        #   最后一次在第几步、以及**失败原因**（可教学；不静默也不拖垮训练）。
+        #   ⚠ 写进 artifacts 而不是 `res.error`：写盘失败**不该**把一次成功的训练
+        #   判成失败（`ok=false` 会让 job 报"命令失败"，那是假事实）。
+        ck_stats = dict(stats.get("checkpoint") or {})
+        if ck_every > 0:
+            res.artifacts["nn_checkpoint_every"] = np.array([int(ck_every)])
+            res.artifacts["nn_checkpoint_n"] = np.array(
+                [int(ck_stats.get("n_ok") or 0)])
+            if ck_stats.get("last_step") is not None:
+                res.artifacts["nn_checkpoint_last_step"] = np.array(
+                    [int(ck_stats["last_step"])])
+            ck_errors = [str(e) for e in (ck_stats.get("errors") or [])]
+            if ck_errors:
+                res.artifacts["nn_checkpoint_errors"] = np.array(ck_errors[:4])
+        # ⭐ **`best.pt` 到底按什么选的**（Q4）：进 artifacts ⇒ `describe_run` /
+        #   存档 / 回看都看得到"这份 best 是按哪个指标、哪一步选的"。
+        #   ⚠ 留成**字符串数组**（npz 用 `allow_pickle=False`，装不下 dict）。
+        best_by = dict(stats.get("best_by") or {})
+        if best_by:
+            res.artifacts["nn_best_by"] = np.array([
+                f"{best_by.get('tag')}({best_by.get('direction')})="
+                f"{best_by.get('value')}@epoch{best_by.get('epoch')}"
+                + (f"/step{best_by.get('step')}" if best_by.get("step") is not None
+                   else "")])
+            if best_by.get("requested_tag"):
+                # 声明了但一次都没上报 ⇒ 留痕（**不静默退回**）
+                res.artifacts["nn_best_metric_missing"] = np.array(
+                    [str(best_by.get("note") or "")[:300]])
         # ⭐⭐ **真 checkpoint**（NQS 需求的最高优先项："训练完能把模型拿回来"）
         #   ⚠ 为什么不能靠 `nn_weights`：那个是**诊断产物** —— 只存 `dim()>=2` 的参数
         #   （`recorder.py:246`）⇒ **偏置/LayerNorm 根本没存**，装不回来；
@@ -390,7 +603,11 @@ class CustomNNMethod(MLMethod):
             target_kind=kind, n_in=n_in, n_out=n_out, device=str(dev),
             meta={"n_train": int(len(prep.tr_idx)), "n_val": int(len(prep.va_idx))},
             payload_decl=payload_decl,
-            build_ctx=build_ctx, inline_payload=_inline_payload_of(payload_decl, payload))
+            build_ctx=build_ctx, inline_payload=_inline_payload_of(payload_decl, payload),
+            # ⭐ "这两份是第几步写的"（A2）：终态写的那一份 = 循环总共跑了多少步。
+            saved_at_step=int(stats.get("steps") or 0),
+            saved_at_epoch=int(stats.get("epochs_run") or 0),
+            checkpoint_every=int(ck_every))
         if ckpt:
             res.artifacts["checkpoint_dir"] = np.array([ckpt["dir"]])
             # ⚠ 不能存 object 数组（写进 npz 读不回，实测踩过 `allow_pickle=False`）
@@ -408,6 +625,10 @@ class CustomNNMethod(MLMethod):
                         "device": str(dev), "steps": int(stats.get("steps", 0)),
                         "payload_keys": sorted(payload or {}),
                         "checkpoint": (ckpt or {}).get("files", []),
+                        "checkpoint_every": int(ck_every),
+                        "checkpoint_periodic": ck_stats,
+                        #: ⭐ `metrics` 健康（**不静默**）：见 artifacts 同名说明
+                        "metrics_health": dict(stats.get("metrics_health") or {}),
                         "hooks": sorted(h for h in NETWORK_HOOKS
                                         if callable(getattr(net, h, None)))}
         return res
@@ -447,6 +668,20 @@ class CustomNNMethod(MLMethod):
                 suggest="改代码后重跑；`describe_network` 可取回上一次的源码对照")
         net = compiled.instance
         n_in = int(problem.X.shape[1])
+        # ⭐ `best.pt` 的选择口径（Q4）**图任务同样支持**（GNN 的 NQS 变体也要按 `fid` 选）：
+        #   ⚠ **不许**"声明了却悄悄走 val_loss"——校验放训练之前。
+        best_metric, best_direction, bm_err = _parse_best_metric(net)
+        if bm_err is not None:
+            return self._new_result(target_kind=self.target_kind).fail(
+                bm_err[0], kind="bad_best_metric", hint=bm_err[1], suggest=bm_err[2])
+        if best_metric and not callable(getattr(net, "metrics", None)):
+            return self._new_result(target_kind=self.target_kind).fail(
+                f"声明了 `best_metric = {best_metric!r}`，但网络**没有 `metrics` 钩子**"
+                "⇒ 那个指标永远不会被上报，也就选不出 best",
+                kind="best_metric_without_metrics",
+                hint="`best_metric` 的值来自 `Network.metrics(model, ctx)` 的返回 dict",
+                suggest='加上 `def metrics(self, model, ctx): return {"<tag>": …}`，'
+                        "或删掉 `best_metric` 回到 val_loss 口径")
         # 标签：图任务按"节点分类"语义（一行一个节点一个标签）
         yv = np.asarray(problem.y)
         kind = problem.target_kind or _infer_kind(problem.y)
@@ -505,6 +740,22 @@ class CustomNNMethod(MLMethod):
         res._mu = np.zeros(n_in)
         res._sd = np.ones(n_in)
         res.classes_ = (self._le.classes_ if self._le is not None else None)
+        # ⭐ 中途存档（图任务）：与表格路径同一份实现，**单位是 epoch**
+        #   （图任务没有 batch：整图前向，一步 = 一轮）。
+        ck_every = int(p.get("checkpoint_every", 0) or 0)
+        ck_saver = None
+        if ck_every > 0:
+            ck_saver = _make_periodic_checkpoint_saver(
+                run_id=run_id, source=str(compiled.source),
+                params={k: v for k, v in p.items()},
+                target_kind=kind, n_in=n_in, n_out=n_out, device=str(dev),
+                meta={"task_mode": "graph", "n_nodes": int(len(problem.X))},
+                payload_decl=payload_decl, build_ctx=build_ctx,
+                inline_payload=_inline_payload_of(payload_decl, None),
+                interval=ck_every,
+                best_by_info=({"tag": best_metric or "val_loss",
+                               "direction": best_direction or "lower"} if best_metric
+                              else None))
         try:
             stats = _trainer.train_graph(
                 rec, model=model, problem=problem, torch=torch, nn=torch.nn,
@@ -514,7 +765,10 @@ class CustomNNMethod(MLMethod):
                 patience=int(p.get("early_stop_patience", 10)),
                 on_progress=run_extras.get("on_progress"),
                 forward_graph=fg if callable(fg) else None,
-                device=str(dev), metrics=_hook(net, "metrics"), keep_best=True)
+                device=str(dev), metrics=_hook(net, "metrics"), keep_best=True,
+                checkpoint_every=ck_every, on_checkpoint=ck_saver,
+                # ⭐ 图任务同样支持按声明的 tag 选 best（Q4）——**不许静默忽略**
+                best_metric=best_metric, best_direction=best_direction)
         except Exception as exc:                             # noqa: BLE001
             res = self._new_result(target_kind=kind, params={"lr": lr}).fail(
                 f"图任务训练失败：{type(exc).__name__}: {exc}",
@@ -562,6 +816,44 @@ class CustomNNMethod(MLMethod):
         except Exception:
             pass
         res.artifacts["custom_network_source"] = np.array([str(compiled.source)])
+        # 中途存档的事实（与表格路径同形；详见那边的说明）
+        ck_stats = dict(stats.get("checkpoint") or {})
+        if ck_every > 0:
+            res.artifacts["nn_checkpoint_every"] = np.array([int(ck_every)])
+            res.artifacts["nn_checkpoint_n"] = np.array(
+                [int(ck_stats.get("n_ok") or 0)])
+            if ck_stats.get("last_step") is not None:
+                res.artifacts["nn_checkpoint_last_step"] = np.array(
+                    [int(ck_stats["last_step"])])
+            ck_errors = [str(e) for e in (ck_stats.get("errors") or [])]
+            if ck_errors:
+                res.artifacts["nn_checkpoint_errors"] = np.array(ck_errors[:4])
+        # ⭐ `best.pt` 的选择口径（Q4）：图任务同样报出来（与表格路径同形）
+        best_by_g = dict(stats.get("best_by") or {})
+        if best_by_g:
+            res.artifacts["nn_best_by"] = np.array([
+                f"{best_by_g.get('tag')}({best_by_g.get('direction')})="
+                f"{best_by_g.get('value')}@epoch{best_by_g.get('epoch')}"
+                + (f"/step{best_by_g.get('step')}"
+                   if best_by_g.get("step") is not None else "")])
+            if best_by_g.get("requested_tag"):
+                res.artifacts["nn_best_metric_missing"] = np.array(
+                    [str(best_by_g.get("note") or "")[:300]])
+        # ⭐ 每个参数组的 lr（Q7b）：图任务也留一份（与表格路径同形）
+        try:
+            lr_groups_g = dict(getattr(rec, "lr_by_group", None) or {})
+        except Exception:                                      # noqa: BLE001
+            lr_groups_g = {}
+        if len(lr_groups_g) > 1:
+            res.artifacts["nn_lr_by_group"] = np.array(
+                [", ".join(f"{k}={v:g}" for k, v in sorted(lr_groups_g.items()))])
+        # ⭐ `metrics` 健康（图任务同样报：**不静默**）
+        m_health_g = dict(stats.get("metrics_health") or {})
+        if m_health_g.get("failures"):
+            res.artifacts["nn_metrics_errors"] = np.array(
+                [f"metrics 失败 {int(m_health_g.get('failures') or 0)} 次（"
+                 f"调用 {int(m_health_g.get('calls') or 0)} 次）："
+                 + "；".join(str(e) for e in (m_health_g.get("errors") or [])[:3])])
         # 图任务同样要**完整 checkpoint**（与表格路径同一份实现）
         ckpt = _save_checkpoints(
             run_id=run_id, res=res, stats=stats, source=str(compiled.source),
@@ -571,7 +863,10 @@ class CustomNNMethod(MLMethod):
             payload_decl=payload_decl,
             # ⚠ 图路径**没有 `payload` 局部变量**（负载是表格路径的东西）⇒ 显式给 None，
             #   否则 `NameError`（实测：这一处漏了会连带把 GNN 判据打红）。
-            build_ctx=build_ctx, inline_payload=_inline_payload_of(payload_decl, None))
+            build_ctx=build_ctx, inline_payload=_inline_payload_of(payload_decl, None),
+            saved_at_step=int(stats.get("steps") or stats.get("epochs_run") or 0),
+            saved_at_epoch=int(stats.get("epochs_run") or 0),
+            checkpoint_every=int(ck_every))
         if ckpt:
             res.artifacts["checkpoint_dir"] = np.array([ckpt["dir"]])
             res.artifacts["checkpoint_files"] = np.array(["|".join(ckpt["files"])])
@@ -597,6 +892,10 @@ class CustomNNMethod(MLMethod):
                         "best_val": stats.get("best_watch"),
                         "n_in": n_in, "n_out": n_out,
                         "graph": facts,
+                        "checkpoint_every": int(ck_every),
+                        "checkpoint_periodic": ck_stats,
+                        #: ⭐ `metrics` 健康（**不静默**）
+                        "metrics_health": dict(stats.get("metrics_health") or {}),
                         "hooks": sorted(h for h in ("build", "loss", "configure",
                                                     "forward_step", "forward_graph")
                                         if callable(getattr(net, h, None)))}
@@ -765,8 +1064,103 @@ def load_checkpoint(run_id: str, *, which: str = "best"):
     return model, ck
 
 
+def load_checkpoint_state(source: str, *, which: str = "last") -> tuple[dict, dict]:
+    """按 **run_id 或文件路径**装载 `state_dict` → ``(state_dict, meta)``（Q7 的续训入口）。
+
+    ## 两种给法（AI/人都能顺手写）
+
+    - `resume_from="custom_network-2334125-0"` ⇒ `runs/<id>/checkpoint/<which>.pt`
+    - `resume_from=r"D:\\…\\last.pt"` ⇒ 直接读那个文件
+
+    ## 三条硬纪律
+
+    1. **找不到就抛（可教学）**，**不许静默从头训** —— "以为在续训、其实从零开始"
+       是本仓最忌的假绿（而且它跑得**很好**，你只会觉得"这轮怎么这么慢才收敛"）。
+    2. `which` 越界（不是 last/best）⇒ 同样可教学地拒（`bad_resume_which`）。
+    3. **只回 `state_dict` 与元信息**：这里**不重建模型** —— 续训要用**这次的**
+       `Network.build`（他的代码可能已经改了），装载在适配器里做、并且**默认 strict**
+       （键不匹配就**响亮失败**，见 `pitfalls.md` A7-①：`strict=False` 会静默全不匹配）。
+    """
+    import torch
+    from pathlib import Path
+
+    from ...core.persistence import RUNS_DIR
+
+    w = str(which or "last").strip().lower()
+    if w in ("final",):
+        w = "last"
+    if w not in ("last", "best"):
+        raise ValueError(f"bad_resume_which|resume_which 只能是 last / best，收到 {which!r}")
+
+    raw = str(source or "").strip()
+    if not raw:
+        raise ValueError("no_resume_source|resume_from 是空的")
+    #: 像路径就给路径（含分隔符 / 以 .pt 结尾 / 盘符），否则当 run_id
+    looks_path = any(sep and sep in raw for sep in ("/", "\\")) or raw.endswith(".pt") \
+        or (len(raw) > 1 and raw[1] == ":")
+    if looks_path:
+        path = Path(raw)
+        if not path.is_file():
+            raise ValueError(f"no_resume_checkpoint|找不到要续训的存档：{path}")
+    else:
+        outdir = Path(RUNS_DIR) / raw / "checkpoint"
+        path = outdir / f"{w}.pt"
+        if not path.is_file():
+            alt = sorted(p.name for p in outdir.glob("*.pt")) if outdir.is_dir() else []
+            raise ValueError(
+                f"no_resume_checkpoint|{raw!r} 没有 {w}.pt"
+                + (f"（该目录下现有：{alt}）" if alt else "（checkpoint 目录都不存在）"))
+    try:
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:                                   # noqa: BLE001
+        raise ValueError(f"resume_unreadable|读存档失败：{type(exc).__name__}: {exc}")
+    state = ck.get("state_dict") if isinstance(ck, dict) else None
+    if not state:
+        raise ValueError("resume_no_state_dict|存档里没有 `state_dict`（顶层键："
+                         f"{sorted(ck) if isinstance(ck, dict) else type(ck).__name__}）")
+    meta = {k: v for k, v in ck.items() if k != "state_dict"} if isinstance(ck, dict) else {}
+    meta["path"] = str(path)
+    meta["which"] = w
+    return dict(state), meta
+
+
+def _resume_error_hint(detail: str) -> tuple[str, str, str]:
+    """把 `load_checkpoint_state` 的 `kind|说明` 拆成可教学三件套。"""
+    kind, _, msg = str(detail).partition("|")
+    hints = {
+        "bad_resume_which": "`resume_which` 只能是 `last`（训练终结时那一份）或 "
+                            "`best`（按 best 口径选的那一份）",
+        "no_resume_source": "`resume_from` 要么给 `run_id`，要么给 `.pt` 的绝对路径",
+        "no_resume_checkpoint": "先确认那次运行**真的写过** checkpoint"
+                                "（`checkpoint_detail(run_id=…)` 看 `files`/`tags`；"
+                                "只有 `run_custom` 写 checkpoint；"
+                                "⚠ 训练**还在跑**且没给 `checkpoint_every` 时目录还不存在）",
+        "resume_unreadable": "存档可能损坏（被中断的写盘？本仓的写盘是原子的 ⇒ 更可能是"
+                             "文件被外部改动/截断）",
+        "resume_no_state_dict": "存档顶层必须是 `{'state_dict': …}`；"
+                                "别的来源（自己 `torch.save(model)`）请先转成这个形状",
+    }
+    return (kind or "bad_resume", hints.get(kind or "", ""),
+            '改 `resume_from`（run_id 或绝对路径）与 `resume_which`（last/best）；'
+            '`checkpoint_detail(run_id=…)` 可先看有哪些存档')
+
+
 def describe_checkpoint(run_id: str) -> dict:
-    """**只读投影**：checkpoint 在不在、有哪些文件、结构摘要（**不内联权重**）。"""
+    """**只读投影**：checkpoint 在不在、有哪些文件、结构摘要（**不内联权重**）。
+
+    ## 2026-10-07 增补（用户实测 A2 的三条）
+
+    1. **每份存档各自的元信息**（`files_meta`）：原来 `params`/`meta` 只取
+       **第一个存在的文件**（`("best","last")` 的顺序 ⇒ 永远是 `best.pt`），
+       而 `last.pt` 的 `epochs_run` 在周期落盘之后**必然**更大
+       ⇒ 回执把 `best.pt` 的数字当成**整个 checkpoint** 的数字报出去（"假位置"）。
+    2. **`last_saved`：最后一次落盘在第几步**（按 mtime 取最新的那一份）。
+       这是"这份存档是不是最新的、对应训练到哪"的唯一依据。
+       ⚠ 旧存档（本改动之前写的）没有 `saved_at_step` ⇒ 如实回 `None` +
+       一句"它是**终态**写的"，**不编一个数**。
+    3. **`load_hint`：该用哪个键 load**。`{'state_dict': …}` 这一层是**静默错误**的
+       直接来源（A7-①），写在回执里比写在 README 里更不容易被漏掉。
+    """
     import torch
     from ...core.persistence import RUNS_DIR
 
@@ -774,31 +1168,146 @@ def describe_checkpoint(run_id: str) -> dict:
     if not outdir.is_dir():
         return {"run_id": str(run_id), "available": False,
                 "reason": "这个 run 没有 checkpoint 目录"
-                          "（只有 run_custom 会写；或来自更早的版本）",
-                "files": [], "tags": []}
-    files = sorted(p.name for p in outdir.iterdir() if p.is_file())
-    tags, params, meta = [], None, {}
+                          "（只有 run_custom 会写；或来自更早的版本。"
+                          "⚠ 训练**还在跑**时目录本来就不存在——"
+                          "除非你给了 `checkpoint_every`，"
+                          "那它会在第一个间隔到达时就出现）",
+                "files": [], "tags": [], "files_meta": {}, "last_saved": {},
+                "load_hint": _LOAD_HINT}
+    all_files = sorted(p.name for p in outdir.iterdir() if p.is_file())
+    # ⚠ 残留的 `.tmp-*` = **有一次落盘被打断**（原子写的临时文件没被换名）。
+    #   它是**事实**，既不该混进 `files`（那会让人以为是一份存档），也不该藏起来。
+    leftovers = [n for n in all_files if ".tmp-" in n]
+    files = [n for n in all_files if ".tmp-" not in n]
+    tags, params, meta, per_tag = [], None, {}, {}
     for tag in ("best", "last"):
         p = outdir / f"{tag}.pt"
         if not p.is_file():
             continue
         ck = torch.load(p, map_location="cpu", weights_only=False)
         tags.append(tag)
+        sd = ck.get("state_dict") or {}
+        info = {"n_tensors": len(sd),
+                "n_params": int(sum(int(t.numel()) for t in sd.values())),
+                "has_bias": sorted(k for k, t in sd.items() if t.dim() == 1)[:8],
+                "saved_at_step": _int_or_none(ck.get("saved_at_step")),
+                "saved_at_epoch": _int_or_none(ck.get("saved_at_epoch")),
+                "saved_at": str(ck.get("saved_at") or ""),
+                "save_reason": str(ck.get("save_reason") or ""),
+                "epochs_run": _int_or_none(ck.get("epochs_run")),
+                "best_epoch": _int_or_none(ck.get("best_epoch")),
+                #: ⭐ **这份 best 是按哪个指标、哪一步选的**（Q4）：未声明时它是
+                #:   `{"tag": "val_loss", …}`（与从前一致），声明了 `best_metric`
+                #:   就是那个 tag —— 使用者实测 `best` 在主指标上远差于 `last`
+                #:   （0.6464 vs 0.8174），所以"按什么选的"必须能查。
+                "best_by": (dict(ck.get("best_by") or {}) or None),
+                "val_loss_best": (dict(ck.get("val_loss_best") or {}) or None),
+                #: ⭐⭐ **`metrics` 为什么没产出 tag**（2026-10-07）：三种病必须分得开 ——
+                #:   `hook=False` ⇒ 作者**没写**钩子；
+                #:   `failures>0` ⇒ 写了但**每轮失败**（`errors` 里有类型与消息，常见是 OOM）；
+                #:   两者都正常而某个 tag 不在 `tags` 里 ⇒ **名字写错**。
+                "metrics_health": (dict(ck.get("metrics_health") or {}) or None),
+                "mtime": _mtime_iso(p)}
+        if info["saved_at_step"] is None:
+            # 不编数：旧存档是**终态**写的 ⇒ `epochs_run` 那个数就是它的进度。
+            info["saved_at_step_source"] = "unknown"
+            info["note"] = ("这份存档早于 `saved_at_step` 这次改动 ⇒ 它是**训练终结时**"
+                            "写的那一份，`epochs_run` 就是它的进度（中途没有存档过）")
+        else:
+            info["saved_at_step_source"] = "meta"
+        per_tag[tag] = info
         if params is None:
-            sd = ck.get("state_dict") or {}
-            params = {"n_tensors": len(sd),
-                      "n_params": int(sum(int(t.numel()) for t in sd.values())),
-                      "has_bias": sorted(k for k, t in sd.items() if t.dim() == 1)[:8]}
+            # 旧字段（**形状与语义都不变**，best 优先）——既有消费者零改动。
+            params = {"n_tensors": info["n_tensors"], "n_params": info["n_params"],
+                      "has_bias": info["has_bias"]}
             meta = {k: ck.get(k) for k in
                     ("target_kind", "n_in", "n_out", "trained_on", "tensors_on",
                      "best_epoch", "epochs_run", "source_lines")}
             meta["source_lines"] = len(str(ck.get("source") or "").splitlines())
-    return {"run_id": str(run_id), "available": bool(tags),
-            "reason": "" if tags else "目录在但没有 .pt 文件",
-            "dir": str(outdir), "files": files, "tags": tags,
-            "params": params or {}, "meta": meta,
-            "note": "权重**不内联**（几十万个数不进对话）。要真用它："
-                    "`eval_custom(run_id=…, code=…)` 由系统装载后交给你的代码。"}
+    # 最新那一份：**先按落盘步号**（它就是"进度"），步号未知（旧存档）时按
+    # **mtime（纳秒级）**，最后平手时偏向 `last`（循环里它是**后写**的那一份）。
+    # ⚠ 别用 ISO 秒串比：同一秒内写完两份时它分不出来（实测：best 与 last 都落在
+    #   同一秒 ⇒ "最后一次落盘"被报成了 best）。
+    def _rank(tag: str) -> tuple:
+        info = per_tag.get(tag) or {}
+        step = info.get("saved_at_step")
+        try:
+            ns = int((outdir / f"{tag}.pt").stat().st_mtime_ns)
+        except OSError:
+            ns = 0
+        return (step is not None, step if step is not None else -1, ns,
+                1 if tag == "last" else 0)
+
+    newest_tag = max(per_tag, key=_rank) if per_tag else ""
+    newest = per_tag.get(newest_tag) or {}
+    last_saved = ({"tag": newest_tag,
+                   "saved_at_step": newest.get("saved_at_step"),
+                   "saved_at_epoch": newest.get("saved_at_epoch"),
+                   "saved_at": newest.get("saved_at") or "",
+                   "save_reason": newest.get("save_reason") or "",
+                   "mtime": newest.get("mtime") or "",
+                   #: ⭐ `best.pt` 这条存档是**按什么选的**（Q4）——"最新的那份"与
+                   #:   "best 那份"可能是两个文件，这里只报 `last_saved` 自己的口径。
+                   "best_by": newest.get("best_by")} if newest else {})
+    out = {"run_id": str(run_id), "available": bool(tags),
+           "reason": "" if tags else "目录在但没有 .pt 文件"
+                     + (f"（只有残留的临时文件 {leftovers}：说明**有一次落盘被打断**）"
+                        if leftovers else
+                        "（⚠ 若你给了 `checkpoint_every`，看回执/存档里的 "
+                        "`nn_checkpoint_errors`：写盘失败在那边留痕）"),
+           "dir": str(outdir), "files": files, "tags": tags,
+           "params": params or {}, "meta": meta,
+           #: ⭐ 每个 tag **各自**的元信息（含"落盘于第几步"）
+           "files_meta": per_tag,
+           #: ⭐ **最后一次落盘**在第几步/第几轮（这份存档"到哪了"的唯一依据）
+           "last_saved": last_saved,
+           #: ⭐ 该用哪个键 load（`{'state_dict': …}` 这一层是静默错误的来源）
+           "load_hint": _LOAD_HINT,
+           "note": "权重**不内联**（几十万个数不进对话）。要真用它："
+                   "`eval_custom(run_id=…, code=…)` 由系统装载后交给你的代码。"}
+    if leftovers:
+        out["interrupted_saves"] = leftovers
+    #: ⭐ 顶层也放一份摘要（**最常问的那句**）：为什么没有 epoch 级 tag？
+    mh = out.get("files_meta", {}).get("last", {}).get("metrics_health")
+    if mh:
+        if not mh.get("hook"):
+            out["metrics_note"] = ("这个网络**没有 `metrics` 钩子** ⇒ 没有任何自定义"
+                                   "（epoch 级）指标 tag。要在 TB 里看自己的指标，"
+                                   "请实现 `def metrics(self, model, ctx) -> dict`")
+        elif mh.get("failures"):
+            out["metrics_note"] = (
+                f"⚠ `metrics` **失败过 {int(mh.get('failures') or 0)} 次"
+                f"（调用 {int(mh.get('calls') or 0)} 次）**⇒ 自定义 tag 会缺失："
+                + "；".join(str(e) for e in (mh.get("errors") or [])[:2])
+                + "。常见原因：在 `metrics` 里对**全量负载**做重活（OOM）⇒ 请内部分批")
+    return out
+
+
+#: 装载提示（单一真源：回执与 README 都从这里取，免得两处说法漂移）。
+_LOAD_HINT = {
+    "state_dict_key": "state_dict",
+    "how": "model.load_state_dict(torch.load(path, map_location='cpu')['state_dict'])",
+    "why": "存档顶层是 {'state_dict': …, 'source': …, 'params': …}。"
+           "直接 `load_state_dict(ck)`（整个 dict）在默认 strict=True 下会抛"
+           "（实测 121 个 missing key）；而 `strict=False` 会**静默**全不匹配"
+           "⇒ 模型等于随机初始化而你看不出来。",
+}
+
+
+def _int_or_none(value: Any):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mtime_iso(path: Path) -> str:
+    """文件的修改时间（本地 ISO 串）；取不到回空串（**不编时间**）。"""
+    import time
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime))
+    except OSError:
+        return ""
 
 
 class _PayloadMap(dict):
@@ -983,11 +1492,217 @@ def _inline_payload_of(payload_decl, payload):
     return {str(k): v for k, v in dict(payload or {}).items()}
 
 
+def _now_iso() -> str:
+    """本地时间的 ISO 串（存档元信息里"这份是什么时候写的"）。秒级足够。"""
+    import time
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _atomic_torch_save(obj: Any, path: Path) -> int:
+    """**原子**落盘一个 `torch.save` 对象；返回字节数。
+
+    ## 为什么必须原子（不是洁癖）
+
+    中途存档的**唯一价值**是"被杀死时还有一份能用的"——而 `torch.save` 直接写目标
+    路径时，进程在写一半被杀就会留下**半个 zip**：下次 `torch.load` 报的是一句
+    与真相无关的错（`PytorchStreamReader failed locating file data/…`），
+    而**上一份好的存档已经被覆盖掉了**。⇒ 先写同目录临时文件、`flush`+`fsync`、
+    再 `os.replace`（同卷上是原子的）。
+
+    ⚠ 临时文件**必须同目录**（`os.replace` 跨卷不原子）；失败时**清掉临时文件**
+    （否则 `checkpoint/` 里会攒一堆 `.tmp-*`，而下一次 `checkpoint_detail`
+    会把它们当"文件"列出来）。
+    """
+    import os
+    import time as _t
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{int(_t.time() * 1000) % 100000}")
+    try:
+        with open(tmp, "wb") as fh:                # torch.save 到文件对象：可控 flush
+            import torch
+            torch.save(obj, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)                      # 原子换名
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _checkpoint_common(*, source: str, params: dict, target_kind: str, n_in: int,
+                       n_out: int, device: str, meta: dict,
+                       payload_decl: dict | None,
+                       build_ctx: dict | None,
+                       inline_payload: dict | None) -> dict:
+    """`best.pt` / `last.pt` **共用的那一半**存档内容（单一构造点）。
+
+    ⚠ 为什么抽出来：周期存档与终态存档若各拼一遍，迟早会出现"周期那份缺
+    `build_ctx`/`payload_decl`"这种**只在中途快照上才发作**的偏差
+    （而它恰好只在"死机后拿这份续训"时暴露 —— 最难查的一类）。
+    """
+    return {"source": source, "params": dict(params or {}),
+            "target_kind": target_kind, "n_in": int(n_in),
+            "n_out": int(n_out), "tensors_on": "cpu",
+            "trained_on": str(device),
+            # ⭐ **训练负载的"声明"跟着 checkpoint 走**（不是数组）：
+            #   这样 `eval_custom` 默认就能**继承训练时的数据**
+            #   （反馈建议 4），跨重启也成立（声明里有 HDF5 路径就重读）。
+            #   ⚠ **大数组不进 .pt**：HDF5 那种靠**路径**重读。
+            "payload_decl": dict(payload_decl or {}),
+            # ⚠ 但**内联**负载（`payload={"arrays": …}`）的真值必须随存档走：
+            #   声明里只剩形状/dtype（声明必须 JSON 安全，见
+            #   `_jsonable_payload_decl`）⇒ 否则 `eval_custom` 的
+            #   "默认继承"对内联数据会**静默失效**。`torch.save` 能存 numpy。
+            "inline_payload": inline_payload,
+            # ⚠ **重建模型的充分条件**：`build` 可能依赖这份 ctx
+            #   （负载形状）⇒ 不存它，"能重建"就是假的（实测踩过：
+            #   网络在 build 里读 `payload_shapes` 时 eval_custom 直接炸）。
+            "build_ctx": dict(build_ctx or {}),
+            **dict(meta or {})}
+
+
+def _write_checkpoint_readme(outdir: Path) -> None:
+    """`checkpoint/README.txt`（人打开目录时看到的说明）。
+
+    ⚠ **文案里的工具名必须真实存在**（2026-10-07 修）：这里原来写着
+    "用 `run_checkpoint(run_id=…)` 拿定位符"，而**那个工具/查询根本不存在**
+    （全仓只有这一处字面量；真名是 `checkpoint_detail`）。这正是 pitfalls A21
+    那一类——"文档推荐的用法从没被跑过"。⇒ 现在只写**真实存在**的那三个：
+    `checkpoint_detail` / `eval_custom` / `describe_network`。
+    """
+    try:
+        outdir.mkdir(parents=True, exist_ok=True)
+        (outdir / "README.txt").write_text(
+            "这是 run_custom 的**完整** checkpoint（含 bias/LayerNorm）。\n"
+            "\n"
+            "看它有哪几个文件、多少张量、含不含偏置、**每份落在第几步**：\n"
+            "    checkpoint_detail(run_id=…)      # 只读；权重不内联\n"
+            "把模型交给你的代码（采样/算能量/换尺寸外推）：\n"
+            "    eval_custom(run_id=…, code=…)    # 由系统装载后交给你的代码\n"
+            "\n"
+            "结构：顶层是 {'state_dict': …, 'source': …, 'params': …, 'saved_at_step': …}\n"
+            "      ⇒ **必须 `model.load_state_dict(ck['state_dict'])`**（`strict=True`）。\n"
+            "        ⚠ 直接 `load_state_dict(ck)` 会抛（键是 state_dict 那一层）；\n"
+            "        而 `strict=False` 会**静默**全不匹配（实测 missing=121）⇒ 模型等于随机初始化。\n"
+            "张量一律在 CPU（自己 .to(device)）；`source` 里是那段网络代码。\n"
+            "`save_reason=periodic` ⇒ 中途存档；`=final` ⇒ 训练结束时写的那一份。\n",
+            encoding="utf-8")
+    except Exception:                                        # noqa: BLE001
+        pass                                   # 说明文件写不出来不该拖垮存档
+
+
+def _make_periodic_checkpoint_saver(*, run_id: str, source: str, params: dict,
+                                    target_kind: str, n_in: int, n_out: int,
+                                    device: str, meta: dict,
+                                    payload_decl: dict | None,
+                                    build_ctx: dict | None,
+                                    inline_payload: dict | None,
+                                    interval: int,
+                                    best_by_info: dict | None = None):
+    """造一个"每 N 步写一份 `last.pt`"的回调（交给 `trainer.train` 的 `on_checkpoint`）。
+
+    ## 契约（与 `_try_checkpoint` 对齐）
+
+    ``saver(model=…, step=…, epoch=…) -> dict``：返回**这一份存档的事实**
+    （`{"tag","saved_at_step","saved_at_epoch","saved_at","bytes","path"}`），
+    供回执/诊断引用。**只写 `last.pt`**：
+
+    - `best.pt` 的语义**一行不动**（仍由 `keep_best` 在验证改善时留快照，
+      仍在终态与 `last` 一起写）；
+    - 拿走的 state 一律 `detach().cpu().clone()`（卡上显存留给训练；
+      且存的是**那一刻**的权重，不是对 model 的引用 —— 后者会被后续 step 改掉）。
+
+    ## 失败怎么办
+
+    本函数**不吞异常**（写盘失败就让它抛），由 `trainer._try_checkpoint` 记进
+    `facts["errors"]` ⇒ 适配器写进 artifacts/diag ⇒ **训练照常，但事实留痕**。
+    这是与 TensorBoard 同一条纪律（`tb_log` 的 fail-safe）：存档是**附加的**，
+    主结果优先；但"给了 checkpoint_every 却没存档"绝不许静默。
+    """
+    outdir = Path(_runs_dir()) / str(run_id) / "checkpoint"
+    common = _checkpoint_common(
+        source=source, params=params, target_kind=target_kind, n_in=n_in,
+        n_out=n_out, device=device, meta=meta, payload_decl=payload_decl,
+        build_ctx=build_ctx, inline_payload=inline_payload)
+
+    def saver(*, model, step: int, epoch: int, best_state=None,
+              best_epoch=None, best_value=None, best_step=None) -> dict:
+        outdir.mkdir(parents=True, exist_ok=True)
+        said: dict = {}
+        # ① `last.pt`：**当前权重**（每个周期都写）
+        state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        obj = {"state_dict": state, **common, "tag": "last",
+               "save_reason": "periodic",
+               "checkpoint_every": int(interval),
+               "saved_at_step": int(step), "saved_at_epoch": int(epoch),
+               "saved_at": _now_iso()}
+        size = _atomic_torch_save(obj, outdir / "last.pt")
+        said["last"] = {"tag": "last", "save_reason": "periodic",
+                        "saved_at_step": int(step), "saved_at_epoch": int(epoch),
+                        "saved_at": obj["saved_at"], "bytes": int(size),
+                        "path": str(outdir / "last.pt")}
+        # ② ⭐⭐ `best.pt`：**在最佳快照刷新后的下一个周期**也落一份（Q4b）。
+        #    为什么必须做：否则**一次被中断的长训练只有 `last.pt`**，
+        #    拿不到"按我的指标最好的那一份"——而那正是 `checkpoint_every` 的意义。
+        #    ⚠ 写的是**快照**（`best_state`）不是当前 model：中途那一刻的 model 权重
+        #      早已不是 best 那一轮的了；写错等于把"最佳"记成"此刻"（假事实）。
+        if best_state is not None and best_epoch is not None \
+                and int(best_epoch) != saver.last_best_epoch:
+            #: ⭐ "这份 best 是按什么选的"（Q4）：**中途那份也要能回答** ——
+            #:   口径（tag/direction）来自声明，值/轮次/步号来自**这一刻的 best**。
+            b_info = dict(best_by_info or {})
+            if not b_info:
+                b_info = {"tag": "val_loss", "direction": "lower"}
+            b_info.update({"epoch": int(best_epoch),
+                           "value": best_value,
+                           "step": (int(best_step) if best_step is not None else None),
+                           "note": "中途存档（periodic）：这份 best 是"
+                                   "**训练进行中**按上面的口径选出来的"})
+            bobj = {"state_dict": best_state, **common, "tag": "best",
+                    "save_reason": "periodic",
+                    "checkpoint_every": int(interval),
+                    "saved_at_step": int(step), "saved_at_epoch": int(epoch),
+                    "saved_at": _now_iso(),
+                    #: ⭐ "这份 best 是按什么选的"（Q4）——中途快照同样要能回答
+                    "best_by": b_info,
+                    "best_epoch": int(best_epoch)}
+            bsize = _atomic_torch_save(bobj, outdir / "best.pt")
+            saver.last_best_epoch = int(best_epoch)
+            said["best"] = {"tag": "best", "save_reason": "periodic",
+                            "best_by": dict(b_info),
+                            "saved_at_step": int(step), "saved_at_epoch": int(epoch),
+                            "saved_at": bobj["saved_at"], "bytes": int(bsize),
+                            "path": str(outdir / "best.pt")}
+        # README 只在第一次写（幂等）
+        if not (outdir / "README.txt").is_file():
+            _write_checkpoint_readme(outdir)
+        return said
+
+    #: 上一次写进 `best.pt` 的"最佳轮"（避免每个周期重复写同一份 best）
+    saver.last_best_epoch = None                                   # type: ignore[attr-defined]
+    return saver
+
+
+def _runs_dir():
+    """`RUNS_DIR`（**惰性 import**：本模块顶层 import `core.persistence` 会绕圈）。"""
+    from ...core.persistence import RUNS_DIR
+    return RUNS_DIR
+
+
 def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dict,
                       target_kind: str, n_in: int, n_out: int, device: str,
                       meta: dict, payload_decl: dict | None = None,
                       build_ctx: dict | None = None,
-                      inline_payload: dict | None = None) -> dict | None:
+                      inline_payload: dict | None = None,
+                      saved_at_step: int | None = None,
+                      saved_at_epoch: int | None = None,
+                      checkpoint_every: int = 0) -> dict | None:
     """把**完整** `state_dict` 落盘（`best` 与 `last` 各一份）+ 结构源码 + 元信息。
 
     ## 为什么必须另存（不能靠 `nn_weights`）
@@ -996,58 +1711,64 @@ def _save_checkpoints(*, run_id: str, res, stats: dict, source: str, params: dic
     ⇒ **偏置 / LayerNorm 权重根本没存**，装不回来。而需求的原话是
     "训练完我要拿模型去采样、算能量"——那个模型必须能**逐参数装回**。
 
-    ⚠ `torch.save` 的对象是 `{"state_dict", "source", "meta"}`：源码一起存，
+    ⚠ `torch.save` 的对象顶层是 `{"state_dict", "source", …}`：源码一起存，
     所以"重建模型"这件事**不依赖你还记着那段代码**（与 `custom_network_source`
     同一思路，但这里是为了**装回权重**）。
+    ⇒ 装载方**必须**取 `ck["state_dict"]`：`load_state_dict(ck)`（整个 dict）
+    在默认 `strict=True` 下会抛（实测 121 个 missing key），而 `strict=False`
+    会**静默**全不匹配 ⇒ 模型等于随机初始化。`describe_checkpoint` 现在会把
+    这条**写进回执**（`load_hint.state_dict_key`），不指望人记住。
 
     ⚠ 设备说明写进 meta：**存档里的张量一律在 CPU**（卡上显存要留给训练，
     且存档不该与设备绑定）⇒ 装载方自己 `.to(device)`。
+
+    ⚠ **原子写**（`_atomic_torch_save`）：被杀时不会留下半个档，
+    也不会把上一份好的覆盖掉。
+
     @returns ``{"dir": …, "files": [...]}``；写盘失败回 `None`（**不拖垮训练**）。
     """
     if not run_id or res is None:
         return None
     try:
-        import torch
-        from ...core.persistence import RUNS_DIR
-        outdir = Path(RUNS_DIR) / run_id / "checkpoint"
+        outdir = Path(_runs_dir()) / run_id / "checkpoint"
         outdir.mkdir(parents=True, exist_ok=True)
         files = []
-        payload_common = {"source": source, "params": dict(params or {}),
-                          "target_kind": target_kind, "n_in": int(n_in),
-                          "n_out": int(n_out), "tensors_on": "cpu",
-                          "trained_on": str(device),
-                          # ⭐ **训练负载的"声明"跟着 checkpoint 走**（不是数组）：
-                          #   这样 `eval_custom` 默认就能**继承训练时的数据**
-                          #   （反馈建议 4），跨重启也成立（声明里有 HDF5 路径就重读）。
-                          #   ⚠ **大数组不进 .pt**：HDF5 那种靠**路径**重读。
-                          "payload_decl": dict(payload_decl or {}),
-                          # ⚠ 但**内联**负载（`payload={"arrays": …}`）的真值必须随存档走：
-                          #   声明里只剩形状/dtype（声明必须 JSON 安全，见
-                          #   `_jsonable_payload_decl`）⇒ 否则 `eval_custom` 的
-                          #   "默认继承"对内联数据会**静默失效**。`torch.save` 能存 numpy。
-                          "inline_payload": inline_payload,
-                          # ⚠ **重建模型的充分条件**：`build` 可能依赖这份 ctx
-                          #   （负载形状）⇒ 不存它，"能重建"就是假的（实测踩过：
-                          #   网络在 build 里读 `payload_shapes` 时 eval_custom 直接炸）。
-                          "build_ctx": dict(build_ctx or {}),
-                          **dict(meta or {})}
+        common = _checkpoint_common(
+            source=source, params=params, target_kind=target_kind, n_in=n_in,
+            n_out=n_out, device=device, meta=meta, payload_decl=payload_decl,
+            build_ctx=build_ctx, inline_payload=inline_payload)
+        if saved_at_step is None:
+            saved_at_step = int(stats.get("steps") or 0)
+        if saved_at_epoch is None:
+            saved_at_epoch = int(stats.get("epochs_run") or 0)
         for tag, key in (("best", "best_state"), ("last", "last_state")):
             state = stats.get(key)
             if not state:
                 continue
             path = outdir / f"{tag}.pt"
-            torch.save({"state_dict": state, **payload_common,
-                        "tag": tag, "best_epoch": stats.get("best_epoch"),
-                        "epochs_run": stats.get("epochs_run")}, path)
+            _atomic_torch_save(
+                {"state_dict": state, **common, "tag": tag, "save_reason": "final",
+                 # ⭐ **"这份文件是第几步写的"**：没有它，`last.pt` 与"训练进度"
+                 #   无法对账（用户实测 A2：拿到一份 last.pt 判断不出它对应哪一步）。
+                 "saved_at_step": int(saved_at_step),
+                 "saved_at_epoch": int(saved_at_epoch),
+                 "saved_at": _now_iso(),
+                 # 这次用的周期存档口径（0 = 没开）：存档自己说清"我这份是怎么来的"。
+                 "checkpoint_every": int(checkpoint_every),
+                 # ⭐ **best 的选择口径**（Q4）：写在**两份**里都无害，而写在
+                 #   `best.pt` 里是必须的——"这份 best 按什么选的"要能反查。
+                 "best_by": dict(stats.get("best_by") or {}),
+                 "val_loss_best": dict(stats.get("val_loss_best") or {}),
+                 #: ⭐⭐ **`metrics` 健康**（2026-10-07）：`checkpoint_detail` **只有磁盘**
+                 #:   ⇒ 这条必须跟着存档走，否则"为什么一个 epoch 级 tag 都没有"
+                 #:   跨重启就答不出来（而 `describe_run` 依赖会话内存）。
+                 "metrics_health": dict(stats.get("metrics_health") or {}),
+                 "best_epoch": stats.get("best_epoch"),
+                 "epochs_run": stats.get("epochs_run")}, path)
             files.append(path.name)
         if not files:
             return None
-        (outdir / "README.txt").write_text(
-            "这是 run_custom 的**完整** checkpoint（含 bias/LayerNorm）。\n"
-            "装载：`run_checkpoint(run_id=…)` 拿定位符；"
-            "`eval_custom(from_run=…, code=…)` 由系统装载后交给你的代码。\n"
-            "张量在 CPU（自己 .to(device)）；`source` 里是那段网络代码。\n",
-            encoding="utf-8")
+        _write_checkpoint_readme(outdir)
         files.append("README.txt")
         return {"dir": str(outdir), "files": files}
     except Exception:                                        # noqa: BLE001

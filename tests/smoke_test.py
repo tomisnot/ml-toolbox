@@ -28,6 +28,11 @@ SLOW = os.environ.get("MLTB_SLOW") == "1"
 # fast：小样本够验证"跑通 + 出指标 + 有检视页"；slow：更接近真实规模
 _N = 240 if SLOW else 60
 _SLOW_METHODS = ("umap", "tsne")        # JIT 冷启动大户，仅 slow 层跑
+#: **需要调用方提供代码**的方法：它们的代码**逐请求携带**（不在方法/注册表里），
+#: 而本脚本走"遍历方法名"的通用路径 ⇒ 必然报"没有拿到网络代码"。
+#: ⚠ 列在这里是**如实标注能力边界**，**不是**"它被修好了"——
+#: 它的判据在 `tests/test_nqs_path.py` 与 `tests/test_ai_efficiency.py`（那边带代码跑）。
+_NEEDS_CALLER_CODE = ("custom_network",)
 # fast：统一压迭代预算（resolve() 只认各方法 schema 里的键，未知键自动忽略）。
 # members 换成轻量双任务方法：stacking/voting 的基学习器不吃外层 overrides，
 # 默认 3×300 棵树 ×4 折是最大耗时户。
@@ -83,11 +88,21 @@ def check(name, ds, task_filter, cfg=None):
     skip = set(skip_methods())
     if not SLOW:
         skip |= set(_SLOW_METHODS)       # fast 层：JIT 冷启动大户移入 slow
+    #: ⭐ **需要调用方提供代码的方法**（Q5-③）：`custom_network` 的代码是**逐请求携带**的
+    #: （`cfg.extras['custom_network_code']`，见 `methods/neural/custom.py` 的说明），
+    #: 而本脚本走的是"按注册表遍历方法名"的**通用路径** ⇒ 它**必然**报
+    #: "没有拿到网络代码"。⇒ 列进 skip 并**写明理由**：
+    #: ⚠ 这不代表它没问题，也不代表它被修好了 —— 它的判据在
+    #: `tests/test_nqs_path.py` / `tests/test_ai_efficiency.py`（那边**带代码**跑）。
+    skip |= set(_NEEDS_CALLER_CODE)
     skipped = [m.name for m in methods if m.name in skip]
     methods = [m for m in methods if m.name not in skip]
     print(f"\n=== {name} | {len(methods)} 方法 | task={task_filter} ===")
     if skipped:
-        print(f"  SKIP：{', '.join(skipped)}")
+        print(f"  SKIP：{', '.join(skipped)}"
+              + ("（其中需要调用方给代码："
+                 f"{', '.join(n for n in skipped if n in _NEEDS_CALLER_CODE)}）"
+                 if any(n in _NEEDS_CALLER_CODE for n in skipped) else ""))
     recs = runner.run_batch([m.name for m in methods], spec, cfg)
     table = runner.compare_table(recs)
     fails = [r.method for r in recs if not r.result.ok]
