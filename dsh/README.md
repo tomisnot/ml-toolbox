@@ -70,8 +70,8 @@ dsh 内置客户端的 streamable-http "HTTP 世代"死区而写的；ML 先靠"
 
 ## 数据根从哪来（`MLTB_ML_ROOT`）
 
-host 半读运行期描述符时会先看环境变量 **`MLTB_ML_ROOT`**，没有才用
-`process.cwd()`。看门人起 dsh 时显式设置它。
+host 半读端口文件时会先看环境变量 **`MLTB_ML_ROOT`**，没有才用
+`process.cwd()`。它由**启动方按站点声明**注入（`DSHSpec.env`）。
 
 **为什么不只靠 cwd**：cwd 是隐式耦合——dsh 从别处起（或 cwd 不是 ML 仓根）时，
 host 半会去读**另一个**数据根的文件，甚至读到上一次会话的**残留**描述符
@@ -93,15 +93,20 @@ npm run bundle       # → lib/index.mjs（host 半）+ lib/client.js（client �
 > 直接写普通 ESM 会让 dsh 的合并包整体 SyntaxError。
 > banner 里的 `id` 必须等于 `package.json` 的 `name`（`ml-toolbox-dsh`）。
 
-没构建也能用：`launcher.py` 只在 `lib/index.mjs` 存在时才追加本插件 overlay，
-否则打一条"面板插件未构建"的降级日志——AI 模式照常，只是没有右栏面板。
+没构建也能用：`lib/index.mjs` 不存在时**不挂本插件 overlay**
+（站点声明的 `plugin_artifacts` 会就绪前置检查它：缺了**响亮失败**）
+——软件与工具面照常，只是没有右栏面板。
+
+> ⚠ **旧启动器还会自动 `npm install` / 检测产物比源码旧就重建**；
+> 那两件今天**没有承接者**（框架只查"存在"）⇒ 改了 `src/` 必须自己重建，
+> 见 `docs/旧启动器-活知识存档.md` §6「未决」。
 
 > ⚠ **改了 `src/` 之后必须 `npm run bundle` 并重启 dsh**：client 半是浏览器里的
 > 合并包，dsh 不会热加载它。面板行为没变时，先怀疑"bundle 没重建 / dsh 没重启"。
 
 ## 怎么被加载
 
-`launcher.py` 起 dsh 时带**三份** overlay：
+启动方起 dsh 时带这些 overlay（`DSHSpec.patches` + 框架生成的那一层）：
 
 ```powershell
 dsh --profile web --patch ./dsh/cordis.patch.yml `
@@ -116,7 +121,7 @@ dsh --profile web --patch ./dsh/cordis.patch.yml `
 - `runtime/dsh-ml-mcp.patch.yml`（**生成物，不入库**）：每次启动按实际 MCP 端口重写，
   内含 `@deepseek-ai/dsh-mcp-client` 条目（`- insert:` 包住）。
 
-环境变量：`MLTB_ML_ROOT` = ML 仓根（launcher 显式设置，见上一节）。
+环境变量：`MLTB_ML_ROOT` = ML 仓根（**启动方按站点声明显式设置**，见上一节）。
 
 ## 参数化：监控地址从哪来
 
@@ -144,8 +149,8 @@ EL 正是为这条死区写了自愈桥。ML 目前不写桥，所以必须知�
 
 ### 手动步骤（约 3 分钟）
 
-1. 起 AI 模式：`python launcher.py` → 选「AI 模式」（或直接
-   `python app_entry.py --authority` 后手工起 dsh）。
+1. 起整站：`python -m mecha --all --root .`（或直接
+   `python app_entry.py --mcp` 后手工起 dsh）。
 2. 在 dsh 里让 AI 调一个**只读**工具（例如问"现在有哪些方法能用？"）→ 确认能拿到结果。
    记下此时 `runtime/.ml-mecha-runtime.json` 里的 `mcp_port`（记为 P1）。
 3. **在 dsh 不退出的前提下**杀掉权威进程：
@@ -172,4 +177,6 @@ EL 正是为这条死区写了自愈桥。ML 目前不写桥，所以必须知�
 - 本插件的 host 半**只注册一个查询命令**，不 spawn/kill 进程、不写任何文件。
 - 监控端点是**只读**的（`POST` 一律 404），绑回环、无鉴权——理由见
   `ml_mecha/monitor_http.py` 的模块 docstring（读的是操作流水，不是域数据覆写面）。
-- 切回 GUI 模式在 P2 走**看门人控制台**；dsh 里的「→ GUI」按钮 + `/ml-gui` 命令属 P3。
+- ⚠ **切写权不在 dsh 里**：三层架构下它是**控制端点**上的操作
+  （`set_write_authority`），入口在**启动面板/常驻控制台**上，
+  切完**立刻生效、不动进程** —— 旧那套 `/ml-gui` + 写文件换模式已作废。

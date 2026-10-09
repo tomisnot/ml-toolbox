@@ -9,7 +9,7 @@
  * （`makeMonitorUrlHandler` + `resolveMonitorBase`）里——它是 **`file:` 依赖**
  * （junction 指向 mecha 仓那一份，磁盘上只有一份代码），不再是本仓的逐字副本。
  * 本文件只剩 ML 的三件事：**参数家**（`./ml-panel-params.ts`）、**注入**（见下）、
- * 与**数据根从哪来**（`MLTB_ML_ROOT` 环境变量，看门人起 dsh 时显式设置）。
+ * 与**数据根从哪来**（`MLTB_ML_ROOT` 环境变量，由启动方按站点声明注入，见下）。
  *
  * ## ⚠ 行为变更（相对迁移前，已申报）
  *
@@ -47,7 +47,8 @@ export const name = 'ml-toolbox-monitor'
 export const inject = ['webServer']
 
 /**
- * 数据根的环境变量名：**看门人起 dsh 时显式设置**，指向 ML 仓根。
+ * 数据根的环境变量名：由**启动方**按站点声明注入（`dsh/README.md` 的 `DSHSpec.env`），
+ * 指向 ML 仓根。
  *
  * 为什么不只靠 `process.cwd()`：cwd 是隐式耦合——dsh 从别处起（或 cwd 不是仓根）时，
  * 本半会去读**另一个**数据根的端口文件，甚至读到上一次会话的**残留**（真机排查时实测到过）。

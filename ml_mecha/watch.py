@@ -79,7 +79,7 @@ DEFAULT_FRESH_S = 300.0
 #: 终态状态集（与 mecha job 契约同名，不另造一套词）。
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled"})
 
-#: 权威端口文件名（launcher 生成）。
+#: 权威端口文件名（由**软件自己**在启动时写；名字的单一真源见 ``runtime.MCP_PORT_FILE``）。
 PORT_FILE = ".mcp-port"
 
 #: "这个句柄在作业表里查不到"的判据串（权威 ``unknown_job`` 的 kind 与消息）。

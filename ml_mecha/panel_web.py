@@ -82,7 +82,7 @@ def ensure_registry() -> None:
     except Exception:
         pass
     # ⚠ **自足地预载优化侧**：opt 的读档/取页能力是它 import 时**注册进 core 的槽**的。
-    #   只靠 launcher 传 `--preload` 不够——手动起面板（或忘了传）时 `list_runs("opt")`
+    #   只靠启动方传 `--preload` 不够——手动起面板（或忘了传）时 `list_runs("opt")`
     #   会**静默空着**（实测踩过：一次全量渲染里 opt 那 4 页一个都没出）。
     #   ⇒ 这里按**名字**载（名字是数据，不是本层的依赖，边界判据仍过）。
     if not _opt_ready():
@@ -108,8 +108,10 @@ def preload_modules(names) -> list[str]:
     用 `ast.walk` 静态扫描，连函数体内的静默 import 都算违规。而"优化运行"这一路
     确实需要 opt 层在场（它 import 时会把读档能力注册进 `core.persistence` 的槽）。
 
-    ⇒ **由 application 层（launcher）决定载什么**，本层只按名字载：名字在这里是**数据**，
+    ⇒ **由 application 层（启动方）决定载什么**，本层只按名字载：名字在这里是**数据**，
     不是本层的依赖。职责也对：选哪些层是应用的事，边界层不该知道。
+    ⚠ 今天的"启动方"可能是**框架的 supervisor**（按站点声明起服务）或**手动起的进程**
+    ⇒ 所以本层**不许假设**有人传过 `--preload`（见上面 `_ensure_opt_preloaded` 的自足兜底）。
 
     @returns 载入失败的名字（空 = 全成功）——**不静默**，调用方可据此记日志。
     """
@@ -854,7 +856,7 @@ class PanelWeb:
         """NN 的「训练过程」页 = **TensorBoard iframe**（用户裁决：嵌进 viewer）。
 
         ⚠ **按需起**：没起来时给个按钮（`GET /tensorboard?open=1`），点了起它并回到本页。
-        这样**面板自己就能把 TensorBoard 拉起来** —— 不必依赖 launcher 传地址、
+        这样**面板自己就能把 TensorBoard 拉起来** —— 不必依赖启动方传地址、
         也不必你手动开第二个进程（"更正规更简洁直接"：少一个前置条件）。
         """
         if self.tensorboard_url:
@@ -1019,10 +1021,10 @@ def resolve_panel_base(port_file, *, host: str = "127.0.0.1",
 
 
 def main(argv=None) -> int:                            # pragma: no cover - CLI 入口
-    """独立进程入口：``python -m ml_mecha.panel_web``（给 launcher 起窗口用）。"""
+    """独立进程入口：``python -m ml_mecha.panel_web``（给启动方起窗口用）。"""
     import argparse
     import sys as _sys
-    # 与 `app_entry.py` / `launcher.py` 同一惯例：Windows 控制台按 UTF-8 输出，
+    # 与 `app_entry.py` 同一惯例：Windows 控制台按 UTF-8 输出，
     # 否则中文日志在子进程里会变成乱码（实测）。
     for stream in (_sys.stdout, _sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -1036,7 +1038,7 @@ def main(argv=None) -> int:                            # pragma: no cover - CLI 
     ap.add_argument("--port-file", default=str(Path(RUNS_DIR).parent / WEB_PORT_FILE))
     ap.add_argument("--backend-url", default=None)
     ap.add_argument("--tensorboard-url", default=None)
-    # ⭐ application 层（launcher）指定要预载的层：例如 `ml_toolbox.opt.persistence`
+    # ⭐ application 层（启动方）指定要预载的层：例如 `ml_toolbox.opt.persistence`
     #   （它 import 时会把优化侧的读档能力注册进 core 的槽）。名字在这里是**数据**，
     #   所以边界层不因此依赖 opt 层（见 `preload_modules` 的说明）。
     ap.add_argument("--preload", action="append", default=[],

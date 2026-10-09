@@ -30,14 +30,18 @@ python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
 [docs/交付说明.md](docs/交付说明.md) §1–§2。这里只给启动：
 
 ```powershell
-python launcher.py                    # 看门人：弹窗选「本地 GUI 模式」/「AI 模式」
+python -m mecha --all --root .        # 起整站（本软件 + harness + 进程编排）
 ```
 
-选 **AI 模式** 后会起 headless 权威（写权出厂 LOCKED、由人类侧开闸）+ 本地 MCP 工具服务
+⚠ **进程编排整块归 mecha 的统一启动器**：本项目**不再自己编排**，
+声明在 `ml_mecha/mecha_site.py`（旧 `launcher.py` 已删；它踩出来的坑与实测常量
+抽在 [docs/旧启动器-活知识存档.md](docs/旧启动器-活知识存档.md)）。
+
+起来后会起 headless 权威（写权出厂 LOCKED、由**启动者**的声明开闸）+ 本地 MCP 工具服务
 + dsh 界面（本实例绑 3081，3080 留给官方 dsh）；在 dsh 里用自然语言让 AI 调
 `describe_methods` / `prepare_dataset` / `run_method` / `submit_run` / `read_job`，
 点会话头「◈ 监控」看只读驾驶舱（飞行记录仪 / 配置态 / 运行记录 / 磁盘存档）。
-模式切换用看门人控制台敲 `gui` / `ai` / `quit`。
+⚠ **切写权在启动面板/控制端点上**（不是"重启换模式"）：切完**立刻生效**，进程不重启。
 
 - 使用者请看 [docs/交付说明.md](docs/交付说明.md)（安装、启动、示例、排错）。
 

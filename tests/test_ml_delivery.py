@@ -154,8 +154,8 @@ _TIMEOUT = 90.0
 def _authority(root, *, open_gate: bool = False, toolhost=None, **kw):
     """起一台临时权威（数据根 = ``root``），yield ``(ml, host)``，退出即收尾。
 
-    ``open_gate=False`` 保持出厂 ``LOCKED``（判据 4 靠它）；``True`` 模拟看门人
-    代理启动意图开闸（判据 5 靠它）。``toolhost`` 给了就**在起服务之前**换掉传输
+    ``open_gate=False`` 保持出厂 ``LOCKED``（判据 4 靠它）；``True`` 模拟
+    **启动者声明的初始写权**（框架按站点声明的 ``initial_mode`` 送来；判据 5 靠它）。``toolhost`` 给了就**在起服务之前**换掉传输
     seam（null 垫片判据用它做"只记录、不执行"的观测宿主，见 :class:`_StubToolHost`）；
     替换前先把真宿主交给它 ``attach``——声明面必须照抄真宿主，否则框架的 reach 守卫
     （"端点列得出、toolhost 声明 0 个"＝绑错注册表）会如实报错。
@@ -245,12 +245,49 @@ def _spawned_authority(root, *, open_gate: bool = True, extra_args=()):
             sup.shutdown()
 
 
-def _supervisor_proc(sup):
-    """取监督者里那个 child 的 Popen（判据要读退出码/pid 时用）。"""
-    for child in getattr(sup, "_children", {}).values():
-        if getattr(child, "id", None) == "ml":
-            return getattr(child, "proc", None) or getattr(child, "_proc", None)
-    return None
+def _pick_free_port(preferred: int = 3081, tries: int = 10) -> int:
+    """挑一个能绑的端口，**永不返回 3080**（官方 dsh 的端口）。
+
+    ⚠ 本文件自己的小工具：旧 ``launcher.pick_dsh_port`` 已随旧架构删除。
+    框架侧对应的是站点声明的 ``DSHSpec.port_preference`` + **回读**（铁律 6）。
+    """
+    import socket as _socket
+
+    for port in range(preferred, preferred + tries):
+        if port == 3080:
+            continue
+        with _socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return 0
+
+
+def _kill_tree(proc) -> None:
+    """杀**整棵进程树**（Windows ``taskkill /T /F``）——只 terminate 会留孤儿。
+
+    ⚠ 为什么在本文件里留这一份：这里的 dsh 是**本判据自己**起的子进程，
+    不归框架的 supervisor 管（框架用 Job Object 让整组内核级死，那是它起的孩子）。
+    孤儿的形状：``cmd.exe`` 是直系、``node`` 是孙进程 ⇒ 端口一直被占（P3 实测）。
+    """
+    import subprocess as _subprocess
+
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            _subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                            timeout=30)
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _http_get(url: str, method: str = "GET"):
@@ -1135,7 +1172,7 @@ def test_port_file_written_on_start_and_removed_on_stop():
         try:
             port = host.start(timeout=30.0)
             assert port > 0
-            assert pf.exists(), "起服务后必须写端口文件（看门人靠它发现端点）"
+            assert pf.exists(), "起服务后必须写端口文件（**发现机制**靠它找端点）"
             assert pf.read_text(encoding="utf-8").strip() == str(port)
         finally:
             host.stop()
@@ -1144,7 +1181,7 @@ def test_port_file_written_on_start_and_removed_on_stop():
 
 
 def test_stale_port_file_from_killed_run_is_replaced_on_start():
-    """上一次被强杀留下的端口文件必须被清掉/覆写（否则看门人会连死端点）。
+    """上一次被强杀留下的端口文件必须被清掉/覆写（否则启动方会连死端点）。
 
     这条是**实测得出的**：Windows 上 ``terminate()``/``taskkill /F`` 不会跑
     Python 的 ``finally``，所以"起写止删"靠不住——必须在启动时兜一次。
@@ -2490,192 +2527,11 @@ def test_dataset_roots_authorization_is_fail_closed():
                 assert body["n_rows"] > 0, body
 
 
-# ------------------------------------------------------- P1：看门人机械件
-def test_launcher_pick_dsh_port_skips_official_3080():
-    """dsh 端口从 3081 起找，**3080 硬跳过**（官方实例的端口永不占）。"""
-    import launcher
-
-    for _ in range(5):
-        port = launcher.pick_dsh_port()
-        assert port != 3080, port
-        assert 3081 <= port <= 3090, port
-
-
-def test_child_processes_force_utf8_io_encoding():
-    """⭐⭐ 子进程的 stdio **强制 UTF-8**（A7②）：一句 `print("⚠")` 不许把任务搞崩。
-
-    用户实测（原话）："我这边 Windows 是 GBK 控制台：我的网络代码里
-    `print('⚠ …')` 会让**后台任务整个崩掉**（`UnicodeEncodeError`）。"
-
-    我现场核实的真相是**更坏的那种**：这条保证当时是**偶然的** ——
-    权威进程的 stdout 恰好是真控制台（utf-8）且 `app_entry.main()` 会 reconfigure，
-    但 `PYTHONIOENCODING` **从来没设过**、`_spawn(env=None)` **什么都不注入**、
-    reconfigure 只配 stdout 且只在走到 `main()` 时发生。⇒ 只要输出被重定向
-    （`> log.txt` / 被上层按管道捕获），编码就退回 **cp936**，同一个 `print` 立刻致命
-    （证据：我自己的探针脚本当场死于 `'\u26a0'`）。
-
-    本条钉两件：
-    1. `launcher._spawn` 的子进程环境里**必须有** `PYTHONIOENCODING=utf-8`
-       （不依赖"是否走到 main()"，对所有子进程生效）；
-    2. ⭐ **端到端**：一个 **stdout 是管道** 的子进程打印 `⚠` 必须 **exit 0**
-       —— 并给出**对照组**（显式抹掉 `PYTHONIOENCODING` ⇒ 在本机应当崩），
-       以证明这条判据真的在测那个机制（对照组崩不了就如实说明，不当成通过）。
-    """
-    import io
-    import re
-    import subprocess
-
-    import launcher
-
-    # ① 注入是**默认行为**（不给 env 也要有）
-    seen = {}
-
-    class _FakePopen:
-        def __init__(self, cmd, **kw):
-            seen.update(kw)
-
-    real = launcher.subprocess.Popen
-    launcher.subprocess.Popen = _FakePopen
-    try:
-        launcher._spawn(["python", "-c", "pass"])
-    finally:
-        launcher.subprocess.Popen = real
-    env = dict(seen.get("env") or {})
-    assert env.get("PYTHONIOENCODING") == "utf-8", (
-        f"`_spawn` 没有注入 PYTHONIOENCODING ⇒ 重定向时子进程会退回 cp936：{env}")
-    # ② 调用方显式给的编码优先（判据要能构造对照组）
-    seen.clear()
-    launcher.subprocess.Popen = _FakePopen
-    try:
-        launcher._spawn(["python", "-c", "pass"],
-                        env={"PYTHONIOENCODING": "cp936", "X": "1"})
-    finally:
-        launcher.subprocess.Popen = real
-    assert (seen.get("env") or {}).get("PYTHONIOENCODING") == "cp936", seen.get("env")
-    assert (seen.get("env") or {}).get("X") == "1", seen.get("env")
-
-    # ③ 端到端：**管道**里的 `print("⚠")` 必须活着（这正是崩掉的现场）
-    code = "print('[probe] \u26a0 non-ascii')"
-    base = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
-
-    def _run(child_env):
-        p = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, env=child_env, timeout=60)
-        return p.returncode, (p.stdout or b"").decode("utf-8", "replace")
-
-    # ③ 端到端：**管道**里的 `print("⚠")` 必须活着（这正是崩掉的现场）
-    #    ⚠ 用**① 里真的从 `_spawn` 抓到的那个 env**（不是手写的等价物）——
-    #      否则这条只证明"我手写的 env 有用"，不证明"启动路径会这么写"。
-    code = "import sys; print('[enc]', sys.stdout.encoding); print('[probe] \u26a0 ok')"
-    injected = dict(env)                                     # ① 抓到的（含注入）
-    base = {k: v for k, v in injected.items() if k != "PYTHONIOENCODING"}
-
-    def _run(child_env):
-        p = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, env=child_env, timeout=60)
-        return p.returncode, (p.stdout or b"").decode("utf-8", "replace")
-
-    rc_bad, out_bad = _run(dict(base))                       # 对照组：抹掉注入
-    rc_ok, out_ok = _run(injected)                           # 实验组：启动路径给的 env
-    assert rc_ok == 0, (
-        f"注入后仍然崩了（这就是用户遇到的那个病）：rc={rc_ok} out={out_ok[:300]}")
-    assert "\u26a0" in out_ok, f"字符没到管道里：{out_ok[:200]}"
-    assert "[enc] utf-8" in out_ok, (
-        f"子进程自己的 stdout.encoding 不是 utf-8 ⇒ 注入没生效：{out_ok[:200]}")
-    #: ⭐ **对照组必须真的复现**（否则这条判据只是"看起来在测"）：本机是 cp936
-    #:   ⇒ 不注入时应当在 **print 这一步** 抛 `UnicodeEncodeError`，并说出 **codec 名**
-    #:   与**那个字符**。把两者都打出来，作为"修复前确实会崩"的证据。
-    m = re.search(r"UnicodeEncodeError: '([\w-]+)' codec can't encode character "
-                  r"'([^']*)'", out_bad)
-    if rc_bad == 0:
-        print("    （注意：本机没能复现对照组的崩溃 ⇒ 机制由 ① 的注入断言钉住；"
-              f"观测：rc=0 out={out_ok[:80]!r}）")
-    else:
-        assert m, f"对照组崩了但不是编码错（那就不是这条判据要测的机制）：{out_bad[:300]}"
-        codec, ch = m.group(1), m.group(2)
-        print(f"    （对照组**复现**了用户的病：codec={codec!r} 字符={ch!r} "
-              f"⇒ 不注入时 `print` 这一步就崩）")
-        assert codec.lower() != "utf-8", m.group(0)
-        assert "26a0" in ch.lower() or ch == "\u26a0", m.group(0)
-        # 对照组自报的编码也该是 gbk（把"现场"钉住，而不是只钉错误字符串）
-        assert "[enc] gbk" in out_bad, out_bad[:200]
-
-    # ④ ⭐ **stderr 也要被 reconfigure**（只配 stdout = 只修一半）
-    #    直接验 `app_entry.main`：把两个流都换成 cp936 的包装，跑一次 `--help`
-    #    （不开服务、立刻返回）⇒ 两个流的编码都必须变成 utf-8。
-    import io
-
-    import app_entry
-    real_out, real_err = sys.stdout, sys.stderr
-    mine_out = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
-    mine_err = io.TextIOWrapper(io.BytesIO(), encoding="gbk")
-    try:
-        sys.stdout, sys.stderr = mine_out, mine_err
-        assert app_entry.main(["--help"]) == 0
-        assert str(sys.stdout.encoding).lower().startswith("utf-8"), sys.stdout.encoding
-        assert str(sys.stderr.encoding).lower().startswith("utf-8"), (
-            f"stderr 没被 reconfigure（cp936 下 `print(…, file=sys.stderr)` 仍会崩）："
-            f"{sys.stderr.encoding}")
-    finally:
-        sys.stdout, sys.stderr = real_out, real_err
-
-
-def test_launcher_await_authority_rejects_stale_port_file():
-    """D13 就绪判据：**陈旧端口文件不算就绪**——必须内容新鲜 + HTTP 在听。
-
-    这条直接钉住"只判文件存在"的假绿：先放一个陈旧 ``.mcp-port``（指向一个
-    没人听的端口），若看门人只看存在性，它会立刻返回就绪并把 dsh 指向死端口。
-    """
-    import launcher
-
-    with tempfile.TemporaryDirectory(prefix="ml-delivery-ready-") as td:
-        root = Path(td)
-        pf = root / ".mcp-port"
-        # 陈旧文件：内容是 1（几乎肯定没人听），且 mtime 早于 spawn
-        pf.write_text("1", encoding="utf-8")
-        time.sleep(0.05)
-        pf.write_text("1", encoding="utf-8")          # 内容不变，只更新 mtime
-        stale_mtime = pf.stat().st_mtime
-
-        proc = _spawn_authority_proc(root, extra_args=["--no-open-gate"])
-        try:
-            ok, port, reason = launcher.await_authority(proc, pf, timeout=90.0)
-            assert ok is True, reason
-            assert port > 1, port
-            assert port != 1, "把陈旧端口当成就绪了"
-            assert pf.read_text(encoding="utf-8").strip() == str(port)
-            assert pf.stat().st_mtime >= stale_mtime
-            assert launcher._probe_http("127.0.0.1", port), port
-
-            # 交接纪律：terminate + 等退出 ⇒ 写租约释放（同根可再起一台权威）
-            launcher._terminate_group([proc])
-            launcher.await_exit([proc], timeout=20)
-            assert proc.poll() is not None, "等退出后进程必须真的没了"
-            second = _spawn_authority_proc(root, extra_args=["--no-open-gate"])
-            try:
-                assert second.poll() is None
-                ok2, port2, reason2 = launcher.await_authority(second, pf, timeout=90.0)
-                assert ok2 is True, reason2
-                assert port2 != port, (port, port2)
-            finally:
-                launcher._terminate_group([second])
-                launcher.await_exit([second], timeout=20)
-        finally:
-            launcher._terminate_group([proc])
-            launcher.await_exit([proc], timeout=10)
-
-        # await_authority 对"起不来的权威"必须如实失败，不假装就绪
-        class _Dead:
-            returncode = 3
-
-            @staticmethod
-            def poll():
-                return 3
-
-        ok3, port3, reason3 = launcher.await_authority(_Dead(), pf, timeout=5.0)
-        assert ok3 is False and port3 is None
-        assert "退出" in reason3, reason3
-
+# ⚠ **旧看门人机械件的 4 条判据已随旧 `launcher.py` 删除**（清理归一）：
+#   D13 陈旧端口文件 / dsh 端口 3080 硬跳过 / `PYTHONIOENCODING` 注入 / 进程树终止。
+#   它们的承诺**没有丢**——改由框架门禁接管：`mecha/checks/launch_selfcheck.py`
+#   （③ 陈旧端口 / ③b 非空但没人听 / kill_tree / env_probe 四条都在那里跑）。
+#   本文件不再自建就绪判据：真子进程夹具走框架 `Supervisor` + 本仓声明的 `ReadySpec`。
 
 # ------------------------------------------------------- P2：只读监控端点
 def test_monitor_shapes_match_el_cockpit_contract():
@@ -2954,45 +2810,46 @@ def test_monitor_extra_routes_are_registered_and_core_routes_untouched():
                 ml.close()
 
 
-# ------------------------------------------------------- P2：dsh overlay 生成
-def test_generated_dsh_patch_composes_with_real_dsh():
-    """生成的 overlay 必须真能被 dsh 组合（`- insert:` + 端口 + 超时）。
+# ------------------------------------------------------- dsh 的 patch 组合
+def test_ml_dsh_patches_compose_with_real_dsh():
+    """ML 侧那份**入库** patch 必须真能被 dsh 组合（跑真 dsh CLI 的 `--dump-config`）。
 
-    这条跑**真的 dsh CLI**（`--dump-config` 只组合配置、不 mount 服务），因为
-    patch 形态错误恰恰是"静默跳过"（裸 id 被判目标不存在）——只看我们自己生成的
-    文本会漏掉这类假绿。dsh 不在 PATH 时如实说明并跳过。
+    ⚠ 为什么还要留这条：patch 形态错误恰恰是**静默跳过**（裸 id 被判目标不存在）
+    ⇒ 只看我们自己写的文本会漏掉这类假绿。
+    ⚠ **MCP 客户端那份 overlay 已归框架生成**（指向聚合端点，旧 `launcher.dsh_patch_text`
+    随旧架构删除）⇒ 那条"`- insert:` + url + toolCallTimeoutMs"的形态判据
+    **随它一起移交框架门禁**；这里只钉 ML **自己**还拥有的两层。
+    dsh 不在 PATH 时如实说明并跳过。
     """
     import shutil as _shutil
 
-    import launcher
+    from ml_mecha.mecha_site import SITE
 
     dsh_exe = _shutil.which("dsh")
     if not dsh_exe:
         print("    （跳过：PATH 里没有 dsh——patch 组合未验证）")
         return
 
+    patches = [str(p) for p in SITE.dsh.patches]
     with tempfile.TemporaryDirectory(prefix="ml-delivery-patch-") as td:
-        patch = launcher.write_dsh_patch(Path(td) / "dsh-ml-mcp.patch.yml", 59999)
-        text = patch.read_text(encoding="utf-8")
-        assert "- insert:" in text, "patch 条目必须用 `- insert:` 包住"
-        for token in ("mcp-mltoolbox", "serverName: mltoolbox",
-                      "transport: streamable-http",
-                      "url: http://127.0.0.1:59999/mcp",
-                      "failOnStartupError: true",
-                      f"toolCallTimeoutMs: {launcher.TOOL_CALL_TIMEOUT_MS}"):
-            assert token in text, token
-
-        proc = subprocess.run(
-            [dsh_exe, "--profile", "web", "--patch", str(patch), "--dump-config"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=180)
-        assert proc.returncode == 0, (proc.returncode, (proc.stdout or "")[-800:],
-                                      (proc.stderr or "")[-800:])
+        #: ⚠ 插件产物的存在性由声明的 `plugin_artifacts` 拦（缺了**响亮失败**），
+        #:   这里只跑组合，不重复那道检查。
+        patches = [p for p in patches if not p.endswith("cordis.patch.yml")
+                   or Path(p).exists()]
+        cmd = [dsh_exe, "--profile", "web"]
+        for p in patches:
+            cmd += ["--patch", p]
+        cmd += ["--dump-config"]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=180)
+        assert proc.returncode == 0, (
+            proc.returncode, (proc.stdout or "")[-800:], (proc.stderr or "")[-800:])
         dumped = proc.stdout or ""
-        assert "mcp-mltoolbox" in dumped, "组合树里没有我们的条目（被跳过了？）"
-        assert "serverName: mltoolbox" in dumped, dumped[-500:]
-        assert "url: http://127.0.0.1:59999/mcp" in dumped, dumped[-500:]
-        assert f"toolCallTimeoutMs: {launcher.TOOL_CALL_TIMEOUT_MS}" in dumped
+        # 面板插件条目必须真进了组合树（不是"目标不存在、静默跳过"）
+        assert "ml-toolbox-monitor" in dumped, (
+            "组合树里没有 ML 的面板插件条目（被静默跳过了？）" + dumped[-500:])
+        # 项目隔离层必须把 webserver 的 host/port 还原成表达式（否则 --port 不生效）
+        assert "webStartup" in dumped, dumped[-500:]
 
 
 def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
@@ -3362,17 +3219,20 @@ def test_panel_client_half_uses_same_origin_fetch_not_command():
 
 
 def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
-    """真实两进程 mount：权威 + dsh（三份 overlay）——R19 的最强代理。
+    """真实两进程 mount：软件 + dsh（ML 侧两层 patch）——R19 的最强代理。
 
     断言：dsh 起来后**进程仍活着**、在挑到的端口上**真的在听 HTTP**、输出里
     **没有插件加载失败 / 语法错 / 未处理拒绝**；且**不碰官方 :3080**。
-    收尾用进程树杀（``launcher._kill_tree``）——只 terminate 会留下持有端口的
-    node 孤儿（P3 实测踩过，见 launcher 里 ``_kill_tree`` 的注释）。
+    ⚠ 权威那侧由**框架的 supervisor** 起（本文件不再自建就绪判据）；
+    ⚠ 收尾用 `Supervisor.shutdown()`（框架用 Job Object 整组死 —— 只 terminate
+    会留下持有端口的 node 孤儿，那是 P3 实测踩过的）。
+    ⚠ **MCP 客户端那份 overlay 已归框架**（指向聚合端点）⇒ 这里只挂 ML 自己
+    还拥有的两层；"工具面真接上"由框架的聚合端点判据覆盖。
     """
     import shutil as _shutil
     import socket
 
-    import launcher
+    from ml_mecha.mecha_site import SITE
 
     dsh_exe = _shutil.which("dsh")
     if not dsh_exe:
@@ -3381,21 +3241,18 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
 
     with tempfile.TemporaryDirectory(prefix="ml-delivery-mount-") as td:
         root = Path(td)
-        authority = _spawn_authority_proc(root)
         dsh_proc = None
-        try:
-            ok, mcp_port, reason = launcher.await_authority(
-                authority, root / ".mcp-port", timeout=90.0)
-            assert ok is True, reason
+        with _spawned_authority(root, open_gate=True) as (_url, sup):
+            row = next(r for r in sup.state()["children"] if r["id"] == "ml")
+            mcp_port = row["port"]
+            assert mcp_port, row
 
-            patches = launcher.dsh_overlays(mcp_port)
+            patches = [str(p) for p in SITE.dsh.patches if Path(p).exists()]
             names = [Path(p).name for p in patches]
-            # 三份都要在：插件（面板）+ 项目隔离（让 --port 生效）+ 工具接入
             assert "cordis.patch.yml" in names, names
             assert "cordis.project.patch.yml" in names, names
-            assert "dsh-ml-mcp.patch.yml" in names, names
 
-            dsh_port = launcher.pick_dsh_port()
+            dsh_port = _pick_free_port(preferred=3081)
             assert dsh_port != 3080, "绝不能占官方 dsh 的端口"
             cmd = [dsh_exe, "--profile", "web"]
             for patch in patches:
@@ -3406,60 +3263,51 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
                                         encoding="utf-8", errors="replace",
                                         env={**os.environ,
                                              "MLTB_ML_ROOT": str(root)})
-
-            deadline = time.time() + 120
-            serving = False
-            while time.time() < deadline:
-                if dsh_proc.poll() is not None:
-                    break
-                try:
-                    with socket.create_connection(("127.0.0.1", dsh_port),
-                                                  timeout=1.0):
-                        serving = True
-                        break
-                except OSError:
-                    time.sleep(0.5)
-            assert dsh_proc.poll() is None, f"dsh 提前退出 rc={dsh_proc.returncode}"
-            assert serving, f"dsh 起来了但 :{dsh_port} 没有在听"
-
-            time.sleep(3)                      # 给插件加载/工具同步留出时间
-            assert dsh_proc.poll() is None, "dsh 在启动后几秒内退出了"
-
-            # ---- 端到端真证据：dsh **同源路由**返回的 base 必须指向权威真写的端口 ----
-            from ml_mecha.runtime import MONITOR_PORT_FILE, read_port
-            real_monitor_port = read_port(root / MONITOR_PORT_FILE)
-            assert real_monitor_port, "权威没写 .ml-monitor-port"
-            code, _, body = _http_get(
-                f"http://127.0.0.1:{dsh_port}/ml-toolbox/monitor-url")
-            assert code == 200, (code, body[:300])
-            route_payload = json.loads(body)
-            assert route_payload.get("base") == \
-                f"http://127.0.0.1:{real_monitor_port}", route_payload
-            # 顺着这个 base 真去读一次监控面（证明它可直接用，不只是字符串对）
-            code, _, body = _http_get(f"{route_payload['base']}/status")
-            assert code == 200, (code, body[:300])
-            assert json.loads(body)["mode"] == "ai", body[:200]
-
-            launcher._kill_tree(dsh_proc)
             try:
-                out, _ = dsh_proc.communicate(timeout=30)
-            except subprocess.TimeoutExpired:                  # pragma: no cover
-                launcher._kill_tree(dsh_proc)
-                out, _ = dsh_proc.communicate(timeout=15)
-            output = out or ""
-            lowered = output.lower()
-            for bad in ("failed to load", "cannot find module", "unhandled rejection",
-                        "syntaxerror", "plugin load error"):
-                assert bad not in lowered, f"dsh 输出里有 {bad!r}：\n{output[-1500:]}"
-        finally:
-            if dsh_proc is not None:
-                launcher._kill_tree(dsh_proc)
+                deadline = time.time() + 120
+                serving = False
+                while time.time() < deadline:
+                    if dsh_proc.poll() is not None:
+                        break
+                    try:
+                        with socket.create_connection(("127.0.0.1", dsh_port),
+                                                      timeout=1.0):
+                            serving = True
+                            break
+                    except OSError:
+                        time.sleep(0.5)
+                assert dsh_proc.poll() is None, f"dsh 提前退出 rc={dsh_proc.returncode}"
+                assert serving, f"dsh 起来了但 :{dsh_port} 没有在听"
+
+                time.sleep(3)                      # 给插件加载留出时间
+                assert dsh_proc.poll() is None, "dsh 在启动后几秒内退出了"
+
+                # ---- 端到端真证据：dsh **同源路由**返回的 base 必须指向权威真写的端口 ----
+                from ml_mecha.runtime import MONITOR_PORT_FILE, read_port
+                real_monitor_port = read_port(root / MONITOR_PORT_FILE)
+                assert real_monitor_port, "权威没写 .ml-monitor-port"
+                code, _, body = _http_get(
+                    f"http://127.0.0.1:{dsh_port}/ml-toolbox/monitor-url")
+                assert code == 200, (code, body[:300])
+                route_payload = json.loads(body)
+                assert route_payload.get("base") == \
+                    f"http://127.0.0.1:{real_monitor_port}", route_payload
+                # 顺着这个 base 真去读一次监控面（证明它可直接用，不只是字符串对）
+                code, _, body = _http_get(f"{route_payload['base']}/status")
+                assert code == 200, (code, body[:300])
+                assert json.loads(body)["mode"] == "ai", body[:200]
+            finally:
+                _kill_tree(dsh_proc)
                 try:
-                    dsh_proc.wait(timeout=20)
+                    out, _ = dsh_proc.communicate(timeout=30)
                 except subprocess.TimeoutExpired:              # pragma: no cover
-                    pass
-            launcher._terminate_group([authority])
-            launcher.await_exit([authority], timeout=20)
+                    _kill_tree(dsh_proc)
+                    out, _ = dsh_proc.communicate(timeout=15)
+                output = out or ""
+                lowered = output.lower()
+                for bad in ("failed to load", "cannot find module",
+                            "unhandled rejection", "syntaxerror", "plugin load error"):
+                    assert bad not in lowered, f"dsh 输出里有 {bad!r}：\n{output[-1500:]}"
 
 
 #: ⭐ **内省收集**（2026-10-03 改）：此前这里是**手写**的判据清单，而门禁用
