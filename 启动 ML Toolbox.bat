@@ -12,6 +12,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM ⭐ 要【不开黑框】地起（需求 6 的"0 黑框"）=> 用**框架的无黑框入口**：
+REM      <框架仓>\start_mecha.pyw   （双击即可；站点根清单写进 mecha_roots.txt）
+REM    ⚠ 本窗口是**带日志**的那条路 => 首次跑 / 出问题时**用它更有用**（看得见输出）。
+
 REM ⚠ cwd 必须是项目仓（声明发现点 `ml_mecha/mecha_site.py` 在仓内），
 REM   并用 `--root` 显式告诉框架去哪儿找声明（不靠 cwd 的隐式约定）。
 python -m mecha --all --root "%~dp0"
