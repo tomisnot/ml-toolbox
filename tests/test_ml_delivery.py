@@ -2909,54 +2909,59 @@ def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
     assert "commands.execute" not in client_code, \
         "客户端不得经 commands.execute 取地址（会污染会话 + 形状脆弱）"
     assert "remote.commands" not in client_code, "客户端不该再依赖 remote.commands"
-    # host 半必须用**共享的**地址实现（参数块给路由与端口文件名）
-    assert "makeMonitorUrlHandler" in host_code, "host 半没有用共享的地址路由实现"
-    assert "monitor_url" not in host_code and ".ml-monitor-port" not in host_code, \
-        "host 半不该自己写端口文件名（单一来源是参数块 PANEL_CONFIG.PORT_FILE）"
+    # ⚠ **2026-10-09 删掉两条**（监控地址路由上提进框架）：原先这里钉"host 半必须用**共享的**
+    #   地址实现 + 端口文件名只来自参数块" —— 而那条路由与那份参数**都不在本仓了**
+    #   （`dsh/src/index.ts` 只剩**空载体**；框架按声明注册路由并现取端口）。
+    #   ⇒ 承诺换人，由 mecha 的 `host-plugin/mecha-panel-host.test.ts`（含与资产实现的等价判据）
+    #     与 `checks/phase13_panel_decl_selfcheck` 守；本仓这边由新的
+    #     `test_panel_host_half_is_a_carrier_and_registers_no_route` **反向**钉住"不许再加回来"。
 
     # 页签：标准两页的文案默认在资产里；ML 的两条附加页文案在本仓 client 数据层里
     panel_data = (dsh_dir / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-data.ts").read_text(
         encoding="utf-8")
     for label in ("飞行记录仪", "配置态"):
         assert label in panel_data, f"共享面板缺少标准页签 {label!r}"
-    # ⚠ 附加页声明住在 `client/extraPages.ts`（无 react 的数据层，可 node 直测）
-    extra = (dsh_dir / "src" / "client" / "extraPages.ts").read_text(
-        encoding="utf-8")
-    for label in ("运行记录", "磁盘存档"):
-        assert label in extra, f"本仓 client 未声明附加页签 {label!r}"
+    # ⚠ **2026-10-09 删掉下面三条**（附加页的页签与文案在**阶段② 就搬进声明**了）：
+    #   原先它们在本仓 `dsh/src/client/extraPages.ts` 里找「运行记录 / 磁盘存档」，
+    #   而那个文件现在只放**呈现细化**（取值/格式化的函数）⇒ 实测在 HEAD 上就是红的。
+    #   ⇒ 页签与文案由**声明**持有（本文件上一条判据 `test_panel_runs_page_...` 已经在读声明），
+    #     呈现细化由 `dsh/test/panel-extra-pages.test.ts` 守。
 
 
 def test_panel_runs_page_shows_readable_error_instead_of_blank():
     """D6 的面板侧：``/runs`` 取数失败要显示**可读错误**，不能渲染成空表。
 
-    ⚠ **迁移后本条判据的对象变了**（强度不变）：这条性质现在由**共享资产**实现——
-    `panel-view.ts::extraPageHtml` 的失败分支画 `unreadableText` + 真因，而"每条分支都
-    返回非空可读 HTML"由资产自己的 `panel-view.test.ts` 逐档断言（随 `npm test` 执行）。
-    本仓侧要钉的是**声明对不对**：两条附加页各自声明了 `emptyText` 与 `unreadableText`，
-    且**两者必须不同**（"确实没有数据"与"读不到"是两件事）。
+    ⚠ **2026-10-09 收窄**：原先它在本仓 `dsh/src/client/extraPages.ts` 里数
+    `emptyText:`/`unreadableText:` 与那两句文案 —— 而**阶段② 起那两份文案已经搬进声明**
+    （`ml_mecha/mecha_site.py` 的 `ExtraPage(empty_text=…, unreadable_text=…)`）
+    ⇒ 那几条断言**一直在读一个不再持有它们的文件**（实测在 HEAD 上就是红的）。
+
+    ⇒ 现在本仓侧只钉**声明**那两件事：两条附加页各自给了两套文案，且**两两不同**
+    （"确实没有数据"与"读不到"是两件事，不许共用一句）。
+    ⚠ 资产那一侧（`extraPageHtml` 的失败分支画 `unreadableText` + 真因、每条分支都非空）
+    由**资产自己的** `panel-view.test.ts` 逐档断言（随框架门禁跑），本文件不再重抄一遍。
     """
-    client = (REPO / "dsh" / "src" / "client" / "extraPages.ts").read_text(
-        encoding="utf-8")
-    view = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-view.ts").read_text(
-        encoding="utf-8")
-    # 资产把"读不到"渲染成 `unreadableText` + 真因（不是空表）
-    assert "spec.unreadableText" in view and "result.failure.detail" in view, \
-        "资产的附加页失败分支没有画可读错误（读不到 ≠ 空表）"
-    # 我的两条声明都必须给"空"与"读不到"两套文案
-    for key in ("emptyText", "unreadableText"):
-        assert client.count(key + ":") >= 2, f"两条附加页都该声明 {key}"
-    assert "不是空的" in client, "错误文案没有与「确实没有数据」区分开"
-    assert "磁盘存档读取失败" in client, "附加页缺少可读的失败文案"
-    # 资产自测覆盖"每条分支都非空"（这条性质在 npm test 里跑；此处确认判据存在，不是被删了）
-    view_test = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-view.test.ts").read_text(
-        encoding="utf-8")
-    assert "每条分支都返回**非空**可读 HTML" in view_test, \
-        "资产自测里少了「每条分支都非空」那条（性质没被守）"
-    # 附加页失败**不牵连**标准两页：取数把它们单独返回（不塞进 panelState 的 extra）
-    data = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-data.ts").read_text(
-        encoding="utf-8")
-    assert "extraRoutes: ExtraRoute[] = []" in data and "extras[r.id] =" in data, \
-        "loadPanel 没有把附加页取数单独返回（失败会牵连标准两页）"
+    import ast as _ast
+
+    src = (REPO / "ml_mecha" / "mecha_site.py").read_text(encoding="utf-8")
+    tree = _ast.parse(src)
+    pages: list[dict[str, str]] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call) and getattr(node.func, "id", "") == "ExtraPage":
+            got: dict[str, str] = {}
+            for kw in node.keywords:
+                if kw.arg in ("empty_text", "unreadable_text") and isinstance(kw.value, _ast.Constant):
+                    got[kw.arg] = str(kw.value.value)
+            pages.append(got)
+    assert len(pages) == 2, f"声明里该有两条附加页，实得 {len(pages)}"
+    for got in pages:
+        assert got.get("empty_text", "").strip(), f"某条附加页没声明 empty_text：{got}"
+        assert got.get("unreadable_text", "").strip(), f"某条附加页没声明 unreadable_text：{got}"
+        assert got["empty_text"] != got["unreadable_text"], \
+            f"「空表」与「读不到」共用了同一句文案（那是本工程最忌的混淆）：{got}"
+    # R8 自证：两两都不同（不是"两条都抄了同一句"就过）
+    all_text = [v for got in pages for v in (got["empty_text"], got["unreadable_text"])]
+    assert len(set(all_text)) == len(all_text), f"文案有重复（判据被绕过）：{all_text}"
 
 
 # ------------------------------------------------------- P3：面板的自动化代理验收
@@ -3024,58 +3029,6 @@ try {
 console.log('RESULT ' + JSON.stringify(out))
 """
 
-_CLIENT_HALF_JS = r"""
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-
-const registry = {}
-globalThis.window = { __ModuleLoader__: { load: (m) => { registry.mod = m } } }
-const code = readFileSync(join(process.env.MLTB_BUNDLE, 'client.js'), 'utf8')
-new Function('window', code)(globalThis.window)      // classic-script 形态
-const mod = registry.mod
-if (!mod) { console.log('RESULT ' + JSON.stringify({ loaded: false })); process.exit(0) }
-
-const react = {
-  createElement: (t, p, ...c) => ({ t, p, c }),
-  useState: (v) => [v, () => {}],
-  useEffect: () => {},
-  useRef: (v) => ({ current: v }),
-  useCallback: (f) => f,
-  Fragment: 'fragment',
-}
-const jsx = { jsx: (t, p) => ({ t, p }), jsxs: (t, p) => ({ t, p }) }
-const fakeRequire = (id) =>
-  id === 'react' ? react : (id === 'react/jsx-runtime' ? jsx : {})
-
-const exported = mod.factory(fakeRequire)
-const regs = []
-let bodyDesc = null
-const ctx = {
-  effect: async (fn) => fn(),
-  slots: {
-    inject: (_slot, cb) => cb(),
-    register: (desc, comp) => {
-      regs.push({ slot: desc.name, id: desc.id ?? null, key: desc.key ?? null,
-                  comp: comp && comp.name,
-                  hasInject: typeof desc.inject === 'function' })
-      if (desc.name === 'sidebar.right.pane.tab') bodyDesc = desc
-      return () => {}
-    },
-  },
-  layout: { openRightbar: () => {} },
-  sidebarRight: { openTab: () => {} },
-  sidebarRightTabs: { register: (d) => { regs.push({ tab: d.id, kind: d.kind }); return () => {} } },
-  logger: { info() {}, warn() {}, error() {} },
-}
-await exported.apply(ctx)
-
-const out = { loaded: true, name: exported.name, inject: exported.inject, regs,
-              hasApply: typeof exported.apply === 'function' }
-out.injectedKeys = Object.keys(bodyDesc.inject() || {})
-// 附加页声明必须真的进到组件 props 里（R17：声明了就得被读——不是"看起来能注入"）
-out.injectedExtraIds = (bodyDesc.inject().extraPages || []).map((p) => p.id)
-console.log('RESULT ' + JSON.stringify(out))
-"""
 
 
 def test_panel_host_half_is_a_carrier_and_registers_no_route():
@@ -3119,61 +3072,15 @@ def test_panel_host_half_is_a_carrier_and_registers_no_route():
         assert needle not in host_src, f"host 源码里仍有 {needle!r}（路由该归框架）"
 
 
-def test_panel_client_half_uses_same_origin_fetch_not_command():
-    """CLIENT 半（真产物）：地址走**共享资产**的同源 `fetch`；旧 command 形状必须失败。
-
-    ⚠ **迁移后本条判据的对象变了**（强度不变）：
-    * 注册面仍断言**本仓 client**（按钮 / tab / 注入面 / 附加页声明真的进到 props）；
-    * 取址行为改断言**共享资产**的管线源码 + **真产物 bundle**——`fetchMonitorBase`
-      不再是本仓 client 的导出（它是资产内部实现），而"喂真形状得 base / 喂旧 command
-      形状必须失败 / 空 base 必须失败"这三条负例由资产的 `monitor-client.test.ts`
-      逐条覆盖（随 `npm test` 执行）。
-    """
-    if not _node_available():
-        print("    （跳过：PATH 里没有 node）")
-        return
-    if not (REPO / "dsh" / "lib" / "client.js").exists():
-        print("    （跳过：dsh/lib 未构建）")
-        return
-    rc, out, err = _run_node(_CLIENT_HALF_JS)
-    assert rc == 0, (rc, out[-1500:], err[-1500:])
-    got = _payload(out)
-    assert got.get("loaded") is True, got
-    assert got["name"] == "ml-toolbox-monitor", got
-
-    # 依赖面：不再需要 remote.commands（那正是污染会话与形状脆弱的来源）
-    assert "slots" in got["inject"], got
-    assert "remote" not in got["inject"], got
-    assert "remote.commands" not in got["inject"], got
-
-    regs = got["regs"]
-    header = [r for r in regs if r.get("slot") == "conversation.session.header.actions"]
-    assert header and header[0]["comp"] == "CockpitButton", regs
-    assert header[0]["id"] == "ml-toolbox-monitor", header
-    tab = next(r for r in regs if r.get("tab"))
-    assert tab["tab"] == "ml-toolbox-monitor", regs
-    body = [r for r in regs if r.get("slot") == "sidebar.right.pane.tab"]
-    # tab body 现在**就是共享面板本体**（本仓不再自绘）
-    assert body and body[0]["comp"] == "MonitorTabBody", regs
-    assert body[0]["key"] == "ml-toolbox-monitor", body
-
-    # R17：声明了就必须被读——注入面只有 extraPages，且它**真的**是那两条声明
-    assert got["injectedKeys"] == ["extraPages"], got
-    assert got["injectedExtraIds"] == ["summary", "runs"], got
-
-    # 取址走共享资产的管线：同源 fetch + `cache: no-store` + 失败落 `address` 档
-    pipeline = (REPO / "dsh" / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "monitor-client.ts").read_text(
-        encoding="utf-8")
-    assert "doFetch(routePath, { cache: 'no-store' })" in pipeline, \
-        "共享管线没有同源 fetch 地址路由"
-    assert "tier: 'address'" in pipeline, "取址失败没有落 address 档（会被误报成离线）"
-    assert "isOriginLike" in pipeline, "缺少地址形状自检（垃圾地址会被当成 base）"
-    # 真产物 bundle：路由字面量来自参数块（单一来源），且**不含**任何命令调用
-    bundle = (REPO / "dsh" / "lib" / "client.js").read_text(encoding="utf-8")
-    assert "ml-toolbox/monitor-url" in bundle, \
-        "bundle 里没有地址路由字面量 ⇒ 参数块没被打进产物（bundle 陈旧？）"
-    assert "commands.execute" not in bundle and "remote.commands" not in bundle, \
-        "bundle 里出现了命令调用（地址必须走同源 fetch）"
+# ⚠ **2026-10-09 删掉一条整测试**（`test_panel_client_half_uses_same_origin_fetch_not_command`）
+#    + 它的探针 `_CLIENT_HALF_JS`：那条判据断言的是**本仓 client 半自己注册**
+#    （「◈ 监控」按钮 / 右栏 tab 类型 / 注入给人的 props）与**本仓 bundle 里带地址路由字面量**
+#    —— ⭐ 这两件事**阶段①（按钮与 tab 归框架）与阶段②（参数搬进声明 + 框架生成）就都不成立了**，
+#    它在 HEAD 上本来就是红的（实测）。⇒ 删掉，承诺逐条换人：
+#    · "按钮恒 1 个 / 按声明挂 N 个 tab / 各读各的" ⇒ mecha `dsh-panel/panel/auto.test.ts`（①②③，含红证）
+#    · "本仓 client 只留一行 bootstrap + 自己的呈现细化" ⇒ `dsh/test/ml-panel.test.ts`（含闭包检查）
+#    · "取址走同源 fetch、失败落 address 档、地址形状自检" ⇒ 资产 `panel/monitor-client.test.ts`
+#    · "地址路由现取端口" ⇒ mecha `host-plugin/mecha-panel-host.test.ts`（含与资产实现的等价判据）
 
 
 def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
