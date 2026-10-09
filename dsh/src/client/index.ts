@@ -1,18 +1,23 @@
 /**
  * ML Toolbox dsh 插件 —— **CLIENT 半**（浏览器侧 Cordis 插件）。
  *
- * 三件事：
- *  1. 会话头部「◈ 监控」按钮 → 开右栏 + 打开 `ml-toolbox-monitor` tab。
- *  2. 右栏 tab body = **共享资产的面板**（`@mecha/dsh-panel/panel/MonitorTabBody.tsx`，
- *     `file:` 依赖 ⇒ junction 指向 mecha 仓那一份，磁盘上只有一份代码）；本仓**不再自己渲染**
- *     （旧的自绘面板已删——用户已裁"ML 也并入"，三家共用一份面板）。
- *  3. **ML 的附加页用声明式列表挂上**（`ExtraPageSpec[]`）：领域词（列名/文案/取值）全留在
+ * 两件事（⚠ 按钮**不在这里**了，见下）：
+ *  1. 右栏 tab body = **共享资产的面板**（`@mecha/dsh-panel/panel/MonitorTabBody.tsx`，
+ *     `file:` 依赖 ⇒ junction 指向 mecha 仓那一份，磁盘上只有一份代码）；本仓**不再自己渲染**。
+ *  2. **ML 的附加页用声明式列表挂上**（`ExtraPageSpec[]`）：领域词（列名/文案/取值）全留在
  *     本文件，资产里零 ML 字面量。
  *
- * ## 取数走资产的管线（本文件**不再**自己 fetch）
+ * ## ⭐ 2026-10 阶段①：改用框架 helper（**按钮与 tab 注册都交给框架**）
  *
- * 地址、四基础路由取数、三档错误态（`address`/`offline`/`route`）、`empty` 档、R8 自证全在
- * `@mecha/dsh-panel/panel/` 里；本文件只声明"ML 多出来的那两页"。
+ * 原先本文件自己做三件易错的事：① 注册会话头部「◈ 监控」按钮；② 注册 `sidebarRightTabs`；
+ * ③ 注册正文字段。三家里**各写一遍** ⇒ 两个已实测的后果：
+ * - **每家一个按钮** ⇒ 3 个项目 = 3 个「◈ 监控」（用户要的是"唤醒**所有**监控面板"）；
+ * - **`title: () => panelConfig().title` 渲染时才求值** ⇒ 三家装进同一个 dsh 时
+ *   **三个 tab 的标题与取数路由全落到"最后注册那一份"**（且不报错）。
+ *
+ * ⇒ 现在只调一次 `mountClientPanel`：参数**跟着这一次注册走**（标题闭包捕获自己那份、
+ * 正文以显式 prop 收到自己那份），头部按钮由框架注册**唯一一个**（语义 = 开右栏）。
+ * ⚠ 本文件仍**必须把 `panelConfig` 交给它**（那是 ML 专有的值，资产不许猜）。
  *
  * ## ⚠ 两条已申报的行为变更（相对旧的自绘面板）
  *
@@ -25,32 +30,25 @@
  * `npm run bundle` 并**重启 dsh** 才生效（dsh 的 web client 只吃合并包）。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { configurePanel, panelConfig } from '@mecha/dsh-panel/panel/panel-config.ts'
+import { mountClientPanel } from '@mecha/dsh-panel/panel/mount-client-plugin.ts'
 import { MonitorTabBody } from '@mecha/dsh-panel/panel/MonitorTabBody.tsx'
 import type { ExtraPageSpec } from '@mecha/dsh-panel/panel/panel-view.ts'
 import { ML_PANEL } from '../ml-panel-params.ts'
-import { CockpitButton, type CockpitInjected } from './buttons'
 import { EXTRA_PAGES } from './extraPages.ts'
-
-// ⚠ **注入必须在模块顶层**（不是"更稳"，是**必需**）：client 半是**另一份 bundle、另一个进程**
-// （浏览器），host 半那次注入到不了这里；而资产的 `panelConfig()` **未注入即抛**。
-// ⚠ 漏了这一次**类型检查不会报错**（下面只在 `title()` 里才读它）⇒ 会一路绿到浏览器里才炸。
-// 有判据专门验这条往返：`test/ml-panel.test.ts`。
-configurePanel(ML_PANEL)
 
 /** Cordis 插件名（与 host 半、package.json 一致）。 */
 export const name = 'ml-toolbox-monitor'
 
-/** slots（按钮 + tab body）+ layout（开右栏）+ 右栏 tab 服务。 */
+/** slots（tab body）+ layout（开右栏）+ 右栏 tab 服务。 */
 export const inject = ['slots', 'layout', 'sidebarRight', 'sidebarRightTabs']
 
-/** 右栏 tab 的 kind/id。 */
-const TAB_ID = 'ml-toolbox-monitor'
+/** ⭐ §7.3.3 定案：逐服务一个 `kind` / 一个 `id`（契约拒绝重复 id 与同 tier 同 kind 二次注册）。 */
+const TAB_KIND = 'mecha:ML'
+const TAB_ID = 'mecha-panel:ML'
 
 /**
  * tab body 的注入面：**共享面板自己要的只有 `extraPages`**（地址与取数它自己走资产管线）。
- * slot 的 `inject()` 返回值就是组件的 props ⇒ 直接把资产组件注册进去即可，不需要包装器
- * （包装器会把 hooks 边界挪一层，且是多余的）。
+ * ⚠ 面板参数**不在这里**——由 `mountClientPanel` 以显式 prop 传给正文（各读各的）。
  */
 export interface MonitorInjected {
   extraPages: ExtraPageSpec[]
@@ -58,67 +56,15 @@ export interface MonitorInjected {
 
 export async function apply(ctx: Context): Promise<void> {
   await ctx.effect(() => {
-    // 会话头部：「◈ 监控」按钮（开右栏 + 打开我们的 tab）。
-    const disposeCockpit = ctx.slots.inject(
-      'conversation.session.header.actions',
-      () =>
-        ctx.slots.register(
-          {
-            name: 'conversation.session.header.actions',
-            id: TAB_ID,
-            order: 200,
-            label: '◈ 监控',
-            inject: (): CockpitInjected => ({
-              openCockpit: () => {
-                ctx.layout?.openRightbar?.(true, false)
-                try {
-                  ctx.sidebarRight?.openTab?.(TAB_ID)
-                } catch {
-                  /* 降级：右栏开了但 tab 没切过去，不影响面板本体 */
-                }
-              },
-            }),
-          },
-          CockpitButton,
-        ),
-    )
-
-    // 右栏 tab 类型 + body（`sidebar.right.pane.tab` 是 session 作用域 slot）。
-    const releaseTab = ctx.sidebarRightTabs?.register?.({
+    // ⭐ 一次调用管全部：标题/正文绑**ML 自己那份**参数；头部按钮由框架注册**唯一一个**。
+    const dispose = mountClientPanel(ctx as never, {
+      panelConfig: ML_PANEL,
+      kind: TAB_KIND,
       id: TAB_ID,
-      kind: TAB_ID,
-      title: () => panelConfig().title,
-    }) || null
-    const disposeBody = ctx.slots.inject('sidebar.right.pane.tab', () =>
-      ctx.slots.register(
-        {
-          name: 'sidebar.right.pane.tab',
-          key: TAB_ID,
-          inject: (): MonitorInjected => ({ extraPages: EXTRA_PAGES }),
-        },
-        MonitorTabBody as never,
-      ))
-
-    return () => {
-      if (disposeBody) {
-        try {
-          disposeBody()
-        } catch {
-          /* ignore */
-        }
-      }
-      if (typeof releaseTab === 'function') {
-        try {
-          releaseTab()
-        } catch {
-          /* ignore */
-        }
-      }
-      try {
-        disposeCockpit?.()
-      } catch {
-        /* ignore */
-      }
-    }
+      body: MonitorTabBody,
+      bodyProps: { extraPages: EXTRA_PAGES } satisfies MonitorInjected,
+      titlePrefix: '◈ 监控 · ',
+    })
+    return () => { dispose() }
   }, 'ml-toolbox-monitor: client monitor UI')
 }

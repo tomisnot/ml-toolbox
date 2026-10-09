@@ -173,9 +173,13 @@ test('⭐ 单一来源：路由字面量只在 ml-panel-params.ts，两半各注
   // host 半：自己注入（**不换 `mountHostPlugin` 骨架**——ML 没有 MCP 桥，骨架主要装桥的生命周期）
   assert.match(read('index.ts'), /^configurePanel\(ML_PANEL\)$/m,
     'host 半必须在模块顶层注入 ML 的面板参数')
-  // client 半：另一份 bundle / 另一个进程 ⇒ 它自己注入一次（host 那次的注入到不了浏览器）
-  assert.match(read('client/index.ts'), /^configurePanel\(ML_PANEL\)$/m,
-    'client 半必须自己注入 ML 的面板参数')
+  // client 半：另一份 bundle / 另一个进程 ⇒ 它自己把参数交出去（host 那次到不了浏览器）
+  // ⚠ 2026-10 阶段①：**交出方式**从"顶层 `configurePanel(ML_PANEL)`"变成
+  //   "`mountClientPanel(..., { panelConfig: ML_PANEL, ... })`"（按钮/ tab 注册归框架）。
+  //   ⇒ 判据跟着改**机制**，但断言的**性质**没变：**client 半必须把 ML 那份参数交进去**
+  //   （资产的 `openPanelConfig` 未注入即抛 ⇒ 少了它就是浏览器里才炸的那类故障）。
+  assert.match(read('client/index.ts'), /panelConfig:\s*ML_PANEL/,
+    'client 半必须把 ML 的面板参数交给框架 helper（另一份 bundle，host 那次到不了这里）')
   assert.match(read('ml-panel-params.ts'), /'\/ml-toolbox\/monitor-url'/,
     '路由字面量必须住在 ml-panel-params.ts（ML 的参数家）')
   const offenders = literalOutsideParams(ML_PANEL.routePath,
