@@ -57,7 +57,9 @@ def test_ready_port_file_matches_runtime_constant():
     """`ready.port_file` 必须与 `ml_mecha/runtime.py` 的常量**同一个名字**。
 
     ⚠ 为什么：端口文件名是**跨语言单一事实** ——
-    dsh 插件的 `portFile`（`dsh/src/ml-panel-params.ts`）也读它。
+    框架起 dsh 时注入的 `MECHA_PANEL_PORT_FILES`（由**声明**里 `MonitorSpec.port_file` 解析成
+    绝对路径）也指向同一个文件（⚠ 2026-10-09 起那条地址路由归**框架的 host 插件**，
+    项目侧那份参数常量已删）。
     两处各写一个字面量 ⇒ 改名时必然分叉，而现象是"永远不就绪"。
     """
     from ml_mecha.mecha_site import SITE

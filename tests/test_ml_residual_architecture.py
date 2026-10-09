@@ -57,8 +57,6 @@ WHITELIST_DIRS: dict[str, str] = {
     "pyproject.toml": "B 类改写后残留一句'旧 launcher 已删'（防止读者以为它还在）",
     "app_entry.py": "B 类改写：'同源'关系仍在、机制换了（旧 launcher 已删）",
     "ml_mecha/tools.py": "B 类改写：`TOOL_CALL_TIMEOUT_MS` 的值仍在用，出处指向活知识存档",
-    "dsh/lib/": "构建产物：源码注释的投影（重建即同步；判据另有'源码不许有'那条）",
-    "dsh/src/client/buttons.tsx": "换代说明：为什么 ML 不需要「→ GUI」按钮",
     "tests/test_ml_delivery.py": "换代说明：写明哪 4 条判据随旧 launcher 移交框架门禁",
     "skills/": "SKILL 文档：'旧启动方式'那段的处置见报告未决",
     ".dsh/skills/": "同上（`.dsh/` 是 `skills/` 的 junction 镜像）",
@@ -122,14 +120,41 @@ def test_no_legacy_launcher_residue_outside_whitelist():
         + "\n  ".join(bad))
 
 
+def _scanned_files() -> list[str]:
+    """扫描**读过**的文件（与命中无关）—— 用来证明"遍历范围够宽"（R8 自证的正确形式）。
+
+    ⚠ **2026-10-09 改**：原来自证写成"扫描结果里出现过 `dsh/lib/` 下的文件"，
+    而"扫描结果"只含**命中旧词**的行 ⇒ 那条自证实际依赖"构建产物里恰好还留着旧词注释"。
+    一旦把源码注释改准、重建产物 ⇒ 命中消失 ⇒ **自证假红**（实测踩到）。
+    ⇒ 覆盖度要看**读过哪些文件**，不看命中（命中归白名单那两条判据管）。
+    """
+    out: list[str] = []
+    for path in sorted(REPO.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        if any(m in path.name for m in SKIP_NAME_MARKERS):
+            continue
+        if path.suffix.lower() in SKIP_EXT:
+            continue
+        rel = path.relative_to(REPO).as_posix()
+        try:
+            path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        out.append(rel)
+    return out
+
+
 def test_scanner_reaches_gitignored_build_artifacts():
     """⭐ 自证：扫描**真的覆盖**被 gitignore 的构建产物（否则这条判据是空转）。
 
     ⚠ 为什么专门钉它：`dsh/lib/*.js` + `.map` 是构建产物、**不入库**，
     而"python 不读 JS" ⇒ 只扫 `.py/.ts` 的实现**看不到**它们（R14 的坑，本次实地踩过）。
-    这里断言"扫描结果里出现过 `dsh/lib/` 下的文件"——那证明遍历范围够宽。
+    ⚠ 断言的是**读过它们**（`_scanned_files`），不是"它们命中了旧词"（见该函数注释）。
     """
-    seen = {rel for rel, _i, _t, _l in _scan()}
+    seen = _scanned_files()
     assert any(r.startswith("dsh/lib/") for r in seen), (
         "扫描没覆盖 dsh/lib/（构建产物）⇒ 判据会在'改了 TS 忘了重建'时漏报："
         f"实际扫到 {len(seen)} 个文件")

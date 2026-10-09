@@ -26,9 +26,10 @@
  * - `sidebarRightTabs` / `sidebar.right.pane.tab` 的手写注册：同上，且
  *   `title: () => panelConfig().title` 是**渲染时求值**的 thunk ⇒ 三家装进同一个 dsh 时
  *   三个 tab 的标题与取数路由**全落到"最后注册那一份"**（阶段① 修掉的真缺陷）；
- * - 本仓的面板参数（`ML_PANEL`）：**面板参数的家已经在声明里**（`mecha_site.py`）；
- *   ⚠ `dsh/src/ml-panel-params.ts` 仍在，因为 **host 半**那条"监控地址路由"仍由本仓注册
- *   （§7.3.8 末段如实登记为下一步）。两处必须同值，由 `test/ml-panel.test.ts` 对拍钉住。
+ * - 本仓的面板参数常量（**已删**）：面板参数的家已经在声明里（`mecha_site.py`）；
+ *   ⭐ **2026-10-09 起 `ml-panel-params.ts` 也删了**（连同 host 半那条监控地址路由一起
+ *   上提进框架）：地址路由由**框架的 host 插件**按 `MECHA_PANEL_PORT_FILES` 现取端口
+ *   ⇒ 本仓**不再有**参数的第二处真值，也没有"两处必须同值"这回事了。
  *
  * ⚠ 本目录经 tsdown 打成 CJS + `__ModuleLoader__.load` 包装；改源码后须
  * `npm run bundle` 并**重启 dsh** 才生效（dsh 的 web client 只吃合并包）。

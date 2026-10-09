@@ -229,8 +229,8 @@ SITE = Site(
             #: **只在这里写一次** —— 它就是"声明 ↔ 面板"之间的唯一那份真值。
             #: ⚠ 框架把它生成成一份参数（**不含端口号**），经**框架自己的 patch** 带上的
             #: 插件交给浏览器 ⇒ 本项目 dsh 侧只留一行 bootstrap（`dsh/src/client/index.ts`）。
-            #: ⚠ 与 `dsh/src/ml-panel-params.ts` 的 `ML_PANEL` **必须同值**（host 半那条
-            #: 监控地址路由仍由本项目注册）；由 `dsh/test/ml-panel.test.ts` 的声明对拍钉住。
+            #: ⭐ 2026-10-09：**监控地址路由也由框架注册**（框架的 host 插件按 `port_file` 的
+            #: **绝对路径**现取端口）⇒ 这是那三个值的**唯一家**（项目侧那份参数常量已删）。
             monitor=MonitorSpec(
                 route_path="/ml-toolbox/monitor-url",
                 port_file=".ml-monitor-port",      # 与 ml_mecha/runtime.py 的 MONITOR_PORT_FILE 同名

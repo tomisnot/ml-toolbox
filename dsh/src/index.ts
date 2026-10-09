@@ -1,98 +1,35 @@
 /**
  * ML Toolbox dsh 插件 —— **HOST 半**（Cordis 插件，函数形态）。
  *
- * 职责**只有一件**：把 ML 只读监控端点的地址交给 client 半（面板要轮询它）。
+ * ## ⭐ 2026-10-09：它现在只是**载体**（路由与参数都上提进框架了）
  *
- * ## 现在这份实现来自共享资产**包**
+ * | 事 | 现在谁做 |
+ * |---|---|
+ * | 监控端点的**地址路由**（读 `.ml-monitor-port` 现取端口、**不回落**） | ⭐ **框架的 host 插件**（`mecha/dsh-panel/host-plugin/mecha-panel-host.mjs`，按 `MECHA_PANEL_PORT_FILES` 的**绝对**路径现读） |
+ * | 面板参数（路由 / 端口文件名 / 标题） | ⭐ **声明**（`ml_mecha/mecha_site.py` 的 `Service.monitor`）——本仓不再有第二份 |
+ * | 右栏 tab 的挂载 | ⭐ **框架的 client 插件**（`src/client/index.ts` 只留那一行 bootstrap） |
  *
- * 路由处理、端口文件解析、"绝不回落"的纪律都在 `@mecha/dsh-panel/host/monitor-url.ts`
- * （`makeMonitorUrlHandler` + `resolveMonitorBase`）里——它是 **`file:` 依赖**
- * （junction 指向 mecha 仓那一份，磁盘上只有一份代码），不再是本仓的逐字副本。
- * 本文件只剩 ML 的三件事：**参数家**（`./ml-panel-params.ts`）、**注入**（见下）、
- * 与**数据根从哪来**（`MLTB_ML_ROOT` 环境变量，由启动方按站点声明注入，见下）。
+ * ## ⚠ 那它为什么还在（"载体的代价"，如实记）
  *
- * ## ⚠ 行为变更（相对迁移前，已申报）
+ * dsh 的加载形状是"**一条 patch entry 带一个包**"：`cordis.patch.yml` 里
+ * `- id: ml-toolbox-monitor / name: './lib/index.mjs'` 既加载**这个包的 host 半**，
+ * 也（经 `package.json` 的 `dsh.client`）把**这个包的 client 半**送进浏览器。
+ * ⇒ 少了这一件，**右栏一个 tab 都没有，而且那是静默的**。
  *
- * **地址来源：两级 → 单级。** 迁移前本文件**先读 `.ml-mecha-runtime.json` 的
- * `monitor_port`，读不到再回落裸端口文件**；资产纪律是**单级、绝不回落**。
- * ⇒ 现在**只读 `.ml-monitor-port`**（`ML_PANEL.portFile`），描述符**不再参与取址**。
- * 后果（刻意）：裸端口文件缺失而描述符里有端口时，旧版能出面板、**新版回 `503` + 可读错误**
- * ——"权威没起来"不许伪装成"连上了但空面板"。
+ * ⚠ 删它需要**同时**改 `ml_mecha/mecha_site.py`（`patches` / `plugin_artifacts`）与
+ * `package.json` 的 exports —— 而"换一种加载方式"是 **dsh 的机制**，不是本仓能定的
+ * ⇒ 本轮**保留这个空载体**。（EL / GP 的 host 半不是空载体：它们还要装自愈 MCP 桥。）
  *
- * ## 为什么是同源只读 HTTP 路由，而不是一个 command
- *
- * 早先注册 `/ml-monitor-url` command，由 client 经 `remote.commands.execute(...)` 取地址。
- * 真机实测挂在两处：① command 返回类型是 `RemoteResult<CommandExecution>`，地址在
- * `value.result.text`，按 `value.text` 读永远取不到；② 每次取地址都会往会话里写
- * `command/run` + `command/done`，污染聊天记录。现在走同源 `fetch`：无包装、无跨源、
- * 无会话副作用。
- *
- * 安全红线：本插件**只读** + 只暴露一个"地址查询"路由，**不** spawn/kill 任何进程、
- * 不写任何文件。不移植 EL 的自愈 MCP 桥（ML 的工具接入走 dsh 内置
- * `@deepseek-ai/dsh-mcp-client`；自愈桥只在命中 R1 时上，见 `dsh/README.md`）。
+ * 安全红线：本插件**不** spawn/kill 任何进程、不写任何文件、也不注册任何路由。
  */
-import { configurePanel, panelConfig } from '@mecha/dsh-panel/panel/panel-config.ts'
-import { makeMonitorUrlHandler } from '@mecha/dsh-panel/host/monitor-url.ts'
-import { ML_PANEL } from './ml-panel-params.ts'
-
-// ⚠ **注入必须在模块顶层**（不是"更稳"，是**必需**）：资产的 `panelConfig()` **未注入即抛**，
-// 而这是个 **host 半**进程——client 半是另一份 bundle、另一个进程（浏览器），两半各注一次。
-// 放在 import 之后、任何读取之前，保证"本模块一加载就已注入"。
-configurePanel(ML_PANEL)
 
 /** Cordis 插件显示名（诊断用）。 */
 export const name = 'ml-toolbox-monitor'
 
-/** 只依赖 webserver 服务（注册那条只读路由）。 */
-export const inject = ['webServer']
+/** ⚠ **不再需要任何服务**：地址路由归框架（原先这里要 `webServer`，那是唯一的依赖）。 */
+export const inject: string[] = []
 
-/**
- * 数据根的环境变量名：由**启动方**按站点声明注入（`dsh/README.md` 的 `DSHSpec.env`），
- * 指向 ML 仓根。
- *
- * 为什么不只靠 `process.cwd()`：cwd 是隐式耦合——dsh 从别处起（或 cwd 不是仓根）时，
- * 本半会去读**另一个**数据根的端口文件，甚至读到上一次会话的**残留**（真机排查时实测到过）。
- * 显式环境变量把"我的数据根在哪"讲清楚；cwd 只作兜底（资产 `resolveMonitorBase` 的默认）。
- */
-export const ML_ROOT_ENV = 'MLTB_ML_ROOT'
-
-/** 本插件该读哪个数据根：显式环境变量优先；没设就交给资产用 `process.cwd()`。 */
-export function pluginRoot(): string | undefined {
-  const fromEnv = process.env[ML_ROOT_ENV]
-  return fromEnv && fromEnv.trim() ? fromEnv.trim() : undefined
-}
-
-/**
- * 路由处理：能解析就 `200 {base}`；解析不了就 `503` + 可读错误（**不回落**）。
- *
- * ⚠ **`portFile` 必须是 getter，不许"顺手简化"成普通属性**：
- * 资产的惰性只针对**读取时机**（它在每次请求时才读 `opts.portFile`），而**值表达式在
- * 调用处就被求值**。写成 `portFile: panelConfig().portFile` 的话，本模块**在 import 时**
- * 就读 `panelConfig()`——于是"某条加载路径没先注入"会变成**每次插件加载都抛**，
- * 而不是"面板请求时才 503"。且因为本文件此刻还没读面板参数，**类型检查不会报错**，
- * 会一路绿到运行时。getter 把求值推迟到真正需要那一刻，与资产的惰性对齐。
- *
- * ⚠ **每次请求现读端口文件**（资产实现，不缓存）：权威重启换端口后下一拍就落在新端口上。
- */
-export const monitorUrlHandler = makeMonitorUrlHandler({
-  get root() { return pluginRoot() },
-  get portFile() { return panelConfig().portFile },
-})
-
-/** 挂载只读路由（路径来自 ML 的参数家，只有一处字面量）。 */
-export async function apply(ctx: any): Promise<void> {
-  await ctx.effect(() => {
-    const dispose = ctx.webServer.register({
-      kind: 'exact',
-      path: panelConfig().routePath,
-      handler: monitorUrlHandler,
-    })
-    return () => {
-      try {
-        dispose()
-      } catch {
-        /* ignore */
-      }
-    }
-  }, 'ml-toolbox-monitor: monitor endpoint address route')
+/** 空的挂载点：本插件的价值在"**它被加载**"（client 半随之进 dsh），不在它做了什么。 */
+export async function apply(): Promise<void> {
+  // 有意为空（见文件头）。⚠ 不注册任何东西 ⇒ 也不留"按了没反应"的死缝。
 }

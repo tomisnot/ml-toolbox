@@ -2992,74 +2992,34 @@ def _payload(stdout: str, marker: str = "RESULT "):
 
 _HOST_HALF_JS = r"""
 import { pathToFileURL } from 'node:url'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const bundle = join(process.env.MLTB_BUNDLE, 'index.mjs')
 const mod = await import(pathToFileURL(bundle).href)
-const root = process.argv[2]
 const out = { name: mod.name, inject: mod.inject, hasApply: typeof mod.apply === 'function' }
 
-// --- apply：捕获 webServer.register 的路由 + disposer ---
-let route = null
-let disposed = false
-let disposer = null
+// ⚠ **反向断言**（2026-10-09，监控地址路由上提进框架之后）：本仓 host 半
+//    **不许**再注册任何路由 —— 那条路由由**框架的 host 插件**按声明 + 
+//    `MECHA_PANEL_PORT_FILES` 注册；同一条 `routePath` 注册两次是**接线错误**
+//    （谁生效取决于注册顺序，而那是静默的）。
+const registered = []
 const ctx = {
-  effect: async (fn) => { disposer = fn(); return disposer },
-  webServer: { register: (r) => { route = r; return () => { disposed = true } } },
+  effect: async (fn) => await fn(),
+  webServer: { register: (r) => { registered.push({ path: r && r.path, kind: r && r.kind }); return () => {} } },
   logger: { info() {}, warn() {}, error() {} },
 }
 await mod.apply(ctx)
-out.routeKind = route && route.kind
-out.routePath = route && route.path
-out.handlerIsFn = !!(route && typeof route.handler === 'function')
+out.registeredRoutes = registered
 
-// --- stub req/res：handler 拥有完整响应生命周期 ---
-function callHandler() {
-  const chunks = []
-  const res = {
-    statusCode: 0,
-    headers: {},
-    setHeader(k, v) { this.headers[k] = v },
-    end(body) { if (body) chunks.push(Buffer.from(body)) },
-  }
-  route.handler({ method: 'GET', url: route.path, headers: {} }, res)
-  return { status: res.statusCode, headers: res.headers,
-           body: Buffer.concat(chunks).toString('utf8') }
+// 对偶（不许空洞）：**没有 webServer** 时也必须照常挂载（本仓不再依赖任何服务）
+const bare = { effect: async (fn) => await fn(), logger: { info() {}, warn() {}, error() {} } }
+try {
+  await mod.apply(bare)
+  out.bareOk = true
+} catch (e) {
+  out.bareOk = false
+  out.bareErr = String(e)
 }
-
-// (a) 描述符就位 → 200 + {base}
-process.env.MLTB_ML_ROOT = root
-const okRes = callHandler()
-out.okStatus = okRes.status
-out.okContentType = okRes.headers['Content-Type']
-out.okCacheControl = okRes.headers['Cache-Control']
-try { out.okBase = JSON.parse(okRes.body).base } catch { out.okBase = null }
-
-// (b) 描述符缺失（把根指到空目录）→ 非 200 + 可读错误 JSON
-const empty = mkdtempSync(join(tmpdir(), 'mltb-empty-'))
-process.env.MLTB_ML_ROOT = empty
-const badRes = callHandler()
-out.badStatus = badRes.status
-try {
-  const parsed = JSON.parse(badRes.body)
-  out.badHasError = typeof parsed.error === 'string' && parsed.error.length > 0
-  out.badError = parsed.error
-  out.badHasBase = 'base' in parsed
-} catch { out.badHasError = false }
-
-// (c) 环境变量与 cwd 都读不到 → 直接函数必须抛错（不许回落硬编码端口）
-delete process.env.MLTB_ML_ROOT
-process.chdir(empty)
-try {
-  out.emptyDirUrl = mod.resolveMonitorBase()
-} catch { out.emptyDirThrew = true }
-
-// (d) disposer 真的撤掉路由
-out.disposedBefore = disposed
-if (typeof disposer === 'function') disposer()
-out.disposedAfter = disposed
 
 console.log('RESULT ' + JSON.stringify(out))
 """
@@ -3118,11 +3078,20 @@ console.log('RESULT ' + JSON.stringify(out))
 """
 
 
-def test_panel_host_half_serves_monitor_url_route():
-    """HOST 半（真产物）：注册**同源只读路由**，200 给 `{base}`、读不到就非 200。
+def test_panel_host_half_is_a_carrier_and_registers_no_route():
+    """HOST 半（真产物）：⭐ **它是载体、不再注册任何路由**（2026-10-09 上提之后）。
 
-    这是真机 bug 的回归判据：地址不再经 command 返回（那个形状
-    `value.result.text` 曾让我们读成 `value.text`，面板永远"监控端点未知"）。
+    ## 本判据改过（承诺换人，不是放宽）
+
+    原先它钉"本仓 host 半注册那条同源只读路由（200 `{base}` / 503 可读错误 / 不回落）"。
+    那条路由**上提进框架**了（框架的 host 插件按声明 + `MECHA_PANEL_PORT_FILES` 现取端口，
+    判据在 mecha：`host-plugin/mecha-panel-host.test.ts`，含**与资产实现的等价判据**）。
+    ⇒ 本仓这一半只剩**载体**（dsh 的加载形状要求"一条 patch entry 带一个包"，
+    client 半靠它进浏览器）。
+
+    ⚠ **反向断言**（R13）：本仓 host 半**不许**再注册任何路由 —— 同一条 `routePath`
+    注册两次是**接线错误**（谁生效取决于注册顺序，而那是静默的）。
+    ⚠ 对偶（不许空洞）：**没有 webServer** 时也必须照常挂载（它不再依赖任何服务）。
     """
     if not _node_available():
         print("    （跳过：PATH 里没有 node）")
@@ -3130,52 +3099,24 @@ def test_panel_host_half_serves_monitor_url_route():
     if not (REPO / "dsh" / "lib" / "index.mjs").exists():
         print("    （跳过：dsh/lib 未构建——cd dsh && npm install && npm run bundle）")
         return
-    from ml_mecha.monitor_http import MonitorEndpoint
-    from ml_mecha.runtime import MONITOR_PORT_FILE, write_runtime
+    rc, out, err = _run_node(_HOST_HALF_JS)
+    assert rc == 0, (rc, out[-1200:], err[-1200:])
+    got = _payload(out)
 
-    with tempfile.TemporaryDirectory(prefix="ml-delivery-host-") as td:
-        root = Path(td)
-        with _authority(root, open_gate=True) as (ml, host):
-            monitor = MonitorEndpoint(ml, mcp_port=host.port,
-                                      port_file=root / MONITOR_PORT_FILE)
-            try:
-                mon_port = monitor.start()
-                # ⚠ 不传 mode：描述符里**不再有**那个字段（写权运行中可切，
-                # "启动时那个值"不是真相）。`/status` 的 `mode` 来自 authority 本身。
-                write_runtime(root, mcp_port=host.port,
-                              monitor_port=mon_port)
-                rc, out, err = _run_node(_HOST_HALF_JS, root)
-                assert rc == 0, (rc, out[-1200:], err[-1200:])
-                got = _payload(out)
+    assert got["name"] == "ml-toolbox-monitor", got
+    assert got["hasApply"] is True, got
+    # ⭐ 不再需要任何服务（原先它要 `['webServer']` 才能注册那条路由）
+    assert got["inject"] == [], got
+    # ⭐⭐ 一条路由都没注册（那条归框架的 host 插件）
+    assert got["registeredRoutes"] == [], \
+        f"本仓 host 半又自己注册路由了（会与框架那条撞同一路径）：{got['registeredRoutes']}"
+    assert got["bareOk"] is True, f"没有 webServer 时挂载失败：{got.get('bareErr')}"
 
-                assert got["name"] == "ml-toolbox-monitor", got
-                # 依赖换成 webserver（不再有 commands）
-                assert got["inject"] == ["webServer"], got
-                assert got["hasApply"] is True, got
-                # 路由形状必须精确（dsh 契约：绝对路径、无尾斜杠、exact）
-                assert got["routeKind"] == "exact", got
-                assert got["routePath"] == "/ml-toolbox/monitor-url", got
-                assert got["handlerIsFn"] is True, got
-
-                # (a) 描述符就位 → 200 + {base} == 权威真写的端口
-                assert got["okStatus"] == 200, got
-                assert got["okBase"] == f"http://127.0.0.1:{mon_port}", got
-                assert "application/json" in (got["okContentType"] or ""), got
-                assert got["okCacheControl"] == "no-store", got
-
-                # (b) 描述符缺失 → 非 200 + 可读错误（**不许回落硬编码端口**）
-                assert got["badStatus"] == 503, got
-                assert got["badHasError"] is True, got
-                assert got["badHasBase"] is False, got
-                assert "监控端点未知" in got["badError"], got
-                assert got["emptyDirThrew"] is True, got
-
-                # (d) disposer 撤路由
-                assert got["disposedBefore"] is False, got
-                assert got["disposedAfter"] is True, got
-            finally:
-                monitor.stop()
-                ml.close()
+    # 静态对偶：本仓 host 源码里不许再有"取址/注册路由"的代码（只许剩下载体）
+    host_src = _strip_js_comments(
+        (REPO / "dsh" / "src" / "index.ts").read_text(encoding="utf-8"))
+    for needle in ("makeMonitorUrlHandler", "resolveMonitorBase", "webServer"):
+        assert needle not in host_src, f"host 源码里仍有 {needle!r}（路由该归框架）"
 
 
 def test_panel_client_half_uses_same_origin_fetch_not_command():
@@ -3243,12 +3184,14 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
     ⚠ 权威那侧由**框架的 supervisor** 起（本文件不再自建就绪判据）；
     ⚠ 收尾用 `Supervisor.shutdown()`（框架用 Job Object 整组死 —— 只 terminate
     会留下持有端口的 node 孤儿，那是 P3 实测踩过的）。
-    ⚠ **MCP 客户端那份 overlay 已归框架**（指向聚合端点）⇒ 这里只挂 ML 自己
-    还拥有的两层；"工具面真接上"由框架的聚合端点判据覆盖。
+    ⭐ **2026-10-09：patches 与 env 都按框架的那套合成**（`merge_dsh`）——
+    监控**地址路由**上提进框架之后，只挂 ML 那两层已经**没有**那条路由了
+    （那正是本次要改的判据形状：拿框架会给的那一份，才是真实部署形态）。
     """
     import shutil as _shutil
     import socket
 
+    from mecha.launch import merge_dsh
     from ml_mecha.mecha_site import SITE
 
     dsh_exe = _shutil.which("dsh")
@@ -3264,10 +3207,23 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
             mcp_port = row["port"]
             assert mcp_port, row
 
-            patches = [str(p) for p in SITE.dsh.patches if Path(p).exists()]
+            # ⭐ 按**框架的那套**合成 dsh 的 patches/env（项目两层 + 框架的面板插件）。
+            # ⚠ 用一份**把根指向临时根**的声明副本：软件是被 `--root <td>` 起的
+            #   （`_spawned_authority` 同时注入 `MECHA_SOFTWARE_ROOT=<td>`）⇒ 框架那条
+            #   地址路由要读的端口文件就在 `<td>` 下。⚠ 否则它会读**声明里那个根**
+            #   （本仓根）的文件，与本次真起的实例不是同一个 —— 那正是本条要断言的东西。
+            import dataclasses
+
+            svc_tmp = dataclasses.replace(SITE.services[0], cwd=root, data_root=root)
+            temp_site = dataclasses.replace(SITE, services=(svc_tmp,))
+            _child, merged = merge_dsh((temp_site,))
+            patches = [str(p) for p in merged.patches if Path(p).exists()]
             names = [Path(p).name for p in patches]
             assert "cordis.patch.yml" in names, names
             assert "cordis.project.patch.yml" in names, names
+            # ⭐ 框架自己的 patch（带上面板 host 插件）也必须在这一份里
+            assert "mecha-panel.patch.yml" in names, \
+                f"框架的面板 patch 不在合成结果里（地址路由就没人注册了）：{names}"
 
             dsh_port = _pick_free_port(preferred=3081)
             assert dsh_port != 3080, "绝不能占官方 dsh 的端口"
@@ -3279,6 +3235,7 @@ def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():
                                         stderr=subprocess.STDOUT, text=True,
                                         encoding="utf-8", errors="replace",
                                         env={**os.environ,
+                                             **{str(k): str(v) for k, v in merged.env.items()},
                                              "MLTB_ML_ROOT": str(root)})
             try:
                 deadline = time.time() + 120
