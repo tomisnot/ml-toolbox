@@ -96,10 +96,13 @@ def archived_runs(limit: int = 50) -> list[dict]:
     ⚠ **不吞异常**（迁移变更 1）：``runs/`` 不存在时 ``list_meta`` 已合法返回空表，
     因此这里再包一层 ``except`` 只会把真正的读失败伪装成"没有数据"。异常向上抛，
     由框架归一化成 500 + 结构化错误体。
+
+    ⚠⭐ **``limit`` 必须传下去**（2026-10-10 实测）：旧写法是"全量读 + 切片" ⇒ 真实仓
+    （``runs/`` 下数千个 ``record.json``）这一页要 **16.6 秒**（等于打不开），而它只要最新几十条。
+    现在由机械层"按目录 mtime 预筛 + 只读够用的那些"（实测 0.5 秒级，见 ``core.runs.list_meta``）。
     """
     from ml_toolbox.core import persistence
-    records = persistence.list_records()
-    return [dict(r) for r in records[:max(0, int(limit))]]
+    return [dict(r) for r in persistence.list_records(max(0, int(limit)))]
 
 
 def _limit_of(query: Mapping[str, list[str]], default: int = 50) -> int:

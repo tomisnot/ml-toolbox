@@ -77,9 +77,14 @@ def load_record(run_id: str) -> dict:
         return json.load(f)
 
 
-def list_records() -> list[dict]:
-    """列出全部 ML 运行元数据（新→旧）。机械层见 core.runs（M3/C2）。"""
-    return _runs.list_meta(RUNS_DIR, "record.json")
+def list_records(limit: int | None = None) -> list[dict]:
+    """列出 ML 运行元数据（新→旧）。机械层见 core.runs（M3/C2）。
+
+    ⚠ ``limit`` 给定时走**有限额路径**（只读够用的那些，见 ``core.runs.list_meta``）：
+    大存档（实测数千个 ``record.json``）全量读要**十几秒**，而调用方常常只要最新几条。
+    ``limit=None`` 与旧行为逐字相同。
+    """
+    return _runs.list_meta(RUNS_DIR, "record.json", limit)
 
 
 # ---------------------------------------------------------------- 优化侧的读档槽
