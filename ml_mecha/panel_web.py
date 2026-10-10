@@ -1061,18 +1061,12 @@ class PanelWebSidecar:
 
         ⚠ 与 `TensorBoardSidecar._live_published_port` 同一条理由：面板也可能被两个入口起
         （本项目启动方 / 人自己敲 CLI）⇒ 先认"已公布且在听"的那个，避免**覆盖端口文件**
-        把前一个变成孤儿。
+        把前一个变成孤儿。⭐ "读 + 确认在听"这条规则归框架（`mecha.portfile`）——
+        本项目只给"文件叫什么"。
         """
-        import socket
-        try:
-            port = int(self.port_file.read_text(encoding="utf-8").strip())
-        except Exception:                                  # noqa: BLE001
-            return None
-        if port <= 0:
-            return None
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.3)
-            return port if s.connect_ex(("127.0.0.1", port)) == 0 else None
+        from mecha.portfile import is_listening, read_port
+        port = read_port(self.port_file)
+        return port if port is not None and is_listening("127.0.0.1", port) else None
 
     def start(self) -> dict:
         """起面板（或复用已在跑的）。**不抛**：失败回 ``{ready: false, reason}``。"""

@@ -37,10 +37,13 @@ START_TIMEOUT_S = 20.0
 
 
 def _free_port() -> int:
-    """挑一个可绑定的回环端口（**不指定固定端口** ⇒ 并存的实例不会互相踩）。"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    """挑一个可绑定的回环端口（规则在框架：`mecha.portfile.pick_free_port`）。
+
+    ⚠ 本项**必须在 spawn 之前**拿到端口（要给子进程传 `--port`）⇒ 只能"预选"
+    （框架 docstring 里那条 TOCTOU 纪律：起不来要如实报，别假设挑到了就一定能用）。
+    """
+    from mecha.portfile import pick_free_port
+    return pick_free_port()
 
 
 class TensorBoardSidecar:
@@ -87,16 +90,13 @@ class TensorBoardSidecar:
         有两个入口（监视端点那条路 / 本项目自己面板那条路）。只看 ``self._proc`` 的话，
         第二个入口会**再起一个** TensorBoard 并**覆盖**端口文件（旧那个变孤儿、白占端口）。
         ⇒ 起之前先认"**已公布且还在听**"的那个端口，有就复用它。
+
+        ⭐ "读端口文件 + 确认在听"这条规则归框架（`mecha.portfile`）；本项目只给
+        "文件叫什么"（`TB_PORT_FILE`）。
         """
-        try:
-            port = int(self.port_file.read_text(encoding="utf-8").strip())
-        except Exception:                                  # noqa: BLE001 - 没有/坏文件 = 没有
-            return None
-        if port <= 0:
-            return None
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.3)
-            return port if s.connect_ex(("127.0.0.1", port)) == 0 else None
+        from mecha.portfile import is_listening, read_port
+        port = read_port(self.port_file)
+        return port if port is not None and is_listening("127.0.0.1", port) else None
 
     def start(self, *, logdir: str | Path | None = None) -> dict:
         """起服务（或复用已在跑的）。**不抛**：失败回 ``{ready: false, reason}``。
@@ -130,21 +130,20 @@ class TensorBoardSidecar:
             return {"ready": False,
                     "reason": f"起 TensorBoard 失败：{type(exc).__name__}: {exc}"}
 
-        # 等它真的在听（**探端口**，不靠 sleep 猜）
+        #: 等它真的在听（**探活**用框架那一条；本循环多管一件事：**子进程早退**要单独报）
+        from mecha.portfile import is_listening
         deadline = time.time() + START_TIMEOUT_S
         while time.time() < deadline:
             if self._proc.poll() is not None:
                 self._proc = None
                 return {"ready": False,
                         "reason": "TensorBoard 进程立刻退出了（多半是没装或参数不对）"}
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(0.3)
-                if s.connect_ex(("127.0.0.1", port)) == 0:
-                    self._port = port
-                    self._publish(port)
-                    self._say(f"[tb] {self.url}（logdir={target}）")
-                    return {"ready": True, "port": port, "url": self.url,
-                            "logdir": str(target)}
+            if is_listening("127.0.0.1", port):
+                self._port = port
+                self._publish(port)
+                self._say(f"[tb] {self.url}（logdir={target}）")
+                return {"ready": True, "port": port, "url": self.url,
+                        "logdir": str(target)}
             time.sleep(0.2)
         self.stop()
         return {"ready": False, "reason": f"等了 {START_TIMEOUT_S:.0f}s 端口仍未就绪"}
