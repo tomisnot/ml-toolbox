@@ -47,8 +47,11 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -989,6 +992,144 @@ def start_panel_web(*, port: int = 0, port_file=None, backend_url=None,
                  tensorboard_url=tensorboard_url, log=log)
     p.start()
     return p
+
+
+#: 面板子进程的启动等待上限（秒）：起服务 ≈ 小启动（要 import 渲染层 + 预载 opt 层）。
+SIDECAR_START_TIMEOUT_S = 30.0
+
+
+def default_web_port_file() -> Path:
+    """本服务默认的端口文件（项目根；与 `.mcp-port` / `.ml-monitor-port` 同族）。"""
+    from ml_toolbox.core.persistence import RUNS_DIR     # 惰性：避免 import 环
+    return Path(RUNS_DIR).parent / WEB_PORT_FILE
+
+
+class PanelWebSidecar:
+    """起/停**独立进程**的面板 web（:class:`PanelWeb` 的进程外壳）。**幂等**：在跑就复用。
+
+    ## ⭐ 为什么要有它（2026-10-10 用户实测："ML 只读窗口还是没成功起来"）
+
+    这个面板是"**人看方法结果的那只眼**"（`PageSpec` 那套：混淆矩阵 / ROC / 残差 / 曲线…），
+    可它原先**只有测试会起** ⇒ 从 mecha 起的整站里**根本没有它**（`.mlweb-port` 不写、
+    浏览器里没有这一页）。而 `main()` 的 docstring 本来就写着
+    "独立进程入口：``python -m ml_mecha.panel_web``（**给启动方起窗口用**）"——
+    缺的就是那个"启动方"。⇒ 启动方 = 本项目的软件进程（`app_entry.py`）：
+    **它起它、并在收尾时收掉它**（与 :class:`~ml_mecha.dashboard.TensorBoardSidecar`
+    同一条纪律：**只收自己起的那个**）。
+
+    ⚠ **best-effort、响亮、不阻塞**（三条都要）：起不来只回 ``{ready: False, reason}``，
+    调用方记一行就够；**绝不许**拖垮 AI 那条腿（MCP/权威面）；同时**绝不假装起了**。
+    """
+
+    def __init__(self, *, port_file: str | Path | None = None, backend_url: str | None = None,
+                 preload: Sequence[str] = (), log=None) -> None:
+        self.port_file = Path(port_file) if port_file else default_web_port_file()
+        self.backend_url = backend_url
+        self.preload = tuple(preload or ())
+        self._log = log
+        self._proc: subprocess.Popen | None = None
+        self._port: int | None = None
+
+    # ------------------------------------------------------------ 事实面
+    @property
+    def port(self) -> int | None:
+        """当前端口（没起 ⇒ ``None``）。**已退出的进程不算**。"""
+        if self._proc is not None and self._proc.poll() is not None:
+            self._proc = None
+            self._port = None
+        return self._port
+
+    @property
+    def url(self) -> str | None:
+        p = self.port
+        return f"http://127.0.0.1:{p}/" if p else None
+
+    @property
+    def running(self) -> bool:
+        return self.port is not None
+
+    def _say(self, msg: str) -> None:
+        if self._log is not None:
+            try:
+                self._log(msg)
+            except Exception:                              # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------ 起停
+    def _live_published_port(self) -> int | None:
+        """端口文件里那个端口**还活着**吗（跨进程幂等：别起第二个面板）。
+
+        ⚠ 与 `TensorBoardSidecar._live_published_port` 同一条理由：面板也可能被两个入口起
+        （本项目启动方 / 人自己敲 CLI）⇒ 先认"已公布且在听"的那个，避免**覆盖端口文件**
+        把前一个变成孤儿。
+        """
+        import socket
+        try:
+            port = int(self.port_file.read_text(encoding="utf-8").strip())
+        except Exception:                                  # noqa: BLE001
+            return None
+        if port <= 0:
+            return None
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            return port if s.connect_ex(("127.0.0.1", port)) == 0 else None
+
+    def start(self) -> dict:
+        """起面板（或复用已在跑的）。**不抛**：失败回 ``{ready: false, reason}``。"""
+        if self.running:
+            return {"ready": True, "port": self.port, "url": self.url, "reused": True}
+        adopted = self._live_published_port()
+        if adopted is not None:
+            self._port = adopted
+            self._say(f"[panel] 复用已在跑的 {self.url}"
+                      f"（{self.port_file.name} 里那个端口还活着）")
+            return {"ready": True, "port": adopted, "url": self.url,
+                    "reused": True, "adopted": True}
+        cmd = [sys.executable, "-m", "ml_mecha.panel_web",
+               "--port", "0", "--port-file", str(self.port_file)]
+        for name in self.preload:
+            cmd += ["--preload", str(name)]
+        if self.backend_url:
+            cmd += ["--backend-url", str(self.backend_url)]
+        try:
+            self._proc = subprocess.Popen(
+                cmd, cwd=str(Path(__file__).resolve().parent.parent),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:                           # noqa: BLE001
+            return {"ready": False,
+                    "reason": f"起面板失败：{type(exc).__name__}: {exc}"}
+        # 等它**真的公布端口**（顺带探端口，不靠 sleep 猜）
+        deadline = time.time() + SIDECAR_START_TIMEOUT_S
+        while time.time() < deadline:
+            if self._proc.poll() is not None:
+                self._proc = None
+                return {"ready": False,
+                        "reason": "面板进程立刻退出了（多半是 import/依赖问题："
+                                  "手敲 `python -m ml_mecha.panel_web` 能看到报错）"}
+            port = self._live_published_port()
+            if port is not None:
+                self._port = port
+                self._say(f"[panel] {self.url}")
+                return {"ready": True, "port": port, "url": self.url}
+            time.sleep(0.2)
+        self.stop()
+        return {"ready": False,
+                "reason": f"等了 {SIDECAR_START_TIMEOUT_S:.0f}s 面板仍没公布端口"}
+
+    def stop(self) -> None:
+        """停面板并按内容清端口文件（**只删自己写的那个**）。重复调不炸。"""
+        proc, port = self._proc, self._port
+        self._proc, self._port = None, None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:                          # noqa: BLE001
+                    proc.kill()
+            except Exception:                              # noqa: BLE001
+                pass
+        clear_port_file(self.port_file, port)
 
 
 def resolve_panel_base(port_file, *, host: str = "127.0.0.1",

@@ -149,6 +149,115 @@ def test_sidecar_stop_is_idempotent():
     assert sc.url is None
 
 
+def test_sidecar_adopts_a_live_published_port(tmp_path):
+    """⭐ **跨进程幂等**：端口文件里那个端口还活着 ⇒ **复用**，不再起第二个。
+
+    为什么必须有这条（2026-10-10 实测）：TensorBoard 是**独立进程**，而"要不要起它"有两个
+    入口（监视端点 / 本项目自己的面板）。只看 ``self._proc`` 的话，第二个入口会**再起一个**
+    并**覆盖**端口文件（旧那个变孤儿、白占端口）。
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        pf = tmp_path / ".tb-port"
+        pf.write_text(str(port), encoding="utf-8")
+        sc = TensorBoardSidecar(tmp_path, port_file=pf, log=lambda _m: None)
+        got = sc.start()
+        assert got["ready"] is True and got.get("adopted") is True, got
+        assert got["port"] == port, got
+        assert sc.running is True
+        #: ⛔ 红证：端口文件里换成**没人听**的端口 ⇒ **不许**认领（该照旧去起/去失败）
+        dead = tmp_path / ".tb-dead"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            dead_port = probe.getsockname()[1]
+        dead.write_text(str(dead_port), encoding="utf-8")
+        sc2 = TensorBoardSidecar(tmp_path, port_file=dead, log=lambda _m: None)
+        assert sc2._live_published_port() is None, "把没人听的端口也认领了 ⇒ 会指向一个死地址"
+        sc.stop()
+
+
+def test_readonly_panel_sidecar_brings_the_window_up(tmp_path):
+    """⭐⭐ **只读监视窗（`PanelWeb`）能作为一个独立进程被启动方起来**（用户实测：
+    "ML 只读窗口还是没成功起来"）。
+
+    现场：那只眼（人看方法结果：混淆矩阵/ROC/残差/曲线…）原先**只有测试会起** ⇒ 从 mecha
+    起的整站里根本没有它（`.mlweb-port` 不写、浏览器里没这一页）。`main()` 的 docstring
+    本来就写着"独立进程入口……**给启动方起窗口用**"，缺的就是那个启动方。
+    ⇒ 本判据真起一个子进程，钉住"启动方能起它 + 它真的在听 + 端口文件公布"。
+    """
+    from ml_mecha.panel_web import PanelWebSidecar
+
+    pf = tmp_path / ".mlweb-port"
+    sc = PanelWebSidecar(port_file=pf, log=lambda _m: None)
+    got = sc.start()
+    try:
+        assert got.get("ready") is True, f"面板起不来：{got}"
+        assert pf.is_file(), "起来了却没公布端口（人/别的入口找不到它）"
+        assert int(pf.read_text(encoding="utf-8").strip()) == got["port"]
+        import urllib.request
+        with urllib.request.urlopen(got["url"] + "health", timeout=20) as r:
+            assert r.status == 200
+    finally:
+        sc.stop()
+    assert not pf.exists(), "收尾没清自己写的端口文件（或误删了别人的）"
+    assert sc.running is False
+
+
+def test_readonly_panel_sidecar_is_honest_when_it_fails(tmp_path, monkeypatch):
+    """⛔ 红证：面板**起不来**时如实回 `ready=False` + **原因**，且**不抛**。
+
+    三条纪律（与 `TensorBoardSidecar` 同款）：best-effort（不许拖垮 AI 那条腿）、
+    响亮（把 reason 说出来）、不假装（回执里 ready 必须是假）。
+    """
+    import subprocess
+
+    from ml_mecha.panel_web import PanelWebSidecar
+
+    def _boom(*_a, **_kw):
+        raise OSError("判据故意让面板起不来")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    sc = PanelWebSidecar(port_file=tmp_path / ".mlweb-port", log=lambda _m: None)
+    got = sc.start()                                   # ⭐ 不许抛
+    assert got["ready"] is False, got
+    assert "判据故意" in str(got.get("reason")), got
+    assert sc.running is False
+
+
+def test_readonly_panel_sidecar_adopts_a_live_published_port(tmp_path):
+    """⭐ **跨进程幂等**：端口文件里那个端口还活着 ⇒ **复用**，不再起第二个面板。
+
+    ⚠ 为什么（与 TB 侧车同一条理由）：面板有两个入口（本项目启动方 / 人自己敲 CLI），
+    只看 `self._proc` 会**再起一个**并**覆盖**端口文件（前一个变孤儿、白占端口）。
+    """
+    import socket
+
+    from ml_mecha.panel_web import PanelWebSidecar
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        pf = tmp_path / ".mlweb-port"
+        pf.write_text(str(port), encoding="utf-8")
+        sc = PanelWebSidecar(port_file=pf, log=lambda _m: None)
+        got = sc.start()
+        assert got.get("adopted") is True and got["port"] == port, got
+        #: ⛔ 红证：换成**没人听**的端口 ⇒ 不许认领（否则浏览器会被开到死地址）
+        dead = tmp_path / ".mlweb-dead"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            dead_port = probe.getsockname()[1]
+        dead.write_text(str(dead_port), encoding="utf-8")
+        sc2 = PanelWebSidecar(port_file=dead, log=lambda _m: None)
+        assert sc2._live_published_port() is None, "把没人听的端口也认领了"
+        sc.stop()
+
+
 def test_duplicate_steps_are_deduped_and_flagged():
     """⚠ 同一 ``tb/`` 目录里堆了多个事件文件时：**按步去重**（后写的赢）且**留痕**。
 

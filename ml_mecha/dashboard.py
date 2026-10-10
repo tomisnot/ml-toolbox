@@ -80,6 +80,24 @@ class TensorBoardSidecar:
                 pass
 
     # ------------------------------------------------------------ 起停
+    def _live_published_port(self) -> int | None:
+        """端口文件里那个端口**还活着**吗（跨进程幂等用）。
+
+        ⚠ **为什么需要它**（2026-10-10 实测）：TensorBoard 是**独立进程**，而"要不要起它"
+        有两个入口（监视端点那条路 / 本项目自己面板那条路）。只看 ``self._proc`` 的话，
+        第二个入口会**再起一个** TensorBoard 并**覆盖**端口文件（旧那个变孤儿、白占端口）。
+        ⇒ 起之前先认"**已公布且还在听**"的那个端口，有就复用它。
+        """
+        try:
+            port = int(self.port_file.read_text(encoding="utf-8").strip())
+        except Exception:                                  # noqa: BLE001 - 没有/坏文件 = 没有
+            return None
+        if port <= 0:
+            return None
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            return port if s.connect_ex(("127.0.0.1", port)) == 0 else None
+
     def start(self, *, logdir: str | Path | None = None) -> dict:
         """起服务（或复用已在跑的）。**不抛**：失败回 ``{ready: false, reason}``。
 
@@ -88,6 +106,14 @@ class TensorBoardSidecar:
         if self.running:
             return {"ready": True, "port": self.port, "url": self.url,
                     "reused": True}
+        #: ⭐ 先认"**别人已经起来的那个**"（跨进程幂等，见 :meth:`_live_published_port`）
+        adopted = self._live_published_port()
+        if adopted is not None:
+            self._port = adopted
+            self._say(f"[tb] 复用已在跑的 {self.url}"
+                      f"（{self.port_file.name} 里那个端口还活着）")
+            return {"ready": True, "port": adopted, "url": self.url,
+                    "reused": True, "adopted": True}
         target = Path(logdir) if logdir else self.root
         if not target.is_dir():
             return {"ready": False,

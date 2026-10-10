@@ -236,6 +236,15 @@ class MonitorEndpoint:
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> int:
+        """起监视端点（**只它自己**）。
+
+        ⚠⭐ **不在这里起"只读监视窗"**（2026-10-10 改回）：本项目的只读监视窗是
+        **`ml_mecha/panel_web.py` 那个独立服务**（`.mlweb-port`，三个 view：ml/opt/nn），
+        而 TensorBoard 是**它**在 `nn` 那一页按需起的（`panel_web.py` 的 docstring 原话：
+        "共享监控端点上也有一条 `GET /dashboard`，但那是**另一条路、今天没人用**"）。
+        ⇒ 让它随端点起来**不符合本项目的设计**（会白起一个没人看的 TB），
+        正确的入口是 `app_entry.py` 起 `PanelWebSidecar`（见那里）。
+        """
         return self._endpoint.start()
 
     def stop(self, timeout: float = 10.0) -> None:

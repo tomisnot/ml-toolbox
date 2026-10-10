@@ -190,6 +190,11 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     #: ⚠ 不带这一档 ⇒ 控制端点传 `open_surface=None` ⇒ 调它**响亮失败**
     #:   （"这个进程有没有人手面"是**启动者选的形态**，不是猜的）。
     parser.add_argument("--with-gui", action="store_true")
+    #: ⭐ **本进程带不带"只读监视窗"**（`PanelWeb`：人看方法结果那只眼；独立进程 + `.mlweb-port`）。
+    #: 与 `--with-gui` 同一条纪律：**形态由启动者选**，不是猜的。
+    #: ⚠ 不带它 ⇒ **不起**（判据/维护/纯 AI 形态都不需要弹一个面板 + 一个浏览器标签）；
+    #: 框架那条路在声明里带上它（见 `mecha_site.py` 的 `_service_argv`）。
+    parser.add_argument("--with-panel", action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
     return parser.parse_args(argv)
 
@@ -281,6 +286,9 @@ def run_mcp(args: argparse.Namespace) -> int:
     from ml_mecha.runtime import (MCP_PORT_FILE, MONITOR_PORT_FILE, resolve,
                                   write_runtime)
 
+    #: ⭐ 只读监视窗的**进程外壳**（人看方法结果那只眼）：`PanelWeb` 的独立进程入口。
+    from ml_mecha.panel_web import WEB_PORT_FILE, PanelWebSidecar
+
     from mecha.authority import Mode
     from mecha.software_control import (CONTROL_PORT_FILE, build_control_registry,
                                         start_control_endpoint)
@@ -325,6 +333,8 @@ def run_mcp(args: argparse.Namespace) -> int:
                    log=lambda m: print(m, flush=True))
     monitor = None
     control = None
+    #: ⭐ 只读监视窗（独立进程）；收尾时 `finally` 会引用它 ⇒ 先钉成 None。
+    panel = None
     try:
         port = host.start()
         # 监控端点在同一权威进程内（与 MCP 共一份 History/Gate）——这正是
@@ -333,6 +343,34 @@ def run_mcp(args: argparse.Namespace) -> int:
                                   port_file=resolve(root, MONITOR_PORT_FILE),
                                   log=lambda m: print(m, flush=True))
         monitor.start()
+        #: ⭐⭐ **只读监视窗随服务起来**（2026-10-10 用户实测："ML 只读窗口还是没成功起来"）。
+        #: 本项目那只眼是 `ml_mecha/panel_web.py` 那个**独立只读 web**
+        #: （`.mlweb-port`，三个 view：ml / opt / nn；`nn` 那一页自己按需起 TensorBoard）。
+        #: 它的 `main()` 本来就写着"**给启动方起窗口用**"——缺的就是那个启动方，就是这里。
+        #: ⚠ **只在 `--with-panel` 时起**（与 `--with-gui` 同一条纪律：形态由启动者选）；
+        #: ⚠ 三条纪律：**best-effort**（起不来不许拖垮 AI 那条腿）·**响亮**（把 reason 打出来，
+        #: 不假装起了）·**收尾时只收自己起的那个**（见下面 finally 里的 stop）。
+        if args.with_panel:
+            panel = PanelWebSidecar(
+                port_file=resolve(root, WEB_PORT_FILE),
+                #: ⭐ 预载优化侧：`opt` 那一页的读档能力靠它 import 时注册（见 CLI 的 `--preload`）。
+                #: ⚠ 名字在这里是**数据** ⇒ 边界层不因此依赖 opt 层（同 `preload_modules` 的说明）。
+                preload=("ml_toolbox.opt.persistence",),
+                log=lambda m: print(m, flush=True))
+            got_panel = panel.start()
+            if got_panel.get("ready"):
+                print(f"[panel] 只读监视窗（人看方法结果）：{got_panel['url']}", flush=True)
+                try:
+                    import webbrowser
+                    webbrowser.open(str(got_panel["url"]))  # "把人的面板带到眼前"（本项目安排）
+                except Exception as exc:                  # noqa: BLE001 - 打不开浏览器不算失败
+                    print(f"[panel] 浏览器没打开（不算失败）：{type(exc).__name__}: {exc}",
+                          flush=True)
+            else:
+                print(f"[panel] 只读监视窗起不来（不影响 AI 那条腿）：{got_panel.get('reason')}",
+                      flush=True)
+        else:
+            print("[panel] 未带 --with-panel ⇒ 不起只读监视窗（纯 AI 形态）", flush=True)
         if args.no_open_gate:
             print("[mcp] 写权保持 LOCKED（--no-open-gate）。", flush=True)
         else:
@@ -396,6 +434,9 @@ def run_mcp(args: argparse.Namespace) -> int:
             control.stop()
         if monitor is not None:
             monitor.stop()
+        #: ⭐ 收尾**只收自己起的那个**面板（复用到的"别人那个"不动，见 `PanelWebSidecar.stop`）。
+        if panel is not None:
+            panel.stop()
         host.stop()
         ml.close()
     return 0
