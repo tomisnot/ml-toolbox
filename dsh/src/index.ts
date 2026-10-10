@@ -18,7 +18,11 @@
  *
  * ⚠ 删它需要**同时**改 `ml_mecha/mecha_site.py`（`patches` / `plugin_artifacts`）与
  * `package.json` 的 exports —— 而"换一种加载方式"是 **dsh 的机制**，不是本仓能定的
- * ⇒ 本轮**保留这个空载体**。（EL / GP 的 host 半不是空载体：它们还要装自愈 MCP 桥。）
+ * ⇒ 本轮**保留这个空载体**。
+ * ⭐ **2026-10-10（用户裁决 = 方案 A）**：原先这里写着"（EL / GP 的 host 半不是空载体：
+ * 它们还要装自愈 MCP 桥。）"——**那座桥已在全生态删除**（资产里的 `mcp-bridge.ts` /
+ * `host/mount-host-plugin.ts` 与 EL/GP 的接线一并删掉）⇒ **三家现在同形：都只是空载体**，
+ * 工具面只有一条腿 = 框架的聚合端点。判据：框架的 `checks/panel_one_leg_selfcheck.py`。
  *
  * 安全红线：本插件**不** spawn/kill 任何进程、不写任何文件、也不注册任何路由。
  */

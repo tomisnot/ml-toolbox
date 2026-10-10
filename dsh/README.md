@@ -45,6 +45,12 @@
 dsh 内置客户端的 streamable-http "HTTP 世代"死区而写的；ML 先靠"权威与 dsh
 同生共死 + 每次启动重生成 overlay"绕开它。**什么时候该上它**见下面的观测程序。
 
+> ⭐ **2026-10-10 更新（用户裁决 = 方案 A）**：那条桥**已在全生态删除**（资产里的
+> `mcp-bridge.ts` / `host/mount-host-plugin.ts` 与 EL/GP 的接线一并删掉）——
+> **工具面只有一条腿 = 框架的聚合端点**。⇒ 下面"上 P3 / 移植 EL 的桥"那个动作**不再存在**；
+> 观测表里的"命中死区"一行**改由框架侧处理**（聚合端点用 dsh 内置
+> `@deepseek-ai/dsh-mcp-client`，连不上就按 `failOnStartupError` 响亮报）。
+
 ## 为什么是"同源路由"，不是"一个 command"（真机教训）
 
 第一版注册的是 `/ml-monitor-url` **command**，由 client 经
@@ -165,7 +171,7 @@ EL 正是为这条死区写了自愈桥。ML 目前不写桥，所以必须知�
 | 观察 | 含义 | 动作 |
 |---|---|---|
 | 工具调用**成功** | 内置客户端已按新端点/新 session 恢复（或 dsh 侧重连生效） | 不上 P3；把这次结果记进 `07` 的 R1 状态 |
-| 工具**仍在列表里，但每次调用都失败**（报 404 / session not found / 连接类错误），**重启 dsh 后立刻恢复** | **命中死区**（旧 `Mcp-Session-Id` 只抛错、不触发 `onclose`） | **上 P3**（移植 EL `dsh/src/host/mcp-bridge.ts`） |
+| 工具**仍在列表里，但每次调用都失败**（报 404 / session not found / 连接类错误），**重启 dsh 后立刻恢复** | **命中死区**（旧 `Mcp-Session-Id` 只抛错、不触发 `onclose`） | ⛔ **原先写"上 P3（移植 EL 的桥）"—— 2026-10-10 该动作已取消**（桥在全生态删除，方案 A）。这条腿现在归**框架的聚合端点**：查看它的日志/`query_software` 元工具，必要时由框架侧处理 |
 | 工具**从列表里消失**了 | `reconnect.maxAttempts`（默认 10）耗尽后工具被移除、重连停止 | 说明 supervisor 侧接管了 HTTP 世代；不算死区，但要写进故障排查 |
 | dsh 自己崩了/日志报插件加载失败 | 与 R1 无关 | 查 dsh 控制台输出与 `dsh --profile web --patch ... --dump-config` |
 

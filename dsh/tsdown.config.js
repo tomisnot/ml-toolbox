@@ -3,12 +3,13 @@ import { defineConfig } from 'tsdown'
 /**
  * 两个产物（对应 package.json 的 "." 与 "./client" 导出）：
  *
- * · `lib/index.mjs`  —— **HOST 半**（node 平台）。本插件只干一件事：注册
- *   `/ml-monitor-url` command，把 ML 只读监控端点的地址告诉 client 半。
- *   **不移植** EL 的自愈 MCP 桥（`dsh/src/host/mcp-bridge.ts`）：ML 的工具接入
- *   走 dsh 内置 `@deepseek-ai/dsh-mcp-client`（方案 A）。自愈桥只在命中 R1
- *   （streamable-http "HTTP 世代"死区）时才上，触发判据见
- *   内部记录（未随仓发布，存档在仓外） §4 P3。
+ * · `lib/index.mjs`  —— **HOST 半**（node 平台）。⭐ **2026-10-10 起它只是空载体**：
+ *   监控**地址路由**已上提进框架（框架的 host 插件按 `MECHA_PANEL_PORT_FILES` 现取端口）
+ *   ⇒ 本产物**什么都不注册**，只为"一条 patch entry 带一个包"的加载形状而存在
+ *   （client 半随之进 dsh）。
+ *   ⛔ **原先这里写着"不移植 EL 的自愈 MCP 桥 / 只在命中 R1 时上"** —— 2026-10-10
+ *   用户裁决（方案 A）后**那座桥在全生态已删除**（资产 + EL/GP 接线），
+ *   "上 P3"这个动作不再存在：工具面只有一条腿 = **框架的聚合端点**。
  *
  * · `lib/client.js`  —— **CLIENT 半**（browser 平台）。dsh 的 web client 把所有
  *   插件的 client.js 合成一个 **classic-script 合并包**，每个模块必须自注册到
