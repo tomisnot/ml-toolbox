@@ -195,6 +195,11 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     #: ⚠ 不带它 ⇒ **不起**（判据/维护/纯 AI 形态都不需要弹一个面板 + 一个浏览器标签）；
     #: 框架那条路在声明里带上它（见 `mecha_site.py` 的 `_service_argv`）。
     parser.add_argument("--with-panel", action="store_true")
+    #: ⭐ **别自动开浏览器**（词汇表口径：`--mcp` / `--with-gui` / `--with-web` / `--with-panel` /
+    #: `--no-open`）。只影响"有网页面那可开"的形态（本项目是 `--with-panel` 起的只读监视窗）；
+    #: ⚠ 与 `--with-panel` **正交**：`--with-panel --no-open` = 起面板但不弹浏览器
+    #: （无人值守/判据/自动化要的就是这个）。
+    parser.add_argument("--no-open", action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
     return parser.parse_args(argv)
 
@@ -360,12 +365,16 @@ def run_mcp(args: argparse.Namespace) -> int:
             got_panel = panel.start()
             if got_panel.get("ready"):
                 print(f"[panel] 只读监视窗（人看方法结果）：{got_panel['url']}", flush=True)
-                try:
-                    import webbrowser
-                    webbrowser.open(str(got_panel["url"]))  # "把人的面板带到眼前"（本项目安排）
-                except Exception as exc:                  # noqa: BLE001 - 打不开浏览器不算失败
-                    print(f"[panel] 浏览器没打开（不算失败）：{type(exc).__name__}: {exc}",
+                if args.no_open:
+                    print("[panel] --no-open：不自动开浏览器（面板已起，地址见上一行）",
                           flush=True)
+                else:
+                    try:
+                        import webbrowser
+                        webbrowser.open(str(got_panel["url"]))  # "把面板带到眼前"（本项目安排）
+                    except Exception as exc:              # noqa: BLE001 - 打不开浏览器不算失败
+                        print(f"[panel] 浏览器没打开（不算失败）：{type(exc).__name__}: {exc}",
+                              flush=True)
             else:
                 print(f"[panel] 只读监视窗起不来（不影响 AI 那条腿）：{got_panel.get('reason')}",
                       flush=True)
