@@ -615,8 +615,9 @@ EXPECTED_DEFAULTED = {
     "describe_method": [],
     "describe_methods": ["dataset_id", "family"],
     "describe_run": ["run_id"],
-    "describe_training": ["best_by", "curve", "grad_layers", "include_series",
-                          "limit", "run_id"],
+    #: ⭐ 2026-10-11 观测面缺口 +3：TB 的另外三轴（默认都是 `"names"` ⇒ 进这张表）。
+    "describe_training": ["best_by", "curve", "distributions", "grad_layers",
+                          "histograms", "include_series", "limit", "run_id", "text"],
     "describe_network": ["limit"],
     "describe_networks": ["limit"],
     # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
@@ -879,7 +880,12 @@ _MIN_ARGS = {
 #: 网络代码里 `print` 的口子）。
 #: 同日**续训**（Q7）+4：`run_custom` 与 `submit_run` 各多 `resume_from`（默认 `""`）
 #: 与 `resume_which`（默认 `"last"`）—— 显式续训入口（不用再在 `build()` 里 `torch.load`）。
-_EXPECTED_OPTIONAL_PARAMS = 83
+#: 2026-10-11 **观测面缺口**（TB 的另外三轴）+3：`describe_training` 多
+#: `histograms` / `distributions` / `text`（默认都是 `"names"`）—— 原来 `histograms`
+#: 与 `text` **只回 tag 名**、`distributions` **连名字都不回** ⇒ AI 只能绕开工具面
+#: 自己解析事件文件（`layers/health/text_summary` 里那张逐层健康表是"表示长在哪一层"
+#: 的唯一证据）。写 `"values"` 才带数值，`"off"` 连名字都不给。
+_EXPECTED_OPTIONAL_PARAMS = 86
 
 
 def test_null_shim_rule_partitions_every_optional_param():

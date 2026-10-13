@@ -740,7 +740,9 @@ def _describe_training(engine: MLEngine,
                 limit: int = 200, pick: Any = None,
                 grad_layers: str = "summary", best_by: str = "",
                 compare: Any = None, tags: Any = None,
-                curve: str = "brief", curve_tags: Any = None) -> Mapping[str, Any]:
+                curve: str = "brief", curve_tags: Any = None,
+                histograms: str = "names", distributions: str = "names",
+                text: str = "names") -> Mapping[str, Any]:
         detail = engine.query("training_detail", run_id=run_id,
                               include_series=bool(include_series),
                               limit=int(limit), grad_layers=str(grad_layers),
@@ -748,7 +750,11 @@ def _describe_training(engine: MLEngine,
                               compare=[str(x) for x in (compare or [])],
                               tags=[str(x) for x in (tags or [])],
                               curve=str(curve or "brief"),
-                              curve_tags=[str(x) for x in (curve_tags or [])])
+                              curve_tags=[str(x) for x in (curve_tags or [])],
+                              #: ⭐ 三轴的值开关（names 默认 / values 给数值）
+                              histograms=str(histograms or "names"),
+                              distributions=str(distributions or "names"),
+                              text=str(text or "names"))
         out = {"ok": True, **detail, "error": ""}
         # ⚠ `pick` 的**边界**（实测踩过，别想当然）：回执里声明的**必填键**
         #   （`output_schema.required`）必须始终在 ⇒ 工具面会校验、缺了直接
@@ -785,7 +791,12 @@ def _describe_training(engine: MLEngine,
                     "可选整条序列（include_series=true）；序列较长时用 `pick` 只取关心的"
                     "那几条（如 ['series.loss.values']），别把整条序列灌进上下文。"
                     "⚠ 数据来自 TensorBoard 事件文件：**没有事件文件就如实说读不到**"
-                    "（训练时未装 tensorboard 时如此）。",
+                    "（训练时未装 tensorboard 时如此）。"
+                    "⭐ **`histograms` / `distributions` / `text` 默认只给 tag 名**；"
+                    "要数值写 `histograms=\"values\"`（同理另两个）。"
+                    "`text` 的正文里是**逐层健康表**（每层 参数数/梯度范数/**权重范数**）"
+                    "——它是「表示长在哪一层」的直接证据；`histograms` 给 `min/max/num/sum`。"
+                    "⚠ 这三轴的**逐次演化**读不到（框架只在终态写 1 次，回执里 `writes` 会说几帧）。",
         parameters={
             "run_id": {"type": "string",
                        "description": "运行编号；留空则按最近落盘的 run 找", "default": ""},
@@ -796,6 +807,20 @@ def _describe_training(engine: MLEngine,
             "limit": {"type": "integer",
                       "description": "每个 tag 最多回多少点（只对 include_series 生效）",
                       "default": 200},
+            "histograms": {"type": "string",
+                           "description": "直方图轴（权重分布）的详细度：names（默认，只给 tag 名）"
+                                          "/ values（给每个 tag 的 min/max/num/sum + 写入帧数）。"
+                                          "⚠ 只写 1 帧时给不出「随时间的变化」",
+                           "default": "names"},
+            "distributions": {"type": "string",
+                              "description": "分布轴（分位数）的详细度：names（默认）/ values"
+                                             "（给末次的分位点：0/5/10/25/50/75/90/95/100%）",
+                              "default": "names"},
+            "text": {"type": "string",
+                     "description": "文本轴（如 `layers/health/text_summary` 的**逐层健康表**）"
+                                    "的详细度：names（默认，只给 tag 名）/ values（给正文；"
+                                    "超长会截断并带 `truncated`/`chars_total`）",
+                     "default": "names"},
             "grad_layers": {"type": "string",
                             "description": "逐层梯度的详细度：summary（默认，前 3 + 后 3 + "
                                            "总数；几十层的网络能省一大截）/ full（全部）",

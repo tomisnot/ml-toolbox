@@ -785,7 +785,10 @@ class MLEngine(Engine):
                                compare: Sequence[str] | None = None,
                                tags: Sequence[str] | None = None,
                                curve: str = "brief",
-                               curve_tags: Sequence[str] | None = None) -> dict[str, Any]:
+                               curve_tags: Sequence[str] | None = None,
+                               histograms: str = "names",
+                               distributions: str = "names",
+                               text: str = "names") -> dict[str, Any]:
         """训练的**逐 epoch 观测数值**（只读；数据源 = TensorBoard 事件文件）。
 
         ## 为什么必须是只读查询 + 不走会话内存
@@ -835,7 +838,7 @@ class MLEngine(Engine):
             return {
                 "run_id": compare_ids[0], "available": True, "reason": "",
                 "latest": {}, "tags": picked, "histograms": [], "images": [],
-                "text": [], "duplicate_steps": [],
+                "distributions": [], "text": [], "duplicate_steps": [],
                 "compare": {"runs": compare_ids, **aligned},
                 #: `compare` 模式下不做单 run 的形状/判读 ⇒ 模式记空串（**不编一个**）
                 "curve": {}, "curve_mode": "",
@@ -856,7 +859,7 @@ class MLEngine(Engine):
                     "run_id": "", "available": False,
                     "reason": "没有任何运行写过训练过程事件（只有神经网络类方法会写）",
                     "latest": {}, "tags": [], "histograms": [], "images": [],
-                    "text": [], "duplicate_steps": [], "max_points": 0,
+                    "distributions": [], "text": [], "duplicate_steps": [], "max_points": 0,
                     #: 没有可读的运行 ⇒ 没有任何形状/判读（如实空，**不假装**）
                     "curve": {}, "curve_mode": "",
                     "convergence": [],
@@ -872,20 +875,55 @@ class MLEngine(Engine):
         #   ⇒ 读一次（按两者的**较大**值），分析用全量、`series` 再按 `limit` 切片。
         #   旧版按 `limit` 截断后再判读 ⇒ 用户那条 `val_loss`（全程 6372→1060）
         #   在只看末 200 点时被误报成"发散"（判读与它手里的证据不一致）。
+        #: ⭐ **三轴开关的取值必须响亮校验**（本仓纪律：不静默把错拼当默认）。
+        #:   `names`（默认，只给 tag 名）/ `values`（给数值）/ `off`（连名字都不给）。
+        def _axis_mode(axis: str, raw: Any) -> str:
+            v = str(raw or "names").strip().lower() or "names"
+            if v not in ("names", "values", "off"):
+                raise MechaError(
+                    f"{axis} 只能是 names / values / off，收到 {raw!r}",
+                    kind="bad_axis_mode",
+                    hint="names=只给 tag 名（默认）；values=连数值一起给；off=这一轴完全不回",
+                    suggest=f'{axis}="values"')
+            return v
+
+        h_mode = _axis_mode("histograms", histograms)
+        d_mode = _axis_mode("distributions", distributions)
+        t_mode = _axis_mode("text", text)
+        ax_modes = {"histograms": h_mode, "distributions": d_mode, "text": t_mode}
         payload = tb_series.read_run(
-            resolved, limit=max(1, int(limit or 200), int(tb_series.MAX_POINTS)))
+            resolved, limit=max(1, int(limit or 200), int(tb_series.MAX_POINTS)),
+            #: ⭐ **值按需带**（2026-10-11 补的观测面缺口）：`histograms`/`text` 原来只给
+            #:   tag 名、`distributions` 连名字都没给 ⇒ AI 只能自己解析事件文件。
+            #:   三个开关互相独立；任一为 "values" 才去碰 protobuf。
+            with_values=any(m == "values" for m in ax_modes.values()))
         out: dict[str, Any] = {
             "run_id": resolved,
             "available": bool(payload.get("available")),
             "reason": str(payload.get("reason") or ""),
             "latest": tb_series.latest_of(payload, grad_layers=grad_layers),
             "tags": sorted((payload.get("scalars") or {}).keys()),
-            "histograms": sorted((payload.get("histograms") or {}) or []),
+            "histograms": (sorted((payload.get("histograms") or {}) or [])
+                           if h_mode != "off" else []),
+            #: ⭐ 新增：分布轴的名字与值（原来完全不暴露）
+            "distributions": (sorted((payload.get("distributions") or {}) or [])
+                              if d_mode != "off" else []),
             "images": sorted((payload.get("images") or {}) or []),
-            "text": sorted((payload.get("text") or {}) or []),
+            "text": sorted((payload.get("text") or {}) or []) if t_mode != "off" else [],
             # 同一 step 写了多个值时的留痕（重跑沿用同一 run_id 会走到这里）
             "duplicate_steps": payload.get("duplicate_steps") or [],
         }
+        #: ⭐ 值：按请求给，并且**明说哪一轴没给值**（不让调用方以为"没数据"）
+        if h_mode == "values":
+            out["histogram_values"] = payload.get("histogram_values") or {}
+        if d_mode == "values":
+            out["distribution_values"] = payload.get("distribution_values") or {}
+        if t_mode == "values":
+            out["text_values"] = payload.get("text_values") or {}
+        if any(m == "names" for m in ax_modes.values()):
+            #: ⚠ 只给名字时**说清怎么取值**（否则又是一次"只知道有、拿不到"）
+            out["values_note"] = ("`histograms`/`distributions`/`text` 默认只给 tag 名；"
+                                  "要数值写 histograms=\"values\"（同理 distributions / text）")
         # ⭐⭐ **曲线形状 + 收敛判读**（R42/R43，**默认就给**）：用户实测的误判是
         #   "只读 `latest`（一个点）⇒ 跨 run 比终值 ⇒ 以为饱和了"。形状是**便宜**的
         #   （每 tag 六个数），所以不该等 `include_series` 才给。

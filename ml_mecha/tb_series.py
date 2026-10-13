@@ -129,12 +129,153 @@ def _tail(values, limit: int = MAX_POINTS):
     return list(values)[-limit:]
 
 
+#: 文本（TEXT 轴）单条上限：逐层健康表这类 markdown 表通常几 KB，留足余量。
+#: ⚠ 必须**有界**：它是模型可见面的一部分，不能因为某个 run 写了一篇长文就把上下文挤爆。
+TEXT_MAX_CHARS = 4000
+
+#: 分布轴（Distributions）在事件文件里的元素是 **``(百分位, 值)`` 元组**，
+#: ⚠ **不是**带 ``percentile``/``value`` 属性的对象（我第一版按属性读 ⇒ 静默回 0 帧，实测抓到）。
+#: 元组里的百分位是"相对 10000 的整数"（如 500 = 5%）⇒ 统一除 100。
+_DIST_ATTR_PERCENTILES = (0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 100.0)
+
+
+def _histo_proto(ev: Any) -> Any:
+    """从直方图事件里取 protobuf（⚠ 跨版本：``histogram_value`` 与 ``histo`` 两种拼法）。"""
+    return getattr(ev, "histogram_value", None) or getattr(ev, "histo", None)
+
+
+def _read_histogram_values(acc: Any, tags: list[str]) -> dict[str, Any]:
+    """直方图的**数值**：每个 tag 回末次的 ``min/max/num/sum`` + 写入次数。
+
+    ## 为什么只回这四个数（而不是桶）
+    框架写的是"**min/max/num/sum 型**"直方图：实测 ``bucket`` 里混着裸 ``float``
+    （占位），真正的桶对象拿不到 ⇒ 回桶只能是空数组（那是**假装给了数据**）。
+    ⇒ 回**确实读得到**的四个数；前端 Histograms 面板画柱状图也靠这四个数兜底。
+    ⚠ 逐次演化**读不到**（框架只在终态写 1 次）⇒ 回 ``writes`` 让调用方知道有几帧。
+    """
+    out: dict[str, Any] = {}
+    for tag in tags:
+        try:
+            evs = acc.Histograms(tag)
+        except Exception:
+            continue
+        if not evs:
+            continue
+        last = evs[-1]
+        hp = _histo_proto(last)
+        if hp is None:
+            continue
+        out[str(tag)] = {
+            "writes": len(evs),
+            "step": int(getattr(last, "step", 0)),
+            "min": float(getattr(hp, "min", 0.0)),
+            "max": float(getattr(hp, "max", 0.0)),
+            "num": float(getattr(hp, "num", 0.0)),
+            "sum": float(getattr(hp, "sum", 0.0)),
+        }
+    return out
+
+
+def _read_distribution_values(acc: Any, tags: list[str]) -> dict[str, Any]:
+    """分布（分位数）数值：每个 tag 回末次的分位点。
+
+    ⚠⚠ **两个实测的坑**（第一版两个都踩了 ⇒ 静默回 0 帧）：
+    1. 元素是 ``(percentile, value)`` **元组**（10000 制：500 = 5%），不是带属性的对象；
+    2. protobuf 字段名在两版里是 ``compressed_histogram_values`` / ``compressed_histogram_value``。
+    ⇒ 两种字段名都试、两种元素形状都收（元组走下标，对象走属性），**不白名单过滤**
+    （照实回它写了几个分位，缺信息的是调用方自己判断）。
+    """
+    out: dict[str, Any] = {}
+    for tag in tags:
+        try:
+            evs = acc.CompressedHistograms(tag)
+        except Exception:
+            continue
+        if not evs:
+            continue
+        last = evs[-1]
+        raw = (getattr(last, "compressed_histogram_values", None)
+               or getattr(last, "compressed_histogram_value", None) or [])
+        pts: dict[str, float] = {}
+        for p in raw:
+            try:
+                if isinstance(p, (tuple, list)) and len(p) >= 2:
+                    pct, val = float(p[0]) / 100.0, float(p[1])
+                elif hasattr(p, "percentile") and hasattr(p, "value"):
+                    pct, val = float(p.percentile) / 100.0, float(p.value)
+                else:
+                    continue
+            except Exception:
+                continue
+            pts["%g" % pct] = val
+        if pts:
+            out[str(tag)] = {"writes": len(evs), "step": int(getattr(last, "step", 0)),
+                             "percentiles": pts}
+    return out
+
+
+def _read_text_values(acc: Any, tags: list[str]) -> dict[str, Any]:
+    """文本（TEXT 轴）**正文**：解码 ``TensorProto``；超长**截断并留痕**。
+
+    ⚠ 纪律：**截断必须说出来**（``truncated`` + ``chars_total``）——
+    静默截断会让调用方以为"正文就这么长"。
+    """
+    out: dict[str, Any] = {}
+    try:
+        from tensorboard.util import tensor_util
+    except Exception:
+        return out
+    for tag in tags:
+        try:
+            evs = acc.Tensors(tag)
+        except Exception:
+            continue
+        if not evs:
+            continue
+        last = evs[-1]
+        try:
+            arr = tensor_util.make_ndarray(last.tensor_proto)
+            raw = arr.item() if getattr(arr, "size", 0) == 1 else arr
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", "replace")
+            else:
+                text = str(raw)
+        except Exception as exc:
+            out[str(tag)] = {"writes": len(evs), "step": int(getattr(last, "step", 0)),
+                             "error": f"{type(exc).__name__}: {exc}"}
+            continue
+        ent = {"writes": len(evs), "step": int(getattr(last, "step", 0)),
+               "chars_total": len(text)}
+        if len(text) > TEXT_MAX_CHARS:
+            ent["text"] = text[:TEXT_MAX_CHARS]
+            ent["truncated"] = True
+        else:
+            ent["text"] = text
+            ent["truncated"] = False
+        out[str(tag)] = ent
+    return out
+
+
 def read_run(run_id: str, *, root: Path | None = None,
-             limit: int = MAX_POINTS) -> dict:
+             limit: int = MAX_POINTS,
+             with_values: bool = False) -> dict:
     """读一个 run 的事件文件，翻成 wire 形状。
 
+    @param with_values
+        ⭐ **是否把"值"也带出来**（默认 ``False`` = 只回 tag 名，与从前逐位一致）。
+        为什么要有这个开关（2026-10-11，实测缺口）：
+        `histograms` / `text` 原来**只回 tag 名**、`distributions` **连名字都不回**
+        ⇒ AI 想回答"是哪一层/哪个参数出问题了"时只能**绕开工具面自己去解析事件文件**
+        （我为此写过一个 `EventAccumulator` 脚本）。而 `layers/health/text_summary`
+        里那张"每层 参数数/梯度范数/**权重范数**"表，正是**唯一**能指出
+        "表示长在哪一层"的证据 ⇒ 它是**观测面缺口**，不是体积问题。
+        ⚠ 开关默认关：正文是**大负载**（几 KB/条），别让默认回执无谓膨胀。
+
     @returns ``{available, reason?, run_id, scalars:{tag:{steps,values,latest}},
-               histograms:[tag…], images:[tag…], text:[tag…]}``
+               histograms:[tag…], distributions:[tag…], images:[tag…], text:[tag…],
+               histogram_values?:{tag:{min,max,num,sum,writes,step}},
+               distribution_values?:{tag:{percentiles,writes,step}},
+               text_values?:{tag:{text,chars_total,truncated,writes,step}}}``
     """
     d = tb_dir(run_id, root)
     if d is None:
@@ -182,9 +323,17 @@ def read_run(run_id: str, *, root: Path | None = None,
         "dir": d.name,
         "scalars": scalars,
         "histograms": list(tags.get("histograms", []) or []),
+        #: ⭐ **新增**：`distributions` 原来**连名字都没回**（`Tags()` 里一直有它，
+        #:   只是没人读）⇒ 前端 Distributions 面板的数据在 AI 侧是**完全不可见**的。
+        "distributions": list(tags.get("distributions", []) or []),
         "images": list(tags.get("images", []) or []),
         "text": list(tags.get("tensors", []) or []),
     }
+    if with_values and acc is not None:
+        #: ⚠ 值**按需**才读：直方图/分位/正文都要碰 protobuf，且正文可达数 KB
+        out["histogram_values"] = _read_histogram_values(acc, out["histograms"])
+        out["distribution_values"] = _read_distribution_values(acc, out["distributions"])
+        out["text_values"] = _read_text_values(acc, out["text"])
     if duplicated:
         # 留痕（不静默）：调用方/AI 能看出"这个 run 的目录里有重复写入"
         out["duplicate_steps"] = sorted(duplicated)
