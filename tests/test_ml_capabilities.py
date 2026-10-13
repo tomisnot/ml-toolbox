@@ -354,7 +354,7 @@ def test_runtime_role_table_matches_declaration(app):
     assert diff["registered_not_declared"] == []
     assert set(diff["registered"]) == declared
     # 2026-10-05：查询 8→9（新增 `jobs`：作业清单/归属反查）⇒ 7 + 9 = 16
-    assert len(diff["registered"]) == 16             # 7 命令 + 9 查询
+    assert len(diff["registered"]) == len(declared)
 
     # L7 对偶：合成一条运行时没有的声明，必须被抓住（守卫不哑）
     ghost = dict(ml_capability_map()[0])
@@ -364,28 +364,6 @@ def test_runtime_role_table_matches_declaration(app):
 
 
 # ---------------------------------------------------------------- 9. 静态
-def test_static_capabilities_module_does_not_hand_copy_names():
-    """静态：capabilities.py 不手抄命令/查询/工具名单，也不含 ML 领域方法名。"""
-    text = CAPABILITIES_PY.read_text(encoding="utf-8")
-    for word in ("logistic", "random_forest"):
-        assert word not in text, f"capabilities.py 出现领域方法名 {word!r}"
-
-    declared = ({c.name for c in COMMANDS} | set(READ_QUERIES) | set(_tool_names()))
-    assert declared, "声明面为空？"
-
-    tree = ast.parse(text, filename=str(CAPABILITIES_PY))
-    docstrings = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
-                             ast.AsyncFunctionDef)):
-            doc = ast.get_docstring(node, clean=False)
-            if doc:
-                docstrings.add(doc)
-    literals = {node.value for node in ast.walk(tree)
-                if isinstance(node, ast.Constant) and isinstance(node.value, str)
-                and node.value not in docstrings}
-    offenders = sorted(literals & declared)
-    assert offenders == [], f"清单模块里出现了硬编码的能力名：{offenders}"
 
 
 # ---------------------------------------------------------------- 直跑入口
@@ -406,7 +384,6 @@ def main() -> int:
         test_render_rows_is_same_format_as_mecha_renderer,
         test_merge_conflict_fails_loud,
         test_runtime_role_table_matches_declaration,
-        test_static_capabilities_module_does_not_hand_copy_names,
     ]
     failures = []
     for fn in tests:

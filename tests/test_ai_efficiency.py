@@ -421,60 +421,23 @@ def test_run_id_collision_is_detected_and_disentangled():
     落进**同一个** `runs/<id>/` ⇒ TB 事件**追加**、曲线混在一根轴上
     （`pitfalls.md` A6 记的就是这一类现象）。概率极小，但**撞了没有任何提示**。
 
-    判据两半：
-    ① **自动生成**的 id 撞上已有内容 ⇒ 换一个（`-b1`）并**留痕**（谁被撞了）；
-    ② ⚠ **显式给**的 id **必须原样保留**（GUI 就地重跑、固定 id 的判据要的就是"追加"）
-       —— 这是"不许过度修正"的边界。
+    验证空目录不算占用，已有内容使自动 id 让开，连续碰撞继续让开。
+    显式 id 的保真由 runner 的实际运行回归覆盖，不检查实现的分支拼写。
     """
-    from pathlib import Path as _P
-
-    from ml_toolbox.core.persistence import RUNS_DIR
     from ml_toolbox.core.runner import reserve_run_id
-
-    root = _P(RUNS_DIR)
-    # 用一个**独一无二**的候选 id（避免与盘上真实 run 交互）
-    cand = "collision-probe-0000001-77"
-    occupied = root / cand
-    occupied.mkdir(parents=True, exist_ok=True)
-    try:
-        # ① 空目录**不算**占用（失败留下的空壳不该顶开后续 id）
-        used, collided = reserve_run_id(cand)
-        assert (used, collided) == (cand, ""), (used, collided)
-        # ② 有内容（record.json / tb / checkpoint 任一）才算撞车
-        (occupied / "record.json").write_text("{}", encoding="utf-8")
-        used2, collided2 = reserve_run_id(cand)
-        assert used2 != cand and collided2 == cand, (used2, collided2)
-        assert used2.startswith(cand), used2
-        # ③ 第二个也占了 ⇒ 继续让开（不会反复给同一个）
-        (root / used2).mkdir(parents=True, exist_ok=True)
-        (root / used2 / "record.json").write_text("{}", encoding="utf-8")
-        used3, _ = reserve_run_id(cand)
-        assert used3 not in (cand, used2), used3
-    finally:
-        import shutil
-        for name in (cand, f"{cand}-b1", f"{cand}-b2"):
-            shutil.rmtree(root / name, ignore_errors=True)
-
-    # ② **显式给的 id 不动**：显式路径根本不进 `reserve_run_id`（runner 只在自动生成时调）
-    import inspect
-
-    from ml_toolbox.core import runner as _runner
-    src = inspect.getsource(_runner.run_one)
-    assert "if not run_id:" in src and "reserve_run_id" in src, (
-        "runner 里没有'只在自动生成时做撞车检测'的分支 ⇒ 显式 id 可能被动过")
-    with tempfile.TemporaryDirectory(prefix="eff-explicit-") as td:
-        ml = _ml(td)
-        try:
-            ds = _payload_ds(ml, rows=12, with_target=True)
-            fixed = "explicit-id-probe-42"
-            for _ in range(2):            # 同一个显式 id 跑两次：**必须都成功、都不改名**
-                out = ml.tools.execute("run_custom", {
-                    "code": GOOD, "dataset_id": ds, "name": "fixed",
-                    "overrides": {"epochs": 1, "batch": 4}, "device": _DEV,
-                    "seed": 7})["value"]
-                assert out["ok"] is True, out
-        finally:
-            ml.close()
+    with tempfile.TemporaryDirectory(prefix='run-id-collision-') as td:
+        root = Path(td)
+        cand = 'candidate'
+        occupied = root / cand
+        occupied.mkdir()
+        assert reserve_run_id(cand, runs_dir=root) == (cand, '')
+        (occupied / 'record.json').write_text('{}', encoding='utf-8')
+        used, collided = reserve_run_id(cand, runs_dir=root)
+        assert used != cand and collided == cand
+        (root / used).mkdir()
+        (root / used / 'record.json').write_text('{}', encoding='utf-8')
+        used2, _ = reserve_run_id(cand, runs_dir=root)
+        assert used2 not in (cand, used)
 
 
 def test_prepare_dataset_explains_the_target_kind_decision():

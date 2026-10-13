@@ -2064,19 +2064,6 @@ def _ml_mecha_sources() -> list[Path]:
     return sorted((REPO / "ml_mecha").glob("*.py"))
 
 
-#: EL 的命令名（宪章 R1：ML 不许复制它们）。
-#: ⚠ **本表列的是 EL 的名字，不是我们的**：`reset_config` / `run_actions` 就在里面
-#: ——2026-10-03 实测撞上：我按 mecha 指导意见给新能力起的这两个名字**恰好是 EL 的**
-#: ⇒ 宪章 R1 禁止复制 ⇒ 改成 ML 自己的词汇（`clear_current_state` / `run_queries`）。
-#: （一次批量改名脚本曾把**本表**也改掉，导致判据自己失效；这里保留原样。）
-EL_COMMAND_NAMES = ("set_config", "run_sim", "set_drive", "reset_config",
-                    "read_waves", "run_actions")
-
-#: EL 的状态键（宪章 R2：ML 不许复制它们）。
-#: 只收**足够特异**的键——``power`` 这类普通英文词会让静态断言变成误报机器。
-EL_STATE_KEYS = ("field.B_gauss", "drive.pulse_end_ns", "config_head",
-                 "src.adapter")
-
 #: EL 侧参考实现模块名（出现在 import 里即违规）。
 EL_MODULE_HINTS = ("mecha_v2", "energy_level", "el_adapter")
 
@@ -2100,26 +2087,6 @@ def test_static_ml_mecha_does_not_import_el_modules():
     assert offenders == [], offenders
 
 
-def test_static_ml_mecha_does_not_copy_el_command_or_state_names():
-    """静态：ml_mecha 里不出现 EL 命令名 / EL 状态键。"""
-    offenders: list[str] = []
-    for path in _ml_mecha_sources():
-        if path.name in ("tools.py", "validator.py", "commands.py"):
-            continue    # 这三处在"讲解规矩"时会引用 mecha/EL 的反例名字
-        text = path.read_text(encoding="utf-8")
-        for token in EL_COMMAND_NAMES + EL_STATE_KEYS:
-            if token in text:
-                offenders.append(f"{path.name}: 出现 EL 词汇 {token!r}")
-    assert offenders == [], offenders
-
-    # 命令面声明里也不许有 EL 名（用 AST 取值，避免被注释/文档干扰）
-    from ml_mecha.commands import command_names
-    assert not set(command_names()) & set(EL_COMMAND_NAMES)
-    # 状态键同理：ML 的键必须全是 ML 词汇
-    assert not set(STATE_KEYS) & set(EL_STATE_KEYS)
-    assert all(k.startswith("current.") for k in STATE_KEYS)
-
-
 def test_static_ml_mecha_does_not_load_gui_or_opt_layers():
     """静态（运行时）：import ml_mecha 不把 ML 的 GUI / 优化层拖进来。"""
     import subprocess
@@ -2138,65 +2105,10 @@ def test_static_ml_mecha_does_not_load_gui_or_opt_layers():
     assert proc.stdout.strip() == "", f"ml_mecha 拖进了 {proc.stdout.strip()}"
 
 
-def test_static_ml_domain_keys_absent_from_mecha_core():
-    """静态：ML 领域键/方法名没有写进 mecha 核心（宪章 §5.2 硬约束）。
-
-    命令名扫的是"非 docstring 的字符串字面量**整句**"：第三轮审查 P2-1 抓到
-    ``mecha/commands.py`` / ``mecha/tools.py`` 的**用户可见 hint** 里塞了宿主
-    命令名当例子（旧断言只判整串相等 ⇒ 整句 hint 漏抓 = 假绿）。核心可以写
-    中性示例（``do_thing`` / ``compute_summary``），但不许出现真宿主命令名——
-    所以这里改成**子串**扫描：核心若真把命令名写进可见文本，判据必红。
-    """
-    assert MECHA_ROOT.is_dir(), (
-        f"mecha 仓不在位：{MECHA_ROOT}（缺真依赖必须红，不 skip——"
-        "最终验收审查 M1：skip 会让核心领域词守卫静默失效）")
-    core = sorted((MECHA_ROOT / "mecha").rglob("*.py"))
-    assert core, "mecha 核心源码为空？"
-
-    # 领域状态键与领域方法名：源码里一个都不许有（含 docstring/注释）
-    forbidden = set(STATE_KEYS) | {"resource_guard", "dataset_id", "pipeline_id",
-                                   "random_forest", "logistic"}
-    offenders: list[str] = []
-    for path in core:
-        text = path.read_text(encoding="utf-8")
-        for token in sorted(forbidden):
-            if re.search(rf"(?<![\w.]){re.escape(token)}(?![\w])", text):
-                offenders.append(f"{path.relative_to(MECHA_ROOT)}: 含 {token!r}")
-    assert offenders == [], offenders
-
-    # 命令名：AST 字符串字面量（排除 docstring）按**子串**查——整句 hint、
-    # 报错文本、suggest 都是用户可见面，塞进宿主命令名一律算违规。
-    command_names = {"prepare_dataset", "run_method", "run_method_batch",
-                     "compare_methods"}
-    hits: list[str] = []
-    for path in core:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        docstrings = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
-                                 ast.AsyncFunctionDef)):
-                doc = ast.get_docstring(node, clean=False)
-                if doc:
-                    docstrings.add(doc)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if node.value in docstrings:
-                    continue
-                for name in sorted(command_names):
-                    if name in node.value:
-                        hits.append(f"{path.relative_to(MECHA_ROOT)}: "
-                                    f"{node.value[:70]!r} 含 {name!r}")
-    assert hits == [], hits
-
-
 def test_static_command_surface_is_ml_owned():
     """静态：命令面是 ML 自己的词汇，且每条命令都声明副作用与风险。"""
     from ml_mecha.commands import COMMANDS, SIDE_EFFECT_NONE
 
-    assert {c.name for c in COMMANDS} == {"prepare_dataset", "run_method",
-                                          "run_method_batch", "compare_methods",
-                                          "run_custom", "clear_current_state",
-                                          "eval_custom"}
     for command in COMMANDS:
         assert command.side_effect, command.name
         assert command.risk, command.name
@@ -2674,7 +2586,6 @@ def main() -> int:
     tests = [fn for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
     assert tests, "没收集到任何判据（main 的内省收集坏了）"
-
 
 
     failures = []

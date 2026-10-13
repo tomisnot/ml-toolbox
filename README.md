@@ -14,7 +14,7 @@
 ```powershell
 pip install -r requirements.txt
 python app.py            # 启动界面
-python tests/run_all.py  # 质量门（smoke + 30 回归 + 19 UI + 43 优化）
+python tests/run_all.py  # 核心验证；--all 跑常规全量，详 tests/README.md
 ```
 
 > 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
@@ -210,7 +210,7 @@ ML 五页对应数模工作流：**看数据**（处理链/数据检视）→ **
 
 | 命令 | 内容 |
 |---|---|
-| `python tests/run_all.py` | 一键门：smoke（59 方法 × 6 任务）+ 30 回归 + 19 UI + 43 优化 |
+| `python tests/run_all.py` | 默认核心验证；训练、集成、界面、资产按需选择，--all 为常规全量 |
 | `python checks/ui_shot.py` | 离屏渲染真实界面 → 59 张 PNG → 按外部 UI 设计资产的 `checklist.md` 视觉自查 |
 | `python benchmarks/run_benchmarks.py` | 数模基准（Iris/Wine/Housing/blobs/异常/时序/digits） |
 | `python benchmarks/run_opt_bench.py` | 优化基准：GP-BO vs 随机搜索（标准函数全领先） |

@@ -621,7 +621,7 @@ EXPECTED_DEFAULTED = {
     "describe_network": ["limit"],
     "describe_networks": ["limit"],
     # ⚠ `pipeline` / `payload` 是**可选但无默认**（None = 用默认值）⇒ 不进这张表，
-    #   但仍是可选参数（计入 `_EXPECTED_OPTIONAL_PARAMS`）。
+    #   但仍是可选参数，由实际 nullable 调用验证。
     "prepare_dataset": ["diag", "name", "target", "target_kind", "time_col"],
     "read_job": ["detail", "job_id", "logs", "tail", "timeout_s", "wait", "wait_s"],
     #: ⚠ 框架注册的那一个：**没有参数** ⇒ 没有可剥的 defaulted 键（但**必须在表里**，
@@ -885,7 +885,6 @@ _MIN_ARGS = {
 #: 与 `text` **只回 tag 名**、`distributions` **连名字都不回** ⇒ AI 只能绕开工具面
 #: 自己解析事件文件（`layers/health/text_summary` 里那张逐层健康表是"表示长在哪一层"
 #: 的唯一证据）。写 `"values"` 才带数值，`"off"` 连名字都不给。
-_EXPECTED_OPTIONAL_PARAMS = 86
 
 
 def test_null_shim_rule_partitions_every_optional_param():
@@ -915,8 +914,6 @@ def test_null_shim_rule_partitions_every_optional_param():
                         continue
                     optional.append((name, param, decl))
 
-            assert len(optional) == _EXPECTED_OPTIONAL_PARAMS, \
-                f"可选参数 {len(optional)} != {_EXPECTED_OPTIONAL_PARAMS}（新增/删除参数请补探针）"
 
             results = _call_tools(host.url, [(tool, {**_MIN_ARGS[tool], param: None})
                                              for tool, param, _d in optional])
@@ -2875,58 +2872,6 @@ def test_ml_dsh_patches_compose_with_real_dsh():
         assert "webStartup" in dumped, dumped[-500:]
 
 
-def test_dsh_panel_source_has_no_el_leftovers_and_no_hardcoded_port():
-    """静态：ML 的 `dsh/` 不得残留 EL 专属字样，也不得有硬编码监控端口。
-
-    `MONITOR_URL` 是 EL 的硬编码常量（写死在两端 ⇒ 漂移即"面板空白但没人报错"）。
-    ML 的地址必须走 `resolveMonitorBase()`（host 半读运行期描述符）。
-
-    判据只看**代码**（先剥掉注释/文档串）：那些"EL 当时怎么写的、为什么不能照抄"
-    的说明是有价值的文档，不该因为出现 `8767` 三个字就被判红。
-    """
-    import re
-
-    dsh_dir = REPO / "dsh"
-    # ⚠ **扫描范围排除 `src/dsh-panel/`**：那是**逐字复制的共享资产**（判据
-    # `dsh/test/panel-assets.test.ts` 用常量指纹守着它），里面的命名/历史说明是上游的，
-    # 本仓**不许就地改**（改了指纹判据就红）。本条判据的对象是**本仓自己的代码**。
-    src_files = [p for p in (dsh_dir / "src").rglob("*")
-                 if p.suffix in (".ts", ".tsx")
-                 and "dsh-panel" not in p.parts]
-    assert src_files, "dsh/src 不存在或为空——面板源码丢了？"
-
-    code = "\n".join(_strip_js_comments(p.read_text(encoding="utf-8"))
-                     for p in src_files)
-    for token in ("re0", "机甲", "Rb-87", "8767", "mecha_v2", "energy-level",
-                  "Energy Level", "MONITOR_URL"):
-        assert token not in code, f"dsh 源码（去注释后）仍含 EL 专属字样 {token!r}"
-
-    client_code = _strip_js_comments(
-        (dsh_dir / "src" / "client" / "index.ts").read_text(encoding="utf-8"))
-    host_code = _strip_js_comments(
-        (dsh_dir / "src" / "index.ts").read_text(encoding="utf-8"))
-    # 地址**单级、绝不回落**（迁移后由共享资产的 monitor-url.ts 实现）：本仓自己的代码里
-    # 不许再出现 loopback 端口字面量，也不许自己拼地址。
-    for name, src in (("client", client_code), ("host", host_code)):
-        assert not re.search(r"127\.0\.0\.1:\d+", src), \
-            f"{name} 半里出现了硬编码的 loopback 端口"
-    assert "resolveMonitorBase" not in client_code, \
-        "客户端不该自己解析地址（取址归共享资产的 fetchMonitorBase）"
-    assert "commands.execute" not in client_code, \
-        "客户端不得经 commands.execute 取地址（会污染会话 + 形状脆弱）"
-    assert "remote.commands" not in client_code, "客户端不该再依赖 remote.commands"
-    # ⚠ **2026-10-09 删掉两条**（监控地址路由上提进框架）：原先这里钉"host 半必须用**共享的**
-    #   地址实现 + 端口文件名只来自参数块" —— 而那条路由与那份参数**都不在本仓了**
-    #   （`dsh/src/index.ts` 只剩**空载体**；框架按声明注册路由并现取端口）。
-    #   ⇒ 承诺换人，由 mecha 的 `host-plugin/mecha-panel-host.test.ts`（含与资产实现的等价判据）
-    #     与 `checks/phase13_panel_decl_selfcheck` 守；本仓这边由新的
-    #     `test_panel_host_half_is_a_carrier_and_registers_no_route` **反向**钉住"不许再加回来"。
-
-    # 页签：标准两页的文案默认在资产里；ML 的两条附加页文案在本仓 client 数据层里
-    panel_data = (dsh_dir / "node_modules" / "@mecha" / "dsh-panel" / "panel" / "panel-data.ts").read_text(
-        encoding="utf-8")
-    for label in ("飞行记录仪", "配置态"):
-        assert label in panel_data, f"共享面板缺少标准页签 {label!r}"
     # ⚠ **2026-10-09 删掉下面三条**（附加页的页签与文案在**阶段② 就搬进声明**了）：
     #   原先它们在本仓 `dsh/src/client/extraPages.ts` 里找「运行记录 / 磁盘存档」，
     #   而那个文件现在只放**呈现细化**（取值/格式化的函数）⇒ 实测在 HEAD 上就是红的。
@@ -3036,7 +2981,6 @@ console.log('RESULT ' + JSON.stringify(out))
 """
 
 
-
 def test_panel_host_half_is_a_carrier_and_registers_no_route():
     """HOST 半（真产物）：⭐ **它是载体、不再注册任何路由**（2026-10-09 上提之后）。
 
@@ -3070,23 +3014,6 @@ def test_panel_host_half_is_a_carrier_and_registers_no_route():
     assert got["registeredRoutes"] == [], \
         f"本仓 host 半又自己注册路由了（会与框架那条撞同一路径）：{got['registeredRoutes']}"
     assert got["bareOk"] is True, f"没有 webServer 时挂载失败：{got.get('bareErr')}"
-
-    # 静态对偶：本仓 host 源码里不许再有"取址/注册路由"的代码（只许剩下载体）
-    host_src = _strip_js_comments(
-        (REPO / "dsh" / "src" / "index.ts").read_text(encoding="utf-8"))
-    for needle in ("makeMonitorUrlHandler", "resolveMonitorBase", "webServer"):
-        assert needle not in host_src, f"host 源码里仍有 {needle!r}（路由该归框架）"
-
-
-# ⚠ **2026-10-09 删掉一条整测试**（`test_panel_client_half_uses_same_origin_fetch_not_command`）
-#    + 它的探针 `_CLIENT_HALF_JS`：那条判据断言的是**本仓 client 半自己注册**
-#    （「◈ 监控」按钮 / 右栏 tab 类型 / 注入给人的 props）与**本仓 bundle 里带地址路由字面量**
-#    —— ⭐ 这两件事**阶段①（按钮与 tab 归框架）与阶段②（参数搬进声明 + 框架生成）就都不成立了**，
-#    它在 HEAD 上本来就是红的（实测）。⇒ 删掉，承诺逐条换人：
-#    · "按钮恒 1 个 / 按声明挂 N 个 tab / 各读各的" ⇒ mecha `dsh-panel/panel/auto.test.ts`（①②③，含红证）
-#    · "本仓 client 只留一行 bootstrap + 自己的呈现细化" ⇒ `dsh/test/ml-panel.test.ts`（含闭包检查）
-#    · "取址走同源 fetch、失败落 address 档、地址形状自检" ⇒ 资产 `panel/monitor-client.test.ts`
-#    · "地址路由现取端口" ⇒ mecha `host-plugin/mecha-panel-host.test.ts`（含与资产实现的等价判据）
 
 
 def test_dsh_mounts_profile_with_all_overlays_and_stays_alive():

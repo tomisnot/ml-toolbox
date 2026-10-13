@@ -115,8 +115,19 @@ def test_session_export_state_summarizes_requests():
     assert "f1" in row["metrics"]
 
 
+def test_explicit_run_id_is_preserved():
+    session = Session(seed=17)
+    spec = session.prepare(_dataset(), pipeline=Pipeline.default())
+    for _ in range(2):
+        rec = session.run(spec, RunRequest(method='logistic', seed=17,
+                                          extras={'run_id': 'explicit-id-probe'}))
+        assert rec.run_id == 'explicit-id-probe'
+        assert 'run_id_collision' not in rec.config.get('extras', {})
+
+
 def main():
-    tests = [test_session_methods_prepare_and_run,
+    tests = [test_explicit_run_id_is_preserved,
+             test_session_methods_prepare_and_run,
              test_session_method_failure_and_resource_guard,
              test_session_batch_and_explicit_save,
              test_run_config_conversion_isolated,
