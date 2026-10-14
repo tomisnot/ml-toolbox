@@ -1,277 +1,158 @@
 # ML Toolbox · 机器学习方法试验台
 
-一个**可被其他项目直接 import** 的机器学习工具箱，也是桌面软件：把"哪个方法好用"
-这件无法提前预测的事，变成"在统一界面里低成本遍历尝试"的工程流程。
+把“哪个方法适合这份数据”变成可比较、可检视、可复现的实验过程：共享数据与处理管道，尝试不同方法，观察训练和结果，再继续调参。
 
-- 59 个方法 / 11 族（含神经网络 MLP，方案 C：训练过程可视化；
-  含 6 个量子启发方法，按建模任务分散归族，零新增依赖）
-- 9 个优化器 + 自动调参工作区（序贯优化，与 ML 三接缝互通；含横场量子退火 SQA）
-- 按**建模目的**（预测/判别/归因/分群/降维/综合评价/异常/代理模型/基线）筛选
-- 每个方法声明自己的核心图，UI 基类不预设图长什么样
-- 一份数据 + 一条可检视管道，全方法共享；实验自动存档可回看
-- 数学建模基准实战验证：遍历结果落在已知答案附近
+ML Toolbox 同时提供可直接 import 的 Python API、PyQt5 桌面软件，以及经 mecha 接入的 AI 工具与观测面。方法、数据和实验属于软件；AI 是选择、编写模型和组织实验的操作者。
 
-```powershell
-pip install -r requirements.txt
-python app.py            # 启动界面
-python tests/run_all.py  # 核心验证；--all 跑常规全量，详 tests/README.md
-```
+## 主要能力
 
-> 神经网络方法族（`torch_mlp`）需 `pip install torch`；优化框架的 TPE/ASHA 引擎需
-> `pip install optuna`；二者均为可选依赖，未装时其余方法/自研优化器照常可用。
-> 依赖声明有两处、**分工明确**：`requirements.txt` 是「把整台软件跑起来」的安装清单（GUI 全量，
-> 本地开发主路径，mecha 走兄弟仓可编辑安装），`pyproject.toml` 是包元数据 + 按用途分组的 extras
-> （`ai` / `neural` / `optuna`）——**AI 模式的依赖（mecha / mcp / uvicorn）都在 `ai` extra 里声明**
-> ⇒ 非本机环境装 AI 模式：`pip install -e ".[ai]"`（其中 mecha 是 GitHub URL 依赖）。
-
-### AI 模式（可选）：运行后在 dsh 界面指挥 AI 调用 ML
-
-安装步骤（两步，含"必须在仓根执行"等注意）**只有一处权威**：
-[docs/交付说明.md](docs/交付说明.md) §1–§2。这里只给启动：
-
-```powershell
-python -m mecha --all --root .        # 起整站（本软件 + harness + 进程编排）
-```
-
-⚠ **进程编排整块归 mecha 的统一启动器**：本项目**不再自己编排**，
-声明在 `ml_mecha/mecha_site.py`（旧 `launcher.py` 已删；它踩出来的坑与实测常量
-抽在 [docs/旧启动器-活知识存档.md](docs/旧启动器-活知识存档.md)）。
-
-起来后会起 headless 权威（写权出厂 LOCKED、由**启动者**的声明开闸）+ 本地 MCP 工具服务
-+ dsh 界面（本实例绑 3081，3080 留给官方 dsh）；在 dsh 里用自然语言让 AI 调
-`describe_methods` / `prepare_dataset` / `run_method` / `submit_run` / `read_job`，
-点会话头「◈ 监控」看只读驾驶舱（飞行记录仪 / 配置态 / 运行记录 / 磁盘存档）。
-⚠ **切写权在启动面板/控制端点上**（不是"重启换模式"）：切完**立刻生效**，进程不重启。
-
-- 使用者请看 [docs/交付说明.md](docs/交付说明.md)（安装、启动、示例、排错）。
-
----
-
-## 一、架构
-
-```
-ml_toolbox/
-├── core/          零 GUI 依赖（已用 grep 核实）
-│   ├── contracts.py    MLMethod 基类 / RunConfig / MLResult / PageSpec / ParamSpec
-│   ├── dataset.py      Dataset —— 单一数据入口
-│   ├── pipeline.py     管道步骤链（缺失值/编码/缩放/筛选/划分）+ transform_new
-│   ├── registry.py     @register 注册表（遍历候选集来源）
-│   ├── runner.py       run_one / run_batch / compare_table / auto_pages
-│   ├── persistence.py  runs/<id>/{record.json, artifacts.npz}
-│   └── demo.py         8 个离线演示数据集
-├── methods/       11 个方法族 + plots.py（纯 matplotlib 绘图函数）
-│   ├── neural/    神经网络（方案 C）：recorder 黑匣子 + TorchMLP + nnplots
-│   ├── quantum.py  6 个量子启发方法（qsvc/qlssvc/qkrr/qkmeans/qpca/qreservoir，
-│   │               按任务分归 svm/linear/cluster/manifold/timeseries 族）
-│   └── qsim.py     小规模量子态模拟器（numpy 态矢量/密度矩阵，零新依赖）
-├── opt/           序贯优化子框架（兄弟框架，零 Qt）
-│   ├── contracts.py   ParamSpace / Objective / Optimizer(ask-tell) / OptRecord
-│   ├── engines/       baseline·bo(GP-BO)·evo(CMA-ES/NSGA-II)·local(NM)·
-│   │                  quantum(横场退火 SQA)·optuna适配
-│   ├── runner.py      optimize() 预算控制 + on_eval 直播回调
-│   ├── sources.py     数据侧接入：FileSource(热重读)/SpecSource/ArraySource
-│   ├── process.py     评估侧接入：ProcessObjective(外部程序黑盒，stdout 解析；
-│   │                  硬约束 constraint_signal + on_infeasible=censor/penalize)
-│   ├── bridges.py     三接缝：AutoTuner / 响应面 / GPR 代理
-│   └── synth.py       标准测试函数（Ackley/Rosenbrock/ZDT…）
-├── ui/            PyQt5 界面（唯一有 Qt 依赖的层）
-│   ├── main_window.py     主窗口装配
-│   ├── inspector.py       检视页基类（按 PageSpec 动态装配 + 页类型注册表）
-│   ├── neural_pages.py    神经网络自定义页（权重热图 / 表示演化回放）
-│   ├── gallery.py         核心图并排缩略（遍历的视觉回报）
-│   ├── chain_page.py      处理链大卡片
-│   ├── data_page.py       数据检视（特征相关热图）
-│   ├── heatmap.py         pyqtgraph 自适应矩阵热图
-│   ├── param_panel.py     旋钮面板（空=默认，就地重跑）
-│   ├── method_browser.py  方法库（族分组 + 用途筛选 + 搜索）
-│   ├── history.py         实验历史回看
-│   └── worker.py          后台线程
-├── tests/         smoke / 回归 / UI / run_all（一键门）
-├── benchmarks/    数学建模基准（结果表在 benchmarks/results/）
-├── checks/        离屏截图自查闭环
-└── docs/          项目定位.md（宪法）· 契约.md · 优化契约.md ·
-                   原子模拟对接.md（实战）· pitfalls.md（43 条）
-```
-
-**依赖方向单向**：`ui → core + methods`，`methods → core`，`core → 无内部依赖`。
-core 不 import 任何 GUI；methods 只在绘图函数**内部**惰性 import matplotlib，
-模块导入本身不碰 GUI（smoke 测试在无显示环境下全过即为证据）。
-
-## 二、后端：高效 / 自由 / 可独立引用
-
-### 高效
-
-| 机制 | 效果 |
+| 能力 | 内容 |
 |---|---|
-| 遍历在后台线程跑（`worker.py`） | 界面不冻结，进度逐方法回报 |
-| 惰性 import（sklearn/xgboost 等在 `make()` 里） | 启动快，未选的方法不加载 |
-| 元学习器外层 `NJOBS=1`，成员模型 `n_jobs=-1` | 避免 Windows OpenMP 嵌套超订（曾致偶发崩溃） |
-| 诊断/交叉验证默认关 | 零侵入：不开时数值路径与耗时不变 |
-| 检视页只在变化时重建 | 切换方法不重复构造画布 |
+| 方法试验台 | 回归、分类、聚类、降维、异常检测、时序、神经网络与量子启发方法；按任务和建模目的检索 |
+| 共享数据管道 | 缺失值、编码、缩放、特征选择和划分；处理链可检视，新数据沿用训练变换 |
+| 对比与检视 | 指标对比、方法自有图表、数据视图、核心图画廊和历史回看 |
+| 自定义网络 | 表格、图与 NQS 路径；真实负载试跑、短步训练、自定义指标、checkpoint 与续训 |
+| 优化试验台 | ask-and-tell 优化器、预算与约束、外部程序目标函数、自动调参和响应面 |
+| 实验资产 | 运行记录、指标、工件和训练观测；通过稳定 API 与 AI 工具查询 |
 
-已知性能边界（诚实列出）：GPR/核方法 O(n³)（>3000 样本慎用）、t-SNE/UMAP 万级样本
-偏慢、画廊 >20 缩略图构建偏慢。这些是方法本身复杂度，非框架缺陷。
+方法库覆盖线性、集成、SVM、近邻、聚类、流形、时序、贝叶斯、异常检测和神经网络等家族。具体方法和参数以当前注册表为准。
 
-### 自由（UI 基类高自由度）
+## 安装
 
-方法用 `PageSpec` 声明自己的检视页，UI 只负责装配：
+Python 3.10+。建议为项目创建独立环境：
 
-```python
-PageSpec(key="cm", title="混淆矩阵", kind="mpl", plot=my_fn)  # plot(ax, result)
-PageSpec(key="emb_pg", title="交互缩放", kind="pg")           # 交给 pyqtgraph
-PageSpec(key="tbl", title="系数表", kind="table")             # 消费 DataFrame 工件
+```bash
+git clone https://github.com/tomisnot/ml-toolbox.git
+cd ml-toolbox
+python -m venv .venv
 ```
 
-- `kind` 决定渲染方式；方法层**零 Qt**（plot 是纯 matplotlib 函数）；
-- 方法没声明 → `runner.auto_pages` 按 task 兜底，UI 永远不空白；
-- 工件缺失 → 显示 `hint` 语义化占位，不让用户猜原因；
-- **新页类型可注册**：`inspector.register_page_builder(kind, builder)` 挂自定义
-  QWidget（神经网络的权重热图 `nn_weights`、表示演化回放 `nn_replay` 即如此接入）——
-  方法层只声明 kind + 把数据装进 artifacts，渲染归 UI 层，框架零改动。
+激活环境：Windows PowerShell 使用 `.venv/Scripts/Activate.ps1`，Linux/macOS 使用 `source .venv/bin/activate`。
 
-### 可独立引用（不开 GUI 完成全部工作）
+```bash
+python -m pip install -e .
+```
+
+按需要安装可选能力：
+
+```bash
+python -m pip install -e ".[neural]"  # PyTorch 与训练事件观测
+python -m pip install -e ".[optuna]"  # Optuna 优化器适配
+```
+
+AI 模式推荐同时检出当前 mecha 源码，并在本环境安装：
+
+```bash
+# 在共同父目录检出 mecha；随后回到本项目根
+git clone https://github.com/tomisnot/mecha.git ../mecha
+python -m pip install -e "../mecha[mcp]"
+```
+
+`.[ai]` extra 提供基于 mecha `v0.2.0` 的发布依赖；当前开发代码建议与框架源码配套使用。目录布局不同，请替换 `../mecha`。
+
+`requirements.txt` 保留本地开发的完整安装清单，其中 mecha 使用兄弟目录的可编辑引用；使用该清单时需按实际布局放置框架仓。
+
+## 启动
+
+```bash
+# 本地桌面软件
+python app.py
+
+# 本软件的 headless MCP 服务
+python app_entry.py --mcp
+
+# 软件服务，同时提供可按需打开的桌面窗口与 Web 面板
+python app_entry.py --mcp --with-gui --with-panel
+
+# 由 mecha 统一启动软件、AI 宿主与项目面板
+python -m mecha --all --root .
+```
+
+桌面软件有两个工作区：**ML 方法试验台**用于数据、方法对比、检视和预测；**优化调参**用于变量空间、目标函数、约束、预算与优化过程。
+
+整站 AI 界面需要 PATH 中的 dsh 可执行命令和本仓 `dsh/` 插件资产。插件通过本地 `file:` 引用共享面板；换目录布局时，先将 `dsh/package.json` 的 `@mecha/dsh-panel` 指向所用 mecha 仓的 `mecha/dsh-panel/`，再在 `dsh/` 执行 `npm install` 和 `npm run bundle`。
+
+## Python API
+
+无需打开 GUI 即可准备数据、运行方法、比较记录和预测。以下示例读取含目标列 `y` 的 CSV：
 
 ```python
-import pandas as pd
-from ml_toolbox.core import registry, runner
+from ml_toolbox.api import RunRequest, Session
 from ml_toolbox.core.dataset import Dataset
-from ml_toolbox.core.pipeline import Pipeline
 
-registry.load_builtin()
-pipe = Pipeline.default()
-spec = pipe.run(Dataset.load("train.csv", target="y"))
-
-# 遍历全部适用方法，按主指标排序
-recs = runner.run_batch([m.name for m in registry.for_spec(spec)], spec)
-best = runner.compare_table(recs).iloc[0]
-
-# 用最优方法预测新数据（同管道变换；未见类别/缺失值自动处理）
-rec = runner.run_one(registry.get(best["method"]), spec)
-Xte = pipe.transform_new(pd.read_csv("test.csv"))
-pred = registry.get(best["method"]).predict(Xte, rec.result)
+session = Session()
+spec = session.prepare(Dataset.load("train.csv", target="y"))
+record = session.run(
+    spec,
+    RunRequest(method="random_forest", persist=True),
+)
+print(record.run_id)
+print(record.result.metrics)
 ```
 
-其他独立入口：`registry.for_spec(spec)` 取候选集；`method.cross_validate(X, y, cfg, cv=5)`
-拿 k 折结果；`persistence.list_records()` 读历史；`Dataset.from_arrays(X, y)` 从内存构造。
+`Session` 提供请求、运行状态和结果边界；方法扩展仍使用 `MLMethod`、`ParamSpec`、`PageSpec` 与注册表。数据、方法和持久化约定见 [契约](docs/契约.md)。
 
-## 三、方法总览（按建模目的）
+## AI 操作与训练观测
 
-| 目的 | 数量 | 方法 |
-|---|---|---|
-| 预测 | 41 | 全部回归 + 时序 + 分类器（可预测类别，含 torch_mlp；量子：qsvc/qlssvc/qkrr/qreservoir） |
-| 判别 | 23 | logistic, lda, qda, svc, linear_svc, nusvc, knn, 朴素贝叶斯×3, 树/集成×8, voting, stacking, torch_mlp, dummy, **qsvc, qlssvc** |
-| 归因解释 | 13 | linear_regression, ridge, lasso, elasticnet, bayesian_ridge, huber, theilsen, logistic, linear_svc, lda, random_forest, extra_trees, gpr, arima, ts_trend |
-| 分群 | 7 | kmeans, gmm, dbscan, hdbscan, agglomerative, spectral, **qkmeans** |
-| 降维 | 7 | pca, kernel_pca, lda_proj, tsne, umap, isomap, **qpca** |
-| 综合评价 | 3 | pca, lda_proj, **qpca**（方差/判别权重可作打分依据） |
-| 异常检测 | 4 | iforest, lof, ocsvm, mahalanobis |
-| 代理模型 | 2 | gpr, bayesian_ridge（含不确定度，可喂优化算法） |
-| 参照基线 | 1 | dummy（任何模型都应赢它） |
+AI 工具可检索方法和参数、准备数据、运行或比较方法、编写自定义网络，并读取运行与训练结果。
 
-> 目的由 `task + tags + family` 推导，方法可用 ClassVar `purposes` 显式覆盖。
-> 一个方法可挂多个目的（如 lasso = 预测 + 归因解释）。
+- 自定义网络支持 `code_path`，便于复用源码；`dry_run` 与 `warmup_steps` 用于先检查真实负载和短步训练。
+- `submit_run` 提交后台任务；`read_job` 默认返回摘要，可等待终态或多个任务中的任意一个完成。
+- 训练期间可取得 `run_id`，读取曲线、指标和日志尾段；全量信息按需查询。
+- 后台运行保存业务结果；自定义网络支持周期 checkpoint、声明最佳指标和从 checkpoint 续训。
+- 超过并发名额的任务进入队列，排队状态和等待时间可查询。
+- 写操作由 mecha 治理并留痕；人在控制面切换写权，软件无需重启。
 
-按族：linear 12 · ensemble 9 · cluster 7 · manifold 7 · timeseries 8 · bayes 4 ·
-anomaly 4 · svm 5 · knn 1 · baseline 1 · neural 1（量子启发 6 方法分散在前 5 族，
-以 tag `quantum` 检索，不单独成族）。
+方法试算、指标意义、资源预算和训练恢复属于本项目；通用写权、记录与连接机制由 [mecha](https://github.com/tomisnot/mecha) 提供。详细用法见 [交付说明](docs/交付说明.md)。
 
-## 四、界面速览
+## 架构与扩展
 
-两种对等的工作模式（Perspective，工具栏最左切换）：
-
-```
-┌ [ML 方法试验台 | 优化调参]  打开数据 · 演示数据 · 管道设置 · 历史 · 种子 ┐
-│ ML 模式：方法库 │ 处理链 │ 数据检视 │ 对比视图 │ 核心图对比 │ 方法检视 │ 参数 │
-│ 优化模式：数据源+目标+优化器+预算+超参 │ 收敛曲线│平行坐标│探索地图│Pareto│代理 │
-└ 底部  ▶ 遍历运行所选方法 / ▶ 开始优化（逐条直播）────────────────────────┘
+```text
+ml_toolbox/api.py     稳定的无界面 Python API
+ml_toolbox/core/      数据、管道、契约、注册表、运行与持久化
+ml_toolbox/methods/   方法实现、神经网络与绘图
+ml_toolbox/opt/       优化器、目标函数、约束与 ML 桥接
+ml_toolbox/ui/        PyQt5 界面与可注册检视页
+ml_mecha/            受控命令、AI 工具、任务调度与观测接线
+dsh/                 AI 宿主中的项目面板
+tests/               按主题选择的验证
+benchmarks/          方法、优化与性能实验
+docs/                项目定位、契约与使用说明
 ```
 
-ML 专属控件（诊断/交叉验证/对新数据预测）在优化模式下自动隐藏；数据工具栏共享。
-优化工作区的目标函数三类型：合成函数 / ML 方法调参（AutoTuner，数据源可选
-"ML 内部数据集"或"外部文件 csv/parquet 热重读"）/ 外部程序（参数注入命令模板，
-stdout 解析分数）——"接入正在运行的程序"的两种耦合方式（数据侧/评估侧）都覆盖。
+计算核心与 GUI 分开，方法通过声明提供参数和检视页。新增方法注册后可进入检索、运行与对比流程；需要新的视图时可注册页面构建器。图方法通过 `Problem` 的图结构和节点掩码访问数据，避免将图任务强行变成普通表格任务。
 
-ML 五页对应数模工作流：**看数据**（处理链/数据检视）→ **选模型**（遍历+对比+画廊）→
-**看细节**（方法检视）→ **调参**（右栏就地重跑）→ **出结果**（对新数据预测导出）。
+优化侧通过 AutoTuner、响应面和代理模型与方法库互通，见 [优化契约](docs/优化契约.md)。
 
-### 神经网络检视页（方案 C：训练过程可视化）
+## 开发与验证
 
-`torch_mlp` 跑完后方法检视有 5 张专属页，回答"中间发生了什么"：
-
-| 页 | 形态 | 看到什么 |
-|---|---|---|
-| 训练动态 | matplotlib | loss/val/lr/梯度范数四线 + 过拟合拐点 |
-| 权重热图 | pyqtgraph 交互 | 逐层 W 矩阵，滚轮缩放；切"最终/初始/ΔW"看训练改了什么 |
-| 表示演化 | 滑块+播放动画 | 隐层→PCA 2D 散点逐 epoch 回放，实时读"类纯度"，右附 loss 游标 |
-| 特征归因 | matplotlib | 积分梯度条形图（红推高/蓝压低），诊断开启时算 |
-| 逐层健康 | 表格 | 参数量/梯度范数/权重范数/死 ReLU 比例 |
-
-## 五、质量保障
-
-| 命令 | 内容 |
-|---|---|
-| `python tests/run_all.py` | 默认核心验证；训练、集成、界面、资产按需选择，--all 为常规全量 |
-| `python checks/ui_shot.py` | 离屏渲染真实界面 → 59 张 PNG → 按外部 UI 设计资产的 `checklist.md` 视觉自查 |
-| `python benchmarks/run_benchmarks.py` | 数模基准（Iris/Wine/Housing/blobs/异常/时序/digits） |
-| `python benchmarks/run_opt_bench.py` | 优化基准：GP-BO vs 随机搜索（标准函数全领先） |
-| `python benchmarks/run_autotune_bench.py` | AutoTuner 数模验收（digits 调参 ≥ 默认） |
-
-回归门覆盖的"静默 bug"（只有测试能抓到的那类）：热图朝向像素级验色、异常分数方向、
-标签编码跨实例、时间切分不泄漏未来、CV 零开销、参数三态、Qt 信号载荷污染、
-神经网络初始权重快照/嵌套工件存盘重组、量子核解析锚点（n=1 必等 cos²((x−z)/2)）、
-DME 幂迭代与经典 PCA 首方向对齐、量子储层记忆容量、跨实例量子标签还原。
-
-## 六、已知限制
-
-- 神经网络仅 MLP（全连接，分类/回归）；CNN/RNN/Transformer 等结构未覆盖，
-  但方案 C 的 recorder + 注册页机制可直接复用；torch 为可选依赖，未装时该族跳过；
-- **自动调参 / 序贯优化子框架已落地（阶段 0-4）**——与 ML 工具箱"兄弟框架 +
-  共享内核 + 三接缝互通"：9 个优化器（自研 GP-BO/CMA-ES/NSGA-II/Nelder-Mead/
-  横场量子退火 SQA + 适配 TPE/ASHA）、UI 直播工作区、AutoTuner（自动调 ML 超参）、响应面回流。
-  定位见 内部记录（未随仓发布，存档在仓外），契约见 `docs/优化契约.md`。数模代理模型路径仍是
-  `gpr/bayesian_ridge` 出响应面，再交给优化框架或外部算法；
-- **量子启发方法（6 个）为态矢量/密度矩阵级经典模拟**，非量子计算机接口、
-  不宣称量子加速（教材 §3.3.3/§4.2.4 本就说“计算困难≠学习有效”“量子行为≠加速”）；
-  n_qubits 上限钉死模拟成本，零新增依赖；变分量子线路/量子神经网络（需参数平移训练）暂未做；
-- 时序方法当前只消费 y 序列，**忽略外生特征 X**（`can_handle` 已要求有 y）；
-- 单次运行内 estimator 驻留内存，不支持断点续训；
-- Windows 优先验证（LightGBM×Qt 导入顺序铁律见 `docs/pitfalls.md` L1）。
-
-## 七、扩展：加一个方法
-
-```python
-# ml_toolbox/methods/myfamily.py
-from ..core.contracts import MLMethod, ParamSpec, PageSpec
-from ..core.registry import register
-
-@register
-class MyMethod(MLMethod):
-    name = "my_method"; display_name = "我的方法"; family = "myfamily"
-    tags = ("fast",)                      # purposes 自动推导
-    param_schema = [ParamSpec("k", label="K", kind="int", default=3, min=1)]
-
-    def fit(self, problem, cfg, diag=False):
-        # `problem` 承载"观测 + 标签 + 观测之间的关系"（见 docs/契约.md §1）：
-        X, y = problem.rows("train")      # 经典方法就这一行
-        p = self.params(cfg)              # 自动清洗 UI 覆写
-        ...
-        return self._new_result(metrics={...}, artifacts={...}, params=p)
-
-    def inspect_pages(self, cfg):         # 可选：声明专属核心图
-        return [PageSpec("my", "我的图", "mpl", lambda ax, r: ax.plot(...))]
+```bash
+python tests/run_all.py
+python tests/run_all.py --only api
+python tests/run_all.py --suite training
+python tests/run_all.py --suite integration
+python tests/run_all.py --all
 ```
 
-> 图方法（GNN）用 `problem.require("graph")` + `problem.masks()`（**节点掩码**，
-> 不切行），并声明 `accepts_aux = (AUX_GRAPH,)`；时序方法用 `problem.y`（整条序列，
-> 外生特征在 `problem.X` 里）。
+默认运行核心；训练、Qt 界面、面板资产、优化、性能实验和发布扫描可分别选择。`--all` 是常规软件全量，不包含独立的 benchmarks 与 release 套件。完整命令和环境依赖见 [验证说明](tests/README.md)。
 
-在 `methods/__init__.py` 加一行 import 即完成接入——注册表、遍历、对比、画廊、
-参数面板、导出、历史全部自动可用，无需改框架任何代码。
+日常迭代运行受影响项，跨层变化再扩大范围。文档和工具数量不构成测试的第二份注册表，普通 pytest 模块由实际收集机制执行。修改面板时在 `dsh/` 运行 `npm test`。
 
-## 八、文档
+## 当前边界
 
-- `docs/项目定位.md` —— 项目宪法（定位/目标/原则）与迭代状态
-- `docs/契约.md` —— 方法 / 数据 / 可视化 / 持久化四份契约
-- `docs/优化契约.md` —— 优化侧 ask-and-tell 契约 + 引擎表 + 三接缝桥
-- `docs/pitfalls.md` —— 43 条踩坑（症状→原因→修法），新坑按格式追加
-- `docs/交付说明.md` —— **使用者**：AI 模式安装/启动/示例对话/故障排查
+- 内置神经网络方法以 MLP 为主；其他结构通过自定义网络路径接入，支持程度取决于数据与训练契约。
+- 自定义神经网络可通过 checkpoint 续训；普通 estimator 和优化器不承诺通用的精确中断恢复。
+- 后台 `job_id` 属于当前进程，重启后应通过保存的 `run_id` 和业务存档查结果。
+- 量子启发方法是经典态矢量或密度矩阵模拟，不宣称量子硬件加速。
+- 部分时序方法只消费目标序列，外生特征支持需逐方法确认。
+- 核方法、大样本流形方法和大模型训练有各自的计算成本。Windows 是主要验证环境。
+
+## 文档与许可
+
+- [项目定位](docs/项目定位.md)
+- [数据、方法、可视化与持久化契约](docs/契约.md)
+- [优化契约](docs/优化契约.md)
+- [使用与排障](docs/交付说明.md)
+- [实现中的注意事项](docs/pitfalls.md)
+
+许可：[MIT](LICENSE)。
