@@ -478,10 +478,13 @@ class MLMecha:
         def ref(receipt):
             if not isinstance(receipt, Mapping):
                 return None
-            if not receipt.get("run_ids"):
+            run_ids = list(receipt.get("run_ids") or [])
+            if not run_ids and receipt.get("run_id"):
+                run_ids = [str(receipt["run_id"])]
+            if not run_ids:
                 return None
             return {"kind": "ml_command", "command": command,
-                    "run_ids": list(receipt.get("run_ids", []))}
+                    "run_ids": run_ids}
 
         try:
             job = self.software.jobs.submit(worker, command=command,
@@ -648,7 +651,7 @@ def assemble_ml_mecha(*, root: Path | str | None = None,
     )
 
     software = assemble(
-        root=root_path, data_dir_name=data_dir_name, engine=engine,
+        root=root_path, data_dir_name=data_dir_name,
         summarizer=summarizer or ml_summarizer,
         validate=engine.validator.validate_state,
         project=project, mode=mode, approval_decider=approval_decider,

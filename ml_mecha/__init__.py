@@ -11,7 +11,7 @@
 
 模块分工（各层都可单独 import，避免循环依赖）：
 
-- :mod:`ml_mecha.engine`    —— ``MLEngine(Engine)``：受控命令分派 + 回执瘦身；
+- :mod:`ml_mecha.engine`    —— ``MLEngine``：受控命令分派 + 回执瘦身；
 - :mod:`ml_mecha.validator` —— ML 状态键声明与校验（教学化错误）；
 - :mod:`ml_mecha.summarizer`—— 人类可读摘要 + 可对账 ``Claim``；
 - :mod:`ml_mecha.tools`     —— 从命令面投影出的模型可见工具；

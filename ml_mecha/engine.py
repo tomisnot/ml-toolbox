@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""MLEngine：ML 宿主引擎的 mecha ``Engine`` 实现（薄适配，宪章 §11）。
+"""MLEngine：ML 项目自己的实验协调器（薄适配，公开入口由命令/查询提供）。
 
 职责边界（P1：宿主是唯一领域真值）：
 
@@ -46,7 +46,7 @@ import pandas as pd
 
 from mecha.errors import MechaError
 from mecha.gate import Channel
-from mecha.surface import Engine, ExecutionContext
+from mecha.surface import ExecutionContext
 
 from ml_toolbox.api import RunRequest, Session, SessionError
 from ml_toolbox.core import registry
@@ -330,8 +330,8 @@ def _reason_fallback(command: str, spec: Mapping[str, Any]) -> str:
                   .replace("{n}", "若干").strip()
 
 
-class MLEngine(Engine):
-    """ML 宿主的 Engine Provider：受控命令分派 + 紧凑回执 + 资源估算。"""
+class MLEngine:
+    """ML 项目自己的实验协调器；公开动作通过 mecha 命令和查询注册。"""
 
     def __init__(self, *, session: Session | None = None,
                  state_writer: Callable[[str, Mapping[str, Any], str], list[Any]] | None = None,
@@ -1190,7 +1190,7 @@ class MLEngine(Engine):
                 "note": ("只含**本会话**的作业（注册表在内存里）；重启后为空。"
                          "`run_ids` 来自 job 的 result_ref ⇒ 这是**归属**的反查依据")}
 
-    # ------------------------------------------------------------ Engine ABC
+    # ------------------------------------------------------------ 项目协调器能力
     def schema(self) -> Mapping[str, Any]:
         """一处声明：命令面 + 回执契约 + 状态键 + 资源维度。"""
         return {

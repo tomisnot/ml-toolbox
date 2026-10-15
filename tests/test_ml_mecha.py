@@ -684,8 +684,8 @@ def test_run_method_end_to_end_and_receipt_contract(app):
     assert "prepare_dataset" in unknown["error_suggest"] or \
            "run_method" in unknown["error_suggest"]
 
-    # estimate 走 mecha Surface 的 ops 管道（est_sec 必填）
-    estimate = app.software.surface.estimate(
+    # estimate 属于 ML 自己的资源规划（命令声明与本地协调器）
+    estimate = app.engine.estimate(
         {"command": "run_method", "method": "svc", "dataset_id": dataset_id})
     assert estimate["est_sec"] > 0
     assert estimate["command"] == "run_method"
