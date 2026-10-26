@@ -81,7 +81,8 @@ class TrainingRecorder:
         linear_names = {n for n, m in modules if isinstance(m, nn.Linear)}
         self._relu_linear = {}
         self._relu_handles = []
-        self._relu_activations = []
+        # 按模块名收集；一次探针可以由多个 micro-batch 组成。
+        self._relu_activations = {}
         last_linear = None
         for name, module in modules:
             if isinstance(module, nn.Linear):
@@ -91,26 +92,33 @@ class TrainingRecorder:
                 # idx//2 在启用 Dropout 后仍保持正确。
                 self._relu_linear[name] = last_linear
                 self._relu_handles.append(module.register_forward_hook(
-                    self._relu_hook))
+                    lambda mod, inp, out, name=name:
+                    self._relu_hook(name, mod, inp, out)))
 
         self._latent_features = None
+        self._latent_name = None
         linears = [(n, m) for n, m in modules
                    if m.__class__.__name__.startswith("Linear")]
         self._latent_handle = None
         if len(linears) >= 2:
-            _, latent_module = linears[-2]       # 最后一隐层，排除输出层
+            self._latent_name, latent_module = linears[-2]       # 最后一隐层，排除输出层
             self._latent_handle = latent_module.register_forward_hook(
                 self._latent_hook)
         self._linear_names = linear_names
         self._capture = False
 
-    def _relu_hook(self, module, inputs, output):
+    def _relu_hook(self, name, module, inputs, output):
         if self._capture:
-            self._relu_activations.append(output.detach())
+            self._relu_activations.setdefault(name, []).append(
+                output.detach().cpu())
 
     def _latent_hook(self, module, inputs, output):
         if self._capture:
-            self._latent_features = output.detach()
+            part = output.detach().cpu()
+            if self._latent_features is None:
+                self._latent_features = [part]
+            else:
+                self._latent_features.append(part)
 
     def close(self):
         """移除 hook；可重复调用。finalize 后不再需要继续采集。"""
@@ -122,7 +130,7 @@ class TrainingRecorder:
             self._latent_handle.remove()
         self._closed = True
         self._capture = False
-        self._relu_activations = []
+        self._relu_activations = {}
         self._latent_features = None
 
     # ------------------------------------------------ 每 epoch 调用
@@ -201,7 +209,7 @@ class TrainingRecorder:
     def _collect_probe(self):
         """一次 eval forward 同时返回 latent，并计算 dead-ReLU。"""
         import torch
-        self._relu_activations = []
+        self._relu_activations = {}
         self._latent_features = None
         self._capture = True
         was_training = self.model.training
@@ -214,23 +222,50 @@ class TrainingRecorder:
                     self.model(self._probe)
             self.probe_forward_count += 1
             vals = []
-            for act in self._relu_activations:
-                dead = (act.abs().sum(dim=0) < self.dead_thr).float().mean()
-                vals.append(float(dead))
+            by_name = {}
+            for relu_name in self._relu_linear:
+                pieces = self._relu_activations.get(relu_name, [])
+                if not pieces:
+                    continue
+                # 同一个 ReLU 实例可能被网络复用在不同宽度的层之间；这时
+                # 不能强行 cat。逐段计算再取均值，既支持复用，也支持探针分块。
+                groups = {}
+                for part in pieces:
+                    groups.setdefault(tuple(part.shape[1:]), []).append(part)
+                per = []
+                for same in groups.values():
+                    act = (same[0] if len(same) == 1
+                           else __import__("torch").cat(same, dim=0))
+                    per.append(float((act.abs().sum(dim=0) < self.dead_thr)
+                                     .float().mean()))
+                value = float(np.mean(per)) if per else float("nan")
+                vals.append(value)
+                by_name[relu_name] = value
             self._dead_per_relu = vals
             self._dead_by_linear = {}
-            for relu_name, value in zip(self._relu_linear, vals):
+            for relu_name, value in by_name.items():
                 linear_name = self._relu_linear[relu_name]
                 if linear_name is not None:
                     self._dead_by_linear[linear_name] = value
             latent = self._latent_features
             if latent is None:
                 return None
-            arr = latent.cpu().numpy()
-            return arr[self._probe_selection]
+            if isinstance(latent, list):
+                groups = {}
+                for part in latent:
+                    groups.setdefault(tuple(part.shape[1:]), []).append(part)
+                # latent 通常只有一个形状；若网络复用线性层导致多形状，
+                # 选行数最多的组，避免观测失败拖垮训练。
+                latent = max(groups.values(), key=lambda xs: sum(len(x) for x in xs))
+                latent = (latent[0] if len(latent) == 1
+                          else __import__("torch").cat(latent, dim=0))
+            arr = latent.numpy()
+            sel = self._probe_selection
+            sel = sel[sel < len(arr)]
+            return arr[sel]
         finally:
             self._capture = False
-            self._relu_activations = []
+            self._relu_activations = {}
             self._latent_features = None
             if was_training:
                 self.model.train()

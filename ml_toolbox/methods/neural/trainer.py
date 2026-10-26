@@ -199,6 +199,107 @@ def chunk_budget_from(extras: Any) -> float | None:
         return None
 
 
+def _cuda_oom(exc: BaseException) -> bool:
+    """识别 CUDA 分配失败；只对这类错误自动缩小执行块并重试。"""
+    text = str(exc).lower()
+    return ("out of memory" in text or "cuda error: out of memory" in text
+            or "cublas_status_alloc_failed" in text)
+
+
+def _clear_cuda(torch: Any, dev: Any) -> None:
+    """释放缓存分配器中的空闲块；CPU 路径和不可用 CUDA 都是 no-op。"""
+    try:
+        if getattr(dev, "type", "") == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+class _PayloadStore:
+    """逐行 payload 的自适应驻留器。
+
+    CPU 张量始终是权威副本；只有在实时余量允许时才把整份 payload 驻留到
+    GPU。一次 batch 需要的切片在 CPU 模式下按需迁移，因此网络代码仍看到
+    原来的 ``ctx["payload"]``，不需要知道数据来自哪种路径。
+    """
+
+    def __init__(self, payload, torch, dev):
+        self.torch = torch
+        self.dev = dev
+        cpu = torch.device("cpu")
+        self.cpu = {str(k): _as_tensor(v, torch, cpu)
+                    for k, v in (payload or {}).items()}
+        self.gpu = None
+        self.mode = "cpu"
+        self.last_free_mb = None
+        self.bytes = int(sum(int(getattr(v, "numel", lambda: 0)())
+                             * int(getattr(v, "element_size", lambda: 0)())
+                             for v in self.cpu.values()))
+        self._try_resident()
+
+    def _free_bytes(self):
+        try:
+            if getattr(self.dev, "type", "") == "cuda" \
+                    and self.torch.cuda.is_available():
+                free, _total = self.torch.cuda.mem_get_info(self.dev)
+                return int(free)
+        except Exception:                                      # noqa: BLE001
+            pass
+        return None
+
+    def _try_resident(self):
+        if not self.cpu or getattr(self.dev, "type", "") != "cuda":
+            self.mode = "cpu" if self.cpu else "none"
+            return
+        free = self._free_bytes()
+        self.last_free_mb = None if free is None else round(free / (1024 * 1024), 1)
+        # 30% is only a starting guard; execution still adapts to real OOM/peak
+        # feedback. It prevents a large payload from consuming the whole card.
+        if free is None or self.bytes > int(free * 0.30):
+            self.mode = "cpu"
+            return
+        try:
+            self.gpu = {k: v.to(self.dev, non_blocking=True)
+                        for k, v in self.cpu.items()}
+            self.mode = "resident"
+        except Exception as exc:                              # noqa: BLE001
+            if _cuda_oom(exc):
+                _clear_cuda(self.torch, self.dev)
+            self.gpu = None
+            self.mode = "cpu"
+
+    def refresh(self):
+        """在逻辑 batch 边界重新读余量，显存紧张时主动降级。"""
+        if self.mode != "resident":
+            return
+        free = self._free_bytes()
+        self.last_free_mb = None if free is None else round(free / (1024 * 1024), 1)
+        if free is not None and free < max(32 * 1024 * 1024, self.bytes // 2):
+            self.demote()
+
+    def demote(self):
+        """在一次 OOM 后退回按块迁移，避免下一次重试重复占满显存。"""
+        self.gpu = None
+        self.mode = "cpu" if self.cpu else "none"
+        _clear_cuda(self.torch, self.dev)
+
+    def batch(self, row_idx):
+        if self.mode == "resident" and self.gpu is not None:
+            ix = row_idx.to(self.dev) if getattr(row_idx, "device", None) != self.dev else row_idx
+            return {k: v[ix] for k, v in self.gpu.items()}
+        return {k: v[row_idx].to(self.dev, non_blocking=True)
+                for k, v in self.cpu.items()}
+
+    def full(self):
+        return dict(self.gpu if self.mode == "resident" and self.gpu is not None
+                    else self.cpu)
+
+    def facts(self):
+        return {"mode": self.mode, "bytes": self.bytes,
+                "device": str(self.dev if self.mode == "resident" else "cpu"),
+                "free_mb": self.last_free_mb}
+
+
 @contextlib.contextmanager
 def hook_device(torch: Any, dev: Any):
     """在**调用用户钩子**期间把 torch 默认设备设成训练设备，退出时复原。
@@ -680,20 +781,19 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
     idx_t = torch.tensor(np.asarray(tr, dtype=np.int64), dtype=torch.long)
     items = (Xt, yt, idx_t) if has_y else (Xt, idx_t)
     loader = DataLoader(TensorDataset(*items), batch_size=int(batch), shuffle=True)
-    Xva = (torch.tensor(prep.Xs[va], dtype=torch.float32, device=dev)
+    # 验证集留在 CPU；验证执行器按 batch 搬运，避免整份验证前向制造峰值。
+    Xva = (torch.tensor(prep.Xs[va], dtype=torch.float32)
            if len(va) else None)
     yva = (torch.tensor(prep.yv[va],
                         dtype=torch.long if prep.kind == "classification"
-                        else torch.float32, device=dev)
+                        else torch.float32)
            if (has_y and len(va)) else None)
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=float(lr))
     model = model.to(dev)
 
-    #: 逐行负载的**张量版**：整份放在设备上，按批索引 ⇒ 每批只切一次（省拷贝）。
-    pay_t = None
-    if payload:
-        pay_t = {str(k): _as_tensor(v, torch, dev) for k, v in payload.items()}
+    #: CPU 是权威副本；实时余量允许时才整份驻留 GPU，否则逐批迁移。
+    payload_store = _PayloadStore(payload, torch, dev) if payload else None
 
     #: ⭐ **整场训练复用的分块器**（`ctx["chunks"]`）：预算可来自
     #: `resource_guard.chunk_budget_mb`；复用是为了让"这次切了几块"留得下来。
@@ -708,6 +808,8 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
         ⚠ 一处构造、处处引用：上一轮我在三个地方各拼一遍 ctx，漏了一个键，
         报出来是 `KeyError: 'x'`（离根因很远）。
         """
+        if payload_store is not None:
+            payload_store.refresh()
         out = {"torch": torch, "nn": nn, "device": str(dev), "step": int(step),
                "kind": kind, "n_rows": int(len(prep.Xs)),
                "train_idx": np.asarray(tr, dtype=np.int64),
@@ -722,12 +824,15 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                #   ⚠ **同一个 chunker 复用整场训练**（不是每次 `_ctx` 新建一个）：
                #   那样 `last_plan` 才留得住"这次到底切了几块"，回执才有话可说。
                "chunks": chunker}
-        if pay_t is not None:
+        if payload_store is not None:
             if row_idx is None:
-                out["payload"] = dict(pay_t)                    # 全量（metrics 用）
+                out["payload"] = payload_store.full()            # metrics 的全量视图
+                out["payload_device"] = str(
+                    dev if payload_store.mode == "resident" else "cpu")
             else:
-                out["payload"] = {k: v[row_idx.to(v.device)]
-                                  for k, v in pay_t.items()}
+                out["payload"] = payload_store.batch(row_idx)
+                out["payload_device"] = str(dev)
+            out["payload_facts"] = payload_store.facts()
         return out
 
     model.train()
@@ -756,6 +861,81 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
     metric_skipped = 0
     fallback_state = None
     keep_fallback = keep_best
+    adaptive_facts = {"train_splits": 0, "val_splits": 0,
+                      "oom_retries": 0, "max_micro_batch": 0}
+
+    def _train_custom_batch(xb, yb, ib):
+        """执行一个逻辑 batch；OOM 时自动缩小 micro-batch 并重试整批。"""
+        n = int(len(xb))
+        micro = n
+        while True:
+            optimizer.zero_grad()
+            total_loss = 0.0
+            try:
+                for start in range(0, n, micro):
+                    stop = min(n, start + micro)
+                    xs = xb[start:stop]
+                    ys = None if yb is None else yb[start:stop]
+                    ids = ib[start:stop]
+                    ctx = _ctx(ids, gstep)
+                    ctx["micro_batch"] = int(stop - start)
+                    ctx["logical_batch"] = int(n)
+                    with hook_device(torch, dev):
+                        out, target = forward_step(model, (xs, ys), ctx)
+                    loss = loss_fn(out, target)
+                    weight = float(stop - start) / max(n, 1)
+                    (loss * weight).backward()
+                    total_loss += float(loss.detach()) * float(stop - start)
+                adaptive_facts["max_micro_batch"] = max(
+                    int(adaptive_facts["max_micro_batch"]), int(micro))
+                if micro < n:
+                    adaptive_facts["train_splits"] = int(
+                        adaptive_facts["train_splits"]) + 1
+                return total_loss / max(n, 1)
+            except Exception as exc:                         # noqa: BLE001
+                optimizer.zero_grad(set_to_none=True)
+                if (not _cuda_oom(exc)) or micro <= 1:
+                    raise
+                adaptive_facts["oom_retries"] = int(
+                    adaptive_facts["oom_retries"]) + 1
+                if payload_store is not None:
+                    payload_store.demote()
+                micro = max(1, micro // 2)
+                _clear_cuda(torch, dev)
+
+    def _val_custom_batch(ids, ep):
+        """验证按当前 batch 起步；OOM 时只缩小验证块。"""
+        n = int(len(ids))
+        micro = min(max(1, int(batch)), n)
+        while True:
+            total_loss = 0.0
+            try:
+                for start in range(0, n, micro):
+                    stop = min(n, start + micro)
+                    ii = ids[start:stop]
+                    xs = Xva[start:stop].to(dev, non_blocking=True)
+                    ys = None if yva is None else yva[start:stop].to(
+                        dev, non_blocking=True)
+                    ctx = _ctx(ii, ep, kind="val")
+                    ctx["micro_batch"] = int(stop - start)
+                    ctx["logical_batch"] = int(n)
+                    with hook_device(torch, dev):
+                        out, target = forward_step(model, (xs, ys), ctx)
+                    total_loss += float(loss_fn(out, target)) * float(stop - start)
+                if micro < n:
+                    adaptive_facts["val_splits"] = int(
+                        adaptive_facts["val_splits"]) + 1
+                return total_loss / max(n, 1)
+            except Exception as exc:                         # noqa: BLE001
+                if (not _cuda_oom(exc)) or micro <= 1:
+                    raise
+                adaptive_facts["oom_retries"] = int(
+                    adaptive_facts["oom_retries"]) + 1
+                if payload_store is not None:
+                    payload_store.demote()
+                micro = max(1, micro // 2)
+                _clear_cuda(torch, dev)
+
     try:
         for ep in range(total):
             tot = torch.zeros((), dtype=torch.float32, device=dev)
@@ -765,23 +945,23 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                 else:
                     xb, ib = batch_items
                     yb = None
-                optimizer.zero_grad()
-                ctx = _ctx(ib, gstep)
                 if forward_step is not None:
-                    # ⚠ 用户钩子期间默认设备 = 训练设备（否则随手建的张量落 CPU，
-                    #   报出来的是"维度错"，见 `hook_device` 的说明）
-                    with hook_device(torch, dev):
-                        out, target = forward_step(model, (xb, yb), ctx)
-                    loss = loss_fn(out, target)
+                    loss_value = _train_custom_batch(xb, yb, ib)
                 else:
+                    optimizer.zero_grad()
                     out = model(xb)
                     loss = loss_fn(out.squeeze(-1)
                                    if prep.kind != "classification" else out, yb)
-                loss.backward()
+                    loss.backward()
+                    loss_value = float(loss.detach())
+                # on_step 观察的是整个逻辑 batch；payload 视图仍由统一上下文构造。
+                ctx = _ctx(ib, gstep)
+                ctx["micro_batch"] = int(adaptive_facts.get("max_micro_batch") or len(xb))
+                ctx["logical_batch"] = int(len(xb))
                 if grad_clip and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
-                tot = tot + loss.detach() * len(xb)
+                tot = tot + torch.as_tensor(loss_value, device=dev) * len(xb)
                 # ⭐ **步钩子**：预热（"前 N 步先只训模长"）需要一个"步"的概念。
                 #   ⭐ 从本轮起它还**能上报步级指标**：返回 dict 就写进 TB ⇒
                 #   `describe_training` 看得到"步"这一级的曲线。
@@ -826,15 +1006,12 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
                         #   会逼作者写一个**与损失无关的假 forward**（就为了让验证别炸）。
                         vi = torch.tensor(np.asarray(va, dtype=np.int64),
                                           dtype=torch.long)
-                        with hook_device(torch, dev):
-                            vo, vt = forward_step(model, (Xva, yva if has_y else None),
-                                                  _ctx(vi, ep, kind="val"))
-                        vl = float(loss_fn(vo, vt))
+                        vl = _val_custom_batch(vi, ep)
                     elif has_y:
-                        o = model(Xva)
+                        o = model(Xva.to(dev, non_blocking=True))
                         vl = float(loss_fn(o.squeeze(-1)
                                            if prep.kind != "classification" else o,
-                                           yva))
+                                           yva.to(dev, non_blocking=True)))
                 model.train()
             train_loss = float(tot) / max(len(tr), 1)
             cur_lr = float(optimizer.param_groups[0]["lr"])
@@ -999,6 +1176,9 @@ def train(recorder, *, model, prep: PrepResult, torch, nn,
             # ⭐ **框架分块的实际方案**（网络用了 `ctx["chunks"]` 才有）：回执要能说
             #   "已分 N 块" —— 否则"分块了没有"只能靠猜（用户实测要的就是这句话）。
             "chunks": chunker.facts(),
+            "adaptive_memory": {**adaptive_facts,
+                                 "payload": (payload_store.facts()
+                                             if payload_store is not None else {})},
             # 最后一轮上报的自定义指标：让它**同时进回执**（TB 那条路给"看曲线"，
             # 这条给 `describe_run`/`compare_methods` 的"看数字"）
             "last_extra": dict(last_extra),

@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import logging
+import traceback
 from pathlib import Path
 
 from ...core.contracts import (AUX_GRAPH, AUX_PAYLOAD, MLMethod, PageSpec,
@@ -50,6 +52,8 @@ from . import nnplots
 from . import trainer as _trainer
 from .network import NETWORK_HOOKS                              # noqa: F401 - 单一真源
 from .recorder import TrainingRecorder
+
+_LOG = logging.getLogger(__name__)
 
 #: 这份自定义网络**在 extras 里放代码的键名**（引擎与工具面共用同一常量）。
 #: ⚠ 单一真源：`ml_mecha` 侧从 `ml_toolbox` 读它，不各写一份字面量。
@@ -389,16 +393,38 @@ class CustomNNMethod(MLMethod):
             probe_payload = {k: v[probe_rows] for k, v in (payload or {}).items()}
 
             def probe_fn():                               # noqa: F811
-                pctx = {"torch": torch, "nn": torch.nn, "device": str(dev),
-                        "step": 0, "kind": "probe", "n_rows": int(len(prep.Xs)),
-                        "payload": {k: _trainer._as_tensor(v, torch, dev)
-                                    for k, v in probe_payload.items()}}
-                with _trainer.hook_device(torch, dev):
-                    out, _tgt = net.forward_step(
-                        model, (torch.tensor(prep.Xs[probe_rows],
-                                             dtype=torch.float32, device=dev), None),
-                        pctx)
-                return out
+                # 探针也走按行 micro-batch；recorder 的 hook 会按模块把各段
+                # 拼回去，因此 AI 的 forward_step 无需为观测面写特殊分支。
+                budget = _trainer.chunk_budget_from(run_extras) or 256.0
+                row_bytes = int(getattr(prep.Xs, "nbytes", 0) or 0) \
+                    // max(1, int(len(prep.Xs)))
+                plan = _trainer.RowChunks(
+                    budget_mb=budget, x_row_bytes=row_bytes).plan(
+                        len(probe_rows), probe_payload)
+                rows_per = max(1, int(plan.rows_per_block))
+                start = 0
+                while start < len(probe_rows):
+                    stop = min(len(probe_rows), start + rows_per)
+                    local = probe_rows[start:stop]
+                    try:
+                        pctx = {"torch": torch, "nn": torch.nn,
+                                "device": str(dev), "step": 0, "kind": "probe",
+                                "n_rows": int(len(prep.Xs)),
+                                "micro_batch": int(stop - start),
+                                "payload": {k: _trainer._as_tensor(v[start:stop], torch, dev)
+                                            for k, v in probe_payload.items()}}
+                        with _trainer.hook_device(torch, dev):
+                            net.forward_step(
+                                model, (torch.tensor(prep.Xs[local],
+                                                     dtype=torch.float32,
+                                                     device=dev), None), pctx)
+                        start = stop
+                    except Exception as exc:                  # noqa: BLE001
+                        if not _trainer._cuda_oom(exc) or rows_per <= 1:
+                            raise
+                        rows_per = max(1, rows_per // 2)
+                        _trainer._clear_cuda(torch, dev)
+                return None
 
         rec.set_probe(torch.tensor(prep.Xs[probe_rows], dtype=torch.float32,
                                    device=dev),
@@ -461,12 +487,13 @@ class CustomNNMethod(MLMethod):
                 #   （**逐位等价于从前**）。
                 best_metric=best_metric, best_direction=best_direction)
         except Exception as exc:                             # noqa: BLE001
-            import traceback
+            _LOG.exception("custom network training failed")
+            trace = traceback.format_exc(limit=12)
             res = self._new_result(target_kind=kind, params={"lr": lr}).fail(
-                f"自定义网络训练失败：{type(exc).__name__}: {exc}",
+                f"自定义网络训练失败：{type(exc).__name__}: {exc}\n{trace}",
                 kind="network_runtime_error",
                 hint=_device_error_hint(exc) or
-                     "是你那段网络代码在训练期抛的（不是框架）；栈留在宿主日志",
+                     "训练期发生异常；上面的 traceback 用于区分网络代码与框架调度",
                 suggest="改代码后重跑；`describe_network` 可取回上一次的源码对照")
             return res
         res.est = model
@@ -528,6 +555,16 @@ class CustomNNMethod(MLMethod):
                 f"{int(chunk_facts['n_blocks'])} blocks x "
                 f"{int(chunk_facts.get('rows_per_block') or 0)} rows "
                 f"(budget {float(chunk_facts.get('budget_mb') or 0):g} MiB)"])
+        adaptive = dict(stats.get("adaptive_memory") or {})
+        if adaptive:
+            payload_fact = dict(adaptive.get("payload") or {})
+            res.artifacts["nn_memory_policy"] = np.array([
+                f"payload={payload_fact.get('mode', 'none')} "
+                f"({int(payload_fact.get('bytes') or 0)} bytes); "
+                f"train_splits={int(adaptive.get('train_splits') or 0)}; "
+                f"val_splits={int(adaptive.get('val_splits') or 0)}; "
+                f"oom_retries={int(adaptive.get('oom_retries') or 0)}; "
+                f"max_micro_batch={int(adaptive.get('max_micro_batch') or 0)}"])
         # ⭐ **实测显存峰值**（事后归因，用户实测 §3.3）：只在真跑在 CUDA 上时才有值
         #   ⇒ CPU 上**不留这个键**（不假装有数字，也不留一个 0 让人以为"用了 0 MB"）。
         if stats.get("peak_vram_mb") is not None:
@@ -770,11 +807,13 @@ class CustomNNMethod(MLMethod):
                 # ⭐ 图任务同样支持按声明的 tag 选 best（Q4）——**不许静默忽略**
                 best_metric=best_metric, best_direction=best_direction)
         except Exception as exc:                             # noqa: BLE001
+            _LOG.exception("custom graph network training failed")
+            trace = traceback.format_exc(limit=12)
             res = self._new_result(target_kind=kind, params={"lr": lr}).fail(
-                f"图任务训练失败：{type(exc).__name__}: {exc}",
+                f"图任务训练失败：{type(exc).__name__}: {exc}\n{trace}",
                 kind="network_runtime_error",
                 hint=_device_error_hint(exc) or
-                     "是你那段网络代码在训练期抛的（不是框架）；栈留在宿主日志")
+                     "训练期发生异常；上面的 traceback 用于区分网络代码与框架调度")
             return res
         res.est = model
         res._is_graph = True

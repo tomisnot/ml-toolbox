@@ -42,8 +42,8 @@ whenToUse: >-
 
 ## ⭐ 第 0 步：开工前 90 秒自检（**照做，能挡掉一轮里 80% 的返工**）
 
-> 这一节的每一条都来自**真实踩坑**（一次 5 小时级 NQS 训练会话），
-> 不是泛泛的注意事项。**先跑完这 6 条再写第一行训练代码。**
+> 这一节的每一条都来自**真实踩坑**（一次 5 小时级 NQS 训练会话 + 2026-10-15 框架升级），
+> 不是泛泛的注意事项。**先跑完这 8 条再写第一行训练代码。**
 
 | # | 自检 | 为什么（实测代价） |
 |---|---|---|
@@ -53,6 +53,12 @@ whenToUse: >-
 | **4** | **量纲/口径自检**：你的度量函数在一个**已知答案**上是否返回预期值？（归一化、`1/M`、恒模 vs 实际模长） | 我两次把口径写错（差 256 倍），得出"模型全错"的假结论 |
 | **5** | **有不可导操作吗？** 输出过 `sign()`/`argmax()`/硬阈值后，**梯度还到得了那个分支吗**？实测 `sign()` 让主损失对该分支的梯度**精确为 0** | 一个分支白训了 3 次（各 30 分钟–6 小时），根因是一条 `sign()` |
 | **6** | **路径一律绝对**；网络代码里的 `print` **只用 ASCII** | 相对路径被解析到错位置，**等了 120 分钟**才发现；非 ASCII `print` 在 GBK 控制台让**整个后台任务崩掉** |
+| **7** | **`ctx["payload"]` 在哪个设备上？** 框架会把整份逐行负载**自适应驻留**：放不下就**留 CPU**。此时**只有 `metrics`（全量视图）**拿到 CPU 张量，训练/验证/探针仍给卡上的切片。⇒ **一律写 `x.to(ctx["device"])`**（或先读 `ctx["payload_device"]`），别假设它在卡上。 | 实测：我们的网络在 `metrics` 里拿 CPU 张量喂 CUDA 模型 ⇒ `Expected all tensors to be on the same device`，**metrics 每轮静默失败、TB 里一个 epoch 级 tag 都没有**（训练却"正常"跑） |
+| **8** | **你的能量/输出头是"每个分块调用一次"吗？** 若是，**别用 `self.head(x)`（`nn.Module.__call__`）**，改用 `F.linear(x, self.head.weight, self.head.bias)`（权重/续训完全不变）。 | 框架的潜变量采集 hook 挂在"倒数第二个 `nn.Linear`"上且**多段追加** ⇒ 分块头会被采集 `R × M × HID` 个数（探针 120×2^20×128×4B = **61 GB**）⇒ **进程原生崩溃**（`c10.dll` / `0xc0000005`，不是 Python 异常、抓不到栈） |
+
+> 第 7、8 条是 2026-10-15 框架升级后新增的两个"新人必踩"：
+> 都是**静默失败或进程级死亡**，且**不看这两条几乎必踩**。细节见 §逐行负载与设备契约。
+
 
 **⇒ 更细的版本见 `docs/usage-best-practices.md`。开发者视角的缺口见 `docs/反馈-ML工具使用体验与接口审查.md`。**
 
@@ -599,6 +605,58 @@ class Network:
 > ⚠ **不要**把变长数组塞进数据表的一列，也**不要**把复数列直接放进去：前者会以
 > 极难读的广播错冒出来，后者以前会**静默丢掉虚部**（回执还说成功）。现在两者都会
 > 在 `prepare_dataset` 当场被拒，并指路到 `payload`。
+
+### ⭐⭐ 负载在哪个设备上（设备契约，2026-10-15 起；新人必读）
+
+框架对逐行负载有**自适应驻留策略**（`trainer._PayloadStore`）：
+
+| 情形 | 负载位置 | `ctx["payload"]` 给你的张量在哪 |
+|---|---|---|
+| 负载 ≤ **空闲显存 × 30%** | 整份驻留 GPU | **卡上**（快；每批只切一次） |
+| 放不下 / 显存变紧 / 发生 OOM | 权威副本留在 **CPU**，按批搬运 | 训练/验证/探针路径 = **卡上**；**`metrics`（全量视图）＝ CPU** |
+
+**⇒ 写代码的唯一正确姿势**（一条就够）：
+
+```python
+def metrics(self, model, ctx):
+    dev = ctx.get("device") or "cpu"          # 或先读 ctx["payload_device"]
+    P = ctx["payload"]
+    xr = P["xr"].to(dev)                      # ⭐ 逐批/整批都先 to(dev)，别假设在卡上
+```
+
+- 训练/验证/探针路径**不必**这样写（框架已保证切片在卡上），但**统一都写也不会错**；
+- `ctx["payload_device"]` = 这份负载**现在**在哪（`"cuda:0"` / `"cpu"`）；
+  `ctx["payload_facts"]`（含 `mode`/`bytes`/`free_mb`）；
+- **不写会怎样**：`metrics` 每轮抛 `Expected all tensors to be on the same device`，
+  框架**降级不中断**（训练照跑），于是 **TB 里一个 epoch 级 tag 都没有**、`best_metric`
+  也选不出来——而训练表面上"正常"。这是**静默失败**，最难查的一类。
+
+### ⭐⭐ 输出头若"每个分块调用一次"，请用 `F.linear`（否则进程级崩溃）
+
+框架会挂一个**潜变量采集 hook** 在"倒数第二个 `nn.Linear`"上（用于诊断页），
+2026-10-15 起改成**多段追加**（为了支持探针分批）。于是：
+
+- 若你的能量/输出头是**在构型分块循环里被反复调用**的（NQS 的 `(B, 2^N)` 能量头就是），
+  采集量 = `R × M × HID × 4B`：实测探针 `R=120, M=2^20` ⇒ **61 GB** ⇒
+  **进程原生崩溃**（Windows 应用日志：`c10.dll` / `0xc0000005`，**不是** Python 异常，
+  `read_job` 读不到栈、脊椎被杀后由启动器拉起）。
+- **改法（一行、无损）**：头里用函数式调用，**绕开 `Module.__call__` ⇒ 不触发 hook**：
+  ```python
+  h = F.silu(F.linear(mm, self.head1.weight, self.head1.bias))   # 而不是 self.head1(mm)
+  ```
+  权重名不变 ⇒ `state_dict`/续训/`best.pt` 全兼容。代价：本模型的潜变量诊断页为空
+  （分块头的"潜变量"本来也没有单一定义）。
+
+### 显存在哪看（别再靠 Windows 计数器）
+
+- 网络里自己打 `torch.cuda.memory_allocated/reserved/max_memory_allocated()` +
+  `mem_get_info()`：判读 **`reserved ≈ allocated` 健康**；`reserved ≫ allocated` = 碎片/缓存不还。
+  ⚠ `max_memory_allocated` 是**进程生命周期**的，同一脊椎连跑多个 run 会混历史 ⇒ 先 `reset_peak_memory_stats()`。
+- 回执里（框架给的）：`nn_memory_policy`（`payload=cpu/resident(字节); train_splits; val_splits; oom_retries; max_micro_batch`）
+  与 `nn_peak_vram_mb`。**看到 `oom_retries>0` 或 `val_splits>0` 就说明触发了自适应**。
+- ❌ 别用 Windows 的 `GPU Process Memory\Shared Usage` 判断：它是**承诺/高水位**口径
+  （实测报 7.3 GB 而 PyTorch 实际只用 1.7 GB）；`nvidia-smi memory.used` 是**整卡**口径
+  （含 `dwm` 等别人的占用）。
 
 ### 没有标准标签的任务（`target_kind: "custom"`）
 
